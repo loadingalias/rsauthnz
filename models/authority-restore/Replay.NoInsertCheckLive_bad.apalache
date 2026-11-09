@@ -1,0 +1,6 @@
+check
+--cinit=NoInsertCheckInit
+--init=Init
+--next=Next
+--inv=NoLiveRemoved
+--length=10

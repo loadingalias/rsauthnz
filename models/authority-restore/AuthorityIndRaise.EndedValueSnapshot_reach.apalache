@@ -1,0 +1,6 @@
+check
+--cinit=CInitRaise
+--init=IndInitRaise
+--next=Next
+--inv=NoEndedValueSnapshot
+--length=0

@@ -1,0 +1,6 @@
+check
+--cinit=CInitRaise
+--init=IndInitRaise
+--next=NextRevoke
+--inv=IndInv
+--length=1

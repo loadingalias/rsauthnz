@@ -1,0 +1,6 @@
+check
+--cinit=RetentionOneUInit
+--init=Init
+--next=Next
+--inv=NoLiveRemoved
+--length=10

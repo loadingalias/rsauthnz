@@ -1,0 +1,6 @@
+check
+--cinit=ConstInit
+--init=Init
+--next=Next
+--inv=IndInv
+--length=0

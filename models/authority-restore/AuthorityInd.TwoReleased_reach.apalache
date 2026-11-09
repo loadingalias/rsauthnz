@@ -1,0 +1,6 @@
+check
+--cinit=CInit
+--init=IndInit
+--next=Next
+--inv=NoTwoReleased
+--length=0
