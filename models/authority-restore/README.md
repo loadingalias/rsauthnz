@@ -1,18 +1,16 @@
-# authority-restore: design model of task A000
+# authority-restore: design model of tasks A000 and A016
 
-Status (2026-11-08): the modules follow the design as selected on 2026-11-07 and the owner
-re-bootstrap selected on 2026-11-08 ([Decisions](#decisions)). The four design defects of the
-first rounds (F1 to F4) are closed in the design, and each one is now a known-bad variant that
-fails. On 2026-11-08 the user also selected the acknowledgement order of anchor changes
-(`CreationPending`, a defect that the raise of the operations found) and the reduction to one
-account for that raise ([Decisions](#decisions), [Bounds, faults, and reductions](#bounds-faults-and-reductions)).
-At the current digest
-`sha256:5549a6d42d03b46fe37fd498ff38b1413a6260383f23241d4ed8165dee760454` (111 files), every
-profile passed with its required verdict except two raise checks, which did not finish
-([Evidence record](#evidence-record)): `Authority.RaiseOpsOne.cfg` and the seventeen step parts
-of `AuthorityIndRaise`. Both are named limits ([Limits](#limits)), and the model is complete
-with them (selected on 2026-11-09). Task A016 closes them before A009, the restore journal, is
-built. Every other earlier row in this file is the record of earlier files.
+Status (2026-11-10): the inductive invariant of `AuthorityInd.tla` now implies every authority
+property, `AnchorKept`, `AccountKeepsAnchorP`, and `AdminKeptP` included, and the declared proof
+passed in full at the current digest. The raise by one runs in two groups
+(`AuthorityIndAnchors.tla` and `AuthorityIndProcess.tla`), and it replaces the TLC raise searches
+and the reduction to one account, which are removed ([Raise by one](#raise-by-one)). The proof
+work found one gap of the model and one weak property, and both are closed
+([Decisions](#decisions)): a lookup promised the anchor set of the operation's latest commit, not
+of the outcome record that it found; and `AnchorKept` excused an anchor that an operation planned
+to end before that operation wrote its end entry. A016 closed on 2026-11-10 with three named
+limits ([Limits](#limits)): the grouped raises ran only in part, the two declared TLC searches did
+not run at the current digest, and the round-6 logs of the Apalache profiles are lost.
 
 ## Promise
 
@@ -36,10 +34,11 @@ cargo xtask model authority-restore/Authority.TwoOps.cfg authority-restore/Repla
 cargo xtask model authority-restore                        # every profile
 ```
 
-`cargo xtask model authority-restore` includes `Authority.cfg` and `Authority.Bootstrapped.cfg`,
-the declared-bounds searches, which need the evidence host. On the development host, run the other profiles by name. The output and
-each trace go to `target/model/authority-restore/<file>/`: `checker.log`, and `trace.json` (TLC)
-or `<Module>.tla/<run>/violation1.itf.json` (Apalache). [Check the design
+`cargo xtask model authority-restore` includes the declared-bounds searches `Authority.cfg` and
+`Authority.Bootstrapped.cfg` and the step checks of the proofs, which need the evidence host
+([Evidence record](#evidence-record)). On the development host, run the other profiles by name.
+The output and each trace go to `target/model/authority-restore/<file>/`: `checker.log`, and
+`trace.json` (TLC) or `<Module>.tla/<run>/violation1.itf.json` (Apalache). [Check the design
 models](../../docs/content/design-models.md) tells how to install the checkers and what a
 failure means.
 
@@ -52,9 +51,8 @@ three, counter values up to 4, and at most one owner re-bootstrap. "Declared" is
 counter values up to 5, and at most one owner re-bootstrap. The constant `Origin` is "new" (the
 first bootstrap value is not consumed) or "bootstrapped" (it is consumed, and administrator `adm1`
 is live), so that a re-bootstrap and its consequences fit in the operation bound. The constant
-`Raise` is "none" for the declared bounds; its other values raise one bound by one
-([Raise by one](#raise-by-one)), and "oneAccount" and "opsOne" are the reduction to one account
-(selected on 2026-11-08).
+`Raise` is "none" for the declared domains, "anchors" and "process" for the two raised proofs, and
+"slotsA1" (the fourth slot of `a1`) for `SlotsA1AckEarly_bad`.
 
 | Profile | Checker | Check | Bound |
 | --- | --- | --- | --- |
@@ -65,25 +63,22 @@ is live), so that a re-bootstrap and its consequences fit in the operation bound
 | `Authority.Race.cfg` | TLC | Every authority property, with `Turn = "entry"`: each turn ends at the first journal write, so two consumptions of one value can be in doubt at one restore | TwoOps |
 | `Authority.<Rule>_bad.cfg` | TLC | One known-bad variant ([Known-bad variants](#known-bad-variants)) | TwoOps; `Unserialized_bad` Declared |
 | `Authority.<Target>_reach.cfg` | TLC | One reachability witness ([Reachability](#reachability)) | TwoOps; `AdminReplaced_reach` Declared |
-| `AuthorityInd.Init.apalache` | Apalache | `Init => IndInv` | Unbounded integers |
-| `AuthorityInd.Step<Part>.apalache` | Apalache | `IndInv /\ Next<Part> => IndInv'` for the seventeen parts of `Next`: `Enroll`, `Unlink`, `Recover`, `Boot`, `Renew`, `Revoke`, `IssueEnd`, `IssueNone`, `Journal`, `Commit`, `Conflict`, `End`, `Rec`, `Again`, `Fail`, `Serve`, `Restore` | Unbounded integers |
-| `AuthorityInd.Safety.apalache` | Apalache | `IndInv => Safety` | Unbounded integers |
-| `AuthorityInd.<Witness>_reach.apalache` | Apalache | `IndInit` contains a key state: `DoubtSnapshot`, `Pending`, `TwoReleased`, `IssueReady`, `EndedValueSnapshot` | — |
-| `Authority.Raise<Bound>.cfg` | TLC | Every authority property with one bound raised by one ([Raise by one](#raise-by-one)) | Declared + 1 (evidence host) |
-| `Authority.RaiseOpsOne.cfg` | TLC | Every authority property with four operations, under the reduction to one account (selected on 2026-11-08) | Declared + 1 operation (evidence host) |
-| `Authority.OneAccount<Rule>_bad.cfg` | TLC | A known-bad variant under the reduction to one account: it must still fail, so the reduction keeps its failure | TwoOps; `OneAccountNoAgainAccount_bad` and `OneAccountUnserialized_bad` Declared |
-| `Authority.SlotsA1AckEarly_bad.cfg` | TLC | The known-bad variant `ackEarly` on both accounts with the fourth slot of `a1`, so its failure does not come from the reduction | TwoOps |
-| `AuthorityIndRaise.<Check>.apalache` | Apalache | The checks of `AuthorityInd` with every domain raised by one at once | Unbounded integers |
+| `AuthorityInd.Init.apalache` | Apalache | `Init => IndInv` | Declared domains |
+| `AuthorityInd.Step<Part><Group>.apalache` | Apalache | `IndInv /\ Next<Part> => P'` for each part `P` of `IndInv` in the group: `Base` (the eight parts of A000), `Anchor` (`AnchorStateInv`, `PromiseInv`, `KeptNowInv`, `TurnInv`, `ServingInv`), `Restore` (`RestoreAccountInv`, `RestoreAdminInv`), or `RestoreNow` (`RestoreNowAccountInv`, `RestoreNowAdminInv`); four profiles for each of the twenty-three parts of `Next` | Declared domains, unbounded integers |
+| `AuthorityInd.Safety.apalache` | Apalache | `IndInv => Safety` | Declared domains |
+| `AuthorityInd.<Witness>_reach.apalache` | Apalache | `IndInit` contains a key state ([Inductive proofs](#inductive-proofs)) | — |
+| `AuthorityInd.SnapshotOwnMark_bad.apalache` | Apalache | Known-bad variant `ownMark`: a snapshot step breaks `EndInv` | Declared domains |
+| `AuthorityIndAnchors.<Check>.apalache` | Apalache | Each check of `AuthorityInd` with the anchor domains raised by one, and the witnesses `AccountsUsed_reach` and `AdminUsed_reach` | Three accounts, four slots in `a1`, three in `a2`, three administrator slots |
+| `AuthorityIndProcess.<Check>.apalache` | Apalache | Each check of `AuthorityInd` with the process domains raised by one, and the witness `ProcessUsed_reach` | Four operations, three snapshots, four values in each set of bootstrap values |
 | `Replay.Init.apalache`, `Replay.Step.apalache`, `Replay.Safety.apalache` | Apalache | The inductive invariant of the replay window, and `IndInv => Safety` | Unbounded integers and time |
 | `Replay.AcceptedGone_reach.apalache` | Apalache | `IndInv` contains an acceptance whose record expired while a verifier holds a check | — |
 | `Replay.<Rule>_bad.apalache` | Apalache | One known-bad variant, 10 steps | Unbounded integers and time |
 
-`Next` of `Authority.tla` is the disjunction of `NextRun`, `NextEnd`, `NextRec`, `NextAgain`,
-`NextSys`, and `NextRestore`. `AuthorityInd.tla` splits `NextRun` into eleven parts and `NextSys`
-into two, by the definitions of `Start` (the disjunction of its seven kinds, with `StartIssue` as
-the disjunction of `StartIssueEnd` and `StartIssueNone`), `NextRun`, and
-`NextSys`, so that each Apalache run has one symbolic transition, or two for the short ones. The
-seventeen parts together are the step check.
+The twenty-three parts of `Next` are one action each (`AuthorityInd.tla`): the eight kinds of
+`Start`, `JournalEnd`, `Commit`, `Conflict`, `JournalCreate`, `Ack`, `Resolve`,
+`ReconcileCreate`, `ReconcileVoid`, `Redrive`, `RedriveFail`, `Crash`, `Restart`, `Serve`,
+`Snapshot`, and `Restore`. By the definitions of `Next`, `NextRun`, `NextEnd`, `NextRec`,
+`NextAgain`, and `NextSys`, their disjunction is `Next`.
 
 ## Correspondence: authority and restore
 
@@ -95,17 +90,17 @@ and conformance case.
 | --- | --- | --- | --- |
 | `Start(o)`: `StartEnroll`, `StartUnlink`, `StartRecover`, `StartBoot`, `StartRenew`, `StartRevoke`, `StartIssue` | The core checks the request and proposes a transition of one kind. A bootstrap takes a valid bootstrap value and binds a new administrator. `StartIssue` is the owner re-bootstrap ([AUTH Authority Transitions], selected on 2026-11-08): it plans to end the valid bootstrap value, if any. An unlink of an administrator binding keeps another administrator that the journal records as live ([AUTH Authority Transitions]). An anchor change takes its owner's turn. An unlink keeps an anchor that the journal records as live ("counts the journaled anchors that the change does not end"). A recovery binds its new anchor in the commit that consumes its value | Check and turn, one step | Before a journal write (`cChecked`) |
 | `JournalEnd(o)` | Write rule: the end entry is durable before its commit. A consumption entry records its transition. An unlink ends its turn here | One journal append | Between a journal write and its commit (`cJournaled`) |
-| `Commit(o)` | Serializable conditional commit of every dependency, the state change, and the outcome record ([AUTH Authority Transitions]). An owner re-bootstrap depends on the valid bootstrap values that it checked; its commit adds a value with a new identity and ends the value that it checked. The outcome record and the audit stand for the authority's report of each issue and each consumption. Allocation floors: the floor is durable before a commit allocates a value above it | One step, because the storage contract makes the commit atomic; the floor write and the commit are one step, because the state between them differs only by a higher floor | Between a commit and its creation entry, or before the acknowledgement (`cCommitted`) |
+| `Commit(o)` | Serializable conditional commit of every dependency, the state change, and the outcome record ([AUTH Authority Transitions]). The record keeps the anchors of the owner that the commit leaves live (`left`): what the commit promises when it is acknowledged. An owner re-bootstrap depends on the valid bootstrap values that it checked; its commit adds a value with a new identity and ends the value that it checked. The outcome record and the audit stand for the authority's report of each issue and each consumption. Allocation floors: the floor is durable before a commit allocates a value above it | One step, because the storage contract makes the commit atomic; the floor write and the commit are one step, because the state between them differs only by a higher floor | Between a commit and its creation entry, or before the acknowledgement (`cCommitted`) |
 | `Conflict(o)` | A changed dependency refuses the commit. Write rule: the refusal voids each entry of its operation before it returns | One step: a crash before the void is the crash at `journaled` | — |
 | `JournalCreate(o)` | The creation entry, after its commit and before its acknowledgement. It ends the turn | One journal append | Before an acknowledgement (`cCreated`) |
-| `Ack(o)` | The response, after the floor covers the artifact's value. Acknowledgement order (selected on 2026-11-08): an anchor change of an owner is acknowledged only after each other commit of that owner that created an anchor has its creation entry (`CreationPending`), so a restore keeps each anchor in the state that the acknowledged commit saw | One step | — |
-| `Resolve(o)` | A client whose response was lost looks up its operation identity and receives the committed outcome ([AUTH Authority Transitions]: "Resolve it through the accepted receipt/current-state contract"). A lookup that reports a commit is an acknowledgement too, so it has the same `CreationPending` guard (selected on 2026-11-08) | One step | — |
+| `Ack(o)` | The response, after the floor covers the artifact's value. Acknowledgement order (selected on 2026-11-08): an anchor change of an owner is acknowledged only after each other commit of that owner that created an anchor has its creation entry (`CreationPending`), so a restore keeps each anchor in the state that the acknowledged commit saw. The acknowledgement adds the anchor set of its outcome record to the promises (`promised`) | One step | — |
+| `Resolve(o)` | A client whose response was lost looks up its operation identity and receives the committed outcome ([AUTH Authority Transitions]: "Resolve it through the accepted receipt/current-state contract"). A lookup that reports a commit is an acknowledgement too, so it has the same `CreationPending` guard (selected on 2026-11-08). It promises the anchor set of the outcome record that it finds: after a restore, the record of the snapshot (2026-11-09) | One step | — |
 | `Crash` | A crash stops each operation in flight at its point; the store and the journal keep their durable state | One step | — |
 | `Restart`, `Serve` | A start reconciles before it serves; the store serves only with no missing creation entry, no entry to void, and no in-doubt consumption | One step each | — |
 | `ReconcileCreate(o)`, `ReconcileVoid(o)` | Reconciliation writes the missing creation entry of each anchor whose commit has an outcome record, and a void for each end entry whose fact does not hold in the store | One journal append each | A crash during reconciliation |
 | `Redrive(o)`, `RedriveFail(o)` | Restore completes each in-doubt consumption: the first in journal order for each value commits again under its operation identity when its dependencies hold; otherwise the value stays consumed. A bootstrap value must be one that the restored store holds and that no re-bootstrap entry ended | One step each, because the commit is atomic | A crash during reconciliation |
-| `Snapshot` | A snapshot with its low-water mark: the highest journal sequence at or below which every entry is reflected | One step | — |
-| `Restore(s)` | Restore from any retained snapshot of a store that is down: apply each entry after the low-water mark that no void cancels, keep an ended anchor ended, raise the floor, and mark each in-doubt consumption; reconciliation follows. The store holds the snapshot's bootstrap values, so a value issued after the snapshot is lost; consumption and re-bootstrap entries apply as facts | One step before reconciliation | — |
+| `Snapshot` | A snapshot with its low-water mark: the highest journal sequence at or below which every entry is reflected. It holds the outcome records with their anchor sets | One step | — |
+| `Restore(s)` | Restore from any retained snapshot of a store that is down: apply each entry after the low-water mark that no void cancels, keep an ended anchor ended, raise the floor, and mark each in-doubt consumption; reconciliation follows. The store holds the snapshot's bootstrap values and outcome records, so a value issued after the snapshot is lost; consumption and re-bootstrap entries apply as facts | One step before reconciliation | — |
 
 Merged rules, each with the same journal rule in the design:
 
@@ -183,19 +178,16 @@ for each value. That is an argument, not a check.
   for the declared search (one value again after three allocations), up to 4 for the local bound.
   With two anchor slots, no second unlink can make the first one refuse, so F3 needs three. Each
   bound is a state constraint, so a TLC pass is a complete search of the bounded space only. The
-  Apalache proofs have no such bound: they hold at the declared domains for histories of any
-  length.
+  Apalache proofs have no counter, journal, or re-bootstrap bound. An operation identity starts
+  once and commits through `Commit` once, and a snapshot is never removed, so the operation and
+  snapshot bounds count all the operations and snapshots of a run; the proofs hold for any number
+  of crashes, restarts, restores, and reconciliation steps over them.
 - Faults: a crash at each point in the correspondence table, restart, restore from any retained
   snapshot, a commit conflict, a lost response, and a crash during reconciliation.
 - Replay: one signature with symbolic `created` and `expires`, symbolic non-negative `Skew`, `U`,
   and `MaxWin`, and integer time with no bound.
-- The reduction to one account (selected on 2026-11-08) exists for the raise of the operations,
-  whose full form is an estimated 10 to 100 billion states. Its first form had no free slot (`a1`
-  with its three live anchors only), and it hid F1: `OneAccountNoAgainAccount_bad` completed a
-  search of 43,855,280 states with no violation, because no recovery had a free slot to create its
-  new anchor into. The fourth slot `a1s`, absent at the start, gives each recovery and each
-  enrollment a slot, and with it every one-account variant fails. `Authority.RaiseOps.cfg` is
-  removed; `Authority.RaiseOpsOne.cfg` is the raise of the operations.
+- The reduction to one account (selected on 2026-11-08) and the TLC raise searches were removed on
+  2026-11-09: the raised proof covers each bound ([Raise by one](#raise-by-one)).
 
 Each reduction names the failure that it could hide, and a known-bad variant with that failure
 still fails under it ([FP Design Models]):
@@ -204,7 +196,6 @@ still fails under it ([FP Design Models]):
 | --- | --- | --- |
 | Operations start in identity order (`Rank`); the identities are interchangeable | A race that needs a later identity to start first | `RefusalNoVoid_bad`, `RaceNoVoid_bad`, and `Unserialized_bad` need two or three concurrent operations |
 | One account anchor kind for passkeys, provider links, and recovery values; the administrator bindings for the bootstrapped CLI credential | A journal rule that differs by kind | The design gives the kinds one rule; `IgnoreVoids_bad` (unlink) and `NoAgainAccount_bad` (recovery) fail on the one kind |
-| The reduction to one account (`Raise = "oneAccount"`; with four operations, `"opsOne"`): account `a1` with a fourth slot `a1s`, absent at the start, and the administrator bindings, at the declared bounds (selected on 2026-11-08) | An interaction between accounts through the shared low-water mark, the shared operation identities, or the counter; and, without a free slot, every failure that needs an anchor creation in the account | `OneAccountIgnoreVoids_bad`, `OneAccountNoAgainAccount_bad`, `OneAccountRefusalNoVoid_bad`, `OneAccountUnserialized_bad`, `OneAccountVoidOnMissing_bad`, and `OneAccountAckEarly_bad` fail their named properties; `SlotsA1AckEarly_bad` fails the same property on both accounts |
 | One counter for every counter | Two counters with one floor | Each counter has its own floor with one rule; `NoFloor_bad` and `FloorAtRelease_bad` fail |
 | Session generations and grant revisions as one versioned value, whose entry is the death of the replaced value | A renewal that journals the new value | `NoJournal_bad` fails on any end entry; a renewal that journals the new value is A009's wrong-implementation case |
 | The floor write and the commit are one step | A value released before its floor is durable | `FloorAtRelease_bad` fails |
@@ -222,7 +213,7 @@ still fails under it ([FP Design Models]):
 | `NoCounterReuse` | Authority | Restore raises each allocation floor above every released value; a restore from a snapshot of an abandoned history releases no counter value twice |
 | `MissingOutcomeUnknown` | Authority | Restore returns unknown for a missing outcome; lost outcome records (broken binding) |
 | `NoUncommittedAnchor` | Authority | No anchor from an uncommitted creation |
-| `AnchorKept` | Authority | Restore keeps each anchor created after the snapshot; a commit that returned its refusal leaves no entry that applies at restore |
+| `AnchorKept` | Authority | Restore keeps each anchor created after the snapshot; a commit that returned its refusal leaves no entry that applies at restore; a lookup after a restore reports the anchor set of the outcome record that it finds |
 | `AccountKeepsAnchorP` | Authority | No restore leaves a serving store with an account that has no sign-in method; restore completes an in-doubt recovery once |
 | `AdminKeptP` | Authority | The serving authority has an administrator while the store holds a consumed bootstrap value that no re-bootstrap ended; restore completes an in-doubt bootstrap once |
 | `OneBootValid` | Authority | An owner re-bootstrap ends the earlier bootstrap value; at most one bootstrap value is valid |
@@ -293,7 +284,53 @@ selected on 2026-11-08. The design text is in
   known-bad variant `ackEarly` keeps the old order and fails `AnchorKept` under the reduction and
   on both accounts.
 - **The reduction to one account** (selected on 2026-11-08) for the raise of the operations,
-  with a free slot in the account ([Bounds, faults, and reductions](#bounds-faults-and-reductions)).
+  with a free slot in the account. Removed on 2026-11-09 with the TLC raise searches: the raised
+  proof covers the raise of the operations (below).
+
+Selected on 2026-11-09, task A016. The user selected the approach; each finding below changed the
+model, and no design rule changed.
+
+- **The anchor set of each outcome record (finding).** `left`, the anchors of its owner that a
+  commit leaves live, was a history variable of each operation identity, and `Promised` took it
+  for each acknowledged identity. An identity commits twice when a restore loses its first
+  commit and a redrive commits it again, and the redrive replaced `left`. A client that resolved
+  the identity against a restore of a snapshot that recorded the first commit was then promised
+  the anchors of the second. The proof found this: no inductive form held for the snapshot copy
+  of the promise. Now the outcome record keeps the anchor set, a restore brings back the records
+  of its snapshot, and the history variable `promised` collects the anchor set of each
+  acknowledgement and each lookup. No completed TLC search had reached the gap, and every
+  property still holds. The promise is now exact, and the TwoOps search has 601,942 distinct
+  states against 602,230 before, because a restore now brings back the anchor sets with their
+  records.
+- **`Uncertain` needs the end entry (finding).** `AnchorKept` excuses an anchor that an
+  in-doubt end entry ended (`Uncertain`). The excuse also covered an operation that crashed
+  before it wrote its end entry, which cannot have ended anything. Now `Uncertain` requires the
+  entry, so `AnchorKept` is stronger, and every search and proof passes with it.
+- **The proof replaces the TLC raises.** `IndInv` implies every property, and the raised
+  proofs check it with each domain raised by one. That is the raise of each bound that rule 4 of
+  [FP Design Models] asks for, so the eight TLC raise searches and the reduction to one account,
+  which existed only for the raise of the operations, are removed.
+- **Two grouped raises** (selected on 2026-11-10). With every domain raised at once (four
+  operations, three accounts, twelve anchors, three snapshots), five step profiles ran more than
+  one hour on their first or second query, against the budget rule. Rule 4 asks for each bound
+  raised by one, not all at once, so the raise runs in two groups: the anchor domains (accounts,
+  slots, administrator slots) in `AuthorityIndAnchors`, and the process domains (operations,
+  snapshots, bootstrap values) in `AuthorityIndProcess`. Each group covers each single raise in
+  it and each pair inside it.
+- **The form of the proof checks.** Four changes make each check finish in the budget, and none
+  makes a check weaker: the starting set gives each function the fixed domain of its variable
+  (the earlier generated domains kept the raised step parts in one solver query); a step check
+  states `IndInv'` as action invariants, which Apalache checks after the transition only, since
+  each state of the starting set is a state of `IndInv`; each step part is one action, and each
+  has two profiles, one for the restore parts of `IndInv` and one for the others; and the
+  snapshot set of the starting set is one choice, not one transition for each count of
+  snapshots. [Inductive proofs](#inductive-proofs) gives the measured effects.
+- **The cross-account known-bad variant `ownMark`.** A store that keeps one low-water mark for
+  each account, and stamps a snapshot with the mark of one account, misses the in-flight end
+  entries of the others. `Authority.OwnMark_bad.cfg` violates `NothingEndedValid` with two
+  accounts, and `AuthorityInd.SnapshotOwnMark_bad.apalache` shows that the snapshot step of the
+  proof breaks `EndInv` under it. With one account, the variant is the design, so the one-account
+  reduction hid this failure.
 
 Rejected options. Their files were never committed; this record replaces them.
 
@@ -324,50 +361,48 @@ Rejected options. Their files were never committed; this record replaces them.
 ## Known-bad variants
 
 Each variant changes one rule through the constant `Bad` (or `Turn`), and its profile checks only
-its own property. The "Current files" column is the evidence host record of 2026-11-08 and 2026-11-09
-([Evidence record](#evidence-record)); the column before it is the record of earlier files.
+its own property. The results are those of the evidence run of the current files
+([Evidence record](#evidence-record)): distinct states and depth at the violation, and the time
+that the xtask printed.
 
-| Profile | Changed rule | Must violate | Origin, bound | Record of earlier files: verdict, distinct states (depth), time | Current files |
-| --- | --- | --- | --- | --- | --- |
-| `Authority.AfterCommit_bad.cfg` | Option (c): the consumption entry comes after the commit | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated, as required, 4120 (7), 1.68 s | `NothingEndedValid` violated, as required, 9,104 (9), 0.94 s |
-| `Authority.CreateBeforeCommit_bad.cfg` | A creation entry before its commit | `NoUncommittedAnchor` | new, TwoOps | `NoUncommittedAnchor` violated, as required, 1848 (6), 1.22 s | `NoUncommittedAnchor` violated, as required, 5,291 (8), 1.09 s |
-| `Authority.FloorAtRelease_bad.cfg` | F4: the floor is durable at the release, not at the commit | `NoCounterReuse` | new, TwoOps | `NoCounterReuse` violated, as required, 452699 (18), 18.29 s | `NoCounterReuse` violated, as required, 459,913 (18), 4.38 s |
-| `Authority.IgnoreVoids_bad.cfg` | Restore applies voided entries | `AnchorKept` | new, TwoOps | `AnchorKept` violated, as required, 23362 (9), 2.07 s | `AnchorKept` violated, as required, 33,896 (10), 1.27 s |
-| `Authority.IssueNoEnd_bad.cfg` | An owner re-bootstrap that does not end the earlier value (2026-11-08) | `OneBootValid` | new, TwoOps | `OneBootValid` violated, as required, 306 (4), 0.86 s | `OneBootValid` violated, as required, 553 (6), 0.64 s |
-| `Authority.IssueNoJournal_bad.cfg` | An owner re-bootstrap whose end of the earlier value has no journal entry (2026-11-08) | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated, as required, 6294 (8), 1.51 s | `NothingEndedValid` violated, as required, 8,890 (9), 0.95 s |
-| `Authority.LookupAbsent_bad.cfg` | A missing outcome after restore reads as absent | `MissingOutcomeUnknown` | new, TwoOps | `MissingOutcomeUnknown` violated, as required, 3503 (7), 1.70 s | `MissingOutcomeUnknown` violated, as required, 6,034 (8), 1.18 s |
-| `Authority.NoAgainAccount_bad.cfg` | F1: restore leaves an in-doubt recovery unresolved | `AccountKeepsAnchorP` | new, TwoOps | `AccountKeepsAnchorP` violated, as required, 7306 (8), 1.63 s | `AccountKeepsAnchorP` violated, as required, 10,039 (9), 1.38 s |
-| `Authority.NoAgainAdmin_bad.cfg` | F1: restore leaves an in-doubt bootstrap unresolved (the design before 2026-11-07) | `AdminKeptP` | new, TwoOps | `AdminKeptP` violated, as required, 9569 (9), 1.92 s | `AdminKeptP` violated, as required, 15,045 (9), 1.07 s |
-| `Authority.NoFloor_bad.cfg` | Restore does not raise the allocation floor | `NoCounterReuse` | new, TwoOps | `NoCounterReuse` violated, as required, 240675 (14), 8.80 s | `NoCounterReuse` violated, as required, 255,931 (15), 2.98 s |
-| `Authority.OneAccountAckEarly_bad.cfg` | `ackEarly`: an anchor change is acknowledged before the creation entry of another anchor commit of its owner (the order before 2026-11-08) | `AnchorKept` | new, one account, TwoOps | not run on earlier files | `AnchorKept` violated, as required, 42,832 (11), 1.37 s |
-| `Authority.OneAccountIgnoreVoids_bad.cfg` | `ignoreVoids` under the reduction to one account | `AnchorKept` | new, one account, TwoOps | not run on earlier files | `AnchorKept` violated, as required, 42,293 (11), 1.46 s |
-| `Authority.OneAccountNoAgainAccount_bad.cfg` | `noAgain` under the reduction to one account | `AccountKeepsAnchorP` | new, one account, Declared | first form without `a1s`: no violation in a complete search of 43,855,280 states (the reduction hid F1) | `AccountKeepsAnchorP` violated, as required, 877,864 (11), 3.46 s |
-| `Authority.OneAccountRefusalNoVoid_bad.cfg` | `refusalNoVoid` under the reduction to one account | `AnchorKept` | new, one account, TwoOps | not run on earlier files | `AnchorKept` violated, as required, 42,312 (11), 1.42 s |
-| `Authority.OneAccountUnserialized_bad.cfg` | `unserialized` under the reduction to one account | `AccountKeepsAnchorP` | new, one account, Declared | not run on earlier files | `AccountKeepsAnchorP` violated, as required, 2,646,458 (11), 7.46 s |
-| `Authority.OneAccountVoidOnMissing_bad.cfg` | `voidOnMissing` under the reduction to one account | `NothingEndedValid` | new, one account, TwoOps | not run on earlier files | `NothingEndedValid` violated, as required, 193,788 (14), 2.25 s |
-| `Authority.SlotsA1AckEarly_bad.cfg` | `ackEarly` on both accounts with the fourth slot of `a1` | `AnchorKept` | new, raise of `a1`'s slots, TwoOps | not run on earlier files | `AnchorKept` violated, as required, 69,679 (11), 2.04 s |
-| `Authority.NoJournal_bad.cfg` | Restore without its journal | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated, as required, 3454 (7), 1.50 s | `NothingEndedValid` violated, as required, 8,904 (8), 1.05 s |
-| `Authority.PairApplies_bad.cfg` | Option (a): restore applies the pair and creates the anchor at once | `NoUncommittedAnchor` | new, TwoOps | `NoUncommittedAnchor` violated, as required, 4754 (7), 1.83 s | `NoUncommittedAnchor` violated, as required, 4,811 (7), 1.00 s |
-| `Authority.RaceNoVoid_bad.cfg` | F3 with `Turn = "entry"` | `RefusalHolds` | new, TwoOps | `RefusalHolds` violated, as required, 60121 (10), 3.27 s | `RefusalHolds` violated, as required, 61,049 (11), 1.69 s |
-| `Authority.RefusalNoVoid_bad.cfg` | F3: a refusal writes no void | `AnchorKept` | new, TwoOps | `AnchorKept` violated, as required, 22790 (10), 2.22 s | `AnchorKept` violated, as required, 48,396 (11), 1.42 s |
-| `Authority.Unserialized_bad.cfg` | Anchor changes of one account take no turn | `AccountKeepsAnchorP` | new, Declared | `AccountKeepsAnchorP` violated, as required, 1552164 (11), 29.64 s | `AccountKeepsAnchorP` violated, as required, 1,632,112 (12), 6.09 s |
-| `Authority.VoidOnMissing_bad.cfg` | Reconciliation voids on a missing outcome at a normal start after a restore | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated, as required, 154190 (13), 5.68 s | `NothingEndedValid` violated, as required, 172,765 (13), 2.27 s |
-| `Replay.FloorNoSkew_bad.apalache` | A restart floor without the skew | `NoDoubleAccept` | — | not run since 2026-11-08 (`Replay.tla` is unchanged since its run of 2026-11-08, digest `904164456e72…`) | `NoDoubleAccept` violated, as required, 6.42 s |
-| `Replay.InsertLate_bad.apalache` | The insert threshold one bound later (`expires + Skew + U`) | `NoDoubleAccept` | — | not run since 2026-11-08 (`Replay.tla` is unchanged since its run of 2026-11-08, digest `904164456e72…`) | `NoDoubleAccept` violated, as required, 6.89 s |
-| `Replay.NoInsertCheckDouble_bad.apalache` | F2: no insert check (the design before 2026-11-07) | `NoDoubleAccept` | — | not run since 2026-11-08 (`Replay.tla` is unchanged since its run of 2026-11-08, digest `904164456e72…`) | `NoDoubleAccept` violated, as required, 6.74 s |
-| `Replay.NoInsertCheckLive_bad.apalache` | F2: no insert check | `NoLiveRemoved` | — | not run since 2026-11-08 (`Replay.tla` is unchanged since its run of 2026-11-08, digest `904164456e72…`) | `NoLiveRemoved` violated, as required, 6.70 s |
-| `Replay.RetentionOneU_bad.apalache` | Retention with one uncertainty bound | `NoLiveRemoved` | — | not run since 2026-11-08 (`Replay.tla` is unchanged since its run of 2026-11-08, digest `904164456e72…`) | `NoLiveRemoved` violated, as required, 5.93 s |
+| Profile | Changed rule | Must violate | Origin, bound | Result |
+| --- | --- | --- | --- | --- |
+| `Authority.AfterCommit_bad.cfg` | Option (c): the consumption entry comes after the commit | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated (12), as required, 5,649 (7), 1.55 s |
+| `Authority.CreateBeforeCommit_bad.cfg` | A creation entry before its commit | `NoUncommittedAnchor` | new, TwoOps | `NoUncommittedAnchor` violated (12), as required, 1,931 (6), 1.22 s |
+| `Authority.FloorAtRelease_bad.cfg` | F4: the floor is durable at the release, not at the commit | `NoCounterReuse` | new, TwoOps | `NoCounterReuse` violated (12), as required, 461,992 (18), 20.27 s |
+| `Authority.IgnoreVoids_bad.cfg` | Restore applies voided entries | `AnchorKept` | new, TwoOps | `AnchorKept` violated (12), as required, 17,920 (9), 2.00 s |
+| `Authority.IssueNoEnd_bad.cfg` | An owner re-bootstrap that does not end the earlier value (2026-11-08) | `OneBootValid` | new, TwoOps | `OneBootValid` violated (12), as required, 444 (5), 0.71 s |
+| `Authority.IssueNoJournal_bad.cfg` | An owner re-bootstrap whose end of the earlier value has no journal entry (2026-11-08) | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated (12), as required, 5,783 (8), 1.37 s |
+| `Authority.LookupAbsent_bad.cfg` | A missing outcome after restore reads as absent | `MissingOutcomeUnknown` | new, TwoOps | `MissingOutcomeUnknown` violated (12), as required, 5,201 (7), 1.38 s |
+| `Authority.NoAgainAccount_bad.cfg` | F1: restore leaves an in-doubt recovery unresolved | `AccountKeepsAnchorP` | new, TwoOps | `AccountKeepsAnchorP` violated (12), as required, 9,245 (8), 1.84 s |
+| `Authority.NoAgainAdmin_bad.cfg` | F1: restore leaves an in-doubt bootstrap unresolved (the design before 2026-11-07) | `AdminKeptP` | new, TwoOps | `AdminKeptP` violated (12), as required, 11,112 (9), 1.64 s |
+| `Authority.NoFloor_bad.cfg` | Restore does not raise the allocation floor | `NoCounterReuse` | new, TwoOps | `NoCounterReuse` violated (12), as required, 223,428 (14), 7.38 s |
+| `Authority.NoJournal_bad.cfg` | Restore without its journal | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated (12), as required, 4,338 (7), 1.36 s |
+| `Authority.OwnMark_bad.cfg` | `ownMark`: the low-water mark counts the entries of `a1` and the authority only (2026-11-09) | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated (12), as required, 11,443 (8), 1.34 s |
+| `Authority.PairApplies_bad.cfg` | Option (a): restore applies the pair and creates the anchor at once | `NoUncommittedAnchor` | new, TwoOps | `NoUncommittedAnchor` violated (12), as required, 3,327 (7), 1.48 s |
+| `Authority.RaceNoVoid_bad.cfg` | F3 with `Turn = "entry"` | `RefusalHolds` | new, TwoOps | `RefusalHolds` violated (12), as required, 58,066 (11), 3.72 s |
+| `Authority.RefusalNoVoid_bad.cfg` | F3: a refusal writes no void | `AnchorKept` | new, TwoOps | `AnchorKept` violated (12), as required, 29,252 (10), 2.47 s |
+| `Authority.SlotsA1AckEarly_bad.cfg` | `ackEarly`: an anchor change is acknowledged before the creation entry of another anchor commit of its owner (the order before 2026-11-08), with the fourth slot of `a1` | `AnchorKept` | new, TwoOps | `AnchorKept` violated (12), as required, 62,357 (10), 4.75 s |
+| `Authority.Unserialized_bad.cfg` | Anchor changes of one account take no turn | `AccountKeepsAnchorP` | new, Declared | `AccountKeepsAnchorP` violated (12), as required, 1,663,506 (11), 68.33 s |
+| `Authority.VoidOnMissing_bad.cfg` | Reconciliation voids on a missing outcome at a normal start after a restore | `NothingEndedValid` | new, TwoOps | `NothingEndedValid` violated (12), as required, 148,103 (13), 7.31 s |
+| `AuthorityInd.SnapshotOwnMark_bad.apalache` | `ownMark` in the snapshot step of the proof (2026-11-09) | `EndInvPost` | declared domains | `EndInvPost` violated, as required (round 6; the time is not kept) |
+| `Replay.FloorNoSkew_bad.apalache` | A restart floor without the skew | `NoDoubleAccept` | — | `NoDoubleAccept` violated, as required, 6.42 s (A000 record; `Replay.tla` is unchanged) |
+| `Replay.InsertLate_bad.apalache` | The insert threshold one bound later (`expires + Skew + U`) | `NoDoubleAccept` | — | `NoDoubleAccept` violated, as required, 6.89 s (A000 record; `Replay.tla` is unchanged) |
+| `Replay.NoInsertCheckDouble_bad.apalache` | F2: no insert check (the design before 2026-11-07) | `NoDoubleAccept` | — | `NoDoubleAccept` violated, as required, 6.74 s (A000 record; `Replay.tla` is unchanged) |
+| `Replay.NoInsertCheckLive_bad.apalache` | F2: no insert check | `NoLiveRemoved` | — | `NoLiveRemoved` violated, as required, 6.70 s (A000 record; `Replay.tla` is unchanged) |
+| `Replay.RetentionOneU_bad.apalache` | Retention with one uncertainty bound | `NoLiveRemoved` | — | `NoLiveRemoved` violated, as required, 5.93 s (A000 record; `Replay.tla` is unchanged) |
 
 The counterexample of `ackEarly`, from the search of `Authority.RaiseOpsOne.cfg` on 2026-11-08
-that found it: `StartUnlink(o1)` (an unlink in `a1` that keeps another anchor), `JournalEnd(o1)`,
+that found it (that search is removed; `SlotsA1AckEarly_bad` keeps the failure): `StartUnlink(o1)` (an unlink in `a1` that keeps another anchor), `JournalEnd(o1)`,
 `StartEnroll(o2)` (an enrollment of the free slot `a1s`), `Snapshot`, `Commit(o2)` (`a1s` is
 live, and its creation entry is still to come), `Commit(o1)`, `Ack(o1)` (its commit saw `a1s`,
 so `a1s` is in the anchors that the acknowledged commit left), `Crash`, `Restore`. Then `a1s` has
 no creation entry, so the restore makes it absent, and `AnchorKept` fails. With `CreationPending`,
 `Ack(o1)` waits for the creation entry of `o2`, and a crash before it leaves `o1` unacknowledged.
 
-The counterexamples of the record of earlier files, as actions and the observation that breaks
-the property:
+The counterexamples, as actions and the observation that breaks the property. They are the traces
+of the record of 2026-11-08; the current traces differ only where the searches reach their
+violation in another order:
 
 - `Authority.AfterCommit_bad.cfg`: `Start(o1)` bootstrap of value 1 binds adm1, `Snapshot`, `Commit(o1)`, `Crash`, `Restore`. Then a consumption commits with no entry before its commit and crashes before its only entry; the restore from the snapshot before it makes the consumed value valid again.
 - `Authority.CreateBeforeCommit_bad.cfg`: `Start(o1)` enroll makes a2q, `JournalEnd(o1)`, `Snapshot`, `Crash`, `Restore`. Then an enrollment writes its creation entry before its commit; a crash before the commit and a restore make the anchor live with no commit.
@@ -380,6 +415,7 @@ the property:
 - `Authority.NoAgainAdmin_bad.cfg`: `Start(o1)` bootstrap of value 1 binds adm1, `JournalEnd(o1)`, `Snapshot`, `Crash`, `Restore`, `Serve`. Then the bootstrap's consumption entry applies at the restore, its commit does not, and the serving authority has a consumed bootstrap value and no administrator.
 - `Authority.NoFloor_bad.cfg`: `Start(o1)` enroll makes a2q, `Snapshot`, `Commit(o1)`, `JournalCreate(o1)`, `Ack(o1)`, `Crash`, `Restore`, `Serve`, `Start(o2)` renew, `JournalEnd(o2)`, `Commit(o2)`, `Ack(o2)`. Then a commit releases value 2; a restore from an older snapshot keeps the counter at 1, and another operation releases value 2 again.
 - `Authority.NoJournal_bad.cfg`: `Start(o1)` unlink a1r keeps a1p, `JournalEnd(o1)`, `Snapshot`, `Commit(o1)`, `Crash`, `Restore`. Then a commit after the snapshot ends a value or an anchor; a restore without the journal makes it valid again.
+- `Authority.OwnMark_bad.cfg`: `Start(o1)` recover a2p makes a2q, `JournalEnd(o1)`, `Snapshot`, `Commit(o1)`, `Crash`, `Restore`. Then the snapshot's mark counts no entry of `a2`, so it is at or above the recovery's end entry; the restore skips the entry, and the used recovery value `a2p` works again.
 - `Authority.PairApplies_bad.cfg`: `Start(o1)` recover a2p makes a2q, `JournalEnd(o1)`, `Snapshot`, `Crash`, `Restore`. Then a consumption that crashed before its commit gets its new anchor at the restore with no commit.
 - `Authority.RaceNoVoid_bad.cfg`: `Start(o1)` recover a2p makes a2q, `JournalEnd(o1)`, `Start(o2)` enroll makes a2q, `Snapshot`, `Commit(o2)`, `Conflict(o1)`, `Crash`, `Restore`, `Redrive(o1)`. Then a consumption refuses after another commit changed its dependency; with no void, the restore puts the refused consumption in doubt, and the redrive commits it.
 - `Authority.RefusalNoVoid_bad.cfg`: `Start(o1)` unlink a1q keeps a1p, `JournalEnd(o1)`, `Start(o2)` unlink a1p keeps a1r, `Snapshot`, `JournalEnd(o2)`, `Commit(o2)`, `Conflict(o1)`, `Crash`, `Restore`. Then one unlink commits, the other refuses, and the restore applies the refused unlink's entry, so the anchor that its client was told stays ends.
@@ -393,249 +429,253 @@ the property:
 
 ## Reachability
 
-In the record of earlier files, each witness reached its target: the checker reported its `Not<Target>` invariant as violated. The "Current files" column has the evidence host record.
+Each witness passes only when the checker reaches its target: it reports the witness's
+`Not<Target>` invariant as violated. The results are those of the evidence run of the current
+files.
 
-| Profile | Target | Origin, bound | Record of earlier files: verdict, distinct states (depth), time | Current files |
-| --- | --- | --- | --- | --- |
-| `Authority.AccountAfterDoubt_reach.cfg` | F1: after an in-doubt recovery and a restore, the serving store has the new anchor | new, TwoOps | `NotAccountAfterDoubt` violated, as required, 41418 (10), 3.01 s | `NotAccountAfterDoubt` violated, the target is reached, 50,658 (11), 1.50 s |
-| `Authority.AdminAfterDoubt_reach.cfg` | F1: after an in-doubt bootstrap and a restore, the serving store has its administrator | new, TwoOps | `NotAdminAfterDoubt` violated, as required, 35841 (10), 2.73 s | `NotAdminAfterDoubt` violated, the target is reached, 45,550 (11), 1.66 s |
-| `Authority.AdminReplaced_reach.cfg` | The administrator of a re-bootstrap ends the earlier administrator binding through an unlink (2026-11-08) | bootstrapped, Declared | `NotAdminReplaced` violated, as required, 815125 (12), 16.60 s | `NotAdminReplaced` violated, the target is reached, 810,231 (12), 3.63 s |
-| `Authority.CrashBeforeAck_reach.cfg` | Restore after a crash before an acknowledgement | new, TwoOps | `NotRestoreAfterCrashBeforeAck` violated, as required, 13908 (9), 2.00 s | `NotRestoreAfterCrashBeforeAck` violated, the target is reached, 16,380 (9), 1.23 s |
-| `Authority.CrashBeforeCommit_reach.cfg` | Restore after a crash between a journal write and its commit | new, TwoOps | `NotRestoreAfterCrashBeforeCommit` violated, as required, 6170 (7), 1.88 s | `NotRestoreAfterCrashBeforeCommit` violated, the target is reached, 9,811 (8), 1.15 s |
-| `Authority.CrashBeforeCreation_reach.cfg` | Restore after a crash between a commit and its creation entry | new, TwoOps | `NotRestoreAfterCrashBeforeCreation` violated, as required, 7400 (8), 1.88 s | `NotRestoreAfterCrashBeforeCreation` violated, the target is reached, 17,004 (9), 1.21 s |
-| `Authority.CrashBeforeJournal_reach.cfg` | Restore after a crash before a journal write | new, TwoOps | `NotRestoreAfterCrashBeforeJournal` violated, as required, 2107 (6), 1.48 s | `NotRestoreAfterCrashBeforeJournal` violated, the target is reached, 9,592 (8), 1.23 s |
-| `Authority.IssueEndApplied_reach.cfg` | A restore applies the end entry of an owner re-bootstrap whose commit is not known (2026-11-08) | new, TwoOps | `NotIssueEndApplied` violated, as required, 12932 (8), 1.80 s | `NotIssueEndApplied` violated, the target is reached, 17,147 (9), 1.20 s |
-| `Authority.Rebootstrapped_reach.cfg` | After the first bootstrap value was consumed, an owner re-bootstrap gives the authority a new administrator (2026-11-08) | bootstrapped, TwoOps | `NotRebootstrapped` violated, as required, 5998 (7), 1.38 s | `NotRebootstrapped` violated, the target is reached, 8,434 (9), 1.01 s |
-| `Authority.ReconciledCreate_reach.cfg` | Reconciliation writes the creation entry of a crashed commit | new, TwoOps | `NotReconciledCreate` violated, as required, 4703 (8), 1.63 s | `NotReconciledCreate` violated, the target is reached, 11,040 (9), 1.10 s |
-| `Authority.ReconciledVoid_reach.cfg` | Reconciliation voids the entry of a crashed operation that did not commit | new, TwoOps | `NotReconciledVoid` violated, as required, 4765 (7), 1.52 s | `NotReconciledVoid` violated, the target is reached, 10,089 (8), 1.17 s |
-| `Authority.RefusedKept_reach.cfg` | F3: a refused unlink voided its entry, and a restored store keeps its anchor | new, TwoOps | `NotRefusedKept` violated, as required, 79263 (11), 3.63 s | `NotRefusedKept` violated, the target is reached, 81,260 (12), 2.00 s |
-| `Authority.TwoInDoubt_reach.cfg` | `Turn = "entry"`: two consumptions of one value in doubt at one restore | new, TwoOps | `NotTwoInDoubt` violated, as required, 25743 (9), 2.51 s | `NotTwoInDoubt` violated, the target is reached, 19,551 (9), 1.26 s |
+| Profile | Target | Origin, bound | Result |
+| --- | --- | --- | --- |
+| `Authority.AccountAfterDoubt_reach.cfg` | F1: after an in-doubt recovery and a restore, the serving store has the new anchor | new, TwoOps | `NotAccountAfterDoubt` violated (12), the target is reached, 39,202 (10), 3.13 s |
+| `Authority.AdminAfterDoubt_reach.cfg` | F1: after an in-doubt bootstrap and a restore, the serving store has its administrator | new, TwoOps | `NotAdminAfterDoubt` violated (12), the target is reached, 43,463 (10), 2.56 s |
+| `Authority.AdminReplaced_reach.cfg` | The administrator of a re-bootstrap ends the earlier administrator binding through an unlink (2026-11-08) | bootstrapped, Declared | `NotAdminReplaced` violated (12), the target is reached, 645,883 (10), 12.76 s |
+| `Authority.CrashBeforeAck_reach.cfg` | Restore after a crash before an acknowledgement | new, TwoOps | `NotRestoreAfterCrashBeforeAck` violated (12), the target is reached, 14,506 (8), 2.25 s |
+| `Authority.CrashBeforeCommit_reach.cfg` | Restore after a crash between a journal write and its commit | new, TwoOps | `NotRestoreAfterCrashBeforeCommit` violated (12), the target is reached, 4,739 (7), 1.44 s |
+| `Authority.CrashBeforeCreation_reach.cfg` | Restore after a crash between a commit and its creation entry | new, TwoOps | `NotRestoreAfterCrashBeforeCreation` violated (12), the target is reached, 11,540 (8), 1.71 s |
+| `Authority.CrashBeforeJournal_reach.cfg` | Restore after a crash before a journal write | new, TwoOps | `NotRestoreAfterCrashBeforeJournal` violated (12), the target is reached, 3,887 (7), 1.34 s |
+| `Authority.IssueEndApplied_reach.cfg` | A restore applies the end entry of an owner re-bootstrap whose commit is not known (2026-11-08) | new, TwoOps | `NotIssueEndApplied` violated (12), the target is reached, 12,830 (9), 1.85 s |
+| `Authority.Rebootstrapped_reach.cfg` | After the first bootstrap value was consumed, an owner re-bootstrap gives the authority a new administrator (2026-11-08) | bootstrapped, TwoOps | `NotRebootstrapped` violated (12), the target is reached, 9,021 (9), 1.60 s |
+| `Authority.ReconciledCreate_reach.cfg` | Reconciliation writes the creation entry of a crashed commit | new, TwoOps | `NotReconciledCreate` violated (12), the target is reached, 5,591 (7), 1.62 s |
+| `Authority.ReconciledVoid_reach.cfg` | Reconciliation voids the entry of a crashed operation that did not commit | new, TwoOps | `NotReconciledVoid` violated (12), the target is reached, 5,828 (7), 1.40 s |
+| `Authority.RefusedKept_reach.cfg` | F3: a refused unlink voided its entry, and a restored store keeps its anchor | new, TwoOps | `NotRefusedKept` violated (12), the target is reached, 57,922 (11), 3.52 s |
+| `Authority.TwoInDoubt_reach.cfg` | `Turn = "entry"`: two consumptions of one value in doubt at one restore | new, TwoOps | `NotTwoInDoubt` violated (12), the target is reached, 16,962 (9), 2.25 s |
 
 ## Inductive proofs
 
-`AuthorityInd.tla` proves `Safety` for histories of any length, with counter values and journal
-sequences as unbounded integers: `NothingEndedValid`, `OneBootValid`, `NoCounterReuse`,
-`MissingOutcomeUnknown`, `NoUncommittedAnchor`, `RefusalHolds`, `OneUse`, `PendExact`, and
-`NoDoubtServing`, for both origins. The invariant has eight parts: `TypeInd`, the journal and history clauses
-(`JournalInv`), committed ends hold in the store and in each later snapshot (`EndInv`), outcome
-records are commits (`OutcomeInv`), the in-doubt state (`DoubtInv`), created anchors and their
-entries against each snapshot's low-water mark (`AnchorInv`), at most one valid bootstrap value
-in the store and in each snapshot (`BootInv`), and the artifact values against the counter and
-the durable floor (`CounterInv`). Until 2026-11-08, a part `AdminInv` was in the place of
-`BootInv`, and it proved `AdminKeptP` (see below).
-`IndInit` builds each of its two snapshots from generated fields: `Gen(7)` for the anchor
-function (seven anchors), and `Gen(3)` for each set of bootstrap values and each outcome set.
-So the proof covers stores and snapshots that hold, consumed, or ended at most three bootstrap
-values; each step adds at most one, and the declared TLC bounds have at most two. With `Gen(7)`
-for the whole snapshot set, the same witness took 714 s against 7.5 s, so the step checks did not
-fit the development host.
-`Replay.tla` proves `Safety` of the replay window for every non-negative `Skew`, `U`, and
-`MaxWin` and every integer time. The acknowledgement order of 2026-11-08 (`CreationPending`) only
-removes behaviors of `Ack` and `Resolve`, and the proof modules did not change for it; the step
-checks ran again on the current files and passed.
+`AuthorityInd.tla` proves every property of `Safety` with counter values, journal sequences, and
+bootstrap-value identities as unbounded integers, for both origins: `NothingEndedValid`,
+`OneBootValid`, `NoCounterReuse`, `MissingOutcomeUnknown`, `NoUncommittedAnchor`,
+`RefusalHolds`, `OneUse`, `PendExact`, `NoDoubtServing`, and, since 2026-11-09 (A016),
+`AnchorKept`, `AccountKeepsAnchorP`, and `AdminKeptP`. Its scope is exact: an operation identity
+starts once and commits through `Commit` once, and a snapshot is never removed, so the proof
+covers any number of crashes, restarts, restores, redrives, and reconciliation steps over at
+most three operations and two snapshots in a run, and at most three values in each set of
+bootstrap values (four operations, three snapshots, and four values in `AuthorityIndProcess`). That is the domain of rule 4 of
+[FP Design Models]. A proof for any number of operations would need identities that are used
+again and a journal that is a set of entries; rule 4 does not ask for it.
 
-Not inductive: `AnchorKept`, `AccountKeepsAnchorP`, and, since 2026-11-08, `AdminKeptP`. An
-inductive form needs, for each promised anchor and each retained snapshot, the creation and end
-entries of every anchor of its owner against the snapshot's low-water mark, together with the turn
-of each owner and the crash point of each operation that holds it. Until 2026-11-08 no transition
-ended the administrator binding, so `AdminInv` proved `AdminKeptP` without that. Now an unlink
-with the last-anchor check can end an administrator binding, as it ends a sign-in method, so
-`AdminKeptP` needs the same form. The TLC searches check all three at their bounds.
+The invariant has seventeen parts. The eight parts of A000 are `TypeInd`, `JournalInv` (the
+journal and the history; since 2026-11-09 also the order of entries: each has its own sequence
+number, and an operation's entries come in the order of its steps), `EndInv` (committed ends hold in the store and in each later
+snapshot), `OutcomeInv` (outcome records are commits), `DoubtInv` (the in-doubt state),
+`AnchorInv` (created anchors against each snapshot's low-water mark), `BootInv` (at most one
+valid bootstrap value), and `CounterInv` (artifact values against the counter and the floor).
+Nine parts are for the anchor properties (2026-11-09):
 
-| Profile | Check | Record of earlier files: verdict, time | Current files |
+| Part | What it states | Why the anchor properties need it |
+| --- | --- | --- |
+| `AnchorStateInv` | An anchor that the journal records as made or as ended, or that an operation in flight ends, is never absent. An ended anchor was ended by a commit or by an in-doubt end entry, in the store and in each snapshot. An operation that stopped at its check wrote no entry, and each entry of an operation in flight comes after each entry of a crashed operation | A restore cannot make a promised anchor absent, and an ended anchor stays ended. The order of entries is what a crash leaves, and it ties each kept anchor to the unlinks that came before it |
+| `PromiseInv` | Each promised anchor has a journaled creation. Each live anchor, and each anchor that an outcome record left, has one, or a commit in the record made it and its creation entry is still due; while the store serves, that commit is in flight | With `CreationPending`, an acknowledgement promises only journaled anchors, and a restore applies or keeps each journaled creation |
+| `KeptNowInv` | Each account has a live anchor, and the authority has an administrator while it holds a consumed bootstrap value, or an in-doubt recovery or bootstrap makes one before the store serves | `AccountKeepsAnchorP` and `AdminKeptP`: while the store serves, nothing is in doubt |
+| `RestoreAccountInv`, `RestoreAdminInv` | The same through a restore from each retained snapshot: what the restore gives now, from the snapshot and the entries after its low-water mark, with its in-doubt consumptions; one part for the accounts, one for the authority | A crash can come at any step, and the restore then sets the store |
+| `RestoreNowAccountInv`, `RestoreNowAdminInv` | The same for the snapshot that the serving store takes now | The snapshot step keeps the two restore parts |
+| `TurnInv` | The owner's turn has one holder between its check and the end of its turn. An unlink keeps an anchor that the journal records as live; that anchor's creation stays journaled, and each end entry of it that counts comes after the unlink's own, while the unlink's end entry counts. A consumption in its turn has no rival commit of its value, and its new anchor has no entry | An end entry that ends the last anchor of a restore comes with a kept anchor, or with an in-doubt consumption that makes one |
+| `ServingInv` | Each snapshot is a copy of a serving store. While the store serves, the end entry of each crashed operation that no void cancels holds in the store | Reconciliation left no stale entry that a later void could turn into a lockout |
+
+`AuthorityInd.Safety.apalache` checks that `IndInv` implies each property of `Safety`, the three anchor
+properties included.
+
+How the parts were found: each candidate clause first passed `Authority.TwoOps.cfg`,
+`Authority.TwoOpsBootstrapped.cfg`, and `Authority.Race.cfg` as a TLC invariant, so it holds in
+each reachable state of those bounds. Then each counterexample to induction of a step check,
+first on a domain of one account, two operations, and one snapshot, gave a clause that excludes
+an unreachable starting state. One counterexample was not of that kind: it showed the gap of the
+outcome record's anchor set ([Decisions](#decisions)).
+
+The starting set `IndStart(n)` gives each function the fixed domain of its variable and each
+value in it a free choice. Each snapshot is one record of its own fields, and the snapshot set is
+one choice among the sets of up to `NSnaps` snapshots. `n` bounds each set of bootstrap values (3,
+and 4 in `AuthorityIndProcess`). Until 2026-11-09, `Gen` built each function with a domain of its own, and the
+solver had to prove that domain equal to the fixed one: each raised step part stayed in one query
+of its starting set. Apalache checks each part of `IndInv` after the step as an action invariant
+(`<Part>Post == <Part>'`), so it does not check the starting state, which is a state of `IndInv` by
+its definition. As one choice, the snapshot set gives the start one transition: as one transition
+for each number of snapshots, the raised start took 15 to 20 minutes, and as one choice about 1.5
+minutes. Each step part has four profiles: `Step<Part>Base` checks the eight parts of A000,
+`Step<Part>Anchor` the five other parts that the anchor properties need, `Step<Part>Restore`
+the two restore parts for each retained snapshot, and `Step<Part>RestoreNow` the two for a
+snapshot taken now. Their conjunction is the step check. With every part in one profile, the
+declared `Commit`, `Conflict`, and `End` (then one part of three actions) took more than one hour,
+and with every domain raised at once, profiles ran past one hour. With the four profiles and the
+order clauses of 2026-11-09, each declared profile takes 2 to 13 minutes. The times of the grouped
+raise profiles are not kept ([Limits](#limits)).
+
+Each `_reach` witness shows that `IndInit` contains a state that a step must cover; each new part
+has at least one:
+
+| Witness | The starting set contains |
+| --- | --- |
+| `DoubtSnapshot_reach` | A snapshot from which a restore puts a consumption in doubt |
+| `Pending_reach` | An in-doubt consumption that a redrive can commit |
+| `TwoReleased_reach` | Two released artifacts |
+| `IssueReady_reach` | An owner re-bootstrap that can commit and end the valid value |
+| `EndedValueSnapshot_reach` | A snapshot whose valid bootstrap value a later re-bootstrap entry ends at a restore |
+| `MadePromise_reach` | A promise of an anchor that a commit created (`PromiseInv`) |
+| `CreationDue_reach` | An outcome record that left an anchor whose creation entry is still due (`PromiseInv`) |
+| `DoubtKeeps_reach` | An account that a restore keeps only through an in-doubt recovery (`RestoreAccountInv`) |
+| `DoubtAdmin_reach` | An authority that a restore keeps only through an in-doubt bootstrap (`RestoreAdminInv`) |
+| `UncertainEnded_reach` | An ended anchor that only an in-doubt end entry accounts for (`AnchorStateInv`) |
+| `PendKeeps_reach` | During reconciliation, an account that only an in-doubt recovery keeps (`KeptNowInv`) |
+| `DoubtKeepsNow_reach` | A serving store that a snapshot taken now keeps only through an in-doubt recovery (`RestoreNowAccountInv`) |
+| `TurnHeld_reach` | A consumption that committed and still holds its owner's turn (`TurnInv`) |
+| `CrashedHolds_reach` | A serving store with a crashed operation that did not commit and whose end entry holds (`ServingInv`) |
+| `AccountsUsed_reach` | The third account's second anchor and the extra slots of `a1` and `a2` live together |
+| `AdminUsed_reach` | The third administrator live |
+| `ProcessUsed_reach` | Three snapshots, the fourth operation, and four bootstrap values |
+
+Results of the proofs. Each Apalache profile ran through the xtask; a pass is the outcome
+`NoError` with exit status 0, a witness or known-bad variant passes on its violation
+([Evidence record](#evidence-record)):
+
+| Module | Profiles | At the current digest (round 6) | At the digest `sha256:0dba3f3d…` (round 5) |
 | --- | --- | --- | --- |
-| `AuthorityInd.DoubtSnapshot_reach.apalache` | `IndInit` contains `~NoDoubtSnapshot` | `NoDoubtSnapshot` violated, as required, 11.13 s | `NoDoubtSnapshot` violated, the target is reached, 19.76 s |
-| `AuthorityInd.EndedValueSnapshot_reach.apalache` | `IndInit` contains `~NoEndedValueSnapshot` | `NoEndedValueSnapshot` violated, as required, 10.10 s | `NoEndedValueSnapshot` violated, the target is reached, 22.03 s |
-| `AuthorityInd.Init.apalache` | `Init => IndInv` | Pass, 6.17 s; and `ok in 8.21s (exit status: 0)`, outcome NoError, on the files of digest `sha256:7b5cf1bc…` (104 files) | Pass, 13.25 s |
-| `AuthorityInd.IssueReady_reach.apalache` | `IndInit` contains `~NoIssueReady` | `NoIssueReady` violated, as required, 7.71 s | `NoIssueReady` violated, the target is reached, 16.46 s |
-| `AuthorityInd.Pending_reach.apalache` | `IndInit` contains `~NoPending` | `NoPending` violated, as required, 8.17 s | `NoPending` violated, the target is reached, 16.46 s |
-| `AuthorityInd.Safety.apalache` | `IndInv => Safety` | Pass, 26.62 s | Pass, 57.23 s |
-| `AuthorityInd.StepAgain.apalache` | `IndInv /\ NextAgain => IndInv'` | Pass, 382.12 s | Pass, 892.72 s |
-| `AuthorityInd.StepBoot.apalache` | `IndInv /\ NextBoot => IndInv'` | Pass, 1200.19 s | Pass, 2365.38 s |
-| `AuthorityInd.StepCommit.apalache` | `IndInv /\ NextCommit => IndInv'` | Pass, 305.43 s | Pass, 988.18 s |
-| `AuthorityInd.StepConflict.apalache` | `IndInv /\ NextConflict => IndInv'` | Pass, 445.06 s | Pass, 1590.06 s |
-| `AuthorityInd.StepEnd.apalache` | `IndInv /\ NextEnd => IndInv'` | Pass, 348.80 s | Pass, 1275.02 s |
-| `AuthorityInd.StepEnroll.apalache` | `IndInv /\ NextEnroll => IndInv'` | Pass, 654.05 s | Pass, 2896.10 s |
-| `AuthorityInd.StepFail.apalache` | `IndInv /\ NextFail => IndInv'` | Pass, 182.75 s | Pass, 700.87 s |
-| `AuthorityInd.StepIssueEnd.apalache` | `IndInv /\ NextIssueEnd => IndInv'` | Pass, 905.40 s | Pass, 3052.31 s |
-| `AuthorityInd.StepIssueNone.apalache` | `IndInv /\ NextIssueNone => IndInv'` | Pass, 962.45 s | Pass, 2761.80 s |
-| `AuthorityInd.StepJournal.apalache` | `IndInv /\ NextJournal => IndInv'` | Pass, 617.63 s | Pass, 1446.19 s |
-| `AuthorityInd.StepRec.apalache` | `IndInv /\ NextRec => IndInv'` | Pass, 1001.28 s | Pass, 1505.67 s |
-| `AuthorityInd.StepRecover.apalache` | `IndInv /\ NextRecover => IndInv'` | Pass, 1387.04 s | Pass, 2640.55 s |
-| `AuthorityInd.StepRenew.apalache` | `IndInv /\ NextRenew => IndInv'` | not run | Pass, 3089.98 s |
-| `AuthorityInd.StepRestore.apalache` | `IndInv /\ NextRestore => IndInv'` | not run | Pass, 1853.26 s |
-| `AuthorityInd.StepRevoke.apalache` | `IndInv /\ NextRevoke => IndInv'` | not run | Pass, 2566.24 s |
-| `AuthorityInd.StepServe.apalache` | `IndInv /\ NextServe => IndInv'` | not run | Pass, 3184.65 s |
-| `AuthorityInd.StepUnlink.apalache` | `IndInv /\ NextUnlink => IndInv'` | not run | Pass, 2227.65 s |
-| `AuthorityInd.TwoReleased_reach.apalache` | `IndInit` contains `~NoTwoReleased` | not run | `NoTwoReleased` violated, the target is reached, 15.78 s |
-| `Replay.AcceptedGone_reach.apalache` | `IndInv` contains `~NoAcceptedGone` | not run since 2026-11-08 | `NoAcceptedGone` violated, the target is reached, 5.81 s |
-| `Replay.FloorNoSkew_bad.apalache` | `Init /\ Next => NoDoubleAccept'` | not run since 2026-11-08 | `NoDoubleAccept` violated, as required, 6.42 s |
-| `Replay.Init.apalache` | `Init => IndInv` | not run since 2026-11-08 | Pass, 4.90 s |
-| `Replay.InsertLate_bad.apalache` | `Init /\ Next => NoDoubleAccept'` | not run since 2026-11-08 | `NoDoubleAccept` violated, as required, 6.89 s |
-| `Replay.NoInsertCheckDouble_bad.apalache` | `Init /\ Next => NoDoubleAccept'` | not run since 2026-11-08 | `NoDoubleAccept` violated, as required, 6.74 s |
-| `Replay.NoInsertCheckLive_bad.apalache` | `Init /\ Next => NoLiveRemoved'` | not run since 2026-11-08 | `NoLiveRemoved` violated, as required, 6.70 s |
-| `Replay.RetentionOneU_bad.apalache` | `Init /\ Next => NoLiveRemoved'` | not run since 2026-11-08 | `NoLiveRemoved` violated, as required, 5.93 s |
-| `Replay.Safety.apalache` | `IndInv => Safety` | not run since 2026-11-08 | Pass, 5.39 s |
-| `Replay.Step.apalache` | `IndInv /\ Next => IndInv'` | not run since 2026-11-08 | Pass, 3.60 s |
+| `AuthorityInd` (declared domains) | 109 | Every profile passed with its required verdict | Every profile passed; each took 2 to 13 minutes on one core |
+| `AuthorityIndAnchors` (anchor raise) | 110 | 33 profiles passed with their required verdict; 77 did not finish before the hosts stopped | — |
+| `AuthorityIndProcess` (process raise) | 109 | 22 profiles passed with their required verdict; 87 did not finish before the hosts stopped | — |
+
+Round 5 had one module that raised every domain at once; its proof checks passed where they
+finished, but five step profiles ran more than one hour ([Decisions](#decisions)). The two
+clauses that round 5 found (no new anchor in an initial slot, and the order of entries in a
+turn) are the only change from round 5 to round 6 in the declared checks.
+
+`Replay.tla` proves `Safety` of the replay window for every non-negative `Skew`, `U`, and `MaxWin`
+and every integer time. It is unchanged since 2026-11-08, so its results are those of the A000
+record (digest `sha256:5549a6d4…`); round 6 did not reach it:
+
+| Check | Result |
+| --- | --- |
+| `Replay.Init.apalache` (`Init => IndInv`) | Pass, 4.90 s (A000 record) |
+| `Replay.Step.apalache` (`IndInv /\ Next => IndInv'`) | Pass, 3.60 s (A000 record) |
+| `Replay.Safety.apalache` (`IndInv => Safety`) | Pass, 5.39 s (A000 record) |
+| `Replay.AcceptedGone_reach.apalache` (`IndInv` contains an acceptance whose record expired while a verifier holds a check) | Target reached, 5.81 s (A000 record) |
 
 ## Raise by one
 
 Rule 4 of [FP Design Models]: a bound whose sufficiency the model argues but does not prove gets
-one complete search with that bound raised by one before the evidence is final (selected on
-2026-11-08 for A000). The constant `Raise` selects the raised bound; a raised element starts
-inert (an idle operation, an absent slot), except the first anchor of a third account, which is
-live as `a2p` is.
+one complete check with that bound raised by one before the evidence is final. Since 2026-11-09,
+`IndInv` implies every authority property, so the two raised proofs are that check for each
+domain bound (selected on 2026-11-10). Round 6 ran part of each ([Limits](#limits)). A raised element starts inert, except the first anchor of a
+third account, which is live as `a2p` is.
 
-| Bound | Declared | Raised | Apalache proof | TLC profile |
-| --- | --- | --- | --- | --- |
-| Accounts | 2 | 3 (`a3p` live, `a3q` absent) | Fixed domain; `AuthorityIndRaise` | `Authority.RaiseAccounts.cfg` |
-| Anchor slots of `a1` | 3 | 4 (`a1s` absent) | Fixed domain; `AuthorityIndRaise` | `Authority.RaiseSlotsA1.cfg` |
-| Anchor slots of `a2` | 2 | 3 (`a2r` absent) | Fixed domain; `AuthorityIndRaise` | `Authority.RaiseSlotsA2.cfg` |
-| Administrator slots | 2 | 3 (`adm3`) | Fixed domain; `AuthorityIndRaise` | In the re-bootstrap raise (below) |
-| Operations | 3 | 4 (`o4` idle) | Fixed domain; `AuthorityIndRaise` | `Authority.RaiseOpsOne.cfg`, under the reduction to one account (`Authority.RaiseOps.cfg` was removed on 2026-11-08: an estimated 10 to 100 billion states) |
-| Snapshots | 2 | 3 | Fixed domain; `AuthorityIndRaise` | `Authority.RaiseSnaps.cfg` |
-| Counter values | up to 5 | up to 6 | Covered: unbounded integers | `Authority.RaiseCtr.cfg` |
-| Owner re-bootstraps | 1 | 2, with `adm3` | The proof's `Next` has no bound; each value set in its starting set has at most three values (four in `AuthorityIndRaise`) | `Authority.RaiseIssues.cfg`, `Authority.RaiseIssuesBootstrapped.cfg` |
+| Bound | Declared | Raised | Check |
+| --- | --- | --- | --- |
+| Accounts | 2 | 3 (`a3p` live, `a3q` absent) | `AuthorityIndAnchors` |
+| Anchor slots of `a1` | 3 | 4 (`a1s` absent) | `AuthorityIndAnchors` |
+| Anchor slots of `a2` | 2 | 3 (`a2r` absent) | `AuthorityIndAnchors` |
+| Administrator slots | 2 | 3 (`adm3`) | `AuthorityIndAnchors` |
+| Operations | 3 | 4 (`o4` idle) | `AuthorityIndProcess` |
+| Snapshots | 2 | 3 | `AuthorityIndProcess` |
+| Values in each set of bootstrap values | 3 | 4 | `AuthorityIndProcess` |
+| Counter values and journal sequences | Unbounded integers | Unbounded integers | Both proofs |
+| Owner re-bootstraps | No bound in the proof's `Next` | No bound | Both proofs |
 
-The journal sequence is an unbounded integer in the proofs, and it has no TLC bound. Each
-bootstrap binds a new administrator slot, so the slots that a run can reach are one more than its
-re-bootstraps (from a new authority) or `adm1` and its re-bootstraps (bootstrapped): with one
-re-bootstrap, two slots are exactly what is reachable, and a third slot alone is never reached.
-So the re-bootstrap raise brings the third slot, and a separate administrator-slot TLC search
-would repeat the declared one.
+Each grouped raise covers each single raise in its group: a state of a model that raises one
+bound is a state of the grouped model with the other extra elements inert, each `IndInv` clause
+quantifies over the domains uniformly, and each step of the smaller model is a step of the grouped
+one. So each bound is raised by one, and each pair of bounds in one group is raised together. A
+raise of every domain at once (`AuthorityIndRaise`, until 2026-11-10) did not fit the budget
+([Decisions](#decisions)). The witnesses `AccountsUsed_reach`, `AdminUsed_reach`, and
+`ProcessUsed_reach` show that each starting set contains states that use the raised elements.
+Each new anchor needs its own committed maker, so with three operations the anchor raise has two
+witnesses: one for the accounts and one for the administrator.
 
-`AuthorityIndRaise.tla` raises every domain at once (`Raise = "all"`). One combined raise covers
-each single raise: a state of a model that raises one bound is a state of the combined model with
-the other extra elements inert, each `IndInv` clause quantifies over the domains uniformly, and
-each step of the smaller model is a step of the combined one. Its witness `RaiseUsed_reach` shows
-that its starting set contains a state that uses each raised element.
+TLC keeps its declared bounds. `Authority.cfg` and `Authority.Bootstrapped.cfg` search the
+declared space completely, a check that does not depend on the invariant. Their counter bound
+(values up to 5) and re-bootstrap bound (one) are state constraints of the search only.
 
-`AnchorKept`, `AccountKeepsAnchorP`, and `AdminKeptP` have no inductive proof, so only the TLC
-raises cover them. An inductive form was not found (analysis only; no checker run tried one).
-The raise of the operations uses the independence argument across accounts, a reduction to one
-account (selected on 2026-11-08; [Bounds, faults, and reductions](#bounds-faults-and-reductions)):
-
-- The reduction: one account (or the authority's administrator bindings) with every operation
-  free to act on it, and the global steps (crash, restart, snapshot, restore).
-- Why it can hold: the turn, the last-anchor check, and the recovery binding read only the
-  account's own anchors and entries. Another account's operations change only the shared journal
-  sequence, the low-water mark (they can only lower it), and the counter. A lower mark makes a
-  restore apply more entries, and an entry that a snapshot already reflects changes nothing,
-  because facts are monotone.
-- The failure that it could hide: an interaction through the shared low-water mark, the shared
-  operation identities, or the counter.
-- Known-bad variants that still fail under one account: the five `Authority.OneAccount*_bad`
-  profiles of the earlier variants and `Authority.OneAccountAckEarly_bad.cfg`. The account has a
-  fourth slot, absent at the start: the first form without it hid F1. No variant tests a
-  cross-account interaction yet; one would compute the low-water mark from the account's own
-  entries only.
+The TLC raise searches are removed. Their last results, at the A000 digest
+`sha256:5549a6d4…` on 48 vCPUs, were complete searches with no violation: `RaiseCtr` 260,779,156
+distinct states, `RaiseSlotsA2` 422,601,310, `RaiseSlotsA1` 770,348,006 (92 minutes),
+`RaiseAccounts` 545,513,196, `RaiseSnaps` 552,749,238, `RaiseIssues` 220,953,314, and
+`RaiseIssuesBootstrapped` 67,750,337. `RaiseOpsOne`, the raise of the operations under the
+reduction to one account, stopped at 6,866,941,619 distinct states with no violation. Most of
+them took more than the budget of one hour on 16 vCPUs, and none was a proof.
 
 ## Evidence record
 
-### Evidence host record of the current files
+### Evidence of the current files
 
-Runs of every profile on the evidence hosts from 2026-11-08 19:59 to 2026-11-09 02:56 UTC, each
-with `cargo xtask model authority-restore/<profile>` from the repository root, one profile at a
-time on a host (TLC) or one per core (Apalache). The xtask passes a profile only with the
-checker's own completion or violation status and outcome, with no `TIMEOUT` or ignored line.
+Round 6 was the final run of the A016 work (the user selected it as final on 2026-11-10). It ran
+every profile of the current files, each with `cargo xtask model authority-restore/<profile>` from
+the repository root, from 2026-11-10 04:24 UTC.
 
-- Source: the files of this directory, not yet committed, on top of commit
-  `1a6019fe46038ed534f8e084a2b6be8d2b77dd4c`. Each run printed
-  `sha256:5549a6d42d03b46fe37fd498ff38b1413a6260383f23241d4ed8165dee760454 (111 files)`.
+- Source: the files of this directory, not yet committed then, on top of commit `83e1bc3`. Each
+  run printed `sha256:89a81c7ac67f013ad0c1bb41e42042fc12e5faf884dadc46a3a49f9100cbfb53 (378
+  files)`.
 - Checkers: temurin-jre 21.0.13+9 (Linux aarch64, SHA-256 checked against Adoptium), tla2tools
   1.8.0+d8fb231de4e4 (TLC2 Version 2026.11.06.222357, rev d8fb231; SHA-256
   `e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f` checked), with `-workers auto
-  -lncheck final`; apalache 0.62.4.
-- Hosts: EC2 in us-east-1, image `ami-06b1a03fa3561aefb` (Ubuntu 26.04 arm64, 20261104.1),
-  kernel 7.0.0-1016-aws, no other workload: c8g.12xlarge (48 vCPUs, 92 GiB) instances
-  `i-05b81545f5b7a28ea` (the small TLC profiles, `Authority.cfg`, `Authority.Bootstrapped.cfg`,
-  `RaiseCtr`, `RaiseSlotsA2`, `RaiseIssuesBootstrapped`), `i-0301356a189c645dc` (`RaiseSlotsA1`,
-  `RaiseIssues`), `i-0a676670f8e703b3c` (`RaiseAccounts`), and `i-0df7ebb3e43d93ecb` (41 Apalache
-  profiles, 40 at a time, then `RaiseSnaps`). Each instance is terminated. The host's own
-  logs are not kept; the "Current files" columns above hold the figures of each profile.
-- Result: every TLC profile except `Authority.RaiseOpsOne.cfg`, and every Apalache profile
-  except the seventeen `AuthorityIndRaise.Step<Part>.apalache`, passed with its required
-  verdict: each main and raise search complete with no violation, each known-bad variant a
-  violation of its own property, and each witness its target. The searches: `Authority.cfg`
-  218,052,725 distinct states (depth 36, 20 min), `Authority.Bootstrapped.cfg` 67,075,361 (36,
-  6 min), `RaiseCtr` 260,779,156 (39, 24 min), `RaiseSlotsA2` 422,601,310 (36, 51 min),
-  `RaiseSlotsA1` 770,348,006 (37, 92 min), `RaiseAccounts` 545,513,196 (36, 83 min),
-  `RaiseSnaps` 552,749,238 (41, 55 min), `RaiseIssues` 220,953,314 (36, 25 min), and
-  `RaiseIssuesBootstrapped` 67,750,337 (36, 7 min). The declared Apalache step parts took 12 to
-  53 minutes each.
+  -lncheck final`; apalache 0.62.4 (SHA-256 of `lib/apalache.jar` checked).
+- Hosts: EC2 m8g.4xlarge (16 vCPUs, 64 GiB, AWS Graviton4), image `ami-06b1a03fa3561aefb`
+  (Ubuntu 26.04 arm64, 20261104.1), kernel 7.0.0-1016-aws, on demand. `i-0cbfe5a46b68b5a85`
+  (us-east-1b) ran the 109 `AuthorityInd` profiles, nine at a time, and then the TLC and Replay
+  profiles one at a time. `i-0cc104d10ea31d875` (us-east-1a) ran the 110 `AuthorityIndAnchors`
+  profiles, eight at a time, and `i-07b2942b31bd038f9` (us-east-1c) the 109
+  `AuthorityIndProcess` profiles, seven at a time.
+- Result at 04:50 UTC: every one of the 109 `AuthorityInd` profiles exited 0 with its required
+  verdict; 4 of the 45 TLC and Replay profiles, 33 `AuthorityIndAnchors` profiles, and 22
+  `AuthorityIndProcess` profiles had finished, each with its required verdict, and no profile had
+  failed. The hosts then reached their time limits and terminated before their logs were
+  collected (they had no storage to write to), so this record keeps the exit statuses and counts
+  only, not the time of each profile ([Limits](#limits)).
 
-Two raise checks did not finish, so neither is a pass:
+The TLC profiles other than the two declared searches ran again on the development host after
+round 6, at the same digest:
 
-- `Authority.RaiseOpsOne.cfg` (four operations under the reduction to one account) ran on an
-  r8g.16xlarge (64 vCPUs) from 2026-11-08 20:54 UTC. The user stopped it on 2026-11-09 at 02:55
-  UTC, at 6,866,941,619 distinct states with 2,958,680,598 on the queue, depth 21, and no
-  violation found; on the shape of `Authority.cfg` the whole search is about 13 to 14 billion
-  states. An earlier start on a Spot host was lost to a Spot reclaim at 20:47 UTC.
-- The seventeen `AuthorityIndRaise.Step<Part>.apalache` (every domain raised by one) ran on an
-  m8g.8xlarge from 2026-11-09 00:10 UTC. Every step part stayed in one solver query, state
-  invariant 41 of the starting state, from about 00:13 UTC to the end of the run at 02:56 UTC.
-  An earlier start on a Spot host showed the same query in each step part that was read, from
-  20:02 UTC, until a Spot reclaim after 21:20 UTC. That is a formulation defect of the raised
-  starting set, not a resource limit. The raised `Init`, `Safety`, and the six raised witnesses
-  passed.
+- Command: `cargo xtask model` with the 34 TLC profiles other than `Authority.cfg` and
+  `Authority.Bootstrapped.cfg`, from the repository root, on 2026-11-10. Exit status 0. The xtask
+  printed `sha256:89a81c7ac67f013ad0c1bb41e42042fc12e5faf884dadc46a3a49f9100cbfb53 (378 files)`.
+- Checkers: temurin-jre 21.0.13+9 (macOS aarch64), tla2tools 1.8.0+d8fb231de4e4 (TLC2 Version
+  2026.11.06.222357, rev d8fb231), apalache 0.62.4.
+- Host: Apple M1 Pro, 10 cores, macOS 27.2.1, shared with other work, so the times are
+  indicative only. The tables of [Known-bad variants](#known-bad-variants) and
+  [Reachability](#reachability) hold the result of each profile.
 
-Neither check fits the budget rule of [FP Design Models] (one hour on one 16-vCPU host). Symmetry
-over the operations would not bring the operations raise into it: operations already start in
-identity order (`Rank`), so symmetry removes only two to four times the states. The user
-selected on 2026-11-09 to complete the model with both checks as named limits
-([Limits](#limits)); task A016 closes them before A009.
+### Earlier records
 
-Each block below is the record of earlier files: it shows the rules, and it is not the evidence
-of the current files. Those runs used tla2tools 1.8.0+3ec1cc4f8c24 and apalache 0.62.4 on this Mac
-(Darwin 25.6.0, aarch64, 10 cores, 16 GB), shared with other sessions' model checkers, so their
-durations are indicative only. On the digest `sha256:7b5cf1bcf19c1e52e1d8850864d672d715f1078ab8a0ed3c28c3cd4715f48abf`
-(104 files), `AuthorityInd.Init.apalache` passed (`ok in 8.21s (exit status: 0)`, outcome
-NoError), and SANY parsed every module.
-
-**Functional run**, record of earlier files (2026-11-08, digest `sha256:1023dd2115d4609b07d1ca77c6c9a2cf21b0e9ca1a3d40ae5c29a77c15fd25e7 (70 files)`): the owner re-bootstrap model before the `Raise` constant and the slot rule of the re-bootstrap raise. Its 50 rows are in the tables above: every TLC profile, and the Apalache profiles up to `AuthorityInd.StepRecover`. Each passed with its required verdict. The xtask before 12:06 ran the first 48; `StepRec` and `StepRecover` ran under the current xtask. These rows show the rules; they are not the evidence of the current files.
-
-**Refactor check**, record of earlier files (digest `sha256:0b6c17bd3aba39728f0d3a5c3a431adfa8777aa757cb422de76e6bf9f585d2c2`, 81 files, current xtask): with `Raise = "none"`, `Authority.TwoOps.cfg` passed with 602,397 distinct states (51.51 s) and `Authority.TwoOpsBootstrapped.cfg` with 325,333 (23.00 s), the same counts as the functional run, so the parameterization keeps the declared behaviors.
-
-**Raise probe**, record of earlier files (before the slot rule of the re-bootstrap raise): `AuthorityIndRaise.RaiseUsed_reach.apalache` reached its target in 151.27 s (exit status 12), against 7.5 s for the declared witness. `AuthorityIndRaise.StepCommit.apalache` ran about 516 s and was stopped with the host (exit status 143, no outcome): not a pass.
-
-### Evidence host record
-
-This record is for the model before the owner re-bootstrap (digest `904164456e72d62dced2890d6514f99a375675eb`, in the git object-ID form of the earlier xtask). It does not cover the current modules; `Authority.cfg` and `Authority.Bootstrapped.cfg` of the current modules wait for the evidence host.
-
-`Authority.cfg` of that model, the declared bounds, on 2026-11-08. The estimate before the run was 0.1 to 0.4
-billion distinct states; the stop condition was a complete search, a violation, or 12 hours.
-
-- Command: `cargo xtask model authority-restore/Authority.cfg`, from the repository root, with a
-  limit of 12 hours (`timeout 43200`).
-- Source: the files of this directory, the same as the runs above. The digest that the xtask
-  printed: `904164456e72d62dced2890d6514f99a375675eb (56 files)`.
-- Checkers: temurin-jre 21.0.13+9 (Linux aarch64, SHA-256 checked against Adoptium), tla2tools
-  1.8.0+3ec1cc4f8c24 (TLC2 Version 2026.11.06.005304, rev 3ec1cc4; the pinned jar, SHA-256
-  `654aa501…` checked), with `-workers auto -lncheck final`.
-- Host: EC2 m8g.4xlarge (16 vCPUs, 64 GiB), us-east-1a, image `ami-06b1a03fa3561aefb` (Ubuntu
-  26.04 arm64, 20261104.1), kernel 7.0.0-1016-aws, instance `i-0376f74828732047c`, no other
-  workload. The instance is terminated.
-- Result: exit status 0, a complete search with no violation of `TypeOK`, `NothingEndedValid`,
-  `NoCounterReuse`, `MissingOutcomeUnknown`, `NoUncommittedAnchor`, `AnchorKept`, `AdminKeptP`,
-  `AccountKeepsAnchorP`, `RefusalHolds`, `OneUse`, `PendExact`, and `NoDoubtServing`.
-  410,188,991 states generated, 176,229,386 distinct states, depth 36, 29 min 39 s
-  (2026-11-08 07:18:42 to 07:48:23 UTC).
-- Replay: the same command writes the checker output to
-  `target/model/authority-restore/Authority.cfg/checker.log`. The host's own log is not kept.
-
-That search was the bounded check of `AnchorKept` and `AccountKeepsAnchorP` for that model.
+- 2026-11-10, round 5, at the digest `sha256:0dba3f3d…` (267 files): every `AuthorityInd` profile
+  passed, each in 2 to 13 minutes; the raise of every domain at once found two missing clauses
+  and did not fit the budget.
+- 2026-11-09, at the A000 digest `sha256:5549a6d4…` (111 files): every profile passed with its
+  required verdict except `Authority.RaiseOpsOne.cfg` and the seventeen raised step parts (the
+  two limits of A000). On a 16-vCPU host (`i-0cc104d10ea31d875`, each search alone),
+  `Authority.cfg` took 56 min 14 s (218,052,725 distinct states, depth 36) and
+  `Authority.Bootstrapped.cfg` 16 min 50 s (67,075,361, depth 36).
+- 2026-11-08 and earlier, at the digests `904164456e72…`, `1023dd21…`, `0b6c17bd…`, and
+  `7b5cf1bc…`: the rules as they were then. Their tables are in the history of this file
+  (commit `83e1bc3`).
 
 ## Limits
 
-- Two raise checks are not done (selected on 2026-11-09). The operations bound (three operations)
-  of `AnchorKept`, `AccountKeepsAnchorP`, and `AdminKeptP` has no raise-by-one search: these three
-  properties have no inductive proof, and the raise to four operations is more than 6.8 billion
-  states. Each other bound of the three properties has its raise, and each other property has its
-  inductive proof at the declared domains. The inductive steps with every domain raised by one
-  (`AuthorityIndRaise`) do not finish: each stays in one solver query of the starting set. The
-  raised `Init`, `Safety`, and witnesses pass, and the TLC raises cover each raised domain for the
-  TLC bounds. Task A016 closes both limits, with an inductive proof of the three properties,
-  before A009 builds the restore journal.
+- Three limits of the A016 evidence, from round 6, the final run (selected by the user on
+  2026-11-10). The next evidence run of this model, one run of every profile on one 16-vCPU host
+  of about three hours, closes them:
+  - The grouped raises are partial: 33 of the 110 `AuthorityIndAnchors` profiles and 22 of the
+    109 `AuthorityIndProcess` profiles finished, each with its required verdict, and none
+    failed. So the raise by one of the anchor properties is not complete.
+  - `Authority.cfg` and `Authority.Bootstrapped.cfg` did not run at the current digest. Their
+    last complete searches are at the A000 digest, before the exact promise and the stricter
+    `Uncertain`. The declared proof covers each of their properties at the current digest.
+  - The round-6 logs of the Apalache profiles are lost, so the record keeps their exit statuses
+    and counts, not the time of each profile.
+- The proofs cover the domains of rule 4 ([Inductive proofs](#inductive-proofs)): any number of
+  crashes, restarts, restores, and reconciliation steps, over at most three operations and two
+  snapshots in a run (four and three raised). The TLC searches cover their bounds.
+- The proofs check the design's turn (`Turn = "creation"`). The turn that ends at the first
+  journal write (`Turn = "entry"`) has the TLC search `Authority.Race.cfg` at TwoOps and its
+  known-bad variant `RaceNoVoid_bad`, and no proof.
+- `Authority.cfg` is the longest TLC profile, and it is near the one-hour budget on 16 vCPUs
+  ([Evidence record](#evidence-record)). A change that grows its state space needs a reduction
+  first; because the proof covers its properties, a smaller declared search is that reduction.
 - The models check the design, not code. A007–A011 add the code correspondence.
 - Not modeled: the lifetime and expiry of a bootstrap value (the model has no time), the
   authentication of the local owner, and the report as a separate record (the outcome record and
@@ -659,7 +699,6 @@ That search was the bounded check of `AnchorKept` and `AccountKeepsAnchorP` for 
 
 - None for the design. The question of a new administrator after the bootstrap is consumed is
   answered by the owner re-bootstrap (selected on 2026-11-08).
-
 [AUTH Authority Transitions]: ../../docs/specs/authentication.md#authority-transitions
 [AUTH Storage Contract and Bindings]: ../../docs/specs/authentication.md#storage-contract-and-bindings
 [AUTH HTTP-Signature Replay]: ../../docs/specs/authentication.md#http-signature-replay

@@ -1,6 +1,0 @@
-check
---cinit=CInitRaise
---init=IndInitRaise
---next=Next
---inv=NoRaiseUsed
---length=0

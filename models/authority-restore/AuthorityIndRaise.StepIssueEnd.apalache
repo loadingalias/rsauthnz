@@ -1,6 +1,0 @@
-check
---cinit=CInitRaise
---init=IndInitRaise
---next=NextIssueEnd
---inv=IndInv
---length=1

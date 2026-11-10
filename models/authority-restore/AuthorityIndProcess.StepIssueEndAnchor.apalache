@@ -1,0 +1,6 @@
+check
+--cinit=CInitProcess
+--init=IndInitProcess
+--next=NextIssueEnd
+--inv=AnchorStateInvPost,PromiseInvPost,KeptNowInvPost,TurnInvPost,ServingInvPost
+--length=1

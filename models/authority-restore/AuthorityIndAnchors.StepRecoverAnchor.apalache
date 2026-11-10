@@ -1,0 +1,6 @@
+check
+--cinit=CInitAnchors
+--init=IndInitAnchors
+--next=NextRecover
+--inv=AnchorStateInvPost,PromiseInvPost,KeptNowInvPost,TurnInvPost,ServingInvPost
+--length=1

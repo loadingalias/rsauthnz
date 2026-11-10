@@ -1,0 +1,6 @@
+check
+--cinit=CInit
+--init=IndInit
+--next=NextRecCreate
+--inv=RestoreAccountInvPost,RestoreAdminInvPost
+--length=1

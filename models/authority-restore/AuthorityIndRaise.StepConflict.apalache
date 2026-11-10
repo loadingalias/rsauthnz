@@ -1,6 +1,0 @@
-check
---cinit=CInitRaise
---init=IndInitRaise
---next=NextConflict
---inv=IndInv
---length=1

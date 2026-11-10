@@ -1,0 +1,6 @@
+check
+--cinit=CInitAnchors
+--init=IndInitAnchors
+--next=NextResolve
+--inv=RestoreNowAccountInvPost,RestoreNowAdminInvPost
+--length=1

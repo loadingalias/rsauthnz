@@ -43,54 +43,45 @@ CONSTANTS
   \* operation bound.
   \* @type: Str;
   Origin,
-  \* "none" for the declared bounds, or the one bound that a raise-by-one
-  \* search raises ([FP Design Models], rule 4): "accounts", "slotsA1",
-  \* "slotsA2", "ops", "snaps", "ctr", or "issues" (which also adds the
-  \* administrator slot that a second re-bootstrap needs); "adms" adds only
-  \* that slot; "all" raises every one of them. "oneAccount" is the reduction
-  \* to one account, a1, with a fourth anchor slot (a1s, absent at the start,
-  \* so that a recovery or an enrollment has a slot to create into), and the
-  \* administrator bindings, at the declared bounds; its known-bad variants
-  \* show that it keeps their failures. Without a1s it hides the lockout F1.
-  \* "opsOne" raises the operations under that reduction (README,
-  \* "Reductions"; selected on 2026-11-08). A raised element starts inert: an extra operation is
-  \* idle, and an extra anchor slot is absent, except the first anchor of a
-  \* third account, which is live as a2p is.
+  \* "none" for the declared domains. The raised proofs ([FP Design Models],
+  \* rule 4) raise each domain by one in two groups (selected on 2026-11-10):
+  \* "anchors" adds a third account, a fourth slot in a1, a third slot in a2,
+  \* and a third administrator slot; "process" adds a fourth operation and a
+  \* third snapshot. "slotsA1" adds only the fourth slot of a1, so that an
+  \* enrollment can run beside an unlink in an account with two live anchors
+  \* (known-bad "ackEarly"). A raised element starts inert: an extra
+  \* operation is idle, and an extra anchor slot is absent, except the first
+  \* anchor of a third account, which is live as a2p is.
   \* @type: Str;
   Raise
 
 (* @typeAlias: plan = { kind: Str, own: Str, kill: Str, keep: Str, make: Str, val: Int }; *)
-(* @typeAlias: snapshot = { anc: Str -> Str, bvals: Set(Int), bused: Set(Int), bended: Set(Int), cur: Int, dead: Int, revoked: Bool, ctr: Int, out: Set(Str), lwm: Int }; *)
+(* @typeAlias: snapshot = { anc: Str -> Str, bvals: Set(Int), bused: Set(Int), bended: Set(Int), cur: Int, dead: Int, revoked: Bool, ctr: Int, out: Set(Str), left: Str -> Set(Str), lwm: Int }; *)
 Aliases == TRUE
 
 \* The bound that this run raises by one.
-Raised(b) == Raise \in {b, "all"}
+Raised(b) ==
+  \/ Raise = b
+  \/ Raise = "anchors" /\ b \in {"accounts", "slotsA1", "slotsA2", "adms"}
+  \/ Raise = "process" /\ b \in {"ops", "snaps"}
 
 \* Three operation identities (four in a raise). Each is one externally
 \* submitted transition.
-Ops == {"o1", "o2", "o3"} \cup (IF Raised("ops") \/ Raise = "opsOne" THEN {"o4"} ELSE {})
+Ops == {"o1", "o2", "o3"} \cup (IF Raised("ops") THEN {"o4"} ELSE {})
 Rank == [o \in Ops |-> CASE o = "o1" -> 1 [] o = "o2" -> 2 [] o = "o3" -> 3 [] OTHER -> 4]
 
 \* Two accounts and two administrator slots of the authority. Account a1
 \* has three anchor slots, so that a second unlink can make the first one
 \* refuse; a2 has two. Passkeys, provider links, and recovery values have
 \* the same journal rules, so one anchor kind stands for all three. A raise
-\* adds a third account, a fourth slot to a1, a third slot to a2, or a third
+\* adds a third account, a fourth slot to a1, a third slot to a2, and a third
 \* administrator slot.
-\* The reduction to one account keeps only a1.
-OneAccount == Raise \in {"oneAccount", "opsOne"}
-Accounts ==
-  IF OneAccount THEN {"a1"}
-  ELSE {"a1", "a2"} \cup (IF Raised("accounts") THEN {"a3"} ELSE {})
+Accounts == {"a1", "a2"} \cup (IF Raised("accounts") THEN {"a3"} ELSE {})
 Owners == Accounts \cup {"auth"}
-\* Each bootstrap binds a new administrator slot, so the slots that a run can
-\* reach are one more than its re-bootstraps from a new authority, and as
-\* many from a bootstrapped one plus adm1. The re-bootstrap raise therefore
-\* brings the third slot; a third slot alone is never reached.
-Adms == {"adm1", "adm2"} \cup (IF Raised("adms") \/ Raised("issues") THEN {"adm3"} ELSE {})
+Adms == {"adm1", "adm2"} \cup (IF Raised("adms") THEN {"adm3"} ELSE {})
 Anchors ==
-  {"a1p", "a1q", "a1r"} \cup (IF OneAccount THEN {} ELSE {"a2p", "a2q"}) \cup Adms
-  \cup (IF Raised("slotsA1") \/ OneAccount THEN {"a1s"} ELSE {})
+  {"a1p", "a1q", "a1r", "a2p", "a2q"} \cup Adms
+  \cup (IF Raised("slotsA1") THEN {"a1s"} ELSE {})
   \cup (IF Raised("slotsA2") THEN {"a2r"} ELSE {})
   \cup (IF Raised("accounts") THEN {"a3p", "a3q"} ELSE {})
 Owner(x) ==
@@ -100,14 +91,14 @@ Owner(x) ==
   ELSE "auth"
 Anc(a) == {x \in Anchors : Owner(x) = a}
 InitLive ==
-  {"a1p", "a1q", "a1r"}
-  \cup (IF OneAccount THEN {} ELSE {"a2p"})
+  {"a1p", "a1q", "a1r", "a2p"}
   \cup (IF Raised("accounts") THEN {"a3p"} ELSE {})
   \cup (IF Origin = "bootstrapped" THEN {"adm1"} ELSE {})
-\* The snapshot bound, the counter bound, and the re-bootstrap bound.
+\* The snapshot bound, and the counter and re-bootstrap bounds of the TLC
+\* searches. The proofs have no counter or re-bootstrap bound.
 NSnaps == IF Raised("snaps") THEN 3 ELSE 2
-CtrMax == IF Raised("ctr") THEN 6 ELSE 5
-MaxIssues == IF Raised("issues") THEN 2 ELSE 1
+CtrMax == 5
+MaxIssues == 1
 
 \* The points where an operation can stop, and the point after a crash.
 InFlight == {"checked", "journaled", "committed", "created"}
@@ -181,20 +172,25 @@ VARIABLES
   \* The retained snapshots.
   \* @type: Set($snapshot);
   snaps,
-  \* History, for the properties only: each operation that committed in any
-  \* history, and the anchors of its owner that its commit left live.
-  \* @type: Set(Str);
-  committed,
+  \* With each outcome record: the anchors of its owner that the commit left
+  \* live. A restore brings back the records of its snapshot.
   \* @type: Str -> Set(Str);
   left,
+  \* History, for the properties only: each operation that committed in any
+  \* history, and each anchor that an acknowledgement promised: the anchors
+  \* that the acknowledged outcome record left live.
+  \* @type: Set(Str);
+  committed,
+  \* @type: Set(Str);
+  promised,
   \* The identity of the last bootstrap value issued in any history. A value
   \* is a random secret, so no identity repeats; no restore changes this.
   \* @type: Int;
   bnext
 
-store == <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, pend>>
+store == <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend>>
 journal == <<jEnd, jCre, jVoid, jhead, jfloor>>
-hist == <<committed, left, bnext>>
+hist == <<committed, promised, bnext>>
 vars == <<store, pc, plan, art, lock, journal, snaps, hist>>
 
 -----------------------------------------------------------------------------
@@ -266,7 +262,7 @@ AgainOK(o) ==
 First(o) == \A q \in pend : SameValue(q, o) => jEnd[o] <= jEnd[q]
 
 Now == [anc |-> anc, bvals |-> bvals, bused |-> bused, bended |-> bended, cur |-> cur,
-        dead |-> dead, revoked |-> revoked, ctr |-> ctr, out |-> out, lwm |-> 0]
+        dead |-> dead, revoked |-> revoked, ctr |-> ctr, out |-> out, left |-> left, lwm |-> 0]
 
 \* The fact of an operation's end entry holds in t.
 \* @type: (Str, $snapshot) => Bool;
@@ -279,10 +275,13 @@ EndHoldsIn(o, t) ==
 EndHolds(o) == EndHoldsIn(o, Now)
 
 \* The low-water mark: one below the first entry that the store does not
-\* reflect yet.
+\* reflect yet. Known-bad "ownMark": the mark counts the entries of a1 and of
+\* the authority only, as a store that keeps one mark for each account and
+\* stamps each snapshot with the mark of a1.
 Unreflected(o) ==
-  Min(IF jEnd[o] > 0 /\ ~EndHolds(o) /\ jVoid[o] = 0 THEN jEnd[o] ELSE jhead + 1,
-      IF jCre[o] > 0 /\ jVoid[o] = 0 /\ anc[plan[o].make] = "absent" THEN jCre[o] ELSE jhead + 1)
+  IF Bad = "ownMark" /\ plan[o].own \in Accounts \ {"a1"} THEN jhead + 1
+  ELSE Min(IF jEnd[o] > 0 /\ ~EndHolds(o) /\ jVoid[o] = 0 THEN jEnd[o] ELSE jhead + 1,
+           IF jCre[o] > 0 /\ jVoid[o] = 0 /\ anc[plan[o].make] = "absent" THEN jCre[o] ELSE jhead + 1)
 
 \* The fourth operation counts only in a raise.
 LowWater ==
@@ -415,7 +414,7 @@ Commit(o) ==
   /\ left' = [left EXCEPT ![o] = {x \in Anc(p.own) : anc'[x] = "live"}]
   /\ pc' = [pc EXCEPT ![o] = "committed"]
   /\ jfloor' = FloorAt(p)
-  /\ UNCHANGED <<phase, restored, pend, plan, lock, jEnd, jCre, jVoid, jhead, snaps>>
+  /\ UNCHANGED <<phase, restored, pend, plan, lock, jEnd, jCre, jVoid, jhead, snaps, promised>>
 
 \* A dependency changed: the commit refuses and changes no store state. The
 \* binding voids each entry of the operation before the refusal returns. A
@@ -470,10 +469,13 @@ Ack(o) ==
   /\ jfloor' = Max(jfloor, art[o])
   /\ lock' = Unlock(o)
   /\ pc' = [pc EXCEPT ![o] = "acked"]
-  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jVoid, jhead, snaps, hist>>
+  /\ promised' = promised \cup left[o]
+  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jVoid, jhead, snaps, committed, bnext>>
 
 \* A client whose response was lost looks up its operation identity, finds
-\* the committed outcome, and receives its artifact.
+\* the committed outcome, and receives its artifact. The promise is the
+\* anchor set of that outcome record: after a restore, the record of the
+\* snapshot, not of a later commit of the same identity (a redrive).
 Resolve(o) ==
   /\ phase = "up"
   /\ pc[o] \in Crashed
@@ -482,7 +484,8 @@ Resolve(o) ==
   /\ ~CreationPending(o)
   /\ jfloor' = Max(jfloor, art[o])
   /\ pc' = [pc EXCEPT ![o] = "acked"]
-  /\ UNCHANGED <<store, plan, art, lock, jEnd, jCre, jVoid, jhead, snaps, hist>>
+  /\ promised' = promised \cup left[o]
+  /\ UNCHANGED <<store, plan, art, lock, jEnd, jCre, jVoid, jhead, snaps, committed, bnext>>
 
 \* Restore completes an in-doubt consumption: the first in-doubt
 \* consumption of a value commits again against the restored state, under
@@ -502,15 +505,15 @@ Redrive(o) ==
   /\ left' = [left EXCEPT ![o] = {x \in Anc(p.own) : anc'[x] = "live"}]
   /\ jfloor' = FloorAt(p)
   /\ UNCHANGED <<phase, restored, bvals, bended, cur, dead, revoked, pc, plan, lock, jEnd, jCre,
-                 jVoid, jhead, snaps, bnext>>
+                 jVoid, jhead, snaps, promised, bnext>>
 
 \* The dependencies do not hold: the value stays consumed.
 RedriveFail(o) ==
   /\ phase = "rec"
   /\ o \in pend /\ First(o) /\ ~AgainOK(o)
   /\ pend' = pend \ {o}
-  /\ UNCHANGED <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, pc, plan,
-                 art, lock, journal, snaps, hist>>
+  /\ UNCHANGED <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pc,
+                 plan, art, lock, journal, snaps, hist>>
 
 -----------------------------------------------------------------------------
 \* A crash stops each operation in flight at its point. The store and the
@@ -520,8 +523,8 @@ Crash ==
   /\ phase' = "down"
   /\ pc' = [o \in Ops |-> IF pc[o] \in InFlight THEN CrashOf(pc[o]) ELSE pc[o]]
   /\ lock' = [a \in Owners |-> "none"]
-  /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, pend, plan, art,
-                 journal, snaps, hist>>
+  /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, plan,
+                 art, journal, snaps, hist>>
 
 \* A start reconciles before it serves. Known-bad "voidOnMissing": a normal
 \* start reads a missing outcome as absent again after an earlier restore.
@@ -529,8 +532,8 @@ Restart ==
   /\ phase = "down"
   /\ phase' = "rec"
   /\ restored' = IF Bad = "voidOnMissing" THEN FALSE ELSE restored
-  /\ UNCHANGED <<anc, bvals, bused, bended, cur, dead, revoked, ctr, out, pend, pc, plan, art, lock,
-                 journal, snaps, hist>>
+  /\ UNCHANGED <<anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, pc, plan, art,
+                 lock, journal, snaps, hist>>
 
 NeedsCreate(o) == o \in out /\ plan[o].make /= "" /\ jCre[o] = 0
 \* Reconciliation voids an end entry whose fact does not hold in the store.
@@ -566,8 +569,8 @@ Serve ==
   /\ \A o \in Ops : ~NeedsCreate(o) /\ ~NeedsVoid(o)
   /\ pend = {}
   /\ phase' = "up"
-  /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, pend, pc, plan,
-                 art, lock, journal, snaps, hist>>
+  /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, pc,
+                 plan, art, lock, journal, snaps, hist>>
 
 \* A snapshot with its low-water mark. A serving store has no in-doubt
 \* consumption, so a snapshot keeps none.
@@ -618,6 +621,7 @@ Restore(s) ==
   /\ cur' = s.cur
   /\ ctr' = IF Bad \in {"noFloor", "noJournal"} THEN s.ctr ELSE Max(s.ctr, jfloor)
   /\ out' = s.out
+  /\ left' = s.left
   /\ pend' = IF Bad \in {"pairApplies", "noAgain"} THEN {} ELSE doubt
   /\ restored' = TRUE
   /\ phase' = "rec"
@@ -649,6 +653,7 @@ Init ==
   /\ snaps = {}
   /\ committed = {}
   /\ left = [o \in Ops |-> {}]
+  /\ promised = InitLive
   /\ bnext = 1
 
 \* The parts of Next. AuthorityInd.tla splits them further for its step
@@ -676,7 +681,7 @@ SnapOK(s) ==
   /\ s.anc \in [Anchors -> {"absent", "live", "ended"}]
   /\ s.bvals \subseteq Vals /\ s.bused \subseteq Vals /\ s.bended \subseteq Vals
   /\ s.cur \in Nat /\ s.dead \in Nat /\ s.revoked \in BOOLEAN /\ s.ctr \in Nat
-  /\ s.out \subseteq Ops /\ s.lwm \in Seqs
+  /\ s.out \subseteq Ops /\ s.left \in [Ops -> SUBSET Anchors] /\ s.lwm \in Seqs
 
 TypeOK ==
   /\ phase \in {"up", "down", "rec"}
@@ -694,6 +699,7 @@ TypeOK ==
   /\ Cardinality(snaps) <= NSnaps /\ \A s \in snaps : SnapOK(s)
   /\ committed \subseteq Ops
   /\ left \in [Ops -> SUBSET Anchors]
+  /\ promised \subseteq Anchors
   /\ bnext \in Nat \ {0}
 
 -----------------------------------------------------------------------------
@@ -736,8 +742,9 @@ NoUncommittedAnchor ==
 \* Each anchor that an acknowledged commit left is live, ended by a commit,
 \* or ended by an entry of a crashed operation whose outcome is unknown.
 Uncertain(x) ==
-  \E o \in Ops : plan[o].kill = x /\ pc[o] \in Crashed /\ o \notin committed /\ jVoid[o] = 0
-Promised == InitLive \cup UNION {left[o] : o \in {q \in Ops : pc[q] = "acked"}}
+  \E o \in Ops :
+    plan[o].kill = x /\ jEnd[o] > 0 /\ pc[o] \in Crashed /\ o \notin committed /\ jVoid[o] = 0
+Promised == promised
 AnchorKept == \A x \in Promised : anc[x] = "live" \/ x \in EndedAnchors \/ Uncertain(x)
 
 AccountKeepsAnchor == \A a \in Accounts : \E x \in Anc(a) : anc[x] = "live"

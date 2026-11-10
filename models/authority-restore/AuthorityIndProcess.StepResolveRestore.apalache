@@ -1,0 +1,6 @@
+check
+--cinit=CInitProcess
+--init=IndInitProcess
+--next=NextResolve
+--inv=RestoreAccountInvPost,RestoreAdminInvPost
+--length=1

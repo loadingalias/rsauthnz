@@ -12,7 +12,7 @@ these rules.
 | Module | Checker | Check |
 | --- | --- | --- |
 | `Authority.tla` | TLC | A complete search of authority and restore at declared bounds |
-| `AuthorityInd.tla`, `AuthorityIndRaise.tla` | Apalache | An inductive proof of the same safety properties, for histories of each length, at the declared domains and with each domain raised by one |
+| `AuthorityInd.tla`, `AuthorityIndAnchors.tla`, `AuthorityIndProcess.tla` | Apalache | An inductive proof of every authority property, at the declared domains and with each domain raised by one (the anchor domains and the process domains in two groups): for any number of crashes, restarts, and restores over the operations and snapshots of those domains |
 | `Replay.tla` | Apalache | An inductive proof of the replay window, for each clock error in its bound |
 
 ## Install the checkers
@@ -50,8 +50,8 @@ The command prints the digest of the model files, then one result for each profi
 
 ```text
 files of .../models/authority-restore: sha256:<digest> (<count> files)
-── tlc authority-restore/Authority.OneAccountAckEarly_bad.cfg
-   `AnchorKept` is violated: as the known-bad variant requires, in 1.37s (exit status: 12)
+── tlc authority-restore/Authority.SlotsA1AckEarly_bad.cfg
+   `AnchorKept` is violated: as the known-bad variant requires, in 2.50s (exit status: 12)
 ```
 
 - A main profile passes with `ok` and exit status 0: a complete search or proof with no
@@ -72,24 +72,14 @@ The command exits 0 when every selected profile passes. The output of each profi
 ## Large profiles
 
 Most profiles take seconds to minutes. `Authority.TwoOps.cfg` is the local bound for an edit loop.
-These profiles need a large host (TLC measured on 48 vCPUs, 92 GiB, 2026-11-08; each Apalache
-profile uses one core):
+These profiles need a large host (16 vCPUs, 64 GiB; each Apalache profile uses one core):
 
-| Profile | Distinct states | Time |
+| Profile | Size | Time |
 | --- | --- | --- |
-| `Authority.cfg` | 218.1 million | 20 minutes |
-| `Authority.Bootstrapped.cfg` | 67.1 million | 6 minutes |
-| `Authority.RaiseSlotsA1.cfg` | 770.3 million | 92 minutes |
-| `Authority.RaiseAccounts.cfg` | 545.5 million | 83 minutes |
-| `Authority.RaiseSnaps.cfg` | 552.7 million | 55 minutes |
-| `Authority.RaiseSlotsA2.cfg` | 422.6 million | 51 minutes |
-| `Authority.RaiseCtr.cfg`, `Authority.RaiseIssues.cfg` | 260.8 and 221.0 million | 24 and 25 minutes |
-| `Authority.RaiseIssuesBootstrapped.cfg` | 67.8 million | 7 minutes |
-| `AuthorityInd.Step<Part>.apalache` (17 profiles) | — | 12 to 53 minutes each |
-
-`Authority.RaiseOpsOne.cfg` (more than 6.8 billion states) and the seventeen
-`AuthorityIndRaise.Step<Part>.apalache` proofs do not finish in a usable time at the current model.
-Do not run them; the model README records why.
+| `Authority.cfg` | 218.1 million distinct states | 56 minutes (measured at the A000 files) |
+| `Authority.Bootstrapped.cfg` | 67.1 million distinct states | 17 minutes (measured at the A000 files) |
+| `AuthorityInd.Step<Part><Group>.apalache` (92 profiles) | — | 2 to 13 minutes each |
+| `AuthorityIndAnchors.Step<Part><Group>.apalache`, `AuthorityIndProcess.Step<Part><Group>.apalache` (92 profiles each) | — | Not measured in full; the model README, "Limits" |
 
 A large TLC search writes its state queue under `target/model/`, so it also needs free disk.
 Each profile must finish within one hour on a 16-vCPU host. Before you run a new large profile in

@@ -1,0 +1,6 @@
+check
+--cinit=CInit
+--init=IndInit
+--next=NextSnapshot
+--inv=RestoreNowAccountInvPost,RestoreNowAdminInvPost
+--length=1

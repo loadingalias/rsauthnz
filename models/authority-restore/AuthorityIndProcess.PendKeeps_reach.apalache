@@ -1,0 +1,6 @@
+check
+--cinit=CInitProcess
+--init=IndInitProcess
+--next=Next
+--inv=NoPendKeeps
+--length=0

@@ -1,0 +1,6 @@
+check
+--cinit=CInitProcess
+--init=IndInitProcess
+--next=Next
+--inv=NoDoubtAdmin
+--length=0

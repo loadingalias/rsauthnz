@@ -1,0 +1,6 @@
+check
+--cinit=CInitAnchors
+--init=IndInitAnchors
+--next=Next
+--inv=NoUncertainEnded
+--length=0

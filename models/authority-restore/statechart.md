@@ -1,8 +1,9 @@
 # Statecharts of the authority-restore models
 
 These charts come from the actions of `Authority.tla` and `Replay.tla`, the design as selected on
-2026-11-07, and the owner re-bootstrap and the acknowledgement order selected on 2026-11-08. The checkers are the acceptance authority; a chart only shows the shape. Each chart
-names the transitions that it merges or hides. No chart shows a known-bad variant.
+2026-11-07, the owner re-bootstrap and the acknowledgement order selected on 2026-11-08, and the
+anchor set of each outcome record (2026-11-09). The checkers are the acceptance authority; a chart
+only shows the shape. Each chart names the transitions that it merges or hides. No chart shows a known-bad variant.
 
 ## Store phase
 
@@ -53,7 +54,9 @@ Hidden or merged: the seven transition kinds of `Start`, the owner re-bootstrap 
 identity, and its client then finds the outcome by `Resolve`. A crashed operation that never
 committed stays at its crash point; reconciliation voids its end entry when its fact does not hold.
 `Resolve` also needs the creation entry of an operation that makes an anchor; reconciliation
-writes it before `Serve`. "No creation pending" is the guard `CreationPending` of 2026-11-08: an anchor change of an owner
+writes it before `Serve`. `Ack` and `Resolve` promise the anchor set of the outcome record: the
+anchors of the owner that the commit left live. After a restore, that is the record of the
+snapshot, not of a later redrive of the same identity in an abandoned history. "No creation pending" is the guard `CreationPending` of 2026-11-08: an anchor change of an owner
 is acknowledged, and a lookup reports it, only after each other commit of that owner that created
 an anchor has its creation entry. Without it (`ackEarly`), an unlink acknowledged next to an
 enrollment whose creation entry is still to come lets a restore remove the new anchor.
