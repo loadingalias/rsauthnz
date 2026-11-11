@@ -15,6 +15,9 @@ these rules.
 | `AuthorityInd.tla`, `AuthorityIndAnchors.tla`, `AuthorityIndProcess.tla` | Apalache | An inductive proof of every authority property, at the declared domains and with each domain raised by one (the anchor domains and the process domains in two groups): for any number of crashes, restarts, and restores over the operations and snapshots of those domains |
 | `Replay.tla` | Apalache | An inductive proof of the replay window, for each clock error in its bound |
 
+At the current model files, the raised proofs and the two declared TLC searches have no complete
+run. The model README, "Limits", names these open runs.
+
 ## Install the checkers
 
 The model command uses the Rust toolchain that `rust-toolchain.toml` pins and three checkers. Put
@@ -82,17 +85,32 @@ These profiles need a large host (16 vCPUs, 64 GiB; each Apalache profile uses o
 | `AuthorityIndAnchors.Step<Part><Group>.apalache`, `AuthorityIndProcess.Step<Part><Group>.apalache` (92 profiles each) | — | Not measured in full; the model README, "Limits" |
 
 A large TLC search writes its state queue under `target/model/`, so it also needs free disk.
-Each profile must finish within one hour on a 16-vCPU host. Before you run a new large profile in
-full, run it for 10 minutes, and estimate its full size from the growth of the distinct states and
-the queue. A profile that cannot finish in that time needs a smaller model, not a larger host.
+Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
+change stays short. Before you run a new large profile in full, run it for 10 minutes, and estimate
+its full size from the growth of the distinct states and the queue. A profile that does not finish
+in that time gives no result, and a larger host does not change the limit. Make the model smaller
+only in a way that keeps the result sound: symmetry over identical processes, a bound that the
+model proves, or an inductive proof. Each such change needs a known-bad variant that still fails
+under it. A smaller bound must still reach each failure that the model names, and it needs a
+profile with that bound raised by one.
 
 On a smaller host, select the profiles that your change touches, and run every profile before you
 record evidence.
 
 ## When a profile fails
 
-- A main profile reports a violation. The trace is a counterexample to a design rule. The design
-  changes first, and then the model.
+- A main TLC profile, or a main Apalache profile that starts at `Init`, reports a violation. The
+  trace starts at an initial state. Compare each step with the design's transitions. If the model
+  follows the design, the trace is a counterexample to a design rule: the design changes first,
+  and then the model. If the model does not follow the design, correct the model.
+- A `Step` or `Safety` profile of a proof (`AuthorityInd*.Step*.apalache`,
+  `AuthorityInd*.Safety.apalache`, `Replay.Step.apalache`, `Replay.Safety.apalache`) reports a
+  violation. Its trace starts at a state of the invariant, not at an initial state, and that state
+  can be one that no run reaches. Then the invariant is too weak, not the design. Add a clause that
+  excludes that state and holds in each reachable state, and run every profile again. To check a
+  new clause against the reachable states of a small bound, add it first as an invariant of
+  `Authority.TwoOps.cfg`. The trace shows a design defect only when a run from an initial state
+  reaches the same violation.
 - A `_bad` profile reports "no violation". The variant no longer breaks its property, so the
   property or the module changed. Find which one changed before you change the profile.
 - A profile reports a violation of a property other than its own. The variant fails for another
