@@ -46,9 +46,13 @@ fn hex(digits: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Decodes `input` and gives its refusal. A refusal must allocate no memory.
+/// Decodes `input` and gives its refusal. A refusal must allocate no memory. First, an accepted array must
+/// allocate: thus a count that does not work fails, and does not hide an allocation.
 fn refusal(input: &[u8], limits: Limits) -> Option<Error> {
+    let counted = ALLOCATIONS.with(Cell::get);
+    decode(&[0x82, 0x01, 0x02], Limits::default()).expect("[1, 2]");
     let before = ALLOCATIONS.with(Cell::get);
+    assert!(before > counted, "the decode of [1, 2] counted no allocation");
     let error = decode(input, limits).err();
     if error.is_some() {
         assert_eq!(
