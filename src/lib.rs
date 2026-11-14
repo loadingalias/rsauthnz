@@ -3,3 +3,11 @@
 extern crate alloc;
 
 pub mod cbor;
+pub mod evidence;
+pub mod id;
+
+/// Physical time: the reading of the family's shared types, which evidence times, expiry, and
+/// retention use. A reading has an estimate, an uncertainty bound or "unknown", and its source.
+pub mod time {
+    pub use rstypes::time::{Reading, ReadingSource, TimeError};
+}
