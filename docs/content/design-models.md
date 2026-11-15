@@ -1,13 +1,15 @@
 # Check the design models
 
-rsauthnz has TLA+ models of its authority and restore rules:
-[`models/authority-restore/`](../../models/authority-restore/README.md). They check that after
-crashes, restarts, and restores from an older snapshot, nothing that a committed change ended is
-valid again: no revoked passkey, no consumed one-use value, and no reused counter value. They check
-that a restore adds no anchor whose commit did not complete, that each account and the authority
-keep their anchors, and that the replay window accepts no signature twice for each clock error in
-its bound. The models check the design, not the Rust code. Change the model when you change one of
-these rules.
+rsauthnz has TLA+ models of its authority and restore rules, in
+[`models/authority-restore/`](../../models/authority-restore/README.md), and of agent grants and
+operation approval, in [`models/grant-approval/`](../../models/grant-approval/README.md).
+
+The authority models check that after crashes, restarts, and restores from an older snapshot,
+nothing that a committed change ended is valid again: no revoked passkey, no consumed one-use value,
+and no reused counter value. They check that a restore adds no anchor whose commit did not complete,
+that each account and the authority keep their anchors, and that the replay window accepts no
+signature twice for each clock error in its bound. The models check the design, not the Rust code.
+Change the model when you change one of these rules.
 
 | Module | Checker | Check |
 | --- | --- | --- |
@@ -15,8 +17,27 @@ these rules.
 | `AuthorityInd.tla`, `AuthorityIndAnchors.tla`, `AuthorityIndProcess.tla` | Apalache | An inductive proof of every authority property, at the declared domains and with each domain raised by one (the anchor domains and the process domains in two groups): for any number of crashes, restarts, and restores over the operations and snapshots of those domains |
 | `Replay.tla` | Apalache | An inductive proof of the replay window, for each clock error in its bound |
 
-At the current model files, the raised proofs and the two declared TLC searches have no complete
-run. The model README, "Limits", names these open runs.
+At the current authority model files, the raised proofs and the two declared TLC searches have no
+complete run. The `authority-restore` README, "Limits", names these open runs.
+
+The grant models check that an agent acts only within its grant, within its owner's current
+authority under the current policy version, and before the grant deadline, and that a revoked
+agent has no access. They check that one passkey assertion pays for at most one effect of the
+exact approved operation, also after a lost response, a lost request, a retry, or a restore.
+
+| Module | Checker | Check |
+| --- | --- | --- |
+| `GrantAccess.tla` | TLC | A complete search of grant authority and the request check and commit, at the declared bounds and with each bound raised by one |
+| `Approval.tla` | TLC | A complete search of one-use approval with the operation commit, request loss, and restore, at the declared bounds |
+| `ApprovalSnapshotNumber.tla` | TLC | A known-bad variant of `Approval.tla`: a restore raises the store instance number of its snapshot. It must fail with two restores and pass with one |
+
+The grant models assume that cryptographic verification is correct: two different challenges or
+descriptions never give the same digest, and a nonce never repeats. Each grant model takes the
+other model's concern as an environment that can do each thing that the concern can do. In
+`Approval.tla`, a restore installs any earlier state of each part of the store, so it covers each
+real snapshot, and more. The declared profile has one restore. A written argument shows that one
+restore is enough while a store instance number never repeats. The `grant-approval` README gives
+that argument, and it names each bound, reduction, and decision.
 
 ## Install the checkers
 
@@ -45,6 +66,7 @@ From the repository root:
 cargo xtask model authority-restore/Authority.TwoOps.cfg                 # one profile
 cargo xtask model authority-restore/Authority.TwoOps.cfg authority-restore/Replay.Step.apalache
 cargo xtask model authority-restore                                      # every profile
+cargo xtask model grant-approval                                         # every grant profile
 ```
 
 One model run at a time holds the host lock; another run waits for it.
@@ -75,6 +97,7 @@ The command exits 0 when every selected profile passes. The output of each profi
 ## Large profiles
 
 Most profiles take seconds to minutes. `Authority.TwoOps.cfg` is the local bound for an edit loop.
+Each `GrantAccess` profile and each known-bad variant of the grant models finishes in seconds.
 These profiles need a large host (16 vCPUs, 64 GiB; each Apalache profile uses one core):
 
 | Profile | Size | Time |
@@ -83,6 +106,9 @@ These profiles need a large host (16 vCPUs, 64 GiB; each Apalache profile uses o
 | `Authority.Bootstrapped.cfg` | 67.1 million distinct states | 17 minutes (measured at the A000 files) |
 | `AuthorityInd.Step<Part><Group>.apalache` (92 profiles) | — | 2 to 13 minutes each |
 | `AuthorityIndAnchors.Step<Part><Group>.apalache`, `AuthorityIndProcess.Step<Part><Group>.apalache` (92 profiles each) | — | Not measured in full; the model README, "Limits" |
+| `Approval.cfg` | 11.2 million distinct states | 5 minutes (measured at the A400 files) |
+| `Approval.Rev3.cfg` | 23.4 million distinct states | 12 minutes (measured at the A400 files) |
+| `ApprovalSnapshotNumber.cfg` | 11.2 million distinct states, as `Approval.cfg` | 5 minutes (measured at the A400 files) |
 
 A large TLC search writes its state queue under `target/model/`, so it also needs free disk.
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
