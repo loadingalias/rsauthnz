@@ -44,6 +44,8 @@ impl AuthorityVersion {
 
     /// Makes the version `coordinate` of `owner`.
     ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
     /// # Errors
     ///
     /// [`VersionError::Coordinate`] for an empty coordinate or one longer than
@@ -72,6 +74,8 @@ impl AuthorityVersion {
 
     /// Compares two versions of one owner: [`Ordering::Less`] when `self` is earlier than `other`.
     ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
     /// # Errors
     ///
     /// [`VersionError::Owners`] when the owners differ.
@@ -90,6 +94,8 @@ impl AuthorityVersion {
     }
 
     /// Reads the canonical CBOR form of a version.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///

@@ -9,7 +9,7 @@
 //!
 //! ```
 //! use core::time::Duration;
-//! use rsauthnz::cbor::Limits;
+//! use rsauthnz::limits::Limits;
 //! use rsauthnz::cose::{Algorithm, Key, Profile, PublicKey, TrustedKey};
 //! use rsauthnz::id::Id;
 //! use rsauthnz::time::{Reading, ReadingSource};

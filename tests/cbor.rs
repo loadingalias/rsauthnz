@@ -6,7 +6,8 @@ use core::cell::Cell;
 use std::alloc::System;
 
 use rsauthnz::cbor::Value::{Array, Bool, Bytes, Float, Map, Negative, Null, Simple, Tag, Text, Unsigned};
-use rsauthnz::cbor::{Error, Limit, Limits, decode, decode_prefix, encode};
+use rsauthnz::cbor::{Error, decode, decode_prefix, encode};
+use rsauthnz::limits::{Limit, Limits};
 
 thread_local! {
     /// The allocations of this thread. Each test runs on its own thread, so a test counts only its own allocations.
@@ -44,6 +45,13 @@ fn hex(digits: &str) -> Vec<u8> {
         .chunks(2)
         .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).expect("ASCII"), 16).expect("hexadecimal"))
         .collect()
+}
+
+/// The default limits, with the change that `set` makes.
+fn limits(set: impl FnOnce(&mut Limits)) -> Limits {
+    let mut limits = Limits::default();
+    set(&mut limits);
+    limits
 }
 
 /// Decodes `input` and gives its refusal. A refusal must allocate no memory. First, an accepted array must
@@ -240,40 +248,38 @@ fn appendix_a_vectors_outside_deterministic_encoding_refuse() {
 /// Each limit admits an item at the limit, and refuses an item one past it before the decoder allocates.
 #[test]
 fn each_limit_admits_its_value_and_refuses_one_past_it_without_allocating() {
-    let base = Limits::default();
     let cases = [
         // [1, 2] has 3 bytes, and [1, 2, 3] has 4.
-        (Limits { bytes: 3, ..base }, "820102", "83010203", Limit::Bytes),
+        (limits(|limits| limits.bytes = 3), "820102", "83010203", Limit::Bytes),
         // [[]] has 2 levels, and [[[]]] has 3.
-        (Limits { depth: 2, ..base }, "8180", "818180", Limit::Depth),
+        (limits(|limits| limits.depth = 2), "8180", "818180", Limit::Depth),
         // 1(1(0)) has 2 levels, and 1(1(1(0))) has 3.
-        (Limits { depth: 2, ..base }, "c1c100", "c1c1c100", Limit::Depth),
+        (limits(|limits| limits.depth = 2), "c1c100", "c1c1c100", Limit::Depth),
         // [1, 2] has 3 items, and [1, 2, 3] has 4.
-        (Limits { items: 3, ..base }, "820102", "83010203", Limit::Items),
+        (limits(|limits| limits.items = 3), "820102", "83010203", Limit::Items),
         // {1: 1, 2: 2} has 5 items, and [{1: 1, 2: 2}] has 6.
-        (Limits { items: 5, ..base }, "a201010202", "81a201010202", Limit::Items),
+        (
+            limits(|limits| limits.items = 5),
+            "a201010202",
+            "81a201010202",
+            Limit::Items,
+        ),
         // {1: 1, 2: 2} has 2 keys, and {1: 1, 2: 2, 3: 3} has 3.
         (
-            Limits { map_keys: 2, ..base },
+            limits(|limits| limits.map_keys = 2),
             "a201010202",
             "a3010102020303",
             Limit::MapKeys,
         ),
         // h'010203' and "abc" have 3 bytes, and h'01020304' and "abcd" have 4.
         (
-            Limits {
-                string_bytes: 3,
-                ..base
-            },
+            limits(|limits| limits.string_bytes = 3),
             "43010203",
             "4401020304",
             Limit::StringBytes,
         ),
         (
-            Limits {
-                string_bytes: 3,
-                ..base
-            },
+            limits(|limits| limits.string_bytes = 3),
             "63616263",
             "6461626364",
             Limit::StringBytes,
@@ -337,23 +343,11 @@ fn decode_prefix_gives_the_bytes_after_the_item() {
     let input = hex("a10102ff00");
     let item = Map(vec![(Unsigned(1), Unsigned(2))]);
     assert_eq!(
-        decode_prefix(
-            &input,
-            Limits {
-                bytes: 3,
-                ..Limits::default()
-            }
-        ),
+        decode_prefix(&input, limits(|limits| limits.bytes = 3)),
         Ok((item, &input[3..]))
     );
     assert_eq!(
-        decode_prefix(
-            &input,
-            Limits {
-                bytes: 2,
-                ..Limits::default()
-            }
-        ),
+        decode_prefix(&input, limits(|limits| limits.bytes = 2)),
         Err(Error::Limit(Limit::Bytes))
     );
 }

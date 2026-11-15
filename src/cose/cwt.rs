@@ -6,8 +6,9 @@ use core::fmt;
 use core::time::Duration;
 
 use super::{Error, Key, Sign1, TrustedKey};
-use crate::cbor::{self, Limits, Value};
+use crate::cbor::{self, Value};
 use crate::id::{Id, Purpose};
+use crate::limits::Limits;
 use crate::time::Reading;
 
 /// The CWT tag (RFC 8392 section 6). It can enclose the tagged `COSE_Sign1`.
@@ -48,6 +49,8 @@ pub enum Confirmation<'a> {
 
 impl<'a> Claims<'a> {
     /// Decodes the claims map that fills `input`, such as the payload of a CWT.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
@@ -153,6 +156,8 @@ pub struct Profile {
 impl Profile {
     /// Verifies the signed CWT `artifact` at the physical time `now`. `artifact` is a `COSE_Sign1` with the tag 18 or
     /// no tag, and the CWT tag (61) can enclose it.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
     /// The checks of the claims come first, because they are cheap. The signature check comes last. Thus
     /// [`Error::Issuer`], [`Error::Audience`], [`Error::NoExpiry`], [`Error::Expired`], and [`Error::NotYetValid`] can

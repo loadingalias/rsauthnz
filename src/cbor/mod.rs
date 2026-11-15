@@ -5,15 +5,17 @@
 //! Thus each value has one encoding, and the signed bytes of a structure have one meaning. [`encode`] writes that
 //! encoding.
 //!
-//! The decoder checks the whole item against the [`Limits`] of the caller before it builds the value. Thus a
+//! The decoder checks the whole item against the [`Limits`](crate::limits::Limits) of the caller before it builds the value. Thus a
 //! refused input allocates no memory, and the work is linear in the input. Byte and text strings borrow the input.
 //!
 //! ```
-//! use rsauthnz::cbor::{self, Limits, Value};
+//! use rsauthnz::cbor::{self, Value};
+//! use rsauthnz::limits::Limits;
 //!
 //! // {1: 2, 3: -7}: the key type and the algorithm of a COSE key.
 //! let bytes = [0xa2, 0x01, 0x02, 0x03, 0x26];
-//! let limits = Limits { string_bytes: 4096, ..Limits::default() };
+//! let mut limits = Limits::default();
+//! limits.string_bytes = 4096;
 //! let value = cbor::decode(&bytes, limits)?;
 //! assert_eq!(
 //!     value,
@@ -35,6 +37,8 @@ mod float;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
+
+use crate::limits::Limit;
 
 pub use decode::{decode, decode_prefix};
 pub use encode::encode;
@@ -94,54 +98,10 @@ impl fmt::Debug for Value<'_> {
     }
 }
 
-/// The bounds of one decode. [`Error::Limit`] names the bound that refused an input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// The most bytes in the encoded item. The default is 65,536.
-    pub bytes: usize,
-    /// The most levels of nested arrays, maps, and tags. Each array, map, or tag adds one level. The default is 16.
-    /// The type keeps the recursion of the decoder at 255 levels or fewer.
-    pub depth: u8,
-    /// The most data items. Each item counts: the outer item, and each array element, map key, map value, and
-    /// tagged item. The default is 1,024.
-    pub items: usize,
-    /// The most keys in one map. The default is 64.
-    pub map_keys: usize,
-    /// The most bytes in one byte or text string. The default is 16,384.
-    pub string_bytes: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            bytes: 65_536,
-            depth: 16,
-            items: 1_024,
-            map_keys: 64,
-            string_bytes: 16_384,
-        }
-    }
-}
-
-/// A bound of [`Limits`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Limit {
-    /// [`Limits::bytes`].
-    Bytes,
-    /// [`Limits::depth`].
-    Depth,
-    /// [`Limits::items`].
-    Items,
-    /// [`Limits::map_keys`].
-    MapKeys,
-    /// [`Limits::string_bytes`].
-    StringBytes,
-}
-
 /// The cause of a refusal. For each decode refusal, the recovery is to refuse the message that holds the input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The item is larger than a bound of [`Limits`].
+    /// The item is larger than a bound of [`Limits`](crate::limits::Limits).
     Limit(Limit),
     /// The input ends in the item.
     Truncated,

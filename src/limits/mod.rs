@@ -1,0 +1,85 @@
+//! Declared limits and cost classes: the bounds of untrusted input, and the class of the work of each operation.
+//!
+//! [`Limits`] is the one limit set of the crate. Each parser and each verifier checks its input against it before
+//! expensive work, and a refusal names the [`Limit`] that refused the input. A future bound joins [`Limits`] in the
+//! change that adds its first consumer: grants, resource scopes, dependencies, the keys of a key set, and the
+//! signatures of one artifact.
+//!
+//! [`Class`] is the cost class of an operation. Each public function names its class in its documentation, in the
+//! form "Cost class: [`Parse`](Class::Parse)." A method that takes only `&self` and returns no `Result` reads a
+//! value that is already bounded, so it names no class, unless it does signature, KDF, or storage work. A host admits
+//! each class separately, so a flood of one class cannot delay the work of another. The host owns admission.
+//!
+//! An ordinary operation reads current state only by key: the identifier of one principal, session, credential, or
+//! record. It never scans all principals, sessions, audit records, or expiry records. Expiry and retention go
+//! forward in bounded batches.
+
+/// The bounds of one decode. Each parser of the crate takes them, and [`Limit`] names the bound that refused an
+/// input.
+///
+/// A decoded value has at most [`Self::items`] items, and its strings borrow the input. Thus the decoded size is at
+/// most [`Self::items`] times the size of one item, and the decode does not expand the input past that bound.
+///
+/// A new bound can join the set, so build a value from [`Limits::default`] and set each field that you change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Limits {
+    /// The most bytes in the encoded item. The default is 65,536.
+    pub bytes: usize,
+    /// The most levels of nested arrays, maps, and tags. Each array, map, or tag adds one level. The default is 16.
+    /// The type keeps the recursion of the decoder at 255 levels or fewer.
+    pub depth: u8,
+    /// The most data items. Each item counts: the outer item, and each array element, map key, map value, and
+    /// tagged item. The default is 1,024.
+    pub items: usize,
+    /// The most keys in one map. The default is 64.
+    pub map_keys: usize,
+    /// The most bytes in one byte or text string. The default is 16,384.
+    pub string_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            bytes: 65_536,
+            depth: 16,
+            items: 1_024,
+            map_keys: 64,
+            string_bytes: 16_384,
+        }
+    }
+}
+
+/// A bound of [`Limits`]. A new bound can join it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Limit {
+    /// [`Limits::bytes`].
+    Bytes,
+    /// [`Limits::depth`].
+    Depth,
+    /// [`Limits::items`].
+    Items,
+    /// [`Limits::map_keys`].
+    MapKeys,
+    /// [`Limits::string_bytes`].
+    StringBytes,
+}
+
+/// The cost class of an operation. A host admits each class with its own bound on concurrent work and pending
+/// work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Class {
+    /// A cheap parse or refusal. The work is linear in input that [`Limits`] bounds, and it does no signature, KDF,
+    /// storage, or network work.
+    Parse,
+    /// Verification: signature or KDF work on input that the parse admitted.
+    Verify,
+    /// A durable mutation: one atomic commit in the storage binding of the application.
+    Mutate,
+    /// Slow custody or provider work, such as a hardware key or an external identity provider.
+    External,
+}
+
+#[cfg(test)]
+mod tests;

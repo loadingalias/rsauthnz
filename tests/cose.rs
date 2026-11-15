@@ -3,9 +3,10 @@
 
 use core::time::Duration;
 
-use rsauthnz::cbor::{Limits, Value, encode};
+use rsauthnz::cbor::{Value, encode};
 use rsauthnz::cose::{Algorithm, Claims, Confirmation, Error, Key, Profile, PublicKey, Sign1, TrustedKey};
 use rsauthnz::id::Id;
+use rsauthnz::limits::Limits;
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
 use rscrypto::auth::{Ed25519SecretKey, MlDsa65Seed};
 

@@ -17,7 +17,7 @@ A `Profile` holds the facts that the application fixes before it reads an artifa
 | `issuer` | `String` | The `iss` claim must be equal, byte for byte |
 | `audience` | `String` | The `aud` claim must name it, byte for byte. `aud` can be one text string or an array |
 | `purpose` | `Id<Purpose>` | The purpose of the artifacts that the profile accepts. The evidence records it |
-| `limits` | `cbor::Limits` | The bounds of the decode of the artifact and of its claims. See [Parser limits](parser-limits.md) |
+| `limits` | `limits::Limits` | The bounds of the decode of the artifact and of its claims. See [Parser limits](parser-limits.md) |
 
 One profile serves one purpose. Give each purpose its own key, so an artifact of one purpose never verifies for
 another purpose.
@@ -43,7 +43,7 @@ module documentation, and `cargo xtask test` runs it:
 
 ```rust
 use core::time::Duration;
-use rsauthnz::cbor::Limits;
+use rsauthnz::limits::Limits;
 use rsauthnz::cose::{Algorithm, Key, Profile, PublicKey, TrustedKey};
 use rsauthnz::id::Id;
 use rsauthnz::time::{Reading, ReadingSource};

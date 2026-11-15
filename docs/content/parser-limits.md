@@ -1,7 +1,8 @@
 # Parser limits
 
 Each rsauthnz parser bounds its untrusted input before it does work on it. The caller supplies the bounds, and
-each bound has a stated default. A refusal names the bound that refused the input.
+each bound has a stated default. A refusal names the bound that refused the input. [Admit rsauthnz
+work](admission.md) gives the cost class of each operation.
 
 ## CBOR
 
@@ -20,15 +21,17 @@ The decoder accepts only the deterministic encoding of
 encoding. The decoder checks the whole item before it builds the value, so a refused input allocates no memory.
 Byte and text strings in the value borrow the input.
 
-Set the bounds in a `Limits` value. This example is also the example of the `rsauthnz::cbor` module
-documentation, and `cargo xtask test` runs it:
+Set the bounds in a `rsauthnz::limits::Limits` value: the one limit set of the crate. This example is also the
+example of the `rsauthnz::cbor` module documentation, and `cargo xtask test` runs it:
 
 ```rust
-use rsauthnz::cbor::{self, Limits, Value};
+use rsauthnz::cbor::{self, Value};
+use rsauthnz::limits::Limits;
 
 // {1: 2, 3: -7}: the key type and the algorithm of a COSE key.
 let bytes = [0xa2, 0x01, 0x02, 0x03, 0x26];
-let limits = Limits { string_bytes: 4096, ..Limits::default() };
+let mut limits = Limits::default();
+limits.string_bytes = 4096;
 let value = cbor::decode(&bytes, limits)?;
 assert_eq!(
     value,
@@ -39,6 +42,9 @@ assert_eq!(
 );
 assert_eq!(cbor::encode(&value)?, bytes);
 ```
+
+The decoded value has at most `items` items, and its strings borrow the input. Thus the decode does not expand the
+input past `items` times the size of one item. A refusal names its bound with `rsauthnz::limits::Limit`.
 
 | Bound | `Limits` field | Default | Refusal |
 | --- | --- | --- | --- |

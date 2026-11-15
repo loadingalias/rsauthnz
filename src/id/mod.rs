@@ -106,6 +106,8 @@ pub struct Id<K: Kind> {
 impl<K: Kind> Id<K> {
     /// Makes an identifier. It allocates the bytes of the namespace and the value, and no more.
     ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
     /// # Errors
     ///
     /// [`IdError::Namespace`] or [`IdError::Value`] for a part outside its rule.
@@ -150,6 +152,8 @@ impl<K: Kind> Id<K> {
     }
 
     /// Reads the canonical CBOR form of an identifier of kind `K`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
@@ -200,6 +204,8 @@ impl Principal {
     }
 
     /// Reads the canonical CBOR form of a principal.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///

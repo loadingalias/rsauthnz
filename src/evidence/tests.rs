@@ -59,7 +59,7 @@ fn evidence_reads_back_from_its_cbor_form() {
     ];
     for evidence in cases {
         let encoded = cbor::encode(&evidence.to_cbor()).unwrap();
-        let value = cbor::decode(&encoded, cbor::Limits::default()).unwrap();
+        let value = cbor::decode(&encoded, crate::limits::Limits::default()).unwrap();
         assert_eq!(Evidence::from_cbor(&value), Ok(evidence));
     }
 }

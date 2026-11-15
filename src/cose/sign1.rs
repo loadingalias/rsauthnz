@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::{Error, TrustedKey, label};
-use crate::cbor::{self, Limits, Value};
+use crate::cbor::{self, Value};
+use crate::limits::Limits;
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
 const SIGN1_TAG: u64 = 18;
@@ -20,6 +21,8 @@ pub struct Header<'a>(Vec<(Value<'a>, Value<'a>)>);
 
 impl<'a> Header<'a> {
     /// The value of the header with the integer label `label`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     #[must_use]
     pub fn get(&self, label: i64) -> Option<&Value<'a>> {
         let label = super::label(label);
@@ -73,6 +76,8 @@ pub struct Sign1<'a> {
 impl<'a> Sign1<'a> {
     /// Decodes the `COSE_Sign1` that fills `input`, with its tag (18) or without a tag. The decoder applies `limits`
     /// to `input` and to the protected header in it.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
@@ -162,6 +167,8 @@ impl<'a> Sign1<'a> {
 
     /// Verifies the signature with `key`, and gives the payload. The externally supplied data of RFC 9052 section
     /// 4.3 is empty.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
     /// The `alg` of the protected bucket must be the algorithm of `key`. The header only matches the algorithm, so
     /// it never selects one. After that match, the check encodes the `Sig_structure` of RFC 9052 section 4.4 into

@@ -1,14 +1,11 @@
 //! `COSE_Key` (RFC 9052 section 7) and the trusted verification key of a profile.
 
-use alloc::boxed::Box;
 use core::fmt;
 
-use rscrypto::auth::{
-    EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
-};
-
 use super::{Algorithm, Error, label};
-use crate::cbor::{self, Limits, Value};
+use crate::cbor::{self, Value};
+use crate::crypto::Verifier;
+use crate::limits::Limits;
 
 /// A public key from a `COSE_Key`. It is an untrusted value until the application makes a [`TrustedKey`] from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +37,8 @@ pub enum PublicKey<'a> {
 impl<'a> Key<'a> {
     /// Decodes the `COSE_Key` that fills `input`.
     ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
     /// # Errors
     ///
     /// The errors of [`Self::from_value`], and [`Error::Cbor`] if the CBOR decoder refuses `input`.
@@ -48,6 +47,8 @@ impl<'a> Key<'a> {
     }
 
     /// Reads a `COSE_Key` from its decoded CBOR value. It ignores the parameters that it does not read.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
@@ -128,18 +129,13 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<&[u8; N], Error> {
 
 /// A verification key that the application trusts for one algorithm. A [`super::Profile`] holds it, so a header of an
 /// artifact never selects a key or an algorithm.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TrustedKey(Verifier);
-
-#[derive(Clone)]
-enum Verifier {
-    Ed25519(Ed25519PublicKey),
-    Es256(Box<EcdsaP256PublicKey>),
-    MlDsa65(Box<MlDsa65PublicKey>),
-}
 
 impl TrustedKey {
     /// Makes the trusted key of `algorithm` from `key`.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). A P-256 key checks its point and prepares its tables.
     ///
     /// # Errors
     ///
@@ -150,17 +146,9 @@ impl TrustedKey {
             return Err(Error::KeyAlgorithm);
         }
         Ok(Self(match (algorithm, &key.public) {
-            (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::Ed25519(Ed25519PublicKey::from_bytes(**x)),
-            (Algorithm::Es256, PublicKey::P256 { x, y }) => {
-                let mut sec1 = [0x04; EcdsaP256PublicKey::SEC1_LENGTH];
-                sec1[1..33].copy_from_slice(*x);
-                sec1[33..].copy_from_slice(*y);
-                let key = EcdsaP256PublicKey::from_sec1_bytes(&sec1).map_err(|_| Error::Malformed)?;
-                Verifier::Es256(Box::new(key))
-            }
-            (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => {
-                Verifier::MlDsa65(Box::new(MlDsa65PublicKey::from_bytes(**public)))
-            }
+            (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
+            (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
+            (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
             _ => return Err(Error::KeyAlgorithm),
         }))
     }
@@ -177,33 +165,13 @@ impl TrustedKey {
 
     /// Verifies `signature` over `message` with the algorithm of the key.
     pub(super) fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), Error> {
-        let verified = match &self.0 {
-            Verifier::Ed25519(key) => <[u8; 64]>::try_from(signature)
-                .is_ok_and(|signature| key.verify(message, &Ed25519Signature::from_bytes(signature)).is_ok()),
-            Verifier::Es256(key) => <[u8; 64]>::try_from(signature)
-                .ok()
-                .and_then(|signature| EcdsaP256Signature::from_bytes(signature).ok())
-                .is_some_and(|signature| key.verify(message, &signature).is_ok()),
-            Verifier::MlDsa65(key) => MlDsa65Signature::try_from_slice(signature)
-                .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
-        };
-        if verified { Ok(()) } else { Err(Error::Signature) }
-    }
-}
-
-/// Two trusted keys are equal when their algorithms and their public keys are equal.
-impl PartialEq for TrustedKey {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (Verifier::Ed25519(a), Verifier::Ed25519(b)) => a.as_bytes() == b.as_bytes(),
-            (Verifier::Es256(a), Verifier::Es256(b)) => a.to_sec1_bytes() == b.to_sec1_bytes(),
-            (Verifier::MlDsa65(a), Verifier::MlDsa65(b)) => a == b,
-            _ => false,
+        if self.0.verify(message, signature) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
         }
     }
 }
-
-impl Eq for TrustedKey {}
 
 impl fmt::Debug for TrustedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

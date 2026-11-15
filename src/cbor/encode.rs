@@ -9,6 +9,8 @@ use super::{Error, Value};
 /// bytewise order of the key encodings, whatever the order of the entries in `value`. [`super::decode`] accepts
 /// the result and gives an equal value.
 ///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+///
 /// # Errors
 ///
 /// Returns [`Error::DuplicateKey`] if a map has two equal keys. Returns [`Error::Malformed`] for

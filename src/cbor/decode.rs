@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use super::float::{self, DOUBLE, HALF, SINGLE};
-use super::{Error, Limit, Limits, Value};
+use super::{Error, Value};
+use crate::limits::{Limit, Limits};
 
 /// Decodes the one CBOR item that fills `input`.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
 ///
 /// # Errors
 ///
@@ -28,6 +31,8 @@ pub fn decode(input: &[u8], limits: Limits) -> Result<Value<'_>, Error> {
 
 /// Decodes the CBOR item at the start of `input`, and gives the bytes after it. Use it when other data follows the
 /// item, as the extensions follow the credential public key in WebAuthn authenticator data.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
 ///
 /// # Errors
 ///
