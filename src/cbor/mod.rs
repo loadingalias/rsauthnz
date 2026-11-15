@@ -38,6 +38,7 @@ use core::fmt;
 
 pub use decode::{decode, decode_prefix};
 pub use encode::encode;
+pub(crate) use encode::{head, head_len};
 
 /// A CBOR data item. Byte and text strings borrow the decoded input.
 ///
@@ -94,7 +95,7 @@ impl fmt::Debug for Value<'_> {
 }
 
 /// The bounds of one decode. [`Error::Limit`] names the bound that refused an input.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The most bytes in the encoded item. The default is 65,536.
     pub bytes: usize,

@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod cbor;
+pub mod cose;
 pub mod evidence;
 pub mod id;
 

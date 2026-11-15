@@ -64,16 +64,28 @@ fn write(value: &Value<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
 }
 
 /// Writes the head of major type `major` with the shortest form of `arg`.
-fn head(out: &mut Vec<u8>, major: u8, arg: u64) {
-    let (info, size) = match arg {
+pub(crate) fn head(out: &mut Vec<u8>, major: u8, arg: u64) {
+    let size = head_len(arg) - 1;
+    let info = match size {
         // The low byte of `arg` is its value.
-        0..=23 => (arg.to_be_bytes()[7], 0),
-        24..=0xff => (24, 1),
-        0x100..=0xffff => (25, 2),
-        0x1_0000..=0xffff_ffff => (26, 4),
-        _ => (27, 8),
+        0 => arg.to_be_bytes()[7],
+        1 => 24,
+        2 => 25,
+        4 => 26,
+        _ => 27,
     };
     put(out, major << 5 | info, arg, size);
+}
+
+/// The bytes of the head with the shortest form of `arg`: the initial byte, then 0, 1, 2, 4, or 8 argument bytes.
+pub(crate) const fn head_len(arg: u64) -> usize {
+    match arg {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
 }
 
 /// Writes the initial byte, then the low `size` bytes of `arg` with the most significant byte first.

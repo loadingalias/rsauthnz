@@ -11,6 +11,8 @@ publish.workspace = true
 # The physical-time reading of the family, which evidence times use. The alpha is frozen and
 # pinned to its exact version.
 rstypes = { version = "=0.1.0-alpha.2", default-features = false }
+# The only source of signatures. The owned crate is pinned to its exact release.
+rscrypto = { version = "=0.12.0", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa"] }
 
 [lints]
 workspace = true

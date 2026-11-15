@@ -6,7 +6,8 @@ each bound has a stated default. A refusal names the bound that refused the inpu
 ## CBOR
 
 `rsauthnz::cbor` is the one CBOR codec of the crate. It decodes and encodes the CBOR of WebAuthn attestation
-objects and authenticator data, COSE structures, and CWT claims.
+objects and authenticator data, COSE structures, and CWT claims. [Verify COSE and CWT artifacts](verification.md)
+gives the rules of the COSE verifier.
 
 - `decode(input, limits)` decodes one item that fills `input`.
 - `decode_prefix(input, limits)` decodes the item at the start of `input` and gives the bytes after it. Use it
