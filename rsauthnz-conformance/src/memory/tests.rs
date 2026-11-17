@@ -9,6 +9,7 @@ use std::thread;
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Id, Principal};
 use rsauthnz::limits::Limits;
+use rsauthnz::store::journal::{self, Body, Floor, History, Mark};
 use rsauthnz::store::{Commit, CrashLoss, Entry, Instance, Journal, Kind, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Proposal};
@@ -50,6 +51,24 @@ fn proposal(id: &[u8], key: &Key) -> Proposal {
 /// Each durable entry of the journal.
 fn entries(memory: &mut Memory) -> Result<Vec<Entry>, Error> {
     ready(Journal::read(memory, Sequence(0), NonZeroUsize::MAX))
+}
+
+/// Appends and syncs a floor entry of each value of `floors` after `head`, and gives the mark of each entry.
+fn append_floors(memory: &mut Memory, mut head: Mark, floors: &[u64]) -> Vec<Mark> {
+    let operation = OperationId::new(b"f-1").unwrap();
+    let mut marks = Vec::new();
+    for value in floors {
+        let floor = Body::Floor(Floor {
+            kind: Kind::Session,
+            value: *value,
+        });
+        let (data, next) = head.next(&operation, &floor, Limits::default()).unwrap();
+        assert_eq!(ready(memory.append(&data)), Ok(next.sequence));
+        ready(memory.sync()).unwrap();
+        marks.push(next);
+        head = next;
+    }
+    marks
 }
 
 /// The seeds of the seeded run, and the steps of each run.
@@ -208,7 +227,7 @@ fn two_concurrent_commits_that_read_one_absence_give_one_commit_and_one_conflict
 #[test]
 fn a_commit_with_an_earlier_instance_number_refuses() {
     let mut memory = Memory::new(Schedule::None);
-    let empty = memory.snapshot(Sequence(0));
+    let empty = memory.snapshot(Mark::EMPTY);
     let key = Kind::Credential.key(b"c-4").unwrap();
     let proposal = proposal(b"op-1", &key);
 
@@ -277,15 +296,17 @@ fn a_restore_gives_the_state_and_the_mark_of_its_snapshot() {
     let keys = [b"c-1", b"c-2"].map(|id| Kind::Credential.key(id).unwrap());
     let proposals = [proposal(b"op-1", &keys[0]), proposal(b"op-2", &keys[1])];
     let mut snapshot = None;
-    for (proposal, entry) in proposals.iter().zip([b"first", b"later"]) {
+    let mut head = Mark::EMPTY;
+    for (proposal, floor) in proposals.iter().zip([8, 16]) {
         assert_eq!(ready(memory.commit(proposal, instance)), Ok(Commit::Accepted));
-        let mark = ready(memory.append(entry)).unwrap();
-        ready(memory.sync()).unwrap();
-        snapshot.get_or_insert_with(|| memory.snapshot(mark));
+        let mark = append_floors(&mut memory, head, &[floor])[0];
+        snapshot.get_or_insert_with(|| (mark, memory.snapshot(mark)));
+        head = mark;
     }
     let journal = entries(&mut memory).unwrap();
 
-    assert_eq!(memory.restore(&snapshot.unwrap()), Sequence(1));
+    let (mark, snapshot) = snapshot.unwrap();
+    assert_eq!(memory.restore(&snapshot), mark);
     ready(memory.start()).unwrap();
     for (proposal, (key, kept)) in proposals.iter().zip(keys.iter().zip([true, false])) {
         assert_eq!(ready(Store::read(&mut memory, key)).unwrap().is_some(), kept);
@@ -293,6 +314,29 @@ fn a_restore_gives_the_state_and_the_mark_of_its_snapshot() {
         assert_eq!(outcome.as_ref(), kept.then_some(proposal.operation()));
     }
     assert_eq!(entries(&mut memory), Ok(journal));
+}
+
+/// A snapshot keeps the link of the entry at its mark, so a restore with the journal of another history refuses at
+/// its first entry after the mark, also when the sequences are the same.
+#[test]
+fn a_restore_with_the_journal_of_another_history_refuses() {
+    let mut store = Memory::new(Schedule::None);
+    ready(store.start()).unwrap();
+    let marks = append_floors(&mut store, Mark::EMPTY, &[8, 16, 24]);
+    let snapshot = store.snapshot(marks[1]);
+    let mut other = Memory::new(Schedule::None);
+    ready(other.start()).unwrap();
+    append_floors(&mut other, Mark::EMPTY, &[1, 2, 3]);
+
+    for (memory, expected) in [
+        (&mut store, Ok(())),
+        (&mut other, Err(journal::Error::Changed(Sequence(3)))),
+    ] {
+        let mark = memory.restore(&snapshot);
+        ready(memory.start()).unwrap();
+        let page = ready(Journal::read(memory, mark.sequence, NonZeroUsize::MAX)).unwrap();
+        assert_eq!(History::new(mark).extend(&page, Limits::default()), expected);
+    }
 }
 
 /// The loss of journal entries leaves a gap that a read shows, and no later append fills it: the next append gets

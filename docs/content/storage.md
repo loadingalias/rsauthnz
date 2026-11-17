@@ -18,7 +18,7 @@ A binding states its guarantees in a `Declaration`. `Profile::new(declaration)` 
 | `crash_loss` | `CrashLoss::Unsynced`: a crash loses only the writes whose commit or sync did not return. `CrashLoss::Everything`: the store is in the memory of the process | — |
 | `outcome_retention` | The least time for which the binding keeps an outcome record. A lookup after it gives an unknown outcome | — |
 | `crash_injection` | `CrashInjection::Supported` when the binding injects a crash at each commit point, or `Unsupported` | — |
-| `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects | — |
+| `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects. [Restore journal](restore.md) gives what the journal keeps | — |
 | `key_bytes_max` | The most bytes in a key that the binding stores | `Error::KeyBound` below 2048 (`transition::Key::BYTES_MAX`), the longest key of the core |
 | `record_bytes_max` | The most bytes in the record form of a write and in the payload of an intent | `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer one, before the commit |
 
@@ -42,6 +42,9 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Journal::append(&entry)` | Appends the entry after the last entry and gives its `Sequence`. The entry is durable only after a later sync returns |
 | `Journal::sync()` | Makes each earlier append durable. A failed sync is a crash: a retry that succeeds does not show that the data is durable |
 | `Journal::read(after, limit)` | Gives at most `limit` durable entries (`Entry`) after the sequence `after`, in sequence order |
+
+The entries of the journal have the record format of `rsauthnz::store::journal`. [Restore journal](restore.md) gives
+the format, the chain check, and the rules of a restore.
 
 ## Commit
 

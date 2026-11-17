@@ -47,6 +47,8 @@ use crate::id::{Authority, AuthorityVersion, Id};
 use crate::time::{Reading, ReadingSource, TimeError};
 use crate::transition::{self, Change, Key, Operation, OperationId, Proposal};
 
+pub mod journal;
+
 /// The first item of the CBOR form of an audit record. Its number changes with the form.
 const AUDIT_FORM: &str = "rsauthnz.store.audit.1";
 

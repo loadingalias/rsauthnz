@@ -60,6 +60,8 @@ The comparison is declared: `compare` orders two versions of one owner by their 
 by byte. A shorter coordinate that is a prefix of a longer one is earlier. Thus give each later
 version a greater coordinate, for example a counter in big-endian bytes of a fixed width. Versions
 of two owners do not compare: `compare` gives `VersionError::Owners`.
+The [restore journal](restore.md) uses this order: a fact states that each version of a record at or below a
+version is dead.
 
 ```rust
 use rsauthnz::id::{AuthorityVersion, Id, VersionError};

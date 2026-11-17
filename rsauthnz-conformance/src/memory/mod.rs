@@ -77,6 +77,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::limits::Limits;
+use rsauthnz::store::journal::Mark;
 use rsauthnz::store::{
     self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
     Sequence, Store,
@@ -171,12 +172,12 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// A snapshot of the store with its low-water mark. A restore gives back its state, and the journal keeps its own
-/// entries.
+/// A snapshot of the store with its low-water mark, which keeps the link of its entry. A restore gives back its state,
+/// and the journal keeps its own entries.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     state: State,
-    mark: Sequence,
+    mark: Mark,
 }
 
 /// The state of the simulated store. A crash keeps it, and a restart loses it.
@@ -361,10 +362,10 @@ impl Memory {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A snapshot of the current state of the store, with the low-water mark `mark`: the caller states the journal
-    /// sequence at or below which the state reflects each entry.
+    /// A snapshot of the current state of the store, with the low-water mark `mark`: the caller states the mark of the
+    /// journal entry at or below which the state reflects each entry, as `journal::low_water` gives it.
     #[must_use]
-    pub fn snapshot(&self, mark: Sequence) -> Snapshot {
+    pub fn snapshot(&self, mark: Mark) -> Snapshot {
         Snapshot {
             state: self.lock().store.clone(),
             mark,
@@ -373,7 +374,7 @@ impl Memory {
 
     /// Restores the state of the store from `snapshot` and gives its low-water mark. The journal keeps its entries.
     /// The binding stops: the appends after the last sync are lost, and it serves again after a start.
-    pub fn restore(&self, snapshot: &Snapshot) -> Sequence {
+    pub fn restore(&self, snapshot: &Snapshot) -> Mark {
         let mut binding = self.lock();
         binding.stop(Error::Stopped);
         binding.store = snapshot.state.clone();

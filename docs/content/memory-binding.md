@@ -109,8 +109,8 @@ do not change the durable entries of the journal.
 | Operation | Effect |
 | --- | --- |
 | `memory.restart()` | The loss of the process. The store loses all its records: the policy, audit, outcome, and intent records too. The binding stops |
-| `memory.snapshot(mark)` | Gives a `Snapshot` of the state of the store with the low-water mark `mark`. The caller states the mark |
-| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, and gives its low-water mark. The binding stops |
+| `memory.snapshot(mark)` | Gives a `Snapshot` of the state of the store with the low-water mark `mark`, a `journal::Mark`: the sequence and the link of an entry. The caller states the mark, as `journal::low_water` gives it ([Restore journal](restore.md)) |
+| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, and gives its low-water mark. The binding stops. A `History` from that mark refuses a journal of another history |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
 
 A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start gives a larger instance number for
