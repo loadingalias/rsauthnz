@@ -21,8 +21,8 @@ pub struct Entries {
 /// The entries of `proposal`: its facts, its consumption, and the anchors that it creates.
 ///
 /// Each end of a record gives a fact at the version that the proposal read. The kinds that are no authority give no
-/// fact: [`Kind::Replay`], [`Kind::ReplayFloor`], [`Kind::Audit`], [`Kind::Outcome`], [`Kind::Intent`], and
-/// [`Kind::Policy`]. A kind whose consumption pays for nothing ([`Pays::Nothing`]) gives no fact either, because a
+/// fact: [`Kind::Replay`], [`Kind::ReplayFloor`], [`Kind::Audit`], [`Kind::Outcome`], [`Kind::Intent`],
+/// [`Kind::Policy`], and [`Kind::Mark`]. A kind whose consumption pays for nothing ([`Pays::Nothing`]) gives no fact either, because a
 /// restore ends each pending record of it. A write gives a fact only when `replaced` names its key: the version that
 /// it replaces is dead, as for a session renewal or a grant change. A write whose key `anchors` names creates an anchor with that role. A
 /// proposal that creates an anchor and ends one value whose consumption pays for an anchor is a consumption. Its end
@@ -64,7 +64,13 @@ pub fn entries(proposal: &Proposal, replaced: &[Key], anchors: &[(Key, Role)]) -
             Change::End(key) => {
                 if matches!(
                     kind,
-                    Kind::Replay | Kind::ReplayFloor | Kind::Audit | Kind::Outcome | Kind::Intent | Kind::Policy
+                    Kind::Replay
+                        | Kind::ReplayFloor
+                        | Kind::Audit
+                        | Kind::Outcome
+                        | Kind::Intent
+                        | Kind::Policy
+                        | Kind::Mark
                 ) || kind.consumption() == Some(Pays::Nothing)
                 {
                     continue;

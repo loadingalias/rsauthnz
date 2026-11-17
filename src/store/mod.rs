@@ -96,6 +96,9 @@ pub enum Kind {
     Intent = 19,
     /// The current policy version of an owner ([`policy_key`]). A policy change is a commit that writes it.
     Policy = 20,
+    /// The journal mark of the store: the low-water mark of its state, whether a restore made the state, and the
+    /// completions that a restore still owes. The commit driver writes it, and it has no end.
+    Mark = 21,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -110,7 +113,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -131,6 +134,7 @@ impl Kind {
         Self::Outcome,
         Self::Intent,
         Self::Policy,
+        Self::Mark,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -155,7 +159,8 @@ impl Kind {
             | Self::Audit
             | Self::Outcome
             | Self::Intent
-            | Self::Policy => None,
+            | Self::Policy
+            | Self::Mark => None,
         }
     }
 
@@ -165,7 +170,13 @@ impl Kind {
     pub const fn ends(&self) -> bool {
         !matches!(
             self,
-            Self::ProviderLink | Self::Administrator | Self::Agent | Self::ReplayFloor | Self::Intent | Self::Policy
+            Self::ProviderLink
+                | Self::Administrator
+                | Self::Agent
+                | Self::ReplayFloor
+                | Self::Intent
+                | Self::Policy
+                | Self::Mark
         )
     }
 

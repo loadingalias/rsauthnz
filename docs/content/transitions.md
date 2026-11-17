@@ -131,7 +131,8 @@ proposal has no accessor for it. The store never keeps the artifact, so the rece
 
 Notification, signer, and provider calls are not part of the commit. An `Intent` records such a call in the
 commit, so that the call survives a crash. The application calls the effect after the commit. [Storage
-contract](storage.md#effect-intents) gives how a worker finds the stored intents and changes their state.
+contract](storage.md#effect-intents) gives how a worker finds the stored intents and changes their state. An intent of
+`Effect::Journal` belongs to the commit driver, and a worker skips it.
 
 | `State` | Meaning |
 | --- | --- |
@@ -156,6 +157,7 @@ Each `rsauthnz::transition::Error` is a small `Copy` value with no secret. `erro
 | `Changed` | The decision read the same policy or record twice, with two results | `Restart` |
 | `Change` | No read of the proposal allows the change, or another change names its record | `Refuse` |
 | `Reuse` | The operation identity has the outcome record of another request | `Refuse` |
+| `LastAnchor` | The change ends the last sign-in method of an account, or the last administrator binding, that the restore journal records as live | `Refuse` |
 
 ## Limits
 

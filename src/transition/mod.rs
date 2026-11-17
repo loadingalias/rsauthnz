@@ -280,6 +280,10 @@ pub enum Effect {
     Signer,
     /// An external identity provider.
     Provider,
+    /// The creation entry of the restore journal for the anchors of the commit, with the CBOR form of the anchors as
+    /// its payload. The commit driver adds it to an anchor commit with no consumption, appends the entry after the
+    /// commit, and then ends the intent. An application worker skips it.
+    Journal,
 }
 
 /// The state of an intent.
@@ -374,6 +378,7 @@ impl Intent {
             Effect::Notification => 1,
             Effect::Signer => 2,
             Effect::Provider => 3,
+            Effect::Journal => 4,
         };
         let state = match self.state {
             State::Open => 1,
@@ -406,6 +411,7 @@ impl Intent {
             1 => Effect::Notification,
             2 => Effect::Signer,
             3 => Effect::Provider,
+            4 => Effect::Journal,
             _ => return Err(Error::Intent),
         };
         let state = match state {
@@ -664,6 +670,9 @@ pub enum Error {
     Reuse,
     /// The stored form of an intent is not valid.
     Intent,
+    /// The change ends the last sign-in method of an account, or the last administrator binding of the authority, that
+    /// the restore journal records as live.
+    LastAnchor,
 }
 
 impl Error {
@@ -678,7 +687,8 @@ impl Error {
             | Self::Limit(_)
             | Self::Change
             | Self::Reuse
-            | Self::Intent => Recovery::Refuse,
+            | Self::Intent
+            | Self::LastAnchor => Recovery::Refuse,
         }
     }
 }
@@ -696,6 +706,7 @@ impl fmt::Display for Error {
             Self::Change => f.write_str("the proposal does not allow the change"),
             Self::Reuse => f.write_str("the operation identity is in use for another request"),
             Self::Intent => f.write_str("the stored form of the intent is not valid"),
+            Self::LastAnchor => f.write_str("the change ends the last sign-in method or administrator binding"),
         }
     }
 }

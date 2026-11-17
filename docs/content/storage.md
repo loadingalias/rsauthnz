@@ -99,6 +99,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Intent` | An effect intent that the application did not end yet | `None` |
 | `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
+| `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for
@@ -146,6 +147,9 @@ After a crash, a worker finds each intent with bounded reads of `Store::intents(
 other, and reads each one back with `Intent::from_cbor`. A change of the state of an intent is a commit: the
 proposal reads the record at its version, and writes the intent at the version of its new state, which is later. After
 the worker observes the end of the call, a commit ends the record (`Change::End`).
+
+An intent of `Effect::Journal` belongs to the commit driver: it names the anchors whose creation entry the journal
+still owes. A worker skips it.
 
 ## Expiry
 
