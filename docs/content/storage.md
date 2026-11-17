@@ -5,8 +5,8 @@ storage binding: the primitives of `rsauthnz::store::Store`, and of `rsauthnz::s
 restore. The commit driver of the core orders the primitives. A binding executes each primitive and decides no step
 of the protocol. [Propose a transition](transitions.md) gives the proposal that a commit takes.
 
-This release has the contract, but no commit driver, memory binding, or conformance suite yet. Thus nothing in
-rsauthnz calls a binding except the expiry pass `store::expire`.
+This release has the contract and its reference binding, the [memory binding](memory-binding.md), but no commit driver
+or conformance suite yet. Thus nothing in rsauthnz calls a binding except the expiry pass `store::expire`.
 
 ## Declare the binding
 

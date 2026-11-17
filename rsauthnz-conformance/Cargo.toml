@@ -1,0 +1,17 @@
+[package]
+name = "rsauthnz-conformance"
+version = "0.1.0-alpha.1"
+description = "The storage conformance of rsauthnz: the memory binding of the storage contract, for tests and examples."
+repository = "https://github.com/loadingalias/rsauthnz"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The storage contract that the memory binding implements.
+rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
+# The only source of hashes. The seeded fault schedule draws from RapidHash.
+rscrypto = { version = "=0.12.0", default-features = false, features = ["rapidhash"] }
+
+[lints]
+workspace = true
