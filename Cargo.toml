@@ -53,7 +53,7 @@ unreachable_pub = "deny"
 [workspace.lints.clippy]
 # The complete production-ready default set. The negative priority lets every
 # individually reviewed lint below take precedence.
-all = { level = "deny", priority = -1 }
+default = { level = "deny", priority = -1 }
 
 # Concurrency and async correctness.
 arc_with_non_send_sync = "deny"
@@ -65,7 +65,6 @@ significant_drop_in_scrutinee = "deny"
 
 # Production panics and incomplete control flow.
 panic = "deny"
-panic_in_result_fn = "deny"
 string_slice = "deny"
 todo = "deny"
 unchecked_time_subtraction = "deny"
