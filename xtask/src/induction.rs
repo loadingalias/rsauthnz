@@ -1210,6 +1210,27 @@ actions Proof GroupRestore ProofStepRestoreJobs
             let root = crate::evidence::directory(&repo.join("target/induction-tests"))
                 .map_err(|error| error.message)
                 .expect("scheduler inputs");
+            // A run records the revision and the status of its repository. The fixture is a repository with one
+            // commit, so the record does not read the checkout that runs the test, for example a synced worktree.
+            for args in [
+                ["init", "-q"].as_slice(),
+                &["commit", "-q", "--allow-empty", "-m", "scheduler fixture"],
+            ] {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .envs([
+                        ("GIT_AUTHOR_NAME", "fixture"),
+                        ("GIT_AUTHOR_EMAIL", "fixture@example.invalid"),
+                        ("GIT_COMMITTER_NAME", "fixture"),
+                        ("GIT_COMMITTER_EMAIL", "fixture@example.invalid"),
+                    ])
+                    .status()
+                    .expect("git");
+                assert!(status.success(), "git {args:?} in the scheduler fixture");
+            }
             let source = root.join("source");
             std::fs::create_dir(&source).expect("source directory");
             std::fs::write(source.join("Model.tla"), "---- MODULE Model ----\n====\n").expect("model input");
