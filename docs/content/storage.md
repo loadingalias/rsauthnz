@@ -33,11 +33,11 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | Primitive | Effect |
 | --- | --- |
 | `Store::declaration()` | Gives the `Declaration` |
-| `Store::start()` | Writes the next store instance number (`Instance`) durably, before reconciliation, and gives it |
+| `Store::start()` | Writes the next store instance number (`Instance`) durably, before reconciliation, and gives it. Keep the number where a restore cannot lower it, for example in the failure domain of the journal. A restored lower number lets a delayed commit of the abandoned history land |
 | `Store::read(&key)` | Gives the current `Record` of the key (`version`, `end`, and `data`), or `None`. It is a keyed read: it never scans other records |
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
-| `Store::outcome(&id)` | Gives the outcome record (`transition::Operation`) of the operation identity, or `None` |
 | `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
+| `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |
 | `Store::intents(after, limit)` | Gives at most `limit` intent records with a key after `after`, in key order, or from the first key for `None` |
 | `Journal::append(&entry)` | Appends the entry after the last entry and gives its `Sequence`. The entry is durable only after a later sync returns |
 | `Journal::sync()` | Makes each earlier append durable. A failed sync is a crash: a retry that succeeds does not show that the data is durable |
@@ -49,17 +49,21 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 serializable step, or in one equivalent atomic step, it checks that:
 
 1. `instance` is the current store instance number. Thus a commit from an earlier instance refuses after a start.
-2. Each dependency of `proposal.dependencies()` holds: `Policy(version)`, `Version(key, version)`, and `Absent(key)`.
-3. No outcome record has the operation identity of the proposal.
+2. Each dependency of `proposal.dependencies()` holds. `Version(key, version)` holds when the record `key` is at
+   `version`. `Policy(version)` holds when the policy record of its owner is at `version` ([Policy
+   records](#policy-records)). `Absent(key)` holds when no record has the key.
+3. No outcome record has the operation identity of the proposal: no record has the key of
+   `store::outcome_record(&proposal)`.
 
-Then it writes each change of `proposal.changes()`, the audit, each intent record of `store::intent_records(&proposal)`,
-and the outcome record `proposal.operation()` together. Otherwise it writes nothing.
+Then it writes each change of `proposal.changes()`, the audit record of `store::audit_record(&proposal)`, each intent
+record of `store::intent_records(&proposal)`, and the outcome record of `store::outcome_record(&proposal)` together.
+Otherwise it writes nothing.
 
 | `Commit` | Meaning |
 | --- | --- |
 | `Accepted` | The commit wrote everything. It is durable when it returns |
 | `Conflict` | A dependency or the instance number did not hold |
-| `Recorded(record)` | The store has an outcome record of the operation identity. `record.answer(proposal.operation())` gives the outcome |
+| `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). `record.answer(proposal.operation())` gives the outcome |
 
 An error of the commit is a crash with an unknown outcome. The commit takes a proposal, so state changes cannot
 commit without their audit and their outcome record. The rustdoc of `rsauthnz::store` shows it with a compiled
@@ -88,13 +92,46 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
 | `Replay` | The replay record of one accepted signature | `None` |
 | `ReplayFloor` | The replay floor of the store. Each replay insert reads it as a dependency | `None` |
-| `Audit` | An audit record | `None` |
-| `Outcome` | An outcome record | `None` |
+| `Audit` | The audit record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
+| `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Intent` | An effect intent that the application did not end yet | `None` |
+| `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for
 nothing has no journal entry, and a restore ends each pending record of its kind.
+
+## Policy records
+
+The current policy version of an owner is a record in the store, so the commit checks a policy dependency in the
+same atomic step as each other dependency. `store::policy_key(&owner)` gives the key of the policy record of the
+owner: `Kind::Policy` with the SHA-256 digest of the canonical CBOR form of the owner. The digest keeps the key short,
+because an owner identifier can be longer than a key.
+
+A policy change is a commit like each other transition. Its proposal reads the policy record at its current version,
+or as absent for the first policy of the owner. Then it writes the record at the new version, which is later. After
+that commit, each proposal that read the earlier policy version conflicts.
+
+## Audit and outcome records
+
+The commit writes the audit and the outcome record of its proposal as records. Their keys are `Kind::Audit` and
+`Kind::Outcome` with the operation identity, so `Store::read` finds both records of each commit. Only the commit
+writes them: `proposal.change` gives `transition::Error::Change` for a change of an audit or an outcome record.
+
+`store::outcome_record(&proposal)` gives the key and the record of the outcome. The record form is the request
+binding of `proposal.operation()`: 32 bytes. `Store::outcome(&id)` reads this record, and
+`store::outcome_of(&id, &record)` gives its `transition::Operation`. A record in another form gives `None`.
+
+`store::audit_record(&proposal)` gives the key and the record of the audit. The record form is the CBOR array
+`["rsauthnz.store.audit.1", actor, action, time, keys]`:
+
+- `actor` and `action` are the canonical CBOR forms of `audit.actor` and `audit.action`.
+- `time` is `[estimate, bound, source]` of the reading `audit.time`. The estimate and the bound are
+  `[seconds, nanoseconds]`, and the bound is null when it is unknown. The source is 1 for the system clock, 2 for the
+  caller, and 0 for another source.
+- `keys` is the key of each change of the proposal, in order.
+
+The two records have no end. The binding sets the end of each one from its retention.
 
 ## Effect intents
 
@@ -130,8 +167,8 @@ async fn expire_all<S: Store>(binding: &mut S, now: Reading) -> Result<(), Expir
 ```
 
 One pass of `store::expire(binding, now, limit)` makes one `Store::expire` call for each kind that can end
-(`kind.ends()`). No call goes to the provider links, administrator bindings, agent identities, the replay floor, or
-the intents, because their records have no end. Each call removes
+(`kind.ends()`). No call goes to the provider links, administrator bindings, agent identities, the replay floor, the
+intents, or the policy records, because their records have no end. Each call removes
 at most `limit` records whose end is before the earliest time of `now`, so a record that a check can still accept
 stays. The pass gives `Progress::More` while a kind can have more ended records. A reading with no known bound
 gives `ExpiryError::Time` and removes nothing. The host chooses when to run each pass, and its cost class is

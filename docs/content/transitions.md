@@ -64,7 +64,7 @@ a concurrent change between the decision and the commit gives a conflict.
 
 | `Dependency` | The commit checks that |
 | --- | --- |
-| `Policy(version)` | The policy of the owner of `version` is at `version` |
+| `Policy(version)` | The policy of the owner of `version` is at `version`: its [policy record](storage.md#policy-records) is at `version` |
 | `Version(key, version)` | The record `key` is at `version` |
 | `Absent(key)` | No record has the key `key`. A uniqueness condition is the absence of a record under a unique key, for example the provider link of one issuer and subject |
 

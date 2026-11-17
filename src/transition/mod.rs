@@ -63,6 +63,7 @@ use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::id::{Action, AuthorityVersion, Id, Principal};
 use crate::limits::{Limit, Limits};
+use crate::store::Kind;
 use crate::time::Reading;
 
 /// The first item of the CBOR form that a request binding digests. Its number changes with the form.
@@ -179,7 +180,8 @@ impl fmt::Debug for Key {
 /// A read of the decision. The commit checks it again, in the same atomic step as its changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dependency {
-    /// The policy of the owner of the version is at this version.
+    /// The policy of the owner of the version is at this version: the policy record of the owner
+    /// ([`store::policy_key`](crate::store::policy_key)) is at this version.
     Policy(AuthorityVersion),
     /// The record is at this version.
     Version(Key, AuthorityVersion),
@@ -220,7 +222,8 @@ pub enum Change {
 }
 
 impl Change {
-    const fn key(&self) -> &Key {
+    /// The key of the record that the change writes or ends.
+    pub(crate) const fn key(&self) -> &Key {
         match self {
             Self::Write { key, .. } | Self::End(key) => key,
         }
@@ -491,13 +494,15 @@ impl Proposal {
 
     /// Adds a state change. A read of the proposal must allow it: a write of a record that the proposal read as
     /// absent, a write at a later version than the version that the proposal read, or an end of a record that the
-    /// proposal read at a version. Thus the changes are at most [`Limits::dependencies`].
+    /// proposal read at a version. Thus the changes are at most [`Limits::dependencies`]. Only the commit writes an
+    /// audit or an outcome record ([`Kind::Audit`], [`Kind::Outcome`]), so no change can name one.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
-    /// [`Error::Change`] if no read allows `change`, or if another change names its record.
+    /// [`Error::Change`] if no read allows `change`, if another change names its record, or if it names an audit or an
+    /// outcome record.
     pub fn change(&mut self, change: Change) -> Result<(), Error> {
         let allowed = self.dependencies.iter().any(|read| match (read, &change) {
             (Dependency::Absent(read), Change::Write { key, .. }) => read == key,
@@ -508,7 +513,8 @@ impl Proposal {
             _ => false,
         });
         let again = self.changes.iter().any(|earlier| earlier.key() == change.key());
-        (allowed && !again).ok_or(Error::Change)?;
+        let committed = matches!(Kind::of(change.key()), Some(Kind::Audit | Kind::Outcome));
+        (allowed && !again && !committed).ok_or(Error::Change)?;
         self.changes.push(change);
         Ok(())
     }
@@ -651,7 +657,8 @@ pub enum Error {
     Limit(Limit),
     /// The decision read the same policy or record twice, with two results: the state changed between the reads.
     Changed,
-    /// No read of the proposal allows the change, or another change names its record.
+    /// No read of the proposal allows the change, another change names its record, or it names an audit or an outcome
+    /// record, which only the commit writes.
     Change,
     /// The operation identity has the outcome record of another request.
     Reuse,
@@ -686,7 +693,7 @@ impl fmt::Display for Error {
             Self::Limit(Limit::Intents) => f.write_str("the proposal has too many effect intents"),
             Self::Limit(_) => f.write_str("the proposal is larger than a bound of the limits"),
             Self::Changed => f.write_str("the state changed between two reads of the decision"),
-            Self::Change => f.write_str("no read of the proposal allows the change"),
+            Self::Change => f.write_str("the proposal does not allow the change"),
             Self::Reuse => f.write_str("the operation identity is in use for another request"),
             Self::Intent => f.write_str("the stored form of the intent is not valid"),
         }

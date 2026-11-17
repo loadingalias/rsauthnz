@@ -1,10 +1,11 @@
 //! The storage contract: the primitives that a storage binding of the application implements, and its declaration.
 //!
 //! rsauthnz ships no storage backend. A binding implements [`Store`]: keyed reads of the current state, one
-//! conditional atomic commit of a [`Proposal`], outcome lookup, the store instance number, and incremental expiry. A
-//! binding that supports restore also implements [`Journal`]: a durable append, a sync, and a read of the restore
-//! journal. The commit driver of the core orders the primitives. A binding executes them and decides no step of the
-//! protocol.
+//! conditional atomic commit of a [`Proposal`], the store instance number, and incremental expiry. The outcome lookup
+//! [`Store::outcome`] reads the outcome record of the commit with a keyed read. The current policy version of an owner
+//! is a record too ([`policy_key`]), so the commit checks it in the same atomic step. A binding that supports restore also implements [`Journal`]: a durable append, a sync, and a read of the
+//! restore journal. The commit driver of the core orders the primitives. A binding executes them and decides no step
+//! of the protocol.
 //!
 //! A [`Declaration`] states the isolation, what a crash can lose, the outcome retention, crash injection, restore
 //! support, and the key and record bounds of a binding. [`Profile::new`] refuses a binding without an atomic
@@ -34,15 +35,20 @@
 //! ```
 
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use core::num::NonZeroUsize;
 use core::time::Duration;
 
-use crate::cbor;
-use crate::id::AuthorityVersion;
-use crate::time::{Reading, TimeError};
+use crate::cbor::{self, Value};
+use crate::crypto;
+use crate::id::{Authority, AuthorityVersion, Id};
+use crate::time::{Reading, ReadingSource, TimeError};
 use crate::transition::{self, Change, Key, Operation, OperationId, Proposal};
+
+/// The first item of the CBOR form of an audit record. Its number changes with the form.
+const AUDIT_FORM: &str = "rsauthnz.store.audit.1";
 
 /// The kind of a record in the store. The first byte of the key of a record names its kind ([`Kind::key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,12 +86,14 @@ pub enum Kind {
     Replay = 15,
     /// The replay floor of the store. Each replay insert reads it.
     ReplayFloor = 16,
-    /// An audit record.
+    /// The audit record of a commit ([`audit_record`]). Its key is the operation identity.
     Audit = 17,
-    /// An outcome record.
+    /// The outcome record of a commit ([`outcome_record`]). Its key is the operation identity.
     Outcome = 18,
     /// An effect intent that the application did not end yet ([`intent_records`]).
     Intent = 19,
+    /// The current policy version of an owner ([`policy_key`]). A policy change is a commit that writes it.
+    Policy = 20,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -100,7 +108,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -120,6 +128,7 @@ impl Kind {
         Self::Audit,
         Self::Outcome,
         Self::Intent,
+        Self::Policy,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -143,7 +152,8 @@ impl Kind {
             | Self::ReplayFloor
             | Self::Audit
             | Self::Outcome
-            | Self::Intent => None,
+            | Self::Intent
+            | Self::Policy => None,
         }
     }
 
@@ -153,7 +163,7 @@ impl Kind {
     pub const fn ends(&self) -> bool {
         !matches!(
             self,
-            Self::ProviderLink | Self::Administrator | Self::Agent | Self::ReplayFloor | Self::Intent
+            Self::ProviderLink | Self::Administrator | Self::Agent | Self::ReplayFloor | Self::Intent | Self::Policy
         )
     }
 
@@ -227,8 +237,8 @@ pub enum Commit {
     Accepted,
     /// A dependency or the instance number did not hold, so the commit wrote nothing.
     Conflict,
-    /// The store has an outcome record of the operation identity, so the commit wrote nothing. The record answers
-    /// the proposal ([`Operation::answer`]).
+    /// The store has an outcome record of the operation identity ([`outcome_of`]), so the commit wrote nothing. The
+    /// record answers the proposal ([`Operation::answer`]).
     Recorded(Operation),
 }
 
@@ -247,7 +257,9 @@ pub trait Store {
     /// The declaration of the binding.
     fn declaration(&self) -> Declaration;
 
-    /// Writes the next store instance number durably, before reconciliation, and gives it.
+    /// Writes the next store instance number durably, before reconciliation, and gives it. Keep the number where a
+    /// restore cannot lower it, for example in the failure domain of the journal: a restored lower number lets a
+    /// delayed commit of the abandoned history land.
     fn start(&mut self) -> impl Future<Output = Result<Instance, Self::Error>>;
 
     /// Reads the current state of the record `key`, or `None` when no record has the key. It is a keyed read: it
@@ -258,13 +270,27 @@ pub trait Store {
     /// checks the complete dependency set.
     ///
     /// The commit checks that `instance` is the current store instance number, that each dependency holds, and that
-    /// no outcome record has the operation identity. Then it writes each change, the audit, each intent record of
-    /// [`intent_records`], and the outcome record [`Proposal::operation`] together. Otherwise it writes nothing. A commit is durable when it
-    /// returns `Accepted`. An error is a crash, with an unknown outcome.
+    /// no outcome record has the operation identity. A [`Dependency::Version`](transition::Dependency::Version) holds
+    /// when its record is at its version, a [`Dependency::Policy`](transition::Dependency::Policy) when the policy
+    /// record of its owner ([`policy_key`]) is at its version, and a
+    /// [`Dependency::Absent`](transition::Dependency::Absent) when no record has its key. Then the commit writes each
+    /// change, the audit record of [`audit_record`], each intent record of [`intent_records`], and the outcome record
+    /// of [`outcome_record`] together. Otherwise it writes nothing. A commit is durable when it returns `Accepted`.
+    /// An error is a crash, with an unknown outcome.
     fn commit(&mut self, proposal: &Proposal, instance: Instance) -> impl Future<Output = Result<Commit, Self::Error>>;
 
-    /// The outcome record of the operation identity `id`, or `None` when the store has none.
-    fn outcome(&mut self, id: &OperationId) -> impl Future<Output = Result<Option<Operation>, Self::Error>>;
+    /// The outcome record of the operation identity `id`, or `None` when the store has none. It reads the record of
+    /// [`outcome_record`] with [`Store::read`], so a binding implements no other primitive for it. A record in another
+    /// form gives `None`.
+    fn outcome(&mut self, id: &OperationId) -> impl Future<Output = Result<Option<Operation>, Self::Error>> {
+        async move {
+            let key = Kind::Outcome
+                .key(id.as_bytes())
+                .expect("an operation identity of at most 64 bytes makes a valid key");
+            let record = self.read(&key).await?;
+            Ok(record.and_then(|record| outcome_of(id, &record)))
+        }
+    }
 
     /// Removes at most `limit` records of `kind` whose end is before `before`, and gives their number. The binding
     /// sets the end of each audit and outcome record from its retention.
@@ -450,6 +476,118 @@ pub enum ExpiryError<E> {
     Time(TimeError),
     /// The binding failed.
     Store(E),
+}
+
+/// The key of the policy record of `owner`, which holds the current policy version of the owner: [`Kind::Policy`] with
+/// the SHA-256 digest of the canonical CBOR form of `owner`. The digest keeps the key short, because an owner can be
+/// longer than a key. A commit checks each [`Dependency::Policy`](transition::Dependency::Policy) against this record.
+/// A policy change is a commit whose proposal reads this record and writes it at the new version.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn policy_key(owner: &Id<Authority>) -> Key {
+    let form = cbor::encode(&owner.to_cbor()).expect("the form of an identifier has no map and no simple value");
+    Kind::Policy
+        .key(&crypto::sha256(&form))
+        .expect("a key of 33 bytes is valid")
+}
+
+/// The version of each record of `owner` that only the commit writes: an audit or an outcome record. The commit
+/// writes such a record one time, so its version is always the same.
+fn written_once(owner: &str) -> AuthorityVersion {
+    let owner = Id::new("rsauthnz", owner).expect("the owner of a record version is a valid identifier");
+    AuthorityVersion::new(owner, &[1]).expect("a one-byte coordinate is valid")
+}
+
+/// The outcome record of `proposal`, which its commit writes. Its key is [`Kind::Outcome`] with the operation identity,
+/// and its record form is the request binding of [`Proposal::operation`]: 32 bytes. [`Store::outcome`] reads it. The
+/// record has no end: the binding sets the end from its retention.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn outcome_record(proposal: &Proposal) -> (Key, Record) {
+    let operation = proposal.operation();
+    let key = Kind::Outcome
+        .key(operation.id.as_bytes())
+        .expect("an operation identity of at most 64 bytes makes a valid key");
+    let record = Record {
+        version: written_once("outcome"),
+        end: None,
+        data: operation.binding.into(),
+    };
+    (key, record)
+}
+
+/// The operation of the outcome record `record` of the operation identity `id`, or `None` when `record` does not have
+/// the form of [`outcome_record`]. A binding gives it in [`Commit::Recorded`].
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn outcome_of(id: &OperationId, record: &Record) -> Option<Operation> {
+    Some(Operation {
+        id: id.clone(),
+        binding: (*record.data).try_into().ok()?,
+    })
+}
+
+/// The audit record of `proposal`, which its commit writes. Its key is [`Kind::Audit`] with the operation identity,
+/// so [`Store::read`] finds the audit of a commit. Its record form is the CBOR array `["rsauthnz.store.audit.1",
+/// actor, action, time, keys]`:
+///
+/// - `actor` and `action` are the canonical forms of [`Audit::actor`](transition::Audit::actor) and
+///   [`Audit::action`](transition::Audit::action).
+/// - `time` is `[estimate, bound, source]` of the reading. The estimate and the bound are `[seconds, nanoseconds]`,
+///   and the bound is null when it is unknown. The source is 1 for the system clock, 2 for the caller, and 0 for
+///   another source.
+/// - `keys` is the key of each change of the proposal, in order.
+///
+/// The record has no end: the binding sets the end from its retention.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn audit_record(proposal: &Proposal) -> (Key, Record) {
+    let duration = |duration: Duration| {
+        Value::Array(vec![
+            Value::Unsigned(duration.as_secs()),
+            Value::Unsigned(u64::from(duration.subsec_nanos())),
+        ])
+    };
+    let audit = proposal.audit();
+    let time = audit.time;
+    let source = match time.source() {
+        ReadingSource::SystemClock => 1,
+        ReadingSource::Caller => 2,
+        _ => 0,
+    };
+    let form = Value::Array(vec![
+        Value::Text(AUDIT_FORM),
+        audit.actor.to_cbor(),
+        audit.action.to_cbor(),
+        Value::Array(vec![
+            duration(time.estimate()),
+            time.bound().map_or(Value::Null, duration),
+            Value::Unsigned(source),
+        ]),
+        Value::Array(
+            proposal
+                .changes()
+                .iter()
+                .map(|change| Value::Bytes(change.key().as_bytes()))
+                .collect(),
+        ),
+    ]);
+    let key = Kind::Audit
+        .key(proposal.operation().id.as_bytes())
+        .expect("an operation identity of at most 64 bytes makes a valid key");
+    let data = cbor::encode(&form).expect("the audit form has no map and no simple value");
+    (
+        key,
+        Record {
+            version: written_once("audit"),
+            end: None,
+            data: data.into_boxed_slice(),
+        },
+    )
 }
 
 /// The intent records of `proposal`, which its commit writes: the key of each intent is its operation identity and its

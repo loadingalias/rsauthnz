@@ -9,13 +9,13 @@ use core::time::Duration;
 
 use super::{
     Commit, CrashInjection, CrashLoss, Declaration, Error, ExpiryError, Instance, Isolation, Kind, Profile, Progress,
-    Record, Restore, Store, expire, intent_records,
+    Record, Restore, Store, audit_record, expire, intent_records, outcome_record,
 };
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::time::{Reading, ReadingSource, TimeError};
-use crate::transition::{Audit, Change, Dependency, Effect, Intent, Key, Operation, OperationId, Proposal};
+use crate::transition::{Audit, Change, Dependency, Effect, Intent, Key, OperationId, Proposal};
 
 /// The output of a future that is ready at once, as each future of the harness binding is.
 fn ready<F: Future>(future: F) -> F::Output {
@@ -150,10 +150,6 @@ impl Store for Ended {
         Ok(Commit::Conflict)
     }
 
-    async fn outcome(&mut self, _: &OperationId) -> Result<Option<Operation>, !> {
-        Ok(None)
-    }
-
     async fn intents(&mut self, _: Option<&Key>, _: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
         Ok(Vec::new())
     }
@@ -214,11 +210,11 @@ fn expiry_runs_in_bounded_steps_that_keep_each_record_that_a_check_can_accept() 
     assert_eq!(store.calls.len(), calls);
 }
 
-/// The intent records of a binding, which its commit writes.
+/// A binding that keeps the intent, audit, and outcome records that its commit writes.
 #[derive(Default)]
-struct Intents(BTreeMap<Key, Record>);
+struct Records(BTreeMap<Key, Record>);
 
-impl Store for Intents {
+impl Store for Records {
     type Error = !;
 
     fn declaration(&self) -> Declaration {
@@ -235,15 +231,15 @@ impl Store for Intents {
 
     async fn commit(&mut self, proposal: &Proposal, _: Instance) -> Result<Commit, !> {
         self.0.extend(intent_records(proposal).unwrap());
+        self.0.extend([audit_record(proposal), outcome_record(proposal)]);
         Ok(Commit::Accepted)
     }
 
-    async fn outcome(&mut self, _: &OperationId) -> Result<Option<Operation>, !> {
-        Ok(None)
-    }
-
     async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
-        let records = self.0.iter().filter(|(key, _)| after.is_none_or(|after| *key > after));
+        let records = self
+            .0
+            .iter()
+            .filter(|(key, _)| Kind::of(key) == Some(Kind::Intent) && after.is_none_or(|after| *key > after));
         Ok(records
             .take(limit.get())
             .map(|(key, record)| (key.clone(), record.clone()))
@@ -274,7 +270,7 @@ fn a_worker_reads_the_intents_of_a_commit_in_bounded_passes() {
     .unwrap();
     proposal.intend(notify.clone()).unwrap();
     proposal.intend(sign.clone()).unwrap();
-    let mut store = Intents::default();
+    let mut store = Records::default();
     assert_eq!(ready(store.commit(&proposal, Instance(1))), Ok(Commit::Accepted));
 
     let limit = NonZeroUsize::new(1).unwrap();
@@ -312,4 +308,103 @@ fn a_worker_reads_the_intents_of_a_commit_in_bounded_passes() {
             data: cbor::encode(&cancelled.to_cbor()).unwrap().into(),
         })
         .unwrap();
+}
+
+/// The commit writes the audit and the outcome as records that `Store::read` finds by the operation identity. The
+/// audit form names the actor, the action, the time with its bound and source, and the key of each change, so the
+/// application and the conformance suite read the same audit from each binding. A reading with no known bound has a
+/// null bound. `Store::outcome` reads the outcome record, and no proposal can change an audit or an outcome record.
+#[test]
+fn the_commit_writes_the_audit_and_the_outcome_as_records_that_a_keyed_read_finds() {
+    let actor = Principal::Human(Id::<Human>::new("acme", "u-17").unwrap());
+    let action = Id::new("acme.auth", "credential.enroll").unwrap();
+    let version = AuthorityVersion::new(Id::new("acme", "auth").unwrap(), &[1]).unwrap();
+    let [credential, invitation] = [Kind::Credential.key(b"c-4"), Kind::Invitation.key(b"i-9")].map(Result::unwrap);
+    let readings = [
+        Reading::new(
+            Duration::new(1_000, 5),
+            Some(Duration::from_millis(1_500)),
+            ReadingSource::Caller,
+        ),
+        Reading::new(Duration::new(1_000, 5), None, ReadingSource::SystemClock),
+    ];
+    let bounds = [
+        Value::Array(vec![Value::Unsigned(1), Value::Unsigned(500_000_000)]),
+        Value::Null,
+    ];
+    for ((time, bound), source) in readings.into_iter().zip(bounds).zip([2, 1]) {
+        let audit = Audit {
+            actor: actor.clone(),
+            action: action.clone(),
+            time,
+        };
+        let mut proposal = Proposal::new(
+            OperationId::new(b"op-1").unwrap(),
+            audit,
+            &Value::Null,
+            Limits::default(),
+        )
+        .unwrap();
+        proposal
+            .read(Dependency::Version(invitation.clone(), version.clone()))
+            .unwrap();
+        proposal.read(Dependency::Absent(credential.clone())).unwrap();
+        proposal.change(Change::End(invitation.clone())).unwrap();
+        proposal
+            .change(Change::Write {
+                key: credential.clone(),
+                version: version.clone(),
+                end: None,
+                data: Box::new(*b"credential"),
+            })
+            .unwrap();
+        let mut store = Records::default();
+        assert_eq!(ready(store.commit(&proposal, Instance(1))), Ok(Commit::Accepted));
+
+        let record = ready(store.read(&Kind::Audit.key(b"op-1").unwrap())).unwrap().unwrap();
+        assert_eq!(record.end, None);
+        let expected = Value::Array(vec![
+            Value::Text("rsauthnz.store.audit.1"),
+            actor.to_cbor(),
+            action.to_cbor(),
+            Value::Array(vec![
+                Value::Array(vec![Value::Unsigned(1_000), Value::Unsigned(5)]),
+                bound,
+                Value::Unsigned(source),
+            ]),
+            Value::Array(vec![
+                Value::Bytes(invitation.as_bytes()),
+                Value::Bytes(credential.as_bytes()),
+            ]),
+        ]);
+        assert_eq!(cbor::decode(&record.data, Limits::default()).unwrap(), expected);
+        assert_eq!(
+            ready(store.outcome(&proposal.operation().id)),
+            Ok(Some(proposal.operation().clone()))
+        );
+        assert_eq!(ready(store.outcome(&OperationId::new(b"op-2").unwrap())), Ok(None));
+    }
+
+    let mut forged = Proposal::new(
+        OperationId::new(b"op-3").unwrap(),
+        Audit {
+            actor,
+            action,
+            time: reading(1_000),
+        },
+        &Value::Null,
+        Limits::default(),
+    )
+    .unwrap();
+    for kind in [Kind::Audit, Kind::Outcome] {
+        let key = kind.key(b"op-2").unwrap();
+        forged.read(Dependency::Absent(key.clone())).unwrap();
+        let write = Change::Write {
+            key,
+            version: version.clone(),
+            end: None,
+            data: Box::new([0; 32]),
+        };
+        assert_eq!(forged.change(write), Err(crate::transition::Error::Change));
+    }
 }
