@@ -55,7 +55,7 @@ CONSTANTS
   \* @type: Str;
   Raise
 
-(* @typeAlias: plan = { kind: Str, own: Str, kill: Str, keep: Str, make: Str, val: Int }; *)
+(* @typeAlias: plan = { kind: Str, own: Str, kill: Str, retire: Set(Str), keep: Str, make: Str, val: Int }; *)
 (* @typeAlias: snapshot = { anc: Str -> Str, bvals: Set(Int), bused: Set(Int), bended: Set(Int), cur: Int, dead: Int, revoked: Bool, ctr: Int, out: Set(Str), left: Str -> Set(Str), lwm: Int }; *)
 Aliases == TRUE
 
@@ -72,31 +72,37 @@ Rank == [o \in Ops |-> CASE o = "o1" -> 1 [] o = "o2" -> 2 [] o = "o3" -> 3 [] O
 
 \* Two accounts and two administrator slots of the authority. Account a1
 \* has three anchor slots, so that a second unlink can make the first one
-\* refuse; a2 has two. Passkeys, provider links, and recovery values have
-\* the same journal rules, so one anchor kind stands for all three. A raise
+\* refuse; a2 has two. Recovery values have separate slots. They follow the
+\* same journal rules but never count as a sign-in method. A raise
 \* adds a third account, a fourth slot to a1, a third slot to a2, and a third
 \* administrator slot.
 Accounts == {"a1", "a2"} \cup (IF Raised("accounts") THEN {"a3"} ELSE {})
 Owners == Accounts \cup {"auth"}
 Adms == {"adm1", "adm2"} \cup (IF Raised("adms") THEN {"adm3"} ELSE {})
+Recoveries == {"a1c", "a2c"}
+  \cup (IF Raised("accounts") THEN {"a3c"} ELSE {})
+  \cup (IF Raise = "anchors" THEN {"a1d", "a2d"} ELSE {})
 Anchors ==
-  {"a1p", "a1q", "a1r", "a2p", "a2q"} \cup Adms
+  {"a1p", "a1q", "a1r", "a2p", "a2q"} \cup Adms \cup Recoveries
   \cup (IF Raised("slotsA1") THEN {"a1s"} ELSE {})
   \cup (IF Raised("slotsA2") THEN {"a2r"} ELSE {})
   \cup (IF Raised("accounts") THEN {"a3p", "a3q"} ELSE {})
 Owner(x) ==
-  IF x \in {"a1p", "a1q", "a1r", "a1s"} THEN "a1"
-  ELSE IF x \in {"a2p", "a2q", "a2r"} THEN "a2"
-  ELSE IF x \in {"a3p", "a3q"} THEN "a3"
+  IF x \in {"a1p", "a1q", "a1r", "a1s", "a1c", "a1d"} THEN "a1"
+  ELSE IF x \in {"a2p", "a2q", "a2r", "a2c", "a2d"} THEN "a2"
+  ELSE IF x \in {"a3p", "a3q", "a3c"} THEN "a3"
   ELSE "auth"
 Anc(a) == {x \in Anchors : Owner(x) = a}
+SignIns == Anchors \ (Adms \cup Recoveries)
+Protected(a) == Anc(a) \ Recoveries
 InitLive ==
-  {"a1p", "a1q", "a1r", "a2p"}
+  {"a1p", "a1q", "a1r", "a2p"} \cup (Recoveries \ {"a1d", "a2d"})
   \cup (IF Raised("accounts") THEN {"a3p"} ELSE {})
   \cup (IF Origin = "bootstrapped" THEN {"adm1"} ELSE {})
 \* The snapshot bound, and the counter and re-bootstrap bounds of the TLC
 \* searches. The proofs have no counter or re-bootstrap bound.
 NSnaps == IF Raised("snaps") THEN 3 ELSE 2
+SnapIds == 1..NSnaps
 CtrMax == 5
 MaxIssues == 1
 
@@ -109,7 +115,7 @@ CrashOf(s) ==
   ELSE IF s = "committed" THEN "cCommitted"
   ELSE "cCreated"
 
-NoPlan == [kind |-> "", own |-> "", kill |-> "", keep |-> "", make |-> "", val |-> 0]
+NoPlan == [kind |-> "", own |-> "", kill |-> "", retire |-> {}, keep |-> "", make |-> "", val |-> 0]
 
 VARIABLES
   \* The store. "up" serves; "down" after a crash; "rec" reconciles.
@@ -169,9 +175,12 @@ VARIABLES
   jhead,
   \* @type: Int;
   jfloor,
-  \* The retained snapshots.
-  \* @type: Set($snapshot);
+  \* Fixed snapshot slots and the number of retained snapshots.
+  \* Slots after nSnaps are not retained and no restore reads them.
+  \* @type: Int -> $snapshot;
   snaps,
+  \* @type: Int;
+  nSnaps,
   \* With each outcome record: the anchors of its owner that the commit left
   \* live. A restore brings back the records of its snapshot.
   \* @type: Str -> Set(Str);
@@ -191,7 +200,9 @@ VARIABLES
 store == <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend>>
 journal == <<jEnd, jCre, jVoid, jhead, jfloor>>
 hist == <<committed, promised, bnext>>
-vars == <<store, pc, plan, art, lock, journal, snaps, hist>>
+snapshots == <<snaps, nSnaps>>
+ActiveSnaps == {i \in SnapIds : i <= nSnaps}
+vars == <<store, pc, plan, art, lock, journal, snapshots, hist>>
 
 -----------------------------------------------------------------------------
 Max(a, b) == IF a >= b THEN a ELSE b
@@ -202,10 +213,15 @@ ValidBoot == {v \in bvals : v \notin bused /\ v \notin bended}
 
 \* An anchor that the journal records as live: live at the start, or with a
 \* creation entry, and with no end entry that no void cancels.
+\* A recovery's entry consumes its payment and retires displaced sign-in
+\* methods. Both effects belong to the same atomic commit and journal entry.
+\* @type: ($plan, Str) => Bool;
+Ends(p, x) == p.kill = x \/ x \in p.retire
+
 Journaled(x) ==
   /\ \/ x \in InitLive
      \/ \E o \in Ops : plan[o].make = x /\ jCre[o] > 0 /\ jVoid[o] = 0
-  /\ ~\E o \in Ops : plan[o].kill = x /\ jEnd[o] > 0 /\ jVoid[o] = 0
+  /\ ~\E o \in Ops : Ends(plan[o], x) /\ jEnd[o] > 0 /\ jVoid[o] = 0
 
 \* Outcome lookup. After a restore, a missing record is unknown. Known-bad
 \* "lookupAbsent" reads it as absent.
@@ -242,7 +258,8 @@ Issues(p) == p.kind \in {"enroll", "recover", "boot", "renew"}
 DepOK(p) ==
   CASE p.kind = "enroll" -> anc[p.make] = "absent"
     [] p.kind = "unlink" -> anc[p.kill] = "live" /\ anc[p.keep] = "live"
-    [] p.kind = "recover" -> anc[p.kill] = "live" /\ anc[p.make] = "absent"
+    [] p.kind = "recover" ->
+         anc[p.kill] = "live" /\ anc[p.make] = "absent" /\ \A x \in p.retire : anc[x] = "live"
     [] p.kind = "boot" -> p.val \in ValidBoot /\ anc[p.make] = "absent"
     [] p.kind = "issue" ->
          Bad = "issueNoEnd" \/ ValidBoot = (IF p.kill = "boot" THEN {p.val} ELSE {})
@@ -271,7 +288,7 @@ EndHoldsIn(o, t) ==
     [] plan[o].kind = "revoke" -> t.revoked
     [] plan[o].kind = "boot" -> plan[o].val \in t.bused
     [] plan[o].kind = "issue" -> plan[o].val \in t.bended
-    [] OTHER -> t.anc[plan[o].kill] = "ended"
+    [] OTHER -> t.anc[plan[o].kill] = "ended" /\ \A x \in plan[o].retire : t.anc[x] = "ended"
 EndHolds(o) == EndHoldsIn(o, Now)
 
 \* The low-water mark: one below the first entry that the store does not
@@ -299,7 +316,7 @@ FloorAt(p) == IF Issues(p) /\ Bad /= "floorAtRelease" THEN Max(jfloor, ctr + 1) 
 
 \* The anchors after a commit of plan p.
 \* @type: ($plan) => Str -> Str;
-AncAfter(p) == [x \in Anchors |-> IF x = p.kill THEN "ended"
+AncAfter(p) == [x \in Anchors |-> IF Ends(p, x) THEN "ended"
                                   ELSE IF x = p.make THEN "live" ELSE anc[x]]
 
 -----------------------------------------------------------------------------
@@ -317,11 +334,11 @@ Propose(o, p) ==
   /\ plan' = [plan EXCEPT ![o] = p]
   /\ lock' = IF p.own = "" \/ Bad = "unserialized" THEN lock
              ELSE [lock EXCEPT ![p.own] = o]
-  /\ UNCHANGED <<store, art, journal, snaps, hist>>
+  /\ UNCHANGED <<store, art, journal, snapshots, hist>>
 
 \* @type: (Str, Str, Str, Str, Str, Int) => $plan;
 Plan(kind, own, kill, keep, make, val) ==
-  [kind |-> kind, own |-> own, kill |-> kill, keep |-> keep, make |-> make, val |-> val]
+  [kind |-> kind, own |-> own, kill |-> kill, retire |-> {}, keep |-> keep, make |-> make, val |-> val]
 
 \* The seven transition kinds. Each one is the check and the proposal of one
 \* kind; Start is their disjunction.
@@ -336,13 +353,17 @@ StartUnlink(o) ==
   \E x, y \in Anchors :
     /\ x /= y /\ Owner(x) = Owner(y)
     /\ anc[x] = "live" /\ anc[y] = "live" /\ Journaled(y)
+    /\ Bad = "countRecovery" \/ y \in Protected(Owner(x))
     /\ Propose(o, Plan("unlink", Owner(x), x, y, "", 0))
-\* Recovery: it binds a new anchor in the commit that consumes its value.
+\* Account recovery consumes a recovery value, retires any displaced sign-in
+\* methods of the account, and binds a new sign-in method in the same commit.
+\* The new method pays the last-sign-in check even when every old one retires.
 StartRecover(o) ==
-  \E x, y \in Anchors \ Adms :
+  \E x \in Recoveries, y \in SignIns :
     /\ x /= y /\ Owner(x) = Owner(y)
     /\ anc[x] = "live" /\ anc[y] = "absent"
-    /\ Propose(o, Plan("recover", Owner(x), x, "", y, 0))
+    /\ \E retired \in SUBSET {z \in Protected(Owner(x)) : anc[z] = "live"} :
+         Propose(o, [Plan("recover", Owner(x), x, "", y, 0) EXCEPT !.retire = retired])
 \* Bootstrap: it consumes a valid bootstrap value and binds a new
 \* administrator in the first absent slot. The slots are interchangeable.
 StartBoot(o) ==
@@ -385,7 +406,7 @@ JournalEnd(o) ==
   /\ jhead' = jhead + (IF Bad = "createBeforeCommit" /\ plan[o].make /= "" THEN 2 ELSE 1)
   /\ lock' = IF plan[o].make = "" \/ Turn = "entry" THEN Unlock(o) ELSE lock
   /\ pc' = [pc EXCEPT ![o] = "journaled"]
-  /\ UNCHANGED <<store, plan, art, jVoid, jfloor, snaps, hist>>
+  /\ UNCHANGED <<store, plan, art, jVoid, jfloor, snapshots, hist>>
 
 Committable(o) ==
   /\ phase = "up"
@@ -414,7 +435,7 @@ Commit(o) ==
   /\ left' = [left EXCEPT ![o] = {x \in Anc(p.own) : anc'[x] = "live"}]
   /\ pc' = [pc EXCEPT ![o] = "committed"]
   /\ jfloor' = FloorAt(p)
-  /\ UNCHANGED <<phase, restored, pend, plan, lock, jEnd, jCre, jVoid, jhead, snaps, promised>>
+  /\ UNCHANGED <<phase, restored, pend, plan, lock, jEnd, jCre, jVoid, jhead, snapshots, promised>>
 
 \* A dependency changed: the commit refuses and changes no store state. The
 \* binding voids each entry of the operation before the refusal returns. A
@@ -429,7 +450,7 @@ Conflict(o) ==
      THEN UNCHANGED <<jVoid, jhead>>
      ELSE /\ jVoid' = [jVoid EXCEPT ![o] = jhead + 1]
           /\ jhead' = jhead + 1
-  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jfloor, snaps, hist>>
+  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jfloor, snapshots, hist>>
 
 \* The creation entry, after the commit and before the acknowledgement. It
 \* ends the turn. With "afterCommit" (option c), the same entry records the
@@ -444,7 +465,7 @@ JournalCreate(o) ==
   /\ jhead' = jhead + 1
   /\ lock' = Unlock(o)
   /\ pc' = [pc EXCEPT ![o] = "created"]
-  /\ UNCHANGED <<store, plan, art, jVoid, jfloor, snaps, hist>>
+  /\ UNCHANGED <<store, plan, art, jVoid, jfloor, snapshots, hist>>
 
 \* The response, after the floor covers the artifact's value.
 \* Another operation of o's owner committed an anchor creation, and its
@@ -470,7 +491,7 @@ Ack(o) ==
   /\ lock' = Unlock(o)
   /\ pc' = [pc EXCEPT ![o] = "acked"]
   /\ promised' = promised \cup left[o]
-  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jVoid, jhead, snaps, committed, bnext>>
+  /\ UNCHANGED <<store, plan, art, jEnd, jCre, jVoid, jhead, snapshots, committed, bnext>>
 
 \* A client whose response was lost looks up its operation identity, finds
 \* the committed outcome, and receives its artifact. The promise is the
@@ -485,7 +506,7 @@ Resolve(o) ==
   /\ jfloor' = Max(jfloor, art[o])
   /\ pc' = [pc EXCEPT ![o] = "acked"]
   /\ promised' = promised \cup left[o]
-  /\ UNCHANGED <<store, plan, art, lock, jEnd, jCre, jVoid, jhead, snaps, committed, bnext>>
+  /\ UNCHANGED <<store, plan, art, lock, jEnd, jCre, jVoid, jhead, snapshots, committed, bnext>>
 
 \* Restore completes an in-doubt consumption: the first in-doubt
 \* consumption of a value commits again against the restored state, under
@@ -505,7 +526,7 @@ Redrive(o) ==
   /\ left' = [left EXCEPT ![o] = {x \in Anc(p.own) : anc'[x] = "live"}]
   /\ jfloor' = FloorAt(p)
   /\ UNCHANGED <<phase, restored, bvals, bended, cur, dead, revoked, pc, plan, lock, jEnd, jCre,
-                 jVoid, jhead, snaps, promised, bnext>>
+                 jVoid, jhead, snapshots, promised, bnext>>
 
 \* The dependencies do not hold: the value stays consumed.
 RedriveFail(o) ==
@@ -513,7 +534,7 @@ RedriveFail(o) ==
   /\ o \in pend /\ First(o) /\ ~AgainOK(o)
   /\ pend' = pend \ {o}
   /\ UNCHANGED <<phase, restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pc,
-                 plan, art, lock, journal, snaps, hist>>
+                 plan, art, lock, journal, snapshots, hist>>
 
 -----------------------------------------------------------------------------
 \* A crash stops each operation in flight at its point. The store and the
@@ -524,7 +545,7 @@ Crash ==
   /\ pc' = [o \in Ops |-> IF pc[o] \in InFlight THEN CrashOf(pc[o]) ELSE pc[o]]
   /\ lock' = [a \in Owners |-> "none"]
   /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, plan,
-                 art, journal, snaps, hist>>
+                 art, journal, snapshots, hist>>
 
 \* A start reconciles before it serves. Known-bad "voidOnMissing": a normal
 \* start reads a missing outcome as absent again after an earlier restore.
@@ -533,7 +554,7 @@ Restart ==
   /\ phase' = "rec"
   /\ restored' = IF Bad = "voidOnMissing" THEN FALSE ELSE restored
   /\ UNCHANGED <<anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, pc, plan, art,
-                 lock, journal, snaps, hist>>
+                 lock, journal, snapshots, hist>>
 
 NeedsCreate(o) == o \in out /\ plan[o].make /= "" /\ jCre[o] = 0
 \* Reconciliation voids an end entry whose fact does not hold in the store.
@@ -553,31 +574,37 @@ ReconcileCreate(o) ==
   /\ NeedsCreate(o)
   /\ jCre' = [jCre EXCEPT ![o] = jhead + 1]
   /\ jhead' = jhead + 1
-  /\ UNCHANGED <<store, pc, plan, art, lock, jEnd, jVoid, jfloor, snaps, hist>>
+  /\ UNCHANGED <<store, pc, plan, art, lock, jEnd, jVoid, jfloor, snapshots, hist>>
 
 ReconcileVoid(o) ==
   /\ phase = "rec"
   /\ NeedsVoid(o)
   /\ jVoid' = [jVoid EXCEPT ![o] = jhead + 1]
   /\ jhead' = jhead + 1
-  /\ UNCHANGED <<store, pc, plan, art, lock, jEnd, jCre, jfloor, snaps, hist>>
+  /\ UNCHANGED <<store, pc, plan, art, lock, jEnd, jCre, jfloor, snapshots, hist>>
 
 \* The store serves when reconciliation is complete and no in-doubt
 \* consumption remains.
 Serve ==
+  /\ Bad /= "noServe"
   /\ phase = "rec"
   /\ \A o \in Ops : ~NeedsCreate(o) /\ ~NeedsVoid(o)
-  /\ pend = {}
+  /\ pend = {} \/ Bad = "noAgain"
   /\ phase' = "up"
   /\ UNCHANGED <<restored, anc, bvals, bused, bended, cur, dead, revoked, ctr, out, left, pend, pc,
-                 plan, art, lock, journal, snaps, hist>>
+                 plan, art, lock, journal, snapshots, hist>>
 
 \* A snapshot with its low-water mark. A serving store has no in-doubt
-\* consumption, so a snapshot keeps none.
+\* consumption, so a snapshot keeps none. A duplicate capture keeps the
+\* same active slots and uses no capacity. Each new record gets the next slot.
 Snapshot ==
   /\ phase = "up"
-  /\ Cardinality(snaps) < NSnaps
-  /\ snaps' = snaps \cup {[Now EXCEPT !.lwm = LowWater]}
+  /\ nSnaps < NSnaps
+  /\ LET s == [Now EXCEPT !.lwm = LowWater]
+       IN IF \E i \in ActiveSnaps : snaps[i] = s
+          THEN UNCHANGED snapshots
+          ELSE /\ snaps' = [snaps EXCEPT ![nSnaps + 1] = s]
+               /\ nSnaps' = nSnaps + 1
   /\ UNCHANGED <<store, pc, plan, art, lock, journal, hist>>
 
 \* An entry applies at a restore from s. Known-bad "ignoreVoids" applies a
@@ -594,7 +621,7 @@ Applies(seq, o, s) ==
 \* that was issued after the snapshot is lost: the store holds the
 \* snapshot's values. Reconciliation follows. Known-bad "pairApplies"
 \* (option a) creates the anchors of the in-doubt consumptions at once;
-\* "noAgain" (the design before 2026-11-07) leaves them unresolved.
+\* "noAgain" (the design before 2026-11-07) lets Serve leave them unresolved.
 \* @type: ($snapshot) => Bool;
 Restore(s) ==
   LET ends == {o \in Ops : Applies(jEnd[o], o, s)}
@@ -602,7 +629,8 @@ Restore(s) ==
       known(o) == o \in s.out \/ (jCre[o] > 0 /\ Bad /= "noJournal")
       taken(o) == \E q \in Ops : q /= o /\ Consumes(q) /\ SameValue(q, o) /\ known(q)
       doubt == {o \in ends : Consumes(o) /\ ~known(o) /\ ~taken(o)}
-      endedX(x) == s.anc[x] = "ended" \/ \E o \in ends : plan[o].kill = x
+      endedX(x) == s.anc[x] = "ended" \/ \E o \in ends :
+                    IF Bad = "dropRetirement" THEN plan[o].kill = x ELSE Ends(plan[o], x)
       madeX(x) ==
         \/ s.anc[x] = "live"
         \/ \E o \in makes : plan[o].make = x
@@ -622,10 +650,10 @@ Restore(s) ==
   /\ ctr' = IF Bad \in {"noFloor", "noJournal"} THEN s.ctr ELSE Max(s.ctr, jfloor)
   /\ out' = s.out
   /\ left' = s.left
-  /\ pend' = IF Bad \in {"pairApplies", "noAgain"} THEN {} ELSE doubt
+  /\ pend' = IF Bad = "pairApplies" THEN {} ELSE doubt
   /\ restored' = TRUE
   /\ phase' = "rec"
-  /\ UNCHANGED <<pc, plan, art, lock, journal, snaps, hist>>
+  /\ UNCHANGED <<pc, plan, art, lock, journal, snapshots, hist>>
 
 -----------------------------------------------------------------------------
 Init ==
@@ -650,31 +678,78 @@ Init ==
   /\ jVoid = [o \in Ops |-> 0]
   /\ jhead = 0
   /\ jfloor = 1
-  /\ snaps = {}
   /\ committed = {}
   /\ left = [o \in Ops |-> {}]
   /\ promised = InitLive
   /\ bnext = 1
+  /\ snaps = [i \in SnapIds |-> Now]
+  /\ nSnaps = 0
 
-\* The parts of Next. AuthorityInd.tla splits them further for its step
-\* checks. Next is their disjunction.
-NextRun == \E o \in Ops : Start(o) \/ JournalEnd(o) \/ Commit(o) \/ Conflict(o)
-NextEnd == \E o \in Ops : JournalCreate(o) \/ Ack(o) \/ Resolve(o)
-NextRec == \E o \in Ops : ReconcileCreate(o) \/ ReconcileVoid(o)
-NextAgain == \E o \in Ops : Redrive(o) \/ RedriveFail(o)
-NextSys == Crash \/ Restart \/ Serve \/ Snapshot
-NextRestore == \E s \in snaps : Restore(s)
+\* TLC and the complete induction step use the same Next relation.
+\* Named actions keep each atomic transition explicit in a trace.
+NextEnroll == \E o \in Ops : StartEnroll(o)
+NextUnlink == \E o \in Ops : StartUnlink(o)
+NextRecover == \E o \in Ops : StartRecover(o)
+NextBoot == \E o \in Ops : StartBoot(o)
+NextRenew == \E o \in Ops : StartRenew(o)
+NextRevoke == \E o \in Ops : StartRevoke(o)
+NextIssueEnd == \E o \in Ops : StartIssueEnd(o)
+NextIssueNone == \E o \in Ops : StartIssueNone(o)
+NextJournal == \E o \in Ops : JournalEnd(o)
+NextCommit == \E o \in Ops : Commit(o)
+NextConflict == \E o \in Ops : Conflict(o)
+NextCreate == \E o \in Ops : JournalCreate(o)
+NextAck == \E o \in Ops : Ack(o)
+NextResolve == \E o \in Ops : Resolve(o)
+NextRecCreate == \E o \in Ops : ReconcileCreate(o)
+NextRecVoid == \E o \in Ops : ReconcileVoid(o)
+NextRedrive == \E o \in Ops : Redrive(o)
+NextRedriveFail == \E o \in Ops : RedriveFail(o)
+NextCrash == Crash
+NextRestart == Restart
+NextServe == Serve
+NextSnapshot == Snapshot
+NextRestore == \E i \in ActiveSnaps : Restore(snaps[i])
 
-Next == NextRun \/ NextEnd \/ NextRec \/ NextAgain \/ NextSys \/ NextRestore
+Next ==
+  \/ NextEnroll
+  \/ NextUnlink
+  \/ NextRecover
+  \/ NextBoot
+  \/ NextRenew
+  \/ NextRevoke
+  \/ NextIssueEnd
+  \/ NextIssueNone
+  \/ NextJournal
+  \/ NextCommit
+  \/ NextConflict
+  \/ NextCreate
+  \/ NextAck
+  \/ NextResolve
+  \/ NextRecCreate
+  \/ NextRecVoid
+  \/ NextRedrive
+  \/ NextRedriveFail
+  \/ NextCrash
+  \/ NextRestart
+  \/ NextServe
+  \/ NextSnapshot
+  \/ NextRestore
 
 Spec == Init /\ [][Next]_vars
+
+\* Recovery proceeds when faults stop. Weak fairness is on enabled local work,
+\* not on a client's lookup or a storage failure.
+RecoveryStep == Restart \/ Serve \/ NextRecCreate \/ NextRecVoid \/ NextRedrive \/ NextRedriveFail
+RecoverySpec == Spec /\ WF_vars(RecoveryStep)
+Recovers == (<>[][~Crash]_vars) => []<>(phase = "up")
 
 -----------------------------------------------------------------------------
 Kinds == {"", "enroll", "unlink", "recover", "boot", "renew", "revoke", "issue"}
 Items == Anchors \cup {"", "boot", "L"}
 Seqs == 0..jhead
 Vals == 1..bnext
-Plans == [kind : Kinds, own : Owners \cup {""}, kill : Items, keep : Anchors \cup {""},
+Plans == [kind : Kinds, own : Owners \cup {""}, kill : Items, retire : SUBSET SignIns, keep : Anchors \cup {""},
           make : Anchors \cup {""}, val : Nat]
 \* @type: ($snapshot) => Bool;
 SnapOK(s) ==
@@ -696,7 +771,8 @@ TypeOK ==
   /\ lock \in [Owners -> Ops \cup {"none"}]
   /\ jEnd \in [Ops -> Seqs] /\ jCre \in [Ops -> Seqs] /\ jVoid \in [Ops -> Seqs]
   /\ jhead \in Nat /\ jfloor \in Nat
-  /\ Cardinality(snaps) <= NSnaps /\ \A s \in snaps : SnapOK(s)
+  /\ DOMAIN snaps = SnapIds /\ nSnaps \in 0..NSnaps
+  /\ \A i \in SnapIds : SnapOK(snaps[i])
   /\ committed \subseteq Ops
   /\ left \in [Ops -> SUBSET Anchors]
   /\ promised \subseteq Anchors
@@ -705,7 +781,7 @@ TypeOK ==
 -----------------------------------------------------------------------------
 \* Properties. A011 gives each one its conformance case (README.md).
 
-EndedAnchors == {plan[o].kill : o \in {q \in committed : plan[q].kind \in {"unlink", "recover"}}}
+EndedAnchors == {x \in Anchors : \E o \in committed : Ends(plan[o], x)}
 \* The bootstrap values that a committed consumption or a committed owner
 \* re-bootstrap ended.
 EndedBoot ==
@@ -743,11 +819,11 @@ NoUncommittedAnchor ==
 \* or ended by an entry of a crashed operation whose outcome is unknown.
 Uncertain(x) ==
   \E o \in Ops :
-    plan[o].kill = x /\ jEnd[o] > 0 /\ pc[o] \in Crashed /\ o \notin committed /\ jVoid[o] = 0
+    Ends(plan[o], x) /\ jEnd[o] > 0 /\ pc[o] \in Crashed /\ o \notin committed /\ jVoid[o] = 0
 Promised == promised
 AnchorKept == \A x \in Promised : anc[x] = "live" \/ x \in EndedAnchors \/ Uncertain(x)
 
-AccountKeepsAnchor == \A a \in Accounts : \E x \in Anc(a) : anc[x] = "live"
+AccountKeepsAnchor == \A a \in Accounts : \E x \in Protected(a) : anc[x] = "live"
 \* The authority has an administrator when the store holds a consumed
 \* bootstrap value that no owner re-bootstrap ended. Otherwise the local
 \* owner issues a new value.
@@ -806,14 +882,17 @@ AdminAfterDoubt ==
 \* The same for a recovery and its new anchor.
 AccountAfterDoubt ==
   /\ RestoredUp
-  /\ \E o \in Ops : plan[o].kind = "recover" /\ pc[o] = "cJournaled" /\ anc[plan[o].make] = "live"
+  /\ \E o \in Ops :
+       /\ plan[o].kind = "recover" /\ plan[o].kill \in Recoveries
+       /\ plan[o].retire /= {}
+       /\ pc[o] = "cJournaled" /\ anc[plan[o].make] = "live"
 \* A refused unlink voided its entry, and a restored store serves with the
 \* anchor that the unlink would end.
 RefusedKept ==
   /\ RestoredUp
   /\ \E o \in Ops : plan[o].kind = "unlink" /\ pc[o] = "refused" /\ jVoid[o] > 0 /\ anc[plan[o].kill] = "live"
 \* Two consumptions of one value were in doubt at one restore (Turn = "entry").
-TwoInDoubt == \E o, q \in pend : o /= q
+TwoInDoubt == \E o, q \in pend : o /= q /\ SameValue(o, q)
 \* After the first bootstrap value was consumed, the authority gains an
 \* administrator through an owner re-bootstrap.
 Rebootstrapped ==
@@ -842,6 +921,8 @@ NotTwoInDoubt == ~TwoInDoubt
 NotRebootstrapped == ~Rebootstrapped
 NotAdminReplaced == ~AdminReplaced
 NotIssueEndApplied == ~IssueEndApplied
+NotAllIssueValues == Cardinality(bvals) /= 1 + Cardinality(Ops)
+IssueOnly == (\A o \in Ops : plan[o].kind \in {"", "issue"}) /\ nSnaps = 0
 
 -----------------------------------------------------------------------------
 \* Search bounds. Each is a state constraint, so a search is complete only
@@ -858,4 +939,7 @@ Declared == ctr <= CtrMax /\ IssueBound
 \* The local bound: two operations, counter values up to 4, and at most one
 \* re-bootstrap.
 TwoOps == Cardinality({o \in Ops : pc[o] /= "idle"}) <= 2 /\ ctr <= 4 /\ IssueBound
+\* The recovery canary must consume a recovery value, not a bootstrap.
+RecoveryOnly == TwoOps /\ \A o \in Ops : plan[o].kind \in {"", "recover"}
+RecoveryWithoutRetirement == RecoveryOnly /\ \A o \in Ops : plan[o].retire = {}
 =============================================================================

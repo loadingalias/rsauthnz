@@ -1,0 +1,15 @@
+# The native jobs of the complete Step profiles. The model README, "Inductive
+# proofs", gives the argument. A split keeps its group's start, relation, and
+# auxiliary equations, and the jobs check each pair of the group once.
+next Authority Next
+invariant AuthorityInvariant IndInv TypeInd
+start IndStartWith
+shared AuthorityPreservation PreservationNext
+# These groups check each clause of OVERRIDE_AnchorStateInv as its own target.
+clauses AnchorStateInv StepCommitRecords StepRestoreAnchors
+first AuthorityInd StepSnapshotRestorable
+first AuthorityIndAnchors StepSnapshotRestorable
+first AuthorityIndProcess StepSnapshotRestorable StepCommitTurn StepRestoreOther
+targets AuthorityIndProcess StepSnapshotRestorable Account=RestoreAccountInvPost Admin=RestoreAdminInvPost
+targets AuthorityIndProcess StepRestoreOther End=EndInvPost Anchor=AnchorInvPost Remaining
+actions AuthorityIndProcess StepCommitTurn AuthorityIndProcessStepCommitTurnJobs

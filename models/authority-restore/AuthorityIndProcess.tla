@@ -1,8 +1,8 @@
 ------------------------ MODULE AuthorityIndProcess ------------------------
 (***************************************************************************)
 (* The raise by one of the process domains ([FP Design Models], rule 4):   *)
-(* IndInv of AuthorityInd.tla with four operations, three snapshots, and   *)
-(* sets of up to four bootstrap values (Raise = "process"). The raise of   *)
+(* IndInv of AuthorityInvariant.tla with four operations, three snapshots,*)
+(* up to five bootstrap values (Raise = "process"). The raise of          *)
 (* the anchor domains is AuthorityIndAnchors.tla; the two together raise   *)
 (* each bound of the model by one (selected on 2026-11-10). The counter    *)
 (* and the journal sequence are unbounded integers, so they need no raise. *)
@@ -17,14 +17,27 @@
 (* IndInitProcess, and one more witness: the starting set contains a state *)
 (* that uses each raised element (NoProcessUsed).                          *)
 (***************************************************************************)
-EXTENDS AuthorityInd
+EXTENDS AuthorityInvariant
+
+OVERRIDE_Bad == "none"
+OVERRIDE_Turn == "creation"
+OVERRIDE_Raise == "process"
+
+\* Expand the selected raise before native constant-range evaluation.
+\* This is Raised(b) with Raise = "process", for every b.
+OVERRIDE_Raised(b) ==
+  \/ b = "process"
+  \/ b = "ops"
+  \/ b = "snaps"
 
 CInitProcess == Bad = "none" /\ Turn = "creation" /\ Origin \in {"new", "bootstrapped"} /\ Raise = "process"
 
-IndInitProcess == IndStart(4)
+IndInitProcess == IndStart
 
 \* Vacuity witness: the starting set contains a state that uses each raised
-\* element: three snapshots, the fourth operation, and four bootstrap values.
+\* element: three snapshots, the fourth operation, and all five bootstrap values.
 NoProcessUsed ==
-  ~(Cardinality(snaps) = 3 /\ pc["o4"] /= "idle" /\ Cardinality(bvals) = 4)
+  ~(/\ nSnaps = 3
+    /\ \A i, j \in ActiveSnaps : i /= j => snaps[i] /= snaps[j]
+    /\ pc["o4"] /= "idle" /\ Cardinality(bvals) = 1 + Cardinality(Ops))
 =============================================================================

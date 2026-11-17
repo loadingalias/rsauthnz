@@ -1,6 +1,0 @@
-check
---cinit=CInitProcess
---init=IndInitProcess
---next=NextCommit
---inv=TypeIndPost,JournalInvPost,EndInvPost,OutcomeInvPost,DoubtInvPost,AnchorInvPost,BootInvPost,CounterInvPost
---length=1

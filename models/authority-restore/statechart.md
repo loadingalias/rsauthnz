@@ -1,9 +1,10 @@
 # Statecharts of the authority-restore models
 
-These charts come from the actions of `Authority.tla` and `Replay.tla`, the design as selected on
+These charts come from the actions of `Authority.tla`, `Fencing.tla`, and `Replay.tla`, the design as selected on
 2026-11-07, the owner re-bootstrap and the acknowledgement order selected on 2026-11-08, and the
 anchor set of each outcome record (2026-11-09). The checkers are the acceptance authority; a chart
-only shows the shape. Each chart names the transitions that it merges or hides. No chart shows a known-bad variant.
+only shows the shape. Recovery values have separate slots from sign-in methods (2026-11-11).
+Each chart names the transitions that it merges or hides. No chart shows a known-bad variant.
 
 ## Store phase
 
@@ -22,6 +23,8 @@ stateDiagram-v2
 Hidden or merged: the `restored` flag, which `Restore` sets and no step of the design clears; the
 journal variables; the snapshot set. `Serve` is the only way back to `up`, so no in-doubt
 consumption and no unreconciled entry remains while the store serves (`NoDoubtServing`).
+`RecoverySpec` gives weak fairness to the local recovery steps. After crashes stop, the checked
+rank and enabled-step obligations are the progress argument; their evidence status is in the README.
 
 ## One operation
 
@@ -77,6 +80,23 @@ administrator binding, which stands for the bootstrapped CLI credential) and the
 each anchor. Agent identities are not anchors, and they are not in the chart. An ended anchor never returns to `live`. An
 administrator binding ends only through an unlink with the last-anchor check, which keeps another
 administrator that the journal records as live.
+Recovery consumes a recovery value, retires displaced sign-in methods, and creates a new method
+in the same commit. Its `retire` set is separate from its consumed payment. The last-sign-in
+check counts the new method that the consumption pays for; it does not count recovery values.
+
+## Delayed request across a start
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: Submit (retain current instance)
+    pending --> pending: Crash, Start (new durable instance), Serve
+    pending --> committed: Complete (request instance equals current instance)
+    pending --> refused: Complete (request instance is earlier)
+```
+
+Hidden: other requests and the store phase. A remote completion can occur in any phase. The
+instance read and commit are one conditional transaction. A completion before the new instance
+write can commit; reconciliation must observe it. A completion after that write must refuse.
 
 ## Bootstrap value life (store)
 

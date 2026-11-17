@@ -1,0 +1,8 @@
+check
+--cinit=CInitAnchors
+--init=IndInitAnchors
+--next=Next
+--inv=NoRecoverySlotsUsed
+--length=0
+--discard-disabled=false
+--no-deadlock=true

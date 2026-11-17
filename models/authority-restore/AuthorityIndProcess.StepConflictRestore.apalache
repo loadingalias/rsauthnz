@@ -1,6 +1,0 @@
-check
---cinit=CInitProcess
---init=IndInitProcess
---next=NextConflict
---inv=RestoreAccountInvPost,RestoreAdminInvPost
---length=1

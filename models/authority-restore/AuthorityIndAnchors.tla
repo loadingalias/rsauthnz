@@ -1,8 +1,9 @@
 ------------------------ MODULE AuthorityIndAnchors ------------------------
 (***************************************************************************)
 (* The raise by one of the anchor domains ([FP Design Models], rule 4):    *)
-(* IndInv of AuthorityInd.tla with three accounts, four slots in a1,       *)
-(* three in a2, and three administrator slots (Raise = "anchors"). The     *)
+(* IndInv of AuthorityInvariant.tla with three accounts, four sign-in     *)
+(* slots in a1, three in a2, two recovery slots per original account, and  *)
+(* three administrator slots (Raise = "anchors"). The                     *)
 (* raise of the process domains is AuthorityIndProcess.tla; the two        *)
 (* together raise each bound of the model by one (selected on 2026-11-10). *)
 (*                                                                         *)
@@ -13,14 +14,27 @@
 (* step of this one.                                                       *)
 (*                                                                         *)
 (* The profiles are those of AuthorityInd.tla with CInitAnchors and        *)
-(* IndInitAnchors, and two more witnesses: the starting set contains      *)
-(* states that use the raised elements (NoAccountsUsed, NoAdminUsed).     *)
+(* IndInitAnchors, and witnesses that use the raised account, recovery,   *)
+(* and administrator slots.                                               *)
 (***************************************************************************)
-EXTENDS AuthorityInd
+EXTENDS AuthorityInvariant
+
+OVERRIDE_Bad == "none"
+OVERRIDE_Turn == "creation"
+OVERRIDE_Raise == "anchors"
+
+\* Expand the selected raise before native constant-range evaluation.
+\* This is Raised(b) with Raise = "anchors", for every b.
+OVERRIDE_Raised(b) ==
+  \/ b = "anchors"
+  \/ b = "accounts"
+  \/ b = "slotsA1"
+  \/ b = "slotsA2"
+  \/ b = "adms"
 
 CInitAnchors == Bad = "none" /\ Turn = "creation" /\ Origin \in {"new", "bootstrapped"} /\ Raise = "anchors"
 
-IndInitAnchors == IndStart(3)
+IndInitAnchors == IndStart
 
 \* Vacuity witnesses: the starting set contains states that use the raised
 \* elements. Each new anchor needs its own committed maker, and the raise
@@ -29,4 +43,6 @@ IndInitAnchors == IndStart(3)
 \* and a2 live together, and the third administrator live.
 NoAccountsUsed == ~(anc["a3q"] = "live" /\ anc["a1s"] = "live" /\ anc["a2r"] = "live")
 NoAdminUsed == ~(anc["adm3"] = "live")
+\* The second recovery slot of each original account is used.
+NoRecoverySlotsUsed == ~(anc["a1d"] = "live" /\ anc["a2d"] = "live")
 =============================================================================

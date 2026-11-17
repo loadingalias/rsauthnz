@@ -1,6 +1,0 @@
-check
---cinit=CInitProcess
---init=IndInitProcess
---next=NextEnroll
---inv=RestoreNowAccountInvPost,RestoreNowAdminInvPost
---length=1

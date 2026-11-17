@@ -1,6 +1,0 @@
-check
---cinit=CInitProcess
---init=IndInitProcess
---next=NextCrash
---inv=AnchorStateInvPost,PromiseInvPost,KeptNowInvPost,TurnInvPost,ServingInvPost
---length=1

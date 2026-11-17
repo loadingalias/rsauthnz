@@ -4,3 +4,5 @@ check
 --next=Next
 --inv=NoDoubtAdmin
 --length=0
+--discard-disabled=false
+--no-deadlock=true

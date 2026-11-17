@@ -1,6 +1,0 @@
-check
---cinit=CInitOwnMark
---init=IndInit
---next=NextSnapshot
---inv=EndInvPost
---length=1

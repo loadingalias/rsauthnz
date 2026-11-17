@@ -1,6 +1,0 @@
-check
---cinit=CInit
---init=IndInit
---next=NextCommit
---inv=RestoreAccountInvPost,RestoreAdminInvPost
---length=1

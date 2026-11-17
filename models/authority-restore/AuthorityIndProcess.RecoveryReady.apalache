@@ -1,0 +1,8 @@
+check
+--cinit=CInitProcess
+--init=IndInitProcess
+--next=Next
+--inv=RecoveryReady
+--length=0
+--discard-disabled=false
+--no-deadlock=true

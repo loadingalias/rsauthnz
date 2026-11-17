@@ -1,6 +1,0 @@
-check
---cinit=CInitAnchors
---init=IndInitAnchors
---next=NextRedrive
---inv=AnchorStateInvPost,PromiseInvPost,KeptNowInvPost,TurnInvPost,ServingInvPost
---length=1

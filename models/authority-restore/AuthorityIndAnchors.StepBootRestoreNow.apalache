@@ -1,6 +1,0 @@
-check
---cinit=CInitAnchors
---init=IndInitAnchors
---next=NextBoot
---inv=RestoreNowAccountInvPost,RestoreNowAdminInvPost
---length=1

@@ -1,6 +1,0 @@
-check
---cinit=CInit
---init=IndInit
---next=NextCrash
---inv=AnchorStateInvPost,PromiseInvPost,KeptNowInvPost,TurnInvPost,ServingInvPost
---length=1

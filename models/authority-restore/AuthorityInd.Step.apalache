@@ -1,0 +1,8 @@
+check
+--cinit=CInit
+--init=IndInit
+--next=Next
+--inv=IndInv
+--length=1
+--discard-disabled=false
+--no-deadlock=true

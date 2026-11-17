@@ -1,0 +1,9 @@
+check
+--cinit=CInitOwnMark
+--init=OwnMarkInit
+--next=Next
+--inv=SnapshotEnds
+--length=1
+--discard-disabled=false
+--no-deadlock=true
+--smtprof

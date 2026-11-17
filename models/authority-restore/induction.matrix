@@ -1,0 +1,4 @@
+# Profile module, constant initializer, invariant-state initializer.
+AuthorityInd CInit IndInit
+AuthorityIndAnchors CInitAnchors IndInitAnchors
+AuthorityIndProcess CInitProcess IndInitProcess
