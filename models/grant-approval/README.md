@@ -269,6 +269,33 @@ every reduction, because each profile uses all of them.
   `used` by `Request`). It could hide a second effect of one identity or one assertion.
   `held.outcome` and `held.once` record each such effect at its commit.
 
+- **The approval-required mark is a check of one step** (`GrantAccess`, `Approval`). No module
+  has the mark. Four facts of the design and the guards reduce the rule "a commit of a marked
+  permission names an approval" to the request check:
+  1. The design puts the marks in the grant ([AUTH Grants]: "A grant binds ... optional
+     approval-required marks on permissions"). A grant changes only through a new human-approved
+     transition, which ends the revision that it replaces (decision 4). So a change of a mark
+     advances the grant revision. `GrantAccess!Commit` commits only when the grant did not
+     change after the request check: each grant change and each revocation clears the `gr` flag
+     of each checked operation (`Stale("gr", None)`), and `Same` reads that flag. So when a
+     change sets a mark after a check that passed with no approval, the commit refuses.
+     `NoRevision_bad` removes that comparison and fails `WithinGrant`: its commit lands after a
+     grant change that its check did not see, which is the state of this race.
+  2. `Approval!Commit` with a named approval needs `ApprovalOK`, so the approval is of the current
+     grant revision. `StaleApproval_bad` removes that rule, and it fails `ApprovalBinding`.
+  3. `Approval!Submit` can name no instance for each request. So the model has each behavior in
+     which only a submission that names an approval passes the check of a marked permission, and
+     more. Each approval property holds for those behaviors.
+  4. `Restore` keeps `grev`, and the restore journal keeps each ended revision dead (decision 4).
+     So no restore brings back a revision without the mark.
+
+  The rest is the predicate of the check: a marked permission with no named approval refuses.
+  It reads the grant revision and the submission in one step, and by facts 1 and 4 no other step
+  changes them before the commit. So a test of that one check finds each defect of the rule, and
+  no interleaving adds one. A405 (the marks of each revision) and A503 (the consumption check)
+  own that test. The failure that this reduction could hide is a check that ignores the mark, and
+  only that test shows it.
+
 Faults: the loss of a checked request (a crash or a failed connection), a restore, a lost
 response, the cancellation or expiry of an instance, and the withdrawal or refusal of a checked
 operation. An attacker can replay each assertion. The models check safety only, so they have no
@@ -297,9 +324,9 @@ These readings of the design are recorded for the design owner.
 4. The restore journal keeps each grant revision that a later change or revocation ended dead
    ([AUTH Storage Contract and Bindings]: "A grant change is recorded as the death of the revision
    that it replaces").
-5. Whether a permission needs approval is a grant fact. Neither model checks that a commit of a
-   marked permission names an approval: A400 does not name that rule, and `Approval.tla` takes
-   the mark as an environment input.
+5. Whether a permission needs approval is a grant fact: each grant revision binds its
+   approval-required marks. The rule that a commit of a marked permission names an approval is a
+   check of one step ([Reductions](#reductions), the approval-required mark).
 
 ## Known-bad variants
 
@@ -335,57 +362,60 @@ cannot repeat a number, so that profile shows that only the restore argument of
 
 ## Evidence record
 
-Two rounds checked the profiles, each with `cargo xtask model grant-approval/<profile>` from the
-repository root. Round 1 checked each profile of `GrantAccess.tla` and `Approval.tla`, from
-2026-11-14 03:49 UTC. Round 2 checked the two profiles of `ApprovalSnapshotNumber.tla`, from
-2026-11-15 06:26 UTC.
+One run checked each of the 27 profiles one time, one at a time, with
+`cargo xtask model grant-approval/<profile>` from the repository root. It ran from 2026-11-17
+03:41:54 UTC to 04:04:43 UTC, and each profile had a cap of 3,600 seconds.
 
-- Source of round 1: 29 model files. Each run printed
-  `sha256:bd67d40384d2cbf05d8c7249cfdc756e06c32e51435f6686e8ccc1d3cfcf4a13 (29 files)`. Those
-  files also had the raises `Approval.Ops3.cfg` and `Approval.Restore2.cfg`, which did not finish
-  within one hour. The arguments of [Bounds](#bounds) replace them, so they are removed. No other
-  file of round 1 changed, so its results hold for the current files.
-- Source of round 2: the current 30 model files. Each run printed
-  `sha256:f1521b02fb7a7ac450bdcbbf3960873f95b9e5f3f93109549335ab49dd65f92f (30 files)`.
+- Source: the current 30 model files. Each profile printed
+  `sha256:f1521b02fb7a7ac450bdcbbf3960873f95b9e5f3f93109549335ab49dd65f92f (30 files)`. An earlier
+  source also had the raises `Approval.Ops3.cfg` and `Approval.Restore2.cfg`, which did not finish
+  within one hour. The arguments of [Bounds](#bounds) replace them, so they are removed.
 - Checkers: temurin-jre 21.0.13+9 (Linux aarch64; the SHA-256 of
   `OpenJDK21U-jre_aarch64_linux_hotspot_21.0.13_9.tar.gz` matched the value that Adoptium
-  publishes before the unpack), tla2tools 1.8.0+d8fb231de4e4 (TLC2 Version 2026.11.06.222357, rev
-  d8fb231; SHA-256 `e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f`), and
-  apalache 0.62.4 (not used by these profiles). TLC ran with `-workers auto -lncheck final`: 16
-  workers and a heap of 7004 MB.
+  publishes before the unpack), tla2tools 1.8.0+bc1b506bdcad (TLC2 Version 2026.11.15.002146, rev
+  bc1b506), and apalache 0.62.4 (not used by these profiles). TLC ran with `-workers auto
+  -lncheck final`: 16 workers and a heap of 7004 MB.
 - Host: EC2 c8g.4xlarge (16 vCPUs, AWS Graviton4), on demand, image `ami-06bcda7571e75165c`
-  (Debian 12 arm64), kernel 6.1.0-54-cloud-arm64, in both rounds. In each round, one ephemeral
-  host ran the profiles one at a time, and its volume was deleted after the run.
+  (Debian 12 arm64), kernel 6.1.0-54-cloud-arm64. It was created for dev-machine run
+  `20261117T033658Z-62452` and deleted after it. The run reported exit, collection, and teardown
+  0, and `dev-machine status rsauthnz aws-linux-arm64-debian12` then showed no AWS instance or EBS
+  volume.
 
 | Profile | Result | Distinct states | Depth | Time |
 | --- | --- | --- | --- | --- |
-| `GrantAccess.cfg` | ok | 50,952 | 13 | 1.0 s |
-| `GrantAccess.Ops3.cfg` | ok | 203,212 | 15 | 2.5 s |
-| `GrantAccess.Rev3.cfg` | ok | 107,752 | 14 | 1.4 s |
-| `GrantAccess.Perms2.cfg` | ok | 177,708 | 13 | 1.6 s |
-| `GrantAccess.Own2.cfg` | ok | 105,570 | 14 | 1.5 s |
-| `GrantAccess.Pol3.cfg` | ok | 96,222 | 14 | 1.2 s |
-| `GrantAccess.Agents3.cfg` | ok | 76,426 | 14 | 1.4 s |
-| `GrantAccess.Auds3.cfg` | ok | 85,486 | 13 | 1.5 s |
-| `GrantAccess.Ress3.cfg` | ok | 59,672 | 13 | 1.4 s |
-| `GrantAccess.Acts3.cfg` | ok | 59,672 | 13 | 1.3 s |
-| `GrantAccess.IssuedAuth_bad.cfg` | `EffectiveAccess` violated | 3,372 | 9 | 0.6 s |
-| `GrantAccess.IssuedPolicy_bad.cfg` | `EffectiveAccess` violated | 2,404 | 9 | 0.6 s |
-| `GrantAccess.NoRestrict_bad.cfg` | `WithinGrant` violated | 1,140 | 8 | 0.5 s |
-| `GrantAccess.NoLifecycle_bad.cfg` | `RevokedNoAccess` violated | 1,962 | 9 | 0.6 s |
-| `GrantAccess.NoRevision_bad.cfg` | `WithinGrant` violated | 1,397 | 9 | 0.5 s |
-| `GrantAccess.RevocationRace_reach.cfg` | target reached | 1,713 | 8 | 0.6 s |
-| `GrantAccess.NarrowGrant_reach.cfg` | target reached | 625 | 8 | 0.6 s |
-| `Approval.OtherInst_bad.cfg` | `ApprovalBinding` violated | 4,937 | 9 | 0.7 s |
-| `Approval.StaleApproval_bad.cfg` | `ApprovalBinding` violated | 3,649 | 8 | 0.7 s |
-| `Approval.Separate_bad.cfg` | `ApprovalOnce` violated | 16,442 | 10 | 1.0 s |
-| `Approval.RestoreKeeps_bad.cfg` | `RestoreRejects` violated | 199 | 7 | 0.6 s |
-| `Approval.NoIdentity_bad.cfg` | `OutcomeOnce` violated | 11,235 | 10 | 0.9 s |
-| `Approval.ApprovedWork_reach.cfg` | target reached | 2,250 | 9 | 0.6 s |
-| `Approval.cfg` | ok | 11,210,056 | 23 | 5 min 24 s |
-| `Approval.Rev3.cfg` | ok | 23,402,439 | 24 | 11 min 36 s |
-| `ApprovalSnapshotNumber.cfg` (round 2) | ok | 11,210,056 | 23 | 5 min 24 s |
-| `ApprovalSnapshotNumber.Restore2_bad.cfg` (round 2) | `OutcomeOnce` violated | 407,048 | 13 | 6.8 s |
+| `GrantAccess.cfg` | ok | 50,952 | 13 | 1.03 s |
+| `GrantAccess.Ops3.cfg` | ok | 203,212 | 15 | 2.48 s |
+| `GrantAccess.Rev3.cfg` | ok | 107,752 | 14 | 1.36 s |
+| `GrantAccess.Perms2.cfg` | ok | 177,708 | 13 | 1.66 s |
+| `GrantAccess.Own2.cfg` | ok | 105,570 | 14 | 1.29 s |
+| `GrantAccess.Pol3.cfg` | ok | 96,222 | 14 | 1.22 s |
+| `GrantAccess.Agents3.cfg` | ok | 76,426 | 14 | 1.31 s |
+| `GrantAccess.Auds3.cfg` | ok | 85,486 | 13 | 1.42 s |
+| `GrantAccess.Ress3.cfg` | ok | 59,672 | 13 | 1.35 s |
+| `GrantAccess.Acts3.cfg` | ok | 59,672 | 13 | 1.39 s |
+| `GrantAccess.IssuedAuth_bad.cfg` | `EffectiveAccess` violated | 1,549 | 8 | 0.52 s |
+| `GrantAccess.IssuedPolicy_bad.cfg` | `EffectiveAccess` violated | 2,179 | 9 | 0.56 s |
+| `GrantAccess.NoRestrict_bad.cfg` | `WithinGrant` violated | 1,033 | 8 | 0.56 s |
+| `GrantAccess.NoLifecycle_bad.cfg` | `RevokedNoAccess` violated | 2,195 | 9 | 0.61 s |
+| `GrantAccess.NoRevision_bad.cfg` | `WithinGrant` violated | 1,575 | 9 | 0.53 s |
+| `GrantAccess.RevocationRace_reach.cfg` | target reached | 1,549 | 9 | 0.53 s |
+| `GrantAccess.NarrowGrant_reach.cfg` | target reached | 681 | 8 | 0.58 s |
+| `Approval.OtherInst_bad.cfg` | `ApprovalBinding` violated | 4,536 | 9 | 0.70 s |
+| `Approval.StaleApproval_bad.cfg` | `ApprovalBinding` violated | 6,024 | 10 | 0.76 s |
+| `Approval.Separate_bad.cfg` | `ApprovalOnce` violated | 18,212 | 10 | 0.95 s |
+| `Approval.RestoreKeeps_bad.cfg` | `RestoreRejects` violated | 183 | 8 | 0.58 s |
+| `Approval.NoIdentity_bad.cfg` | `OutcomeOnce` violated | 12,489 | 10 | 0.88 s |
+| `Approval.ApprovedWork_reach.cfg` | target reached | 1,781 | 9 | 0.67 s |
+| `Approval.cfg` | ok | 11,210,056 | 23 | 318.50 s |
+| `Approval.Rev3.cfg` | ok | 23,402,439 | 24 | 697.45 s |
+| `ApprovalSnapshotNumber.cfg` | ok | 11,210,056 | 23 | 323.73 s |
+| `ApprovalSnapshotNumber.Restore2_bad.cfg` | `OutcomeOnce` violated | 376,594 | 12 | 6.22 s |
+
+Each positive search completed with 0 states left on the queue. The state count of a violation
+depends on the order of the workers, so it can differ between runs. The archive
+`~/.local/state/model-evidence/rsauthnz/A400/20261117-grant-approval-evidence.tar.gz` (SHA-256
+`ab9e0307ebfbbf49cd18b973f340117e191e3724c6f9a1fe50cda1c1d719a893`) keeps the output, the traces,
+and the remote run record.
 
 Each trace of a known-bad variant or a witness was read against the task text. Each shows its
 named failure or target. For example, `StaleApproval_bad` approves under revision 1, changes the
@@ -394,5 +424,5 @@ granted permission from the owner, and commits. In the trace of
 `ApprovalSnapshotNumber.Restore2_bad`, a restore gives the number 1, and an operation of that
 store instance commits with a lost response. A second restore from a snapshot of the first store
 instance gives the number 1 again and removes the outcome record. The retry finds no record under
-the current number, so the operation commits a second time. The six steps before the first
-restore do not take part in the failure.
+the current number, so the operation commits a second time. The three steps before the first
+restore do not take part in the failure, because the operation names no approval.
