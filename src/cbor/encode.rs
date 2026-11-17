@@ -111,7 +111,7 @@ fn map(entries: &[(Value<'_>, Value<'_>)], out: &mut Vec<u8>) -> Result<(), Erro
     }
     let key = |&(start, key_end, _): &(usize, usize, usize)| &encoded[start..key_end];
     spans.sort_unstable_by(|a, b| key(a).cmp(key(b)));
-    if spans.windows(2).any(|pair| key(&pair[0]) == key(&pair[1])) {
+    if spans.array_windows().any(|[a, b]| key(a) == key(b)) {
         return Err(Error::DuplicateKey);
     }
     for &(start, _, end) in &spans {
