@@ -108,6 +108,16 @@ pub(super) fn decode(bytes: &[u8], limits: Limits) -> Option<(Link, Entry)> {
     Some((Link(<[u8; 32]>::try_from(*link).ok()?), entry))
 }
 
+/// The CBOR form of `anchors`: the payload of an intent of `Effect::Journal`.
+pub(super) fn encode_anchors(anchors: &[Anchor]) -> Vec<u8> {
+    cbor::encode(&list(anchors, anchor)).expect("the form of an anchor has no map and no simple value")
+}
+
+/// The anchors of the CBOR form `bytes` of [`encode_anchors`], or `None` for another form within `limits`.
+pub(super) fn decode_anchors(bytes: &[u8], limits: Limits) -> Option<Vec<Anchor>> {
+    read_list(&cbor::decode(bytes, limits).ok()?, read_anchor)
+}
+
 fn list<'a, T>(items: &'a [T], form: fn(&'a T) -> Value<'a>) -> Value<'a> {
     Value::Array(items.iter().map(form).collect())
 }

@@ -117,6 +117,17 @@ impl Mark {
     }
 }
 
+/// The CBOR form of `anchors`, the payload of an intent of [`Effect::Journal`](crate::transition::Effect::Journal).
+pub(crate) fn encode_anchors(anchors: &[Anchor]) -> Vec<u8> {
+    form::encode_anchors(anchors)
+}
+
+/// The anchors of the payload of an intent of [`Effect::Journal`](crate::transition::Effect::Journal), or `None` for
+/// another form within `limits`.
+pub(crate) fn decode_anchors(payload: &[u8], limits: Limits) -> Option<Vec<Anchor>> {
+    form::decode_anchors(payload, limits)
+}
+
 /// A journal entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -361,6 +372,17 @@ impl History {
         Ok(())
     }
 
+    /// The history after `mark`, a mark of this history, such as one that [`low_water`] gave.
+    pub(crate) fn after(&self, mark: Mark) -> Self {
+        let from = self.entries.partition_point(|entry| entry.sequence <= mark.sequence);
+        Self {
+            mark,
+            head: self.head,
+            entries: self.entries.get(from..).unwrap_or_default().to_vec(),
+            held: self.held.get(from..).unwrap_or_default().to_vec(),
+        }
+    }
+
     /// The mark before the entry at `index`.
     fn before(&self, index: usize) -> Mark {
         match (self.entries.get(index), self.held.get(index)) {
@@ -489,6 +511,11 @@ impl State {
             None => Ok(false),
             Some(dead) => Ok(compare(version, dead)? != Ordering::Greater),
         }
+    }
+
+    /// The anchors of the creation entries that no void cancels.
+    pub(crate) fn anchors(&self) -> impl Iterator<Item = &Anchor> {
+        self.anchors.values()
     }
 
     /// The acknowledgement rule: a commit of an anchor change of an owner, or a lookup that reports it, is

@@ -5,8 +5,9 @@ storage binding: the primitives of `rsauthnz::store::Store`, and of `rsauthnz::s
 restore. The commit driver of the core orders the primitives. A binding executes each primitive and decides no step
 of the protocol. [Propose a transition](transitions.md) gives the proposal that a commit takes.
 
-This release has the contract and its reference binding, the [memory binding](memory-binding.md), but no commit driver
-or conformance suite yet. Thus nothing in rsauthnz calls a binding except the expiry pass `store::expire`.
+This release has the contract, its reference binding (the [memory binding](memory-binding.md)), and the commit driver
+`rsauthnz::store::driver`, which gives the binding each primitive call ([The commit driver](restore.md#the-commit-driver)).
+It has no conformance suite yet.
 
 ## Declare the binding
 
@@ -99,7 +100,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Intent` | An effect intent that the application did not end yet | `None` |
 | `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
-| `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
+| `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number of its write, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for

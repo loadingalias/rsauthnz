@@ -47,6 +47,7 @@ use crate::id::{Authority, AuthorityVersion, Id};
 use crate::time::{Reading, ReadingSource, TimeError};
 use crate::transition::{self, Change, Key, Operation, OperationId, Proposal};
 
+pub mod driver;
 pub mod journal;
 
 /// The first item of the CBOR form of an audit record. Its number changes with the form.
@@ -96,8 +97,8 @@ pub enum Kind {
     Intent = 19,
     /// The current policy version of an owner ([`policy_key`]). A policy change is a commit that writes it.
     Policy = 20,
-    /// The journal mark of the store: the low-water mark of its state, whether a restore made the state, and the
-    /// completions that a restore still owes. The commit driver writes it, and it has no end.
+    /// The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number
+    /// of its write, and the completions that a restore still owes. The commit driver writes it, and it has no end.
     Mark = 21,
 }
 

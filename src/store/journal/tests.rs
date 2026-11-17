@@ -690,6 +690,18 @@ fn the_mark_stays_below_an_unreflected_entry_of_any_owner() {
             2,
         ),
         (
+            "an anchor with an end that expiry removed",
+            vec![(
+                op("e-1"),
+                Body::Creation(vec![Anchor {
+                    end: Some(Duration::from_secs(10)),
+                    ..anchor(&a1s, Role::SignIn(account("a1")))
+                }]),
+            )],
+            vec![],
+            1,
+        ),
+        (
             "each entry is reflected or voided",
             vec![
                 (op("u-1"), end(unlink("u-1", &a1p, 1))),

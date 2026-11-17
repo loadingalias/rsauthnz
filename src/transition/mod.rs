@@ -576,12 +576,22 @@ impl Proposal {
         &self.intents
     }
 
+    /// The proposal that a restore commits again for an in-doubt consumption: the operation of the consumption entry,
+    /// with its request binding, so that the outcome record answers the request of the first attempt.
+    pub(crate) const fn again(operation: Operation, audit: Audit, limits: Limits) -> Self {
+        Self {
+            operation,
+            audit,
+            dependencies: Vec::new(),
+            changes: Vec::new(),
+            intents: Vec::new(),
+            artifact: None,
+            limits,
+        }
+    }
+
     /// The receipt of the accepted proposal, which releases the prepared artifact. Only the commit of the proposal
     /// accepts it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the commit driver of A017 accepts a proposal after its commit")
-    )]
     pub(crate) fn accept(self) -> Receipt {
         Receipt {
             operation: self.operation.id,

@@ -8,14 +8,15 @@ restored store serves, it applies the journal entries after the snapshot.
 
 The binding implements the primitives of `rsauthnz::store::Journal` ([Storage contract](storage.md)). The module
 `rsauthnz::store::journal` gives the record format, the check of the hash chain, and the rules. The rules are pure
-functions: they do no I/O and order no write. The commit driver of the core orders each effect. This release has no
-commit driver yet, so nothing in rsauthnz calls the rules or a `Journal`.
+functions: they do no I/O and order no write. The commit driver of the core, `rsauthnz::store::driver`, calls the
+rules and orders each effect ([The commit driver](#the-commit-driver)). A binding implements only primitives.
 
 ## What the binding keeps
 
 1. Keep the journal in its own failure domain, and declare it in `Restore::Journal { location, failure_domain }`.
-2. With each snapshot, keep its low-water mark, a `journal::Mark`: the sequence and the link of an entry. The
-   snapshot reflects each entry at or below that sequence.
+2. Snapshot the complete store state. The mark record of the store (`Kind::Mark`) holds its low-water mark, a
+   `journal::Mark`: the sequence and the link of an entry. The state reflects each entry at or below that sequence,
+   and the driver writes the record, so each snapshot holds its mark.
 3. Keep each entry after the low-water mark of the oldest snapshot that a restore can still use.
 4. Treat a failed sync as a crash. Do not retry it.
 
@@ -128,7 +129,8 @@ applies an entry. The activation states what the restored store applies before i
 4. End each pending record of a kind whose consumption pays for no anchor: a sign-in challenge or an operation
    approval (`ends`). Then set the replay floor as a start does.
 5. Commit each in-doubt consumption again under its operation identity, in journal order (`completions`). Keep
-   the list until each one commits, so that a crash before that does not end the restore.
+   the list until each one commits, so that a crash before that does not end the restore. The driver keeps it in
+   the mark record.
 
 A consumption entry is in doubt when the snapshot has no outcome record of its operation, and the history has no
 creation entry of it. A known commit of the same value excludes it. A candidate completes when no earlier completion
@@ -136,7 +138,76 @@ spent its value, and each anchor that it creates is absent. A bootstrap value mu
 re-bootstrap entry may end it. Otherwise the value stays consumed. A completion does not compare the versions or
 the policy that the first attempt read. The known commits are the outcome records of the snapshot and the creation
 entries after the mark. Thus the expiry of an outcome record is outside the checked rules: the design model does not
-check it. After a restore, an outcome lookup that finds no record gives an unknown
-outcome.
+check it. After a restore, an outcome lookup that finds no record gives an unknown outcome.
 
 The history holds each entry after the mark in memory, so the cost of a restore is linear in those entries.
+
+## The commit driver
+
+`rsauthnz::store::driver::Driver` is the one sequencer of the protocol. It gives the binding one effect at a time,
+and the binding executes the primitive and gives its output back. This example is also the example of the
+`rsauthnz::store::driver` module documentation, and `cargo xtask test` compiles it:
+
+```rust
+use rsauthnz::store::driver::{Driver, Effect, Output};
+
+/// Executes each effect of `driver` until it has none. `execute` stands for the primitives of a binding.
+fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
+    while let Some(effect) = driver.effect() {
+        let output = execute(effect);
+        driver.give(output).expect("the output answers its effect");
+    }
+}
+```
+
+| `Effect` | Primitive | `Output` |
+| --- | --- | --- |
+| `Start` | `Store::start` | `Started(instance)` |
+| `Read(key)` | `Store::read` | `Read(record)` |
+| `Commit(proposal, instance)` | `Store::commit` | `Committed(commit)` |
+| `Expire(kind, before, limit)` | `Store::expire` | `Expired(count)` |
+| `Intents(after, limit)` | `Store::intents` | `Intents(records)` |
+| `Append(entry)` | `Journal::append` | `Appended(sequence)` |
+| `Sync` | `Journal::sync` | `Synced` |
+| `ReadJournal(after, limit)` | `Journal::read` | `Journal(entries)` |
+
+Give `Output::Failed` when a primitive fails. It is a crash: the driver stops (`Status::Down`), gives an unknown
+outcome to the operation in progress, and serves again only after `driver.start(now)`. Do not retry the primitive.
+
+1. Call `driver.start(now)` at first, and after each crash. It writes a new store instance number, reads the mark
+   record and the journal after its mark, writes the missing creation entries and the voids of reconciliation, and
+   then serves.
+2. After a restore of a snapshot, call `driver.restore(now)`, never `start`: a start voids the entries that a restore
+   applies. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
+   applies the activation and completes each in-doubt consumption. A start after a crash during the restore
+   completes the rest before it serves.
+3. Submit a commit with `driver.submit(proposal, plan)`. The `Plan` gives the anchors of the owners that the store
+   holds, the writes that replace a dead version, and the role of each new anchor. Take the answer with
+   `driver.take(ticket)`.
+4. Look up a lost outcome with `driver.lookup(operation)`. The result is `Lookup::Committed`, `Refused`, `Absent`,
+   or `Unknown`. `Unknown` is for a missing outcome record after a restore.
+
+The driver runs one operation at a time, a start first. A commit goes through these effects:
+
+1. The last-anchor check, with no effect. A refusal gives `Outcome::Refused(Error::LastAnchor)`.
+2. A floor entry for each counter whose allocated value passes its durable floor (`driver.allocate(kind)`), the end
+   entry, and one sync. A binding with no journal keeps the floors in the mark record, in a commit before this one.
+3. The conditional commit, with the instance number of the latest start.
+4. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
+   also carries an intent of `Effect::Journal`, and a commit of the driver ends it after the creation entry.
+5. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
+   answer.
+
+A start refuses with `Error::Restored` (`Status::Refused`) when the journal shows a commit that the store lost: a
+later write of the mark record, or the creation entry of an anchor with no end that the store lacks. After each write
+of the mark record, the driver appends a floor entry of `Kind::Mark` with the number of the write. A crash loses no
+commit, so a start after a crash serves. Then call `driver.restore(now)`.
+
+Limit: a start cannot detect a restore of a snapshot that is newer than the last write of the mark record, when only
+commits with no creation entry, such as an unlink or a renewal, followed the snapshot. The journal holds no proof that
+such a commit landed, so its loss looks the same as a crash before the commit.
+
+`driver.cancel(ticket)` ends an operation that waits. The operation in progress runs to its commit or its refusal,
+and it gives no answer. The driver moves the mark of the mark record after each start, on `driver.advance(now)`, and
+after `ADVANCE_AT` entries, so the journal after the mark stays under `JOURNAL_ENTRIES_MAX` entries. A start that
+finds a longer journal refuses with `Error::Long`.

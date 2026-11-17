@@ -6,8 +6,9 @@ binding of the application accepts a proposal. It checks each dependency of the 
 state changes, the audit, the effect intents, and the outcome record in one atomic commit. A proposal is not a
 commit and grants no authority.
 
-This release has no commit driver yet. Thus a proposal can be built and inspected, but nothing commits it, and no
-operation gives a `Receipt`. [Storage contract](storage.md) gives the commit that a storage binding implements.
+The commit driver commits a proposal: `driver.submit(proposal, plan)` gives a ticket, and `driver.take(ticket)`
+gives the `Outcome` ([The commit driver](restore.md#the-commit-driver)). [Storage contract](storage.md) gives the
+commit that a storage binding implements.
 
 ## Build a proposal
 

@@ -250,7 +250,7 @@ fn all<T>(items: &[T], mut test: impl FnMut(&T) -> Result<bool, Error>) -> Resul
 /// the reads of the captured state. The snapshot keeps the mark with its link.
 ///
 /// An end entry is reflected when each of its facts holds, and a creation entry when the state holds each of its
-/// anchors, or a fact of `history` ends it. A void, and an entry that a void cancels, need nothing. A floor is
+/// anchors, or a fact of `history` ends it, or it has an end and expiry removed it. A void, and an entry that a void cancels, need nothing. A floor is
 /// reflected when a later floor of its counter is at least as high, so a restore reads the highest floor of each
 /// counter after the mark.
 ///
@@ -281,7 +281,9 @@ pub fn low_water(history: &History, captured: &Reads) -> Result<Mark, Error> {
             Body::Creation(anchors) => {
                 voided.contains(&entry.sequence)
                     || all(anchors, |anchor| {
-                        Ok(captured.version(&anchor.key)?.is_some() || state.ends(&anchor.key, &anchor.version)?)
+                        Ok(captured.version(&anchor.key)?.is_some()
+                            || anchor.end.is_some()
+                            || state.ends(&anchor.key, &anchor.version)?)
                     })?
             }
             Body::Floor(_) => !newest.contains(&entry.sequence),
@@ -314,6 +316,8 @@ pub struct Activation {
 /// An in-doubt consumption that a restore commits again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
+    /// The sequence of its consumption entry.
+    pub sequence: Sequence,
     /// The operation identity.
     pub operation: OperationId,
     /// The transition of the consumption.
@@ -380,6 +384,7 @@ pub fn restore(history: &History, snapshot: &Reads) -> Result<Activation, Error>
             spent.push(value);
             made.extend(consumption.anchors.iter().map(|anchor| &anchor.key));
             completions.push(Completion {
+                sequence: entry.sequence,
                 operation: entry.operation.clone(),
                 consumption: consumption.clone(),
             });
