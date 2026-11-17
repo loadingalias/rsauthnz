@@ -10,7 +10,7 @@ cannot delay durable commits. rsauthnz does no admission itself. The host owns a
 
 | Class | Work | Example |
 | --- | --- | --- |
-| `Parse` | A cheap parse or refusal. The work is linear in input that the limit set or an output slice bounds. It does no signature, KDF, storage, or network work | `cbor::decode`, `json::decode`, `b64::decode`, `cose::Sign1::decode`, `id::Id::new` |
+| `Parse` | A cheap parse or refusal. The work is linear in input that the limit set or an output slice bounds. It does no signature, KDF, storage, or network work | `cbor::decode`, `json::decode`, `b64::decode`, `cose::Sign1::decode`, `id::Id::new`, `transition::Proposal::new` |
 | `Verify` | Signature or KDF work on input that the parse admitted | `cose::Profile::verify`, `cose::Sign1::verify`, `cose::TrustedKey::new` |
 | `Mutate` | One atomic commit in the storage binding of the application | No operation yet |
 | `External` | Slow custody or provider work, such as a hardware key or an external identity provider | No operation yet |
@@ -30,13 +30,14 @@ does signature, KDF, or storage work.
 
 ## The limit set
 
-`rsauthnz::limits::Limits` is the one limit set of the crate. Each parser and each verifier checks its input
-against it before expensive work. A refusal names the bound with `rsauthnz::limits::Limit`. The fields, their
-defaults, and their refusals are in [Parser limits](parser-limits.md). A `cose::Profile` holds the limits of its
-artifacts.
+`rsauthnz::limits::Limits` is the one limit set of the crate. Each parser, each verifier, and each transition
+proposal checks its input against it before expensive work. A refusal names the bound with
+`rsauthnz::limits::Limit`. The fields of the codecs, their defaults, and their refusals are in [Parser
+limits](parser-limits.md). A `cose::Profile` holds the limits of its artifacts. The fields `dependencies` and
+`intents` bound a proposal, as [Propose a transition](transitions.md#limits) gives.
 
 A new bound joins `Limits` in the change that adds its first consumer. The bounds that come next are grants,
-resource scopes, dependencies, the keys of a key set, and the signatures of one artifact.
+resource scopes, the keys of a key set, and the signatures of one artifact.
 
 ## Keyed reads
 

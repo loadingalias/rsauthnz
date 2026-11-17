@@ -1,0 +1,628 @@
+//! Transition proposals: the change of authority that one verified request asks for, and its outcome.
+//!
+//! The core decides a transition with a pure function. Its inputs are a bounded request, verified evidence, the
+//! current policy, and the current state that the decision reads. Its result is a [`Proposal`]: the dependencies
+//! that the decision read, the state changes, the audit, the effect intents, and a prepared artifact. Only the
+//! storage binding of the application accepts a proposal. It checks each dependency and commits the changes, the
+//! audit, the intents, and the outcome record in one atomic commit. The [`Outcome`] is an accepted receipt, a
+//! conflict, a refusal, or unknown.
+//!
+//! A proposal names each read of its decision with [`Proposal::read`]: a policy version, a record version, or the
+//! absence of a record. A uniqueness condition is the absence of a record under a unique key. A change names a
+//! record that the proposal read, so the commit refuses when a concurrent commit changed that record first.
+//!
+//! An operation has a stable identity, which the client chooses or which an existing ceremony or grant identity
+//! supplies. Its request binding is a digest of the actor, the action, and the request. A second submission of the
+//! same request under the same identity gets the outcome of the first, and a different request refuses
+//! ([`Operation::answer`]). A lost response is an [`Outcome::Unknown`]. Its recovery is a lookup of the same
+//! identity, never a new operation.
+//!
+//! ```
+//! use core::time::Duration;
+//!
+//! use rsauthnz::cbor::Value;
+//! use rsauthnz::id::{Authority, AuthorityVersion, Human, Id, Principal};
+//! use rsauthnz::limits::Limits;
+//! use rsauthnz::time::{Reading, ReadingSource};
+//! use rsauthnz::transition::{Audit, Change, Dependency, Key, OperationId, Proposal};
+//!
+//! let owner: Id<Authority> = Id::new("acme", "auth")?;
+//! let version = |n: u64| AuthorityVersion::new(owner.clone(), &n.to_be_bytes());
+//! let audit = Audit {
+//!     actor: Principal::Human(Id::<Human>::new("acme", "u-17")?),
+//!     action: Id::new("acme.auth", "credential.enroll")?,
+//!     time: Reading::new(Duration::from_secs(1_000), Some(Duration::from_secs(1)), ReadingSource::Caller),
+//! };
+//! let invitation = Key::new(b"invitation/i-9")?;
+//! let credential = Key::new(b"credential/c-4")?;
+//! let request = Value::Array(vec![Value::Bytes(b"i-9"), Value::Bytes(b"c-4")]);
+//!
+//! // The decision consumes the invitation and creates the credential. It reads both first.
+//! let mut proposal = Proposal::new(OperationId::new(b"op-1")?, audit, &request, Limits::default())?;
+//! proposal.read(Dependency::Version(invitation.clone(), version(3)?))?;
+//! proposal.read(Dependency::Absent(credential.clone()))?;
+//! proposal.change(Change::End(invitation))?;
+//! proposal.change(Change::Write {
+//!     key: credential,
+//!     version: version(1)?,
+//!     data: Box::new(*b"the credential record"),
+//! })?;
+//! assert_eq!(proposal.dependencies().len(), 2);
+//! # Ok::<(), Box<dyn core::error::Error>>(())
+//! ```
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+use core::fmt;
+
+use crate::cbor::{self, Value};
+use crate::crypto;
+use crate::id::{Action, AuthorityVersion, Id, Principal};
+use crate::limits::{Limit, Limits};
+use crate::time::Reading;
+
+/// The first item of the CBOR form that a request binding digests. Its number changes with the form.
+const BINDING_FORM: &str = "rsauthnz.transition.binding.1";
+
+/// The identity of one externally submitted operation: 1 to [`Self::BYTES_MAX`] opaque bytes.
+///
+/// The client chooses it, for example 16 random bytes, or an existing ceremony or grant identity supplies it. The
+/// store keeps one outcome record for each identity.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperationId(Box<[u8]>);
+
+impl OperationId {
+    /// The most bytes in an operation identity.
+    pub const BYTES_MAX: usize = 64;
+
+    /// Makes the operation identity `bytes`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OperationId`] for no bytes or more than [`Self::BYTES_MAX`] bytes.
+    pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+        (1..=Self::BYTES_MAX).contains(&bytes.len()).ok_or(Error::OperationId)?;
+        Ok(Self(bytes.into()))
+    }
+
+    /// The bytes of the identity.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OperationId({:02x?})", self.0)
+    }
+}
+
+/// An operation: its identity and its request binding. The store keeps it as the outcome record of the identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Operation {
+    /// The identity.
+    pub id: OperationId,
+    /// The request binding: the SHA-256 digest of the canonical CBOR form
+    /// `["rsauthnz.transition.binding.1", actor, action, request]`. A request can hold a secret, so `Debug` does not
+    /// show the binding.
+    pub binding: [u8; 32],
+}
+
+impl Operation {
+    /// The answer of a store that keeps `self` as the outcome record of an identity, to the submission `submitted` of
+    /// that identity. The same request gets the receipt of the commit, with no artifact, and no second commit.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn answer(&self, submitted: &Self) -> Outcome {
+        if self == submitted {
+            Outcome::Accepted(Receipt {
+                operation: self.id.clone(),
+                artifact: None,
+            })
+        } else {
+            Outcome::Refused(Error::Reuse)
+        }
+    }
+}
+
+impl fmt::Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Operation")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The name of a record in the store: 1 to [`Self::BYTES_MAX`] opaque bytes. The storage contract gives the key of
+/// each record kind. A key is no secret: name a record that a secret finds by a keyed digest of the secret.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Key(Box<[u8]>);
+
+impl Key {
+    /// The most bytes in a key. It is the largest partition key of DynamoDB, and B-tree indexes of PostgreSQL and
+    /// MySQL also hold it.
+    pub const BYTES_MAX: usize = 2048;
+
+    /// Makes the key `bytes`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Key`] for no bytes or more than [`Self::BYTES_MAX`] bytes.
+    pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+        (1..=Self::BYTES_MAX).contains(&bytes.len()).ok_or(Error::Key)?;
+        Ok(Self(bytes.into()))
+    }
+
+    /// The bytes of the key.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Key({:02x?})", self.0)
+    }
+}
+
+/// A read of the decision. The commit checks it again, in the same atomic step as its changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dependency {
+    /// The policy of the owner of the version is at this version.
+    Policy(AuthorityVersion),
+    /// The record is at this version.
+    Version(Key, AuthorityVersion),
+    /// No record has this key: an absence, or the uniqueness of the key in its namespace.
+    Absent(Key),
+}
+
+impl Dependency {
+    /// Whether `self` and `other` read the same policy or the same record.
+    fn reads_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Policy(a), Self::Policy(b)) => a.owner() == b.owner(),
+            (Self::Version(a, _) | Self::Absent(a), Self::Version(b, _) | Self::Absent(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// A state change of a proposal.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Writes the record at `version`, with the record form `data`. The record is new when the proposal reads it as
+    /// absent. Otherwise `version` is later than the version that the proposal read.
+    Write {
+        /// The record.
+        key: Key,
+        /// The new version.
+        version: AuthorityVersion,
+        /// The record form. It can hold a secret, so `Debug` shows only its length.
+        data: Box<[u8]>,
+    },
+    /// Ends the record: it consumes a one-use value, revokes, or removes. The proposal reads it at a version.
+    End(Key),
+}
+
+impl Change {
+    const fn key(&self) -> &Key {
+        match self {
+            Self::Write { key, .. } | Self::End(key) => key,
+        }
+    }
+}
+
+impl fmt::Debug for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write { key, version, data } => f
+                .debug_struct("Write")
+                .field("key", key)
+                .field("version", version)
+                .field("data", &Hidden(data))
+                .finish(),
+            Self::End(key) => f.debug_tuple("End").field(key).finish(),
+        }
+    }
+}
+
+/// The required audit of a proposal. The commit records it with the operation identity and the key of each change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Audit {
+    /// The principal that acts.
+    pub actor: Principal,
+    /// The action of the transition, for example `credential.enroll`.
+    pub action: Id<Action>,
+    /// The physical time of the decision.
+    pub time: Reading,
+}
+
+/// An effect intent: a notification, signer, or provider call that the commit records, so that it survives a
+/// crash. The application calls the effect after the commit, and it keeps the record until it observes the end of
+/// the call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Intent {
+    effect: Effect,
+    payload: Box<[u8]>,
+    state: State,
+}
+
+/// The kind of call of an intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Effect {
+    /// A notification, for example to the owner of an account.
+    Notification,
+    /// A signer.
+    Signer,
+    /// An external identity provider.
+    Provider,
+}
+
+/// The state of an intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum State {
+    /// The application can call the effect.
+    Open,
+    /// The application calls the effect no more. A call can still be in progress, so the record stays.
+    Cancelled,
+    /// The application observed the end of the call, so it can remove the record.
+    Ended(Ended),
+}
+
+/// The observed end of the call of an intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Ended {
+    /// The call completed.
+    Completed,
+    /// The resource of the call came back, or the call did not occur.
+    Returned,
+}
+
+impl Intent {
+    /// Makes an open intent of `effect` with the call parameters `payload`. The payload can hold a secret, so `Debug`
+    /// shows only its length.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub const fn new(effect: Effect, payload: Box<[u8]>) -> Self {
+        Self {
+            effect,
+            payload,
+            state: State::Open,
+        }
+    }
+
+    /// The kind of call.
+    #[must_use]
+    pub const fn effect(&self) -> Effect {
+        self.effect
+    }
+
+    /// The call parameters.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// The state.
+    #[must_use]
+    pub const fn state(&self) -> State {
+        self.state
+    }
+
+    /// Stops new calls of an open intent. The record stays until the application observes the end of each call.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    pub fn cancel(&mut self) {
+        if self.state == State::Open {
+            self.state = State::Cancelled;
+        }
+    }
+
+    /// Records the observed end of the call. The first observed end stays.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    pub fn observe(&mut self, ended: Ended) {
+        if !matches!(self.state, State::Ended(_)) {
+            self.state = State::Ended(ended);
+        }
+    }
+}
+
+impl fmt::Debug for Intent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Intent")
+            .field("effect", &self.effect)
+            .field("payload", &Hidden(&self.payload))
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// A proposed transition: the operation, the audit, the reads of the decision, the state changes, the effect
+/// intents, and a prepared artifact. Only the acceptance of the commit releases the artifact.
+#[derive(Debug)]
+pub struct Proposal {
+    operation: Operation,
+    audit: Audit,
+    dependencies: Vec<Dependency>,
+    changes: Vec<Change>,
+    intents: Vec<Intent>,
+    artifact: Option<Artifact>,
+    limits: Limits,
+}
+
+impl Proposal {
+    /// Starts the proposal of the operation `id`, with the required `audit` and the request binding of its actor, its
+    /// action, and `request`. The proposal holds at most [`Limits::dependencies`] dependencies and
+    /// [`Limits::intents`] intents.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). The binding is one SHA-256 digest of the bounded request.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] if `request` has no CBOR encoding.
+    pub fn new(id: OperationId, audit: Audit, request: &Value<'_>, limits: Limits) -> Result<Self, Error> {
+        let form = Value::Array(vec![
+            Value::Text(BINDING_FORM),
+            audit.actor.to_cbor(),
+            audit.action.to_cbor(),
+            request.clone(),
+        ]);
+        let binding = crypto::sha256(&cbor::encode(&form).map_err(Error::Request)?);
+        Ok(Self {
+            operation: Operation { id, binding },
+            audit,
+            dependencies: Vec::new(),
+            changes: Vec::new(),
+            intents: Vec::new(),
+            artifact: None,
+            limits,
+        })
+    }
+
+    /// Adds a read of the decision to the dependencies. A second equal read adds nothing.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Changed`] if the proposal read the same policy or record with another result, and
+    /// [`Error::Limit`] with [`Limit::Dependencies`] for a dependency past [`Limits::dependencies`].
+    pub fn read(&mut self, dependency: Dependency) -> Result<(), Error> {
+        if let Some(earlier) = self.dependencies.iter().find(|earlier| earlier.reads_same(&dependency)) {
+            return (*earlier == dependency).ok_or(Error::Changed);
+        }
+        (self.dependencies.len() < self.limits.dependencies).ok_or(Error::Limit(Limit::Dependencies))?;
+        self.dependencies.push(dependency);
+        Ok(())
+    }
+
+    /// Adds a state change. A read of the proposal must allow it: a write of a record that the proposal read as
+    /// absent, a write at a later version than the version that the proposal read, or an end of a record that the
+    /// proposal read at a version. Thus the changes are at most [`Limits::dependencies`].
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Change`] if no read allows `change`, or if another change names its record.
+    pub fn change(&mut self, change: Change) -> Result<(), Error> {
+        let allowed = self.dependencies.iter().any(|read| match (read, &change) {
+            (Dependency::Absent(read), Change::Write { key, .. }) => read == key,
+            (Dependency::Version(read, earlier), Change::Write { key, version, .. }) => {
+                read == key && version.compare(earlier) == Ok(Ordering::Greater)
+            }
+            (Dependency::Version(read, _), Change::End(key)) => read == key,
+            _ => false,
+        });
+        let again = self.changes.iter().any(|earlier| earlier.key() == change.key());
+        (allowed && !again).ok_or(Error::Change)?;
+        self.changes.push(change);
+        Ok(())
+    }
+
+    /// Adds an effect intent.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Limit`] with [`Limit::Intents`] for an intent past [`Limits::intents`].
+    pub fn intend(&mut self, intent: Intent) -> Result<(), Error> {
+        (self.intents.len() < self.limits.intents).ok_or(Error::Limit(Limit::Intents))?;
+        self.intents.push(intent);
+        Ok(())
+    }
+
+    /// Sets the prepared artifact, for example a signed session or credential. It stays private until the acceptance
+    /// of this exact proposal, and only the receipt of that acceptance releases it.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    pub fn prepare(&mut self, artifact: Box<[u8]>) {
+        self.artifact = Some(Artifact(artifact));
+    }
+
+    /// The operation: its identity and its request binding.
+    #[must_use]
+    pub const fn operation(&self) -> &Operation {
+        &self.operation
+    }
+
+    /// The required audit.
+    #[must_use]
+    pub const fn audit(&self) -> &Audit {
+        &self.audit
+    }
+
+    /// The reads of the decision, in the order of the first read of each policy and record.
+    #[must_use]
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+
+    /// The state changes.
+    #[must_use]
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+
+    /// The effect intents.
+    #[must_use]
+    pub fn intents(&self) -> &[Intent] {
+        &self.intents
+    }
+
+    /// The receipt of the accepted proposal, which releases the prepared artifact. Only the commit of the proposal
+    /// accepts it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the commit driver of A017 accepts a proposal after its commit")
+    )]
+    pub(crate) fn accept(self) -> Receipt {
+        Receipt {
+            operation: self.operation.id,
+            artifact: self.artifact,
+        }
+    }
+}
+
+/// The receipt of an accepted proposal.
+#[derive(Debug)]
+pub struct Receipt {
+    operation: OperationId,
+    artifact: Option<Artifact>,
+}
+
+impl Receipt {
+    /// The identity of the operation that committed.
+    #[must_use]
+    pub const fn operation(&self) -> &OperationId {
+        &self.operation
+    }
+
+    /// The prepared artifact, which the acceptance of the commit releases. The receipt of a lookup has none: the
+    /// store never keeps the artifact.
+    #[must_use]
+    pub fn artifact(&self) -> Option<&[u8]> {
+        self.artifact.as_ref().map(|artifact| &*artifact.0)
+    }
+}
+
+/// The outcome of the commit of a proposal.
+#[derive(Debug)]
+pub enum Outcome {
+    /// The commit accepted the proposal.
+    Accepted(Receipt),
+    /// A dependency changed before the commit, so nothing committed.
+    Conflict,
+    /// The commit refused the proposal, so nothing committed. The refusal stays true.
+    Refused(Error),
+    /// The commit can have occurred: its response was lost, or a restore lost its outcome record.
+    Unknown(Operation),
+}
+
+impl Outcome {
+    /// The recovery of the caller, or `None` for an accepted proposal.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<Recovery> {
+        match self {
+            Self::Accepted(_) => None,
+            Self::Conflict => Some(Recovery::Restart),
+            Self::Refused(error) => Some(error.recovery()),
+            Self::Unknown(_) => Some(Recovery::Lookup),
+        }
+    }
+}
+
+/// The recovery of the caller after an outcome or an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Recovery {
+    /// Look up the outcome of the same operation identity. Never submit the request as a new operation: the first
+    /// attempt can have committed.
+    Lookup,
+    /// Nothing committed. Read the current state again, and propose again as a new operation.
+    Restart,
+    /// Refuse the request. The same request refuses again.
+    Refuse,
+}
+
+/// The cause of a refused proposal. No error holds a secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The operation identity has no bytes or more than [`OperationId::BYTES_MAX`] bytes.
+    OperationId,
+    /// The key has no bytes or more than [`Key::BYTES_MAX`] bytes.
+    Key,
+    /// The request has no CBOR encoding.
+    Request(cbor::Error),
+    /// The proposal is larger than a bound of [`Limits`].
+    Limit(Limit),
+    /// The decision read the same policy or record twice, with two results: the state changed between the reads.
+    Changed,
+    /// No read of the proposal allows the change, or another change names its record.
+    Change,
+    /// The operation identity has the outcome record of another request.
+    Reuse,
+}
+
+impl Error {
+    /// The recovery of the caller.
+    #[must_use]
+    pub const fn recovery(&self) -> Recovery {
+        match self {
+            Self::Changed => Recovery::Restart,
+            Self::OperationId | Self::Key | Self::Request(_) | Self::Limit(_) | Self::Change | Self::Reuse => {
+                Recovery::Refuse
+            }
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OperationId => f.write_str("the operation identity is empty or too long"),
+            Self::Key => f.write_str("the key is empty or too long"),
+            Self::Request(error) => write!(f, "the request has no CBOR encoding: {error}"),
+            Self::Limit(Limit::Dependencies) => f.write_str("the proposal has too many dependencies"),
+            Self::Limit(Limit::Intents) => f.write_str("the proposal has too many effect intents"),
+            Self::Limit(_) => f.write_str("the proposal is larger than a bound of the limits"),
+            Self::Changed => f.write_str("the state changed between two reads of the decision"),
+            Self::Change => f.write_str("no read of the proposal allows the change"),
+            Self::Reuse => f.write_str("the operation identity is in use for another request"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
+/// A prepared artifact. Only [`Receipt::artifact`] gives its bytes.
+struct Artifact(Box<[u8]>);
+
+impl fmt::Debug for Artifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Hidden(&self.0).fmt(f)
+    }
+}
+
+/// Bytes that can hold a secret. `Debug` shows only their length.
+struct Hidden<'a>(&'a [u8]);
+
+impl fmt::Debug for Hidden<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hidden").field("len", &self.0.len()).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests;

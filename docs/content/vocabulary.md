@@ -4,6 +4,7 @@ rsauthnz names principals, authorities, and the objects of authorization with on
 identifiers. It records what an authentication proved as evidence. This page gives each type, its
 rules, and its canonical CBOR form. The CBOR codec is the one of [Parser limits](parser-limits.md).
 [Authorize an operation](authorization.md) checks an action on a resource with these identifiers.
+[Propose a transition](transitions.md) uses authority versions as the dependencies of a proposal.
 
 ## Identifiers
 

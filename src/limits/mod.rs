@@ -1,9 +1,9 @@
 //! Declared limits and cost classes: the bounds of untrusted input, and the class of the work of each operation.
 //!
-//! [`Limits`] is the one limit set of the crate. Each parser and each verifier checks its input against it before
-//! expensive work, and a refusal names the [`Limit`] that refused the input. A future bound joins [`Limits`] in the
-//! change that adds its first consumer: grants, resource scopes, dependencies, the keys of a key set, and the
-//! signatures of one artifact.
+//! [`Limits`] is the one limit set of the crate. Each parser, each verifier, and each transition proposal checks its
+//! input against it before expensive work, and a refusal names the [`Limit`] that refused the input. A future bound
+//! joins [`Limits`] in the change that adds its first consumer: grants, resource scopes, the keys of a key set, and
+//! the signatures of one artifact.
 //!
 //! [`Class`] is the cost class of an operation. Each public function names its class in its documentation, in the
 //! form "Cost class: [`Parse`](Class::Parse)." A method that takes only `&self` and returns no `Result` reads a
@@ -39,6 +39,11 @@ pub struct Limits {
     /// The most bytes in one byte or text string. For a JSON string, the bound applies to its UTF-8 after the
     /// escapes. The default is 16,384.
     pub string_bytes: usize,
+    /// The most dependencies of one transition proposal: each policy and record that its decision reads. The changes
+    /// of a proposal are at most this many too. The default is 64.
+    pub dependencies: usize,
+    /// The most effect intents of one transition proposal. The default is 8.
+    pub intents: usize,
 }
 
 impl Default for Limits {
@@ -49,6 +54,8 @@ impl Default for Limits {
             items: 1_024,
             map_keys: 64,
             string_bytes: 16_384,
+            dependencies: 64,
+            intents: 8,
         }
     }
 }
@@ -67,6 +74,10 @@ pub enum Limit {
     MapKeys,
     /// [`Limits::string_bytes`].
     StringBytes,
+    /// [`Limits::dependencies`].
+    Dependencies,
+    /// [`Limits::intents`].
+    Intents,
 }
 
 /// The cost class of an operation. A host admits each class with its own bound on concurrent work and pending

@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod id;
 pub mod json;
 pub mod limits;
+pub mod transition;
 
 /// Physical time: the reading of the family's shared types, which evidence times, expiry, and
 /// retention use. A reading has an estimate, an uncertainty bound or "unknown", and its source.

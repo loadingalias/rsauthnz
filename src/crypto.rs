@@ -1,5 +1,5 @@
 //! The facade of rscrypto: the only module of the core that calls it. Each signature check of the crate passes
-//! through [`Verifier::verify`], and a test build counts each call.
+//! through [`Verifier::verify`], and a test build counts each call. Each digest passes through [`sha256`].
 
 use alloc::boxed::Box;
 
@@ -50,6 +50,11 @@ impl Verifier {
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
         }
     }
+}
+
+/// The SHA-256 digest of `message`.
+pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
+    rscrypto::Sha256::digest(message)
 }
 
 /// Two keys are equal when their algorithms and their public keys are equal.

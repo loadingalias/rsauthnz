@@ -69,6 +69,7 @@ fn an_input_over_each_bound_refuses_before_a_signature_call() {
             items: 32,
             map_keys: 8,
             string_bytes: 128,
+            ..Limits::default()
         },
     };
     let now = Reading::new(
