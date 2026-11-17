@@ -316,6 +316,29 @@ fn a_restore_gives_the_state_and_the_mark_of_its_snapshot() {
     assert_eq!(entries(&mut memory), Ok(journal));
 }
 
+/// A restart and a restore stop the binding as a crash does: each append after the last sync is lost, so a sync after
+/// the next start makes none of them durable.
+#[test]
+fn a_restart_or_a_restore_loses_each_append_after_the_last_sync() {
+    for stop in ["restart", "restore"] {
+        let mut memory = Memory::new(Schedule::None);
+        let snapshot = memory.snapshot(Mark::EMPTY);
+        ready(memory.start()).unwrap();
+        ready(memory.append(b"synced")).unwrap();
+        ready(memory.sync()).unwrap();
+        let durable = entries(&mut memory).unwrap();
+        ready(memory.append(b"unsynced")).unwrap();
+        if stop == "restart" {
+            memory.restart();
+        } else {
+            memory.restore(&snapshot);
+        }
+        ready(memory.start()).unwrap();
+        ready(memory.sync()).unwrap();
+        assert_eq!(entries(&mut memory), Ok(durable), "{stop}");
+    }
+}
+
 /// A snapshot keeps the link of the entry at its mark, so a restore with the journal of another history refuses at
 /// its first entry after the mark, also when the sequences are the same.
 #[test]
