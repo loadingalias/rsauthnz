@@ -694,9 +694,10 @@ fn a_cancelled_commit_with_an_entry_ends_in_its_commit() {
     let a1p = key(Kind::Credential, "a1p");
     let first = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
     harness.run_until(committed("u-1"), |_| None);
-    harness.driver.cancel(first);
+    // The anchor change of the same owner waits when the cancel comes, so a released turn would run it first.
     let a1q = key(Kind::Credential, "a1q");
     harness.submit(proposal("u-2", &[&a1q], &[]), plan(&passkeys()[1..], &[]));
+    harness.driver.cancel(first);
     harness.run(|_| None);
     assert!(!harness.has(&appended(Written::Void, "u-1")));
     assert!(!harness.holds(&a1p));
