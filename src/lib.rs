@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod id;
 pub mod json;
 pub mod limits;
+pub mod store;
 pub mod transition;
 
 /// Physical time: the reading of the family's shared types, which evidence times, expiry, and

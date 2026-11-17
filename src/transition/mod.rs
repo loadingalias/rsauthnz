@@ -45,6 +45,7 @@
 //! proposal.change(Change::Write {
 //!     key: credential,
 //!     version: version(1)?,
+//!     end: None,
 //!     data: Box::new(*b"the credential record"),
 //! })?;
 //! assert_eq!(proposal.dependencies().len(), 2);
@@ -56,6 +57,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
+use core::time::Duration;
 
 use crate::cbor::{self, Value};
 use crate::crypto;
@@ -206,6 +208,10 @@ pub enum Change {
         key: Key,
         /// The new version.
         version: AuthorityVersion,
+        /// The end of the record, as the time since the Unix epoch, or `None` for a record with no end. Expiry
+        /// removes the record when the earliest time of a reading is past its end, so set the end past the last time
+        /// that a check can accept the record.
+        end: Option<Duration>,
         /// The record form. It can hold a secret, so `Debug` shows only its length.
         data: Box<[u8]>,
     },
@@ -224,10 +230,16 @@ impl Change {
 impl fmt::Debug for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Write { key, version, data } => f
+            Self::Write {
+                key,
+                version,
+                end,
+                data,
+            } => f
                 .debug_struct("Write")
                 .field("key", key)
                 .field("version", version)
+                .field("end", end)
                 .field("data", &Hidden(data))
                 .finish(),
             Self::End(key) => f.debug_tuple("End").field(key).finish(),
@@ -335,6 +347,76 @@ impl Intent {
         if !matches!(self.state, State::Ended(_)) {
             self.state = State::Ended(ended);
         }
+    }
+
+    /// The version of the intent record: a later state has a later version. A commit that changes the state of a
+    /// stored intent reads the record at its version and writes it at the version of the new state.
+    #[must_use]
+    pub fn version(&self) -> AuthorityVersion {
+        let state = match self.state {
+            State::Open => 1,
+            State::Cancelled => 2,
+            State::Ended(_) => 3,
+        };
+        let owner = Id::new("rsauthnz", "intent").expect("the owner of intent versions is a valid identifier");
+        AuthorityVersion::new(owner, &[state]).expect("a one-byte coordinate is valid")
+    }
+
+    /// The canonical CBOR form, which the store keeps as the record form of the intent: the array `[effect, state,
+    /// payload]`. The effect is 1 for a notification, 2 for a signer, and 3 for a provider. The state is 1 for open,
+    /// 2 for cancelled, 3 for completed, and 4 for returned.
+    #[must_use]
+    pub fn to_cbor(&self) -> Value<'_> {
+        let effect = match self.effect {
+            Effect::Notification => 1,
+            Effect::Signer => 2,
+            Effect::Provider => 3,
+        };
+        let state = match self.state {
+            State::Open => 1,
+            State::Cancelled => 2,
+            State::Ended(Ended::Completed) => 3,
+            State::Ended(Ended::Returned) => 4,
+        };
+        Value::Array(vec![
+            Value::Unsigned(effect),
+            Value::Unsigned(state),
+            Value::Bytes(&self.payload),
+        ])
+    }
+
+    /// Reads the canonical CBOR form of an intent.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Intent`] if `value` is not the form of [`Self::to_cbor`].
+    pub fn from_cbor(value: &Value<'_>) -> Result<Self, Error> {
+        let Value::Array(items) = value else {
+            return Err(Error::Intent);
+        };
+        let [Value::Unsigned(effect), Value::Unsigned(state), Value::Bytes(payload)] = items.as_slice() else {
+            return Err(Error::Intent);
+        };
+        let effect = match effect {
+            1 => Effect::Notification,
+            2 => Effect::Signer,
+            3 => Effect::Provider,
+            _ => return Err(Error::Intent),
+        };
+        let state = match state {
+            1 => State::Open,
+            2 => State::Cancelled,
+            3 => State::Ended(Ended::Completed),
+            4 => State::Ended(Ended::Returned),
+            _ => return Err(Error::Intent),
+        };
+        Ok(Self {
+            effect,
+            payload: (*payload).into(),
+            state,
+        })
     }
 }
 
@@ -573,6 +655,8 @@ pub enum Error {
     Change,
     /// The operation identity has the outcome record of another request.
     Reuse,
+    /// The stored form of an intent is not valid.
+    Intent,
 }
 
 impl Error {
@@ -581,9 +665,13 @@ impl Error {
     pub const fn recovery(&self) -> Recovery {
         match self {
             Self::Changed => Recovery::Restart,
-            Self::OperationId | Self::Key | Self::Request(_) | Self::Limit(_) | Self::Change | Self::Reuse => {
-                Recovery::Refuse
-            }
+            Self::OperationId
+            | Self::Key
+            | Self::Request(_)
+            | Self::Limit(_)
+            | Self::Change
+            | Self::Reuse
+            | Self::Intent => Recovery::Refuse,
         }
     }
 }
@@ -600,6 +688,7 @@ impl fmt::Display for Error {
             Self::Changed => f.write_str("the state changed between two reads of the decision"),
             Self::Change => f.write_str("no read of the proposal allows the change"),
             Self::Reuse => f.write_str("the operation identity is in use for another request"),
+            Self::Intent => f.write_str("the stored form of the intent is not valid"),
         }
     }
 }

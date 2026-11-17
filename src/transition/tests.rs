@@ -193,6 +193,7 @@ fn enroll(state: &Current, evidence: &Evidence) -> Result<Proposal, Error> {
     proposal.change(Change::Write {
         key: credential,
         version: version("auth", 1),
+        end: None,
         data: Box::new(*b"credential"),
     })?;
     Ok(proposal)
@@ -237,6 +238,7 @@ fn a_change_needs_a_read_that_allows_it() {
     let write = |name: &str, version| Change::Write {
         key: key(name),
         version,
+        end: None,
         data: Box::new([]),
     };
     let mut proposal = proposal(b"op-1", human(), "session.renew", "s-1");
@@ -336,6 +338,7 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
         .change(Change::Write {
             key: key("session"),
             version: version("auth", 1),
+            end: None,
             data: SECRET.into(),
         })
         .unwrap();

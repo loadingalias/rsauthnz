@@ -6,8 +6,8 @@ binding of the application accepts a proposal. It checks each dependency of the 
 state changes, the audit, the effect intents, and the outcome record in one atomic commit. A proposal is not a
 commit and grants no authority.
 
-This release has no storage contract and no commit driver yet. Thus a proposal can be built and inspected, but
-nothing commits it, and no operation gives a `Receipt`.
+This release has no commit driver yet. Thus a proposal can be built and inspected, but nothing commits it, and no
+operation gives a `Receipt`. [Storage contract](storage.md) gives the commit that a storage binding implements.
 
 ## Build a proposal
 
@@ -51,6 +51,7 @@ proposal.change(Change::End(invitation))?;
 proposal.change(Change::Write {
     key: credential,
     version: version(1)?,
+    end: None,
     data: Box::new(*b"the credential record"),
 })?;
 assert_eq!(proposal.dependencies().len(), 2);
@@ -81,9 +82,12 @@ A `Change` writes or ends one record. A read of the proposal must allow it, or `
 
 | `Change` | The read that allows it |
 | --- | --- |
-| `Write { key, version, data }` of a new record | `Absent(key)` |
-| `Write { key, version, data }` of a record that exists | `Version(key, earlier)`, with `version` later than `earlier` and of the same owner |
+| `Write { key, version, end, data }` of a new record | `Absent(key)` |
+| `Write { key, version, end, data }` of a record that exists | `Version(key, earlier)`, with `version` later than `earlier` and of the same owner |
 | `End(key)`: a consumption of a one-use value, a revocation, or a removal | `Version(key, current)` |
+
+The `end` of a write is the time since the Unix epoch after which expiry can remove the record, or `None`. Set it
+past the last time that a check can accept the record.
 
 One proposal changes each record one time. Thus two consumptions of one value cannot both commit: the second one
 reads a version that the first one ended. A write cannot make an earlier version current again. The changes of a
@@ -126,7 +130,8 @@ proposal has no accessor for it. The store never keeps the artifact, so the rece
 ## Effect intents
 
 Notification, signer, and provider calls are not part of the commit. An `Intent` records such a call in the
-commit, so that the call survives a crash. The application calls the effect after the commit.
+commit, so that the call survives a crash. The application calls the effect after the commit. [Storage
+contract](storage.md#effect-intents) gives how a worker finds the stored intents and changes their state.
 
 | `State` | Meaning |
 | --- | --- |
