@@ -1,42 +1,13 @@
 //! The contracts of the CBOR codec: the RFC 8949 Appendix A vectors, the limits, and the typed refusals. A counting
 //! allocator shows that a refusal allocates no memory.
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::Cell;
-use std::alloc::System;
+mod counting;
 
 use rsauthnz::cbor::Value::{Array, Bool, Bytes, Float, Map, Negative, Null, Simple, Tag, Text, Unsigned};
 use rsauthnz::cbor::{Error, decode, decode_prefix, encode};
 use rsauthnz::limits::{Limit, Limits};
 
-thread_local! {
-    /// The allocations of this thread. Each test runs on its own thread, so a test counts only its own allocations.
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Counts each allocation of the thread, then gives it to the system allocator.
-struct Counting;
-
-#[expect(
-    unsafe_code,
-    reason = "a global allocator implements an unsafe trait; each method forwards to `System` unchanged"
-)]
-// SAFETY: each method gives its arguments, and the contract of its caller, to `System` with no change.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.with(|count| count.set(count.get() + 1));
-        // SAFETY: the caller keeps the contract of `GlobalAlloc::alloc`, which is also the contract of `System`.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `System.alloc` with `layout`, through `Counting::alloc`.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
+use counting::allocations;
 
 /// The bytes of a string of hexadecimal digits.
 fn hex(digits: &str) -> Vec<u8> {
@@ -54,20 +25,11 @@ fn limits(set: impl FnOnce(&mut Limits)) -> Limits {
     limits
 }
 
-/// Decodes `input` and gives its refusal. A refusal must allocate no memory. First, an accepted array must
-/// allocate: thus a count that does not work fails, and does not hide an allocation.
+/// Decodes `input` and gives its refusal. A refusal must allocate no memory.
 fn refusal(input: &[u8], limits: Limits) -> Option<Error> {
-    let counted = ALLOCATIONS.with(Cell::get);
-    decode(&[0x82, 0x01, 0x02], Limits::default()).expect("[1, 2]");
-    let before = ALLOCATIONS.with(Cell::get);
-    assert!(before > counted, "the decode of [1, 2] counted no allocation");
-    let error = decode(input, limits).err();
+    let (error, allocated) = allocations(|| decode(input, limits).err());
     if error.is_some() {
-        assert_eq!(
-            ALLOCATIONS.with(Cell::get),
-            before,
-            "the refusal of {input:02x?} allocated memory"
-        );
+        assert_eq!(allocated, 0, "the refusal of {input:02x?} allocated memory");
     }
     error
 }

@@ -17,24 +17,27 @@
 /// The bounds of one decode. Each parser of the crate takes them, and [`Limit`] names the bound that refused an
 /// input.
 ///
-/// A decoded value has at most [`Self::items`] items, and its strings borrow the input. Thus the decoded size is at
-/// most [`Self::items`] times the size of one item, and the decode does not expand the input past that bound.
+/// A decoded value has at most [`Self::items`] items. Its strings borrow the input, but a JSON string with an escape
+/// is a copy that is not longer than its text in the input. Thus the decoded size is at most [`Self::items`] times
+/// the size of one item, plus the bytes of the input, and the decode does not expand the input past that bound.
 ///
 /// A new bound can join the set, so build a value from [`Limits::default`] and set each field that you change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
-    /// The most bytes in the encoded item. The default is 65,536.
+    /// The most bytes in the encoded item or the JSON text. The default is 65,536.
     pub bytes: usize,
-    /// The most levels of nested arrays, maps, and tags. Each array, map, or tag adds one level. The default is 16.
-    /// The type keeps the recursion of the decoder at 255 levels or fewer.
+    /// The most levels of nested arrays, maps, tags, and JSON objects. Each array, map, tag, or object adds one
+    /// level. The default is 16. The type keeps the recursion of each decoder at 255 levels or fewer.
     pub depth: u8,
     /// The most data items. Each item counts: the outer item, and each array element, map key, map value, and
-    /// tagged item. The default is 1,024.
+    /// tagged item. In JSON, the outer value, each array element, and each member name and member value count. The
+    /// default is 1,024.
     pub items: usize,
-    /// The most keys in one map. The default is 64.
+    /// The most keys in one map, and the most members in one JSON object. The default is 64.
     pub map_keys: usize,
-    /// The most bytes in one byte or text string. The default is 16,384.
+    /// The most bytes in one byte or text string. For a JSON string, the bound applies to its UTF-8 after the
+    /// escapes. The default is 16,384.
     pub string_bytes: usize,
 }
 

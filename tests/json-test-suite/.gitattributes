@@ -1,0 +1,2 @@
+# The cases are exact bytes: no end-of-line conversion and no whitespace check.
+test_parsing/* binary

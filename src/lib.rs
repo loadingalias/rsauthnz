@@ -3,11 +3,13 @@
 extern crate alloc;
 
 pub mod authz;
+pub mod b64;
 pub mod cbor;
 pub mod cose;
 mod crypto;
 pub mod evidence;
 pub mod id;
+pub mod json;
 pub mod limits;
 
 /// Physical time: the reading of the family's shared types, which evidence times, expiry, and
