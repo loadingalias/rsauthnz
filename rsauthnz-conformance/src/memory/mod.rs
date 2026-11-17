@@ -6,14 +6,16 @@
 //! give each concurrent caller its own clone.
 //!
 //! The binding simulates a durable store, and a restore journal in a separate failure domain. A [`Schedule`] injects
-//! each [`Fault`] at a primitive. The same schedule and the same calls give the same results. A fault is a crash of
-//! the simulated store: the store keeps each commit that landed, and the journal keeps each entry whose sync returned.
-//! The crash loses the appends after the last sync. After a crash, each primitive except [`Store::start`] gives the
-//! [`Error`] of the crash.
+//! each [`Fault`] at a primitive, and [`Subject::inject`] gives a fault to the next call of its primitive. The same
+//! faults and the same calls give the same results. A fault is a crash of the simulated store: the store keeps each
+//! commit that landed, and the journal keeps each entry whose sync returned. The crash loses the appends after the
+//! last sync. After a crash, each primitive except [`Store::start`] gives the [`Error`] of the crash.
 //!
-//! [`Memory::restart`] is the loss of the process: the store loses all its state, and the journal keeps its synced
-//! entries. The declaration states it with [`CrashLoss::Everything`]. [`Memory::snapshot`] and [`Memory::restore`]
-//! copy the state of the store with a low-water mark, and [`Memory::lose`] removes entries of the journal.
+//! The binding implements [`Subject`], the controls of the conformance [suite](crate::suite), and passes each case.
+//! [`Subject::restart`] is the loss of the process: the store loses all its state, and the journal keeps its synced
+//! entries. The declaration states it with [`CrashLoss::Everything`]. [`Subject::snapshot`] and [`Subject::restore`]
+//! copy the state of the store, whose mark record holds its low-water mark. [`Subject::lose`] removes entries of the
+//! journal.
 //!
 //! Each future of the binding is ready at its first poll. A commit whose response is lost gives an error, and a lookup
 //! after the next start shows that it landed:
@@ -30,6 +32,7 @@
 //! use rsauthnz::time::{Reading, ReadingSource};
 //! use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
 //! use rsauthnz_conformance::memory::{Error, Fault, Memory, Schedule};
+//! use rsauthnz_conformance::suite::Subject;
 //!
 //! /// The output of a future of the memory binding.
 //! fn ready<F: Future>(future: F) -> F::Output {
@@ -39,8 +42,7 @@
 //!     }
 //! }
 //!
-//! // The first commit loses its response.
-//! let mut memory = Memory::new(Schedule::At(0, Fault::LostResponse));
+//! let mut memory = Memory::new(Schedule::None);
 //! let instance = ready(memory.start())?;
 //!
 //! // The proposal creates a credential.
@@ -60,6 +62,7 @@
 //! })?;
 //!
 //! // The commit lands, and its response is lost. The binding stops until the next start.
+//! memory.inject(Fault::LostResponse);
 //! assert_eq!(ready(memory.commit(&proposal, instance)), Err(Error::Crash(Fault::LostResponse)));
 //! ready(memory.start())?;
 //! let outcome = ready(memory.outcome(&proposal.operation().id))?;
@@ -77,7 +80,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::limits::Limits;
-use rsauthnz::store::journal::Mark;
 use rsauthnz::store::{
     self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
     Sequence, Store,
@@ -85,7 +87,9 @@ use rsauthnz::store::{
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
 use rscrypto::RapidHash64;
 
-/// A fault that a [`Schedule`] injects at one primitive. Each fault crashes the binding.
+use crate::suite::Subject;
+
+/// A fault that a [`Schedule`] or [`Subject::inject`] gives to one primitive. Each fault crashes the binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
     /// The binding crashes before a commit, so the commit writes nothing.
@@ -139,10 +143,6 @@ enum Primitive {
 pub enum Schedule {
     /// No fault.
     None,
-    /// The fault at the call of its primitive with this number. The count starts at 0 when the binding is made, and
-    /// a call to a stopped binding does not count. A commit fault counts the commits, [`Fault::CrashAfterAppend`]
-    /// counts the appends, and [`Fault::FailedSync`] counts the syncs.
-    At(u64, Fault),
     /// Faults from this seed. Each commit, append, and sync takes a fault with a chance of one in 8, and each fault
     /// of its primitive has the same chance. The draw of a call is the RapidHash of its primitive and its number,
     /// with the seed, so a seed gives the same faults at each run.
@@ -172,13 +172,10 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// A snapshot of the store with its low-water mark, which keeps the link of its entry. A restore gives back its state,
-/// and the journal keeps its own entries.
+/// A snapshot of the store. The mark record of the store state holds its low-water mark. A restore gives back its
+/// state, and the journal keeps its own entries.
 #[derive(Clone, Debug)]
-pub struct Snapshot {
-    state: State,
-    mark: Mark,
-}
+pub struct Snapshot(State);
 
 /// The state of the simulated store. A crash keeps it, and a restart loses it.
 #[derive(Clone, Debug, Default)]
@@ -263,6 +260,8 @@ struct Binding {
     /// A commit of [`Fault::DelayedCommit`] and its instance number. It lands after the next start.
     delayed: Option<(Request, Instance)>,
     schedule: Schedule,
+    /// The fault of [`Subject::inject`] for the next call of its primitive.
+    injected: Option<Fault>,
     /// The number of calls of each primitive that can take a fault, in the order of [`Primitive`].
     calls: [u64; 3],
 }
@@ -285,9 +284,11 @@ impl Binding {
         let count = &mut self.calls[primitive as usize];
         let call = *count;
         *count = call.strict_add(1);
+        if let Some(fault) = self.injected.take_if(|fault| fault.primitive() == primitive) {
+            return Some(fault);
+        }
         match self.schedule {
             Schedule::None => None,
-            Schedule::At(at, fault) => (fault.primitive() == primitive && at == call).then_some(fault),
             Schedule::Seeded(seed) => {
                 let mut data = [primitive as u8; 9];
                 data[1..].copy_from_slice(&call.to_le_bytes());
@@ -352,6 +353,7 @@ impl Memory {
             stopped: Some(Error::Stopped),
             delayed: None,
             schedule,
+            injected: None,
             calls: [0; 3],
         })))
     }
@@ -361,37 +363,36 @@ impl Memory {
     fn lock(&self) -> MutexGuard<'_, Binding> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
 
-    /// A snapshot of the current state of the store, with the low-water mark `mark`: the caller states the mark of the
-    /// journal entry at or below which the state reflects each entry, as `journal::low_water` gives it.
-    #[must_use]
-    pub fn snapshot(&self, mark: Mark) -> Snapshot {
-        Snapshot {
-            state: self.lock().store.clone(),
-            mark,
-        }
+impl Subject for Memory {
+    type Snapshot = Snapshot;
+
+    fn inject(&self, fault: Fault) {
+        self.lock().injected = Some(fault);
     }
 
-    /// Restores the state of the store from `snapshot` and gives its low-water mark. The journal keeps its entries.
-    /// The binding stops: the appends after the last sync are lost, and it serves again after a start.
-    pub fn restore(&self, snapshot: &Snapshot) -> Mark {
-        let mut binding = self.lock();
-        binding.stop(Error::Stopped);
-        binding.store = snapshot.state.clone();
-        snapshot.mark
-    }
-
-    /// The loss of the process: the store loses all its state, and the journal keeps its durable entries. The binding
-    /// stops, and it serves again after a start.
-    pub fn restart(&self) {
+    /// The loss of the process: the store loses all its state, and the journal keeps its durable entries. The appends
+    /// after the last sync are lost.
+    fn restart(&self) {
         let mut binding = self.lock();
         binding.stop(Error::Stopped);
         binding.store = State::default();
     }
 
-    /// Removes the durable entries of the journal with a sequence in `sequences`. `lose(..)` is the loss of the
-    /// journal, and a smaller range is a gap. A later append does not get the sequence of a removed entry.
-    pub fn lose(&self, sequences: impl RangeBounds<Sequence>) {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot(self.lock().store.clone())
+    }
+
+    /// Restores the state of the store from `snapshot`. The journal keeps its entries, and the appends after the last
+    /// sync are lost.
+    fn restore(&self, snapshot: &Snapshot) {
+        let mut binding = self.lock();
+        binding.stop(Error::Stopped);
+        binding.store = snapshot.0.clone();
+    }
+
+    fn lose(&self, sequences: impl RangeBounds<Sequence>) {
         self.lock().journal.retain(|sequence, _| !sequences.contains(sequence));
     }
 }

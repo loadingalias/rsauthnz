@@ -33,6 +33,7 @@ use rsauthnz::store::{Kind, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
 use rsauthnz_conformance::memory::{Error, Fault, Memory, Schedule};
+use rsauthnz_conformance::suite::Subject;
 
 /// The output of a future of the memory binding.
 fn ready<F: Future>(future: F) -> F::Output {
@@ -42,8 +43,7 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
-// The first commit loses its response.
-let mut memory = Memory::new(Schedule::At(0, Fault::LostResponse));
+let mut memory = Memory::new(Schedule::None);
 let instance = ready(memory.start())?;
 
 // The proposal creates a credential.
@@ -63,6 +63,7 @@ proposal.change(Change::Write {
 })?;
 
 // The commit lands, and its response is lost. The binding stops until the next start.
+memory.inject(Fault::LostResponse);
 assert_eq!(ready(memory.commit(&proposal, instance)), Err(Error::Crash(Fault::LostResponse)));
 ready(memory.start())?;
 let outcome = ready(memory.outcome(&proposal.operation().id))?;
@@ -76,14 +77,14 @@ futures in an executor gets the same results.
 2. Call `Store::start` to get the store instance number (`Instance`). Give it to each commit.
 3. Call the primitives. After an error, call `Store::start` again, then check the state.
 
-## Schedule faults
+## Inject faults
 
-`Schedule` selects the faults:
+`memory.inject(fault)` gives `fault` to the next call of its primitive. It is a method of
+`rsauthnz_conformance::suite::Subject`, so import the trait. `Schedule` selects the faults of the other calls:
 
 | `Schedule` | Faults |
 | --- | --- |
 | `Schedule::None` | No fault |
-| `Schedule::At(n, fault)` | `fault` at the call `n` of its primitive. The count starts at 0 when the binding is made, and a call to a stopped binding does not count |
 | `Schedule::Seeded(seed)` | Each commit, append, and sync takes a fault with a chance of one in 8. Each fault of the primitive has the same chance. The draw of each call is the RapidHash of the call with the seed, so a seed gives the same faults at each run |
 
 Each fault is a crash of the simulated store:
@@ -106,11 +107,14 @@ primitive except `Store::start` gives `Error::Crash(fault)` until the next start
 The journal is in a simulated failure domain apart from the store and its snapshots. Thus a restart and a restore
 do not change the durable entries of the journal.
 
+These operations are the methods of `rsauthnz_conformance::suite::Subject`, the test controls of the
+[conformance suite](conformance.md). Import the trait to call them. The memory binding passes each case of the suite.
+
 | Operation | Effect |
 | --- | --- |
 | `memory.restart()` | The loss of the process. The store loses all its records: the policy, audit, outcome, and intent records too. The binding stops |
-| `memory.snapshot(mark)` | Gives a `Snapshot` of the state of the store with the low-water mark `mark`, a `journal::Mark`: the sequence and the link of an entry. The caller states the mark, as `journal::low_water` gives it ([Restore journal](restore.md)) |
-| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, and gives its low-water mark. The binding stops. A `History` from that mark refuses a journal of another history |
+| `memory.snapshot()` | Gives a `Snapshot` of the state of the store. The mark record of the store (`Kind::Mark`) holds its low-water mark, so the snapshot holds it too ([Restore journal](restore.md)) |
+| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot. The binding stops. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
 
 A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start gives a larger instance number for
