@@ -47,7 +47,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 
 use super::journal::{self, Anchor, Body, Entries, History, Mark, Reads, Role};
-use super::{Commit, Declaration, Instance, Kind, Record, Restore, Sequence, intent_records, outcome_of};
+use super::{Commit, Instance, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of};
 use crate::cbor;
 use crate::id::AuthorityVersion;
 use crate::limits::Limits;
@@ -71,6 +71,17 @@ pub const FLOOR_BLOCK: NonZeroU64 = NonZeroU64::new(1_024).expect("the block is 
 
 /// The most entries, intents, or records of one read or expiry call.
 pub const PAGE: NonZeroUsize = NonZeroUsize::new(256).expect("the page is not zero");
+
+/// The least record bound ([`Declaration::record_bytes_max`](super::Declaration::record_bytes_max)) of a binding for
+/// a driver with `limits`: the most bytes in a record that the driver writes for itself. These are the mark record,
+/// the replay floor, the anchors of a restore and of a completion, and the audit record of each of its commits. The
+/// audit record holds the key of each change, so the bound grows with [`Limits::dependencies`].
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn record_bytes_min(limits: Limits) -> usize {
+    record::bytes_max(limits)
+}
 
 /// The identity of an operation that the driver runs. [`Driver::take`] gives its answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -180,6 +191,12 @@ pub enum Error {
     Full,
     /// The proposal refuses. The error gives the recovery.
     Transition(transition::Error),
+    /// The record bound of the binding is below this number of bytes, the least bound for the limits of the driver
+    /// ([`record_bytes_min`]). Use a binding with a larger record bound, or smaller limits.
+    RecordBound(usize),
+    /// A record that the commit of the proposal writes is longer than the record bound of the binding
+    /// ([`Profile::admit`]). Refuse the request.
+    RecordBytes,
     /// The driver serves no operation yet. Call [`Driver::start`].
     Down,
     /// A counter is past its largest value.
@@ -202,6 +219,8 @@ impl fmt::Display for Error {
             Self::Long => f.write_str("the journal has too many entries after the mark"),
             Self::Full => f.write_str("too many operations wait for the driver"),
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),
+            Self::RecordBound(bytes) => write!(f, "the record bound of the binding is below {bytes} bytes"),
+            Self::RecordBytes => f.write_str("a record of the proposal is larger than the record bound of the binding"),
             Self::Down => f.write_str("the driver serves no operation yet"),
             Self::Overflow => f.write_str("a counter is past its largest value"),
             Self::Binding => f.write_str("the binding gave an output that the driver did not ask for"),
@@ -324,6 +343,8 @@ enum Work {
 #[derive(Debug)]
 pub struct Driver {
     core: Core,
+    /// The accepted declaration of the binding. Each submitted proposal passes [`Profile::admit`].
+    profile: Profile,
     queue: VecDeque<Job>,
     job: Option<Job>,
     answers: BTreeMap<Ticket, Answer>,
@@ -331,13 +352,21 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// A driver for a binding with `declaration`. Each journal entry and each proposal of the driver stays within
-    /// `limits`. The driver is down until the first [`Driver::start`].
+    /// A driver for a binding with the accepted declaration `profile`, so no driver exists for a binding that
+    /// [`Profile::new`] refuses. Each journal entry and each proposal of the driver stays within `limits`. The driver
+    /// is down until the first [`Driver::start`].
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    #[must_use]
-    pub fn new(declaration: &Declaration, limits: Limits) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RecordBound`] when the record bound of the binding is below [`record_bytes_min`] of `limits`: the
+    /// binding cannot store each record that the driver writes for itself.
+    pub fn new(profile: Profile, limits: Limits) -> Result<Self, Error> {
+        let least = record_bytes_min(limits);
+        let declaration = profile.declaration();
+        (declaration.record_bytes_max >= least).ok_or(Error::RecordBound(least))?;
+        Ok(Self {
             core: Core {
                 journal: matches!(declaration.restore, Restore::Journal { .. }),
                 loses: declaration.crash_loss == super::CrashLoss::Everything,
@@ -353,11 +382,12 @@ impl Driver {
                 floor_key: record::floor_key(),
                 advanced: 0,
             },
+            profile,
             queue: VecDeque::new(),
             job: None,
             answers: BTreeMap::new(),
             tickets: 0,
-        }
+        })
     }
 
     /// The state of the driver.
@@ -436,7 +466,9 @@ impl Driver {
     /// # Errors
     ///
     /// [`Error::Transition`] for a proposal whose entries the journal cannot read back, or with no room for the
-    /// journal intent, [`Error::Journal`] for a plan that does not fit the proposal, and [`Error::Full`].
+    /// journal intent, [`Error::Journal`] for a plan that does not fit the proposal, [`Error::RecordBytes`] for a
+    /// proposal that the binding cannot store ([`Profile::admit`]), and [`Error::Full`]. A refused proposal never
+    /// reaches the binding.
     pub fn submit(&mut self, mut proposal: Proposal, plan: Plan) -> Result<Ticket, Error> {
         (self.queue.len() < QUEUE_MAX).ok_or(Error::Full)?;
         let entries = journal::entries(&proposal, &plan.replaced, &plan.anchors)?;
@@ -467,6 +499,8 @@ impl Driver {
                     .map(|(key, record)| (key.clone(), record.version.clone()));
             }
         }
+        // The check comes after the journal intent, because the binding stores the intent too.
+        self.profile.admit(&proposal).map_err(|_| Error::RecordBytes)?;
         let ticket = self.ticket();
         self.queue.push_back(Job {
             ticket: Some(ticket),
@@ -933,7 +967,7 @@ impl Scanning {
 /// The commit of the driver that ends the intent record `key` at `version`.
 fn release(core: &mut Core, key: &Key, version: &AuthorityVersion) -> Result<Proposal, Error> {
     let id = core.operation();
-    let mut proposal = record::proposal(id, "store.intent", core.now, core.limits);
+    let mut proposal = record::proposal(id, record::INTENT, core.now, core.limits);
     proposal
         .read(Dependency::Version(key.clone(), version.clone()))
         .map_err(Error::Transition)?;
@@ -1393,7 +1427,7 @@ impl Start {
         let mut proposals = VecDeque::new();
         for changes in [facts, anchors] {
             for chunk in changes.chunks(core.limits.dependencies.max(1)) {
-                let mut proposal = record::proposal(core.operation(), "store.restore", core.now, core.limits);
+                let mut proposal = record::proposal(core.operation(), record::RESTORE, core.now, core.limits);
                 for (read, change) in chunk {
                     proposal.read(read.clone()).map_err(Error::Transition)?;
                     proposal.change(change.clone()).map_err(Error::Transition)?;
@@ -1432,7 +1466,7 @@ impl Start {
                 id: entry.operation.clone(),
                 binding: consumption.binding,
             };
-            let mut proposal = Proposal::again(operation, record::audit("store.restore", core.now), core.limits);
+            let mut proposal = Proposal::again(operation, record::audit(record::RESTORE, core.now), core.limits);
             for anchor in &consumption.anchors {
                 proposal
                     .read(Dependency::Absent(anchor.key.clone()))

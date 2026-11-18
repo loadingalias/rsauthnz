@@ -72,17 +72,26 @@ fn a_declaration_without_an_atomic_commit_refuses_its_profile() {
     );
 }
 
-/// The bound of the binding applies to each record form and each intent payload, before the commit.
+/// The bound of the binding applies to each record that the commit writes, before the commit: the record form of a
+/// write, an intent record, and the audit record, which holds the key of each change. A proposal admits at the bound
+/// of its longest stored record, and refuses one byte below it.
 #[test]
 fn a_record_over_the_bound_of_the_binding_refuses_before_the_commit() {
-    let profile = Profile::new(declaration()).unwrap();
+    let profile = |bytes| {
+        Profile::new(Declaration {
+            record_bytes_max: bytes,
+            ..declaration()
+        })
+        .unwrap()
+    };
     let audit = Audit {
         actor: Principal::Human(Id::<Human>::new("acme", "u-17").unwrap()),
         action: Id::new("acme.auth", "credential.enroll").unwrap(),
         time: reading(1_000),
     };
     let version = AuthorityVersion::new(Id::new("acme", "auth").unwrap(), &[1]).unwrap();
-    let proposal = |data: &[u8], payload: &[u8]| {
+    // Each proposal writes one record of `data`, one more key for each of `keys`, and one intent of `payload`.
+    let proposal = |data: usize, keys: u8, payload: usize| {
         let mut proposal = Proposal::new(
             OperationId::new(b"op-1").unwrap(),
             audit.clone(),
@@ -90,24 +99,50 @@ fn a_record_over_the_bound_of_the_binding_refuses_before_the_commit() {
             Limits::default(),
         )
         .unwrap();
-        let key = Kind::Credential.key(b"c-4").unwrap();
-        proposal.read(Dependency::Absent(key.clone())).unwrap();
+        for index in 0..=keys {
+            let id = [index; 1_000];
+            let key = Kind::Credential.key(if index == 0 { b"c-4" } else { &id[..] }).unwrap();
+            proposal.read(Dependency::Absent(key.clone())).unwrap();
+            let data = if index == 0 { vec![0; data] } else { Vec::new() };
+            proposal
+                .change(Change::Write {
+                    key,
+                    version: version.clone(),
+                    end: None,
+                    data: data.into(),
+                })
+                .unwrap();
+        }
         proposal
-            .change(Change::Write {
-                key,
-                version: version.clone(),
-                end: None,
-                data: data.into(),
-            })
-            .unwrap();
-        proposal
-            .intend(Intent::new(Effect::Notification, payload.into()))
+            .intend(Intent::new(Effect::Notification, vec![0; payload].into()))
             .unwrap();
         proposal
     };
-    assert_eq!(profile.admit(&proposal(b"four", b"four")), Ok(()));
-    assert_eq!(profile.admit(&proposal(b"five!", b"four")), Err(Error::RecordBytes));
-    assert_eq!(profile.admit(&proposal(b"four", b"five!")), Err(Error::RecordBytes));
+    // The longest record is the write, the intent record, and the audit record, in this order.
+    for (proposal, longest) in [
+        (proposal(4_000, 0, 10), Kind::Credential),
+        (proposal(10, 0, 4_000), Kind::Intent),
+        (proposal(10, 3, 10), Kind::Audit),
+    ] {
+        let mut stored: Vec<(Key, usize)> = [audit_record(&proposal), outcome_record(&proposal)]
+            .into_iter()
+            .chain(intent_records(&proposal).unwrap())
+            .map(|(key, record)| (key, record.data.len()))
+            .collect();
+        for change in proposal.changes() {
+            if let Change::Write { key, data, .. } = change {
+                stored.push((key.clone(), data.len()));
+            }
+        }
+        let (key, bytes) = stored.into_iter().max_by_key(|(_, bytes)| *bytes).unwrap();
+        assert_eq!(Kind::of(&key), Some(longest));
+        assert_eq!(profile(bytes).admit(&proposal), Ok(()), "{longest:?}");
+        assert_eq!(
+            profile(bytes - 1).admit(&proposal),
+            Err(Error::RecordBytes),
+            "{longest:?}"
+        );
+    }
 }
 
 /// A key names its kind, so the records of two kinds with the same identifier never meet.

@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 use core::assert_matches;
 use core::time::Duration;
 
-use super::{Answer, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket};
+use super::{Answer, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min};
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{self, Anchor, Body, Mark, Role};
 use crate::store::{
-    self, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, Kind, Record, Restore, Sequence,
-    audit_record, intent_records, outcome_of, outcome_record,
+    self, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, Kind, Profile, Record, Restore,
+    Sequence, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Outcome, Proposal};
@@ -79,7 +79,7 @@ fn declaration(journal: bool) -> Declaration {
             Restore::Unsupported
         },
         key_bytes_max: Key::BYTES_MAX,
-        record_bytes_max: 1 << 16,
+        record_bytes_max: usize::MAX,
     }
 }
 
@@ -371,9 +371,9 @@ struct Harness {
 }
 
 impl Harness {
-    fn new(journal: bool, double: Double) -> Self {
+    fn new(declaration: Declaration, double: Double) -> Self {
         Self {
-            driver: Driver::new(&declaration(journal), Limits::default()),
+            driver: Driver::new(Profile::new(declaration).unwrap(), Limits::default()).unwrap(),
             double,
             events: Vec::new(),
             tickets: Vec::new(),
@@ -383,7 +383,7 @@ impl Harness {
 
     /// A harness whose driver started on the store of [`Double::new`] and serves.
     fn serving(journal: bool) -> Self {
-        let mut harness = Self::new(journal, Double::new());
+        let mut harness = Self::new(declaration(journal), Double::new());
         harness.driver.start(now());
         harness.run(|_| None);
         assert_eq!(harness.driver.status(), Status::Serving);
@@ -621,6 +621,54 @@ fn no_answer_comes_before_the_creation_entry_of_an_anchor_commit_of_the_owner() 
     );
 }
 
+/// A binding whose record bound is below the longest record that the driver writes for itself gets no driver: it
+/// refuses with the least bound. At that bound, the driver serves.
+#[test]
+fn a_record_bound_below_the_records_of_the_driver_refuses_at_the_construction() {
+    let least = record_bytes_min(Limits::default());
+    let driver = |bytes| {
+        let declaration = Declaration {
+            record_bytes_max: bytes,
+            ..declaration(true)
+        };
+        Driver::new(Profile::new(declaration).unwrap(), Limits::default())
+    };
+    assert_matches!(driver(least - 1), Err(Error::RecordBound(bytes)) if bytes == least);
+    assert_matches!(driver(least), Ok(_));
+}
+
+/// A proposal with a record longer than the record bound of the binding refuses at its submission, so the binding
+/// never gets its commit.
+#[test]
+fn a_proposal_over_the_record_bound_refuses_before_the_binding_gets_it() {
+    let least = record_bytes_min(Limits::default());
+    let bounded = Declaration {
+        record_bytes_max: least,
+        ..declaration(true)
+    };
+    let mut harness = Harness::new(bounded, Double::new());
+    harness.driver.start(now());
+    harness.run(|_| None);
+    let credential = key(Kind::Credential, "c-9");
+    let mut long = proposal("w-1", &[], &[]);
+    long.read(Dependency::Absent(credential.clone())).unwrap();
+    long.change(Change::Write {
+        key: credential,
+        version: version(1),
+        end: None,
+        data: vec![0; least + 1].into(),
+    })
+    .unwrap();
+    assert_eq!(harness.driver.submit(long, Plan::default()), Err(Error::RecordBytes));
+    harness.run(|_| None);
+    assert!(
+        !harness
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Commit(id, _) if *id == op("w-1")))
+    );
+}
+
 /// Each commit carries the instance number of the latest start, so the binding refuses a commit of an earlier
 /// instance.
 #[test]
@@ -665,7 +713,7 @@ fn in_doubt() -> Double {
 /// next start completes the rest before it serves. A second restore decision would find the bootstrap value ended.
 #[test]
 fn a_crash_during_the_completions_completes_the_rest_at_the_next_start() {
-    let mut harness = Harness::new(true, in_doubt());
+    let mut harness = Harness::new(declaration(true), in_doubt());
     harness.driver.restore(now()).unwrap();
     harness.run(once(committed("b-1"), Fault::Fail));
     assert_eq!(harness.driver.status(), Status::Down);
@@ -724,7 +772,7 @@ fn a_restore_applies_the_journal_after_the_mark_of_its_snapshot() {
         (op("u-1"), Body::End(removal.end.unwrap())),
         (op("e-1"), Body::Creation(vec![anchor(&a1s, sign_in("a1"))])),
     ]);
-    let mut harness = Harness::new(true, double);
+    let mut harness = Harness::new(declaration(true), double);
     harness.driver.restore(now()).unwrap();
     let lookup = harness.lookup("u-1");
     harness.run(|_| None);

@@ -80,7 +80,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rsauthnz::id::AuthorityVersion;
-use rsauthnz::limits::Limits;
 use rsauthnz::store::{
     self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
     Sequence, Store,
@@ -449,7 +448,7 @@ impl Store for Memory {
                 failure_domain: "a simulated domain apart from the store and from its snapshots".into(),
             },
             key_bytes_max: Key::BYTES_MAX,
-            record_bytes_max: Limits::default().bytes,
+            record_bytes_max: usize::MAX,
         }
     }
 

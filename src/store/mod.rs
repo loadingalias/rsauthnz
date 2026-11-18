@@ -9,7 +9,8 @@
 //!
 //! A [`Declaration`] states the isolation, what a crash can lose, the outcome retention, crash injection, restore
 //! support, and the key and record bounds of a binding. [`Profile::new`] refuses a binding without an atomic
-//! conditional commit over the complete dependency set.
+//! conditional commit over the complete dependency set, and the commit driver ([`driver::Driver::new`]) takes only a
+//! [`Profile`].
 //!
 //! The commit takes a proposal, and no primitive writes state, audit, or an outcome record in another way. Thus
 //! state changes cannot commit without their audit and their outcome record:
@@ -360,8 +361,12 @@ pub struct Declaration {
     pub restore: Restore,
     /// The most bytes in a key that the binding stores. It must be at least [`Key::BYTES_MAX`].
     pub key_bytes_max: usize,
-    /// The most bytes in the record form of a write and in the payload of an intent. A larger one refuses before
-    /// the commit ([`Profile::admit`]).
+    /// The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit
+    /// record, or an outcome record. A proposal with a larger one refuses before the commit ([`Profile::admit`]):
+    /// [`driver::Driver::submit`] refuses it, so the binding never gets it.
+    ///
+    /// The least bound is [`driver::record_bytes_min`] of the limits of the driver, because the driver writes records
+    /// of its own. [`driver::Driver::new`] refuses a smaller bound with [`driver::Error::RecordBound`].
     pub record_bytes_max: usize,
 }
 
@@ -435,21 +440,25 @@ impl Profile {
         &self.0
     }
 
-    /// Checks that the binding stores each record form and intent payload of `proposal`, before its commit.
+    /// Checks that the binding stores each record that the commit of `proposal` writes, before its commit: the record
+    /// form of each write, each record of [`intent_records`], and the records of [`audit_record`] and
+    /// [`outcome_record`]. The audit record holds the key of each change, so it grows with the changes.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
-    /// [`Error::RecordBytes`] for a record form or a payload longer than [`Declaration::record_bytes_max`].
+    /// [`Error::RecordBytes`] for a record longer than [`Declaration::record_bytes_max`].
     pub fn admit(&self, proposal: &Proposal) -> Result<(), Error> {
-        let max = self.0.record_bytes_max;
-        let records = proposal.changes().iter().all(|change| match change {
-            Change::Write { data, .. } => data.len() <= max,
+        let fits = |data: &[u8]| data.len() <= self.0.record_bytes_max;
+        let writes = proposal.changes().iter().all(|change| match change {
+            Change::Write { data, .. } => fits(data),
             Change::End(_) => true,
         });
-        let intents = proposal.intents().iter().all(|intent| intent.payload().len() <= max);
-        (records && intents).ok_or(Error::RecordBytes)
+        let intents = intent_records(proposal).expect("an intent has a CBOR form and a key of at most 73 bytes");
+        let records = [audit_record(proposal), outcome_record(proposal)];
+        let stored = intents.iter().chain(&records).all(|(_, record)| fits(&record.data));
+        (writes && stored).ok_or(Error::RecordBytes)
     }
 }
 
@@ -461,7 +470,8 @@ pub enum Error {
     Isolation,
     /// The binding stores no key of [`Key::BYTES_MAX`] bytes. Use a binding with a larger key bound.
     KeyBound,
-    /// A record form or an intent payload is longer than the record bound of the binding. Refuse the request.
+    /// A record that the commit of the proposal writes is longer than the record bound of the binding. Refuse the
+    /// request.
     RecordBytes,
 }
 

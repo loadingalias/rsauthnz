@@ -139,4 +139,4 @@ of one key give one commit and one conflict.
 | `crash_injection` | `CrashInjection::Supported` |
 | `restore` | `Restore::Journal`, in the memory of the process, in a simulated domain apart from the store and its snapshots |
 | `key_bytes_max` | 2048 (`transition::Key::BYTES_MAX`) |
-| `record_bytes_max` | 65,536 (`Limits::default().bytes`). `Profile::admit` refuses a larger record before the commit |
+| `record_bytes_max` | `usize::MAX`: the binding keeps a record of each length in the memory of the process |

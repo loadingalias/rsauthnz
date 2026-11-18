@@ -183,7 +183,8 @@ outcome to the operation in progress, and serves again only after `driver.start(
    completes the rest before it serves.
 3. Submit a commit with `driver.submit(proposal, plan)`. The `Plan` gives the anchors of the owners that the store
    holds, the writes that replace a dead version, and the role of each new anchor. Take the answer with
-   `driver.take(ticket)`.
+   `driver.take(ticket)`. A proposal with a record longer than `record_bytes_max` refuses with
+   `Error::RecordBytes`, and the binding never gets it.
 4. Look up a lost outcome with `driver.lookup(operation)`. The result is `Lookup::Committed`, `Refused`, `Absent`,
    or `Unknown`. `Unknown` is for a missing outcome record after a restore.
 

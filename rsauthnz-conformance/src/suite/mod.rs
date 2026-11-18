@@ -634,7 +634,10 @@ struct Run<S> {
 impl<S: Subject> Run<S> {
     /// A driver that started on `binding`, and that committed the records of [`seed`].
     async fn seeded(binding: S) -> Result<Self, String> {
-        let driver = Driver::new(&binding.declaration(), Limits::default());
+        let profile = Profile::new(binding.declaration())
+            .map_err(|error| format!("the profile refuses the declaration: {error}"))?;
+        let driver = Driver::new(profile, Limits::default())
+            .map_err(|error| format!("the driver refuses the binding: {error}"))?;
         let mut run = Self {
             binding,
             driver,

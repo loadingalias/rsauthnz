@@ -1,13 +1,18 @@
-//! The conformance suite on the memory binding, and on its deliberately broken forms.
+//! The conformance suite on the memory binding, on a form of it that measures each record of a commit, and on its
+//! deliberately broken forms.
 //!
 //! Each broken binding is the memory binding with one defect in one primitive. It is in the test tree of the memory
 //! binding, so that a defect changes the private state of the binding, and no production code holds it.
 
 use core::num::NonZeroUsize;
 use core::ops::RangeBounds;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use rsauthnz::limits::Limits;
+use rsauthnz::store::driver;
 use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 
@@ -169,6 +174,107 @@ impl Subject for Broken {
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
         self.memory.lose(sequences);
     }
+}
+
+/// The memory binding, which keeps the length of the longest record that a commit gives it.
+#[derive(Clone, Debug)]
+struct Measured {
+    memory: Memory,
+    longest: Arc<AtomicUsize>,
+}
+
+impl Store for Measured {
+    type Error = Error;
+
+    fn declaration(&self) -> Declaration {
+        self.memory.declaration()
+    }
+
+    async fn start(&mut self) -> Result<Instance, Error> {
+        self.memory.start().await
+    }
+
+    async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {
+        Store::read(&mut self.memory, key).await
+    }
+
+    /// Measures each record that the commit stores: the record form of each write, and each intent, audit, and
+    /// outcome record.
+    async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
+        let request = Request::new(proposal);
+        let writes = request.changes.iter().filter_map(|change| match change {
+            Change::Write { data, .. } => Some(data.len()),
+            Change::End(_) => None,
+        });
+        let records = request.records.iter().map(|(_, record)| record.data.len());
+        let longest = writes.chain(records).max().unwrap_or(0);
+        self.longest.fetch_max(longest, Ordering::Relaxed);
+        self.memory.commit(proposal, instance).await
+    }
+
+    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
+        self.memory.expire(kind, before, limit).await
+    }
+
+    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, Error> {
+        self.memory.intents(after, limit).await
+    }
+}
+
+impl Journal for Measured {
+    type Error = Error;
+
+    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
+        self.memory.append(entry).await
+    }
+
+    async fn sync(&mut self) -> Result<(), Error> {
+        self.memory.sync().await
+    }
+
+    async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {
+        Journal::read(&mut self.memory, after, limit).await
+    }
+}
+
+impl Subject for Measured {
+    type Snapshot = Snapshot;
+
+    fn inject(&self, fault: Fault) {
+        self.memory.inject(fault);
+    }
+
+    fn restart(&self) {
+        self.memory.restart();
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        self.memory.snapshot()
+    }
+
+    fn restore(&self, snapshot: &Snapshot) {
+        self.memory.restore(snapshot);
+    }
+
+    fn lose(&self, sequences: impl RangeBounds<Sequence>) {
+        self.memory.lose(sequences);
+    }
+}
+
+/// The driver refuses a binding whose record bound is below its own records ([`driver::record_bytes_min`]). The
+/// longest record that a commit of the suite gives the memory binding, a record of the driver's own commits included,
+/// is at most that bound. The commits of each case reach the binding, so the measure is not empty.
+#[test]
+fn no_commit_of_the_suite_gives_a_record_longer_than_the_least_record_bound() {
+    let longest = Arc::new(AtomicUsize::new(0));
+    let report = ready(suite::run(|| Measured {
+        memory: Memory::new(Schedule::None),
+        longest: Arc::clone(&longest),
+    }));
+    assert_eq!(report, Report::default(), "{report}");
+    let longest = longest.load(Ordering::Relaxed);
+    assert!(longest > 0, "no commit reached the binding");
+    assert!(longest <= driver::record_bytes_min(Limits::default()), "{longest}");
 }
 
 /// The memory binding passes each case of the suite, and its declaration selects each case.

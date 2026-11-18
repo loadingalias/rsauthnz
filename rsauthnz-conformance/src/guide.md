@@ -40,8 +40,8 @@ this guide asks you to order two writes. Each step names the public items that i
 ## 1. Declare the guarantees
 
 Give the guarantees of the binding in [`Store::declaration`], as a [`Declaration`]. [`Profile::new`] refuses a
-declaration that cannot keep the contract. The suite calls it before the cases, and the application calls it before
-it makes the driver ([step 10](#10-run-the-commit-driver)).
+declaration that cannot keep the contract, and the driver takes only a [`Profile`] that it accepted
+([step 10](#10-run-the-commit-driver)). The suite calls it before the cases.
 
 | Field | Set it to |
 | --- | --- |
@@ -51,7 +51,7 @@ it makes the driver ([step 10](#10-run-the-commit-driver)).
 | `crash_injection` | [`CrashInjection::Supported`] when the binding implements [`Subject::inject`] ([step 11](#11-implement-the-test-controls)) |
 | `restore` | [`Restore::Journal`] with the location and the failure domain of the journal, or [`Restore::Unsupported`] |
 | `key_bytes_max` | At least [`Key::BYTES_MAX`] |
-| `record_bytes_max` | The most bytes in one record form or intent payload that the store keeps. [`Profile::admit`] refuses a proposal with a larger one before its commit |
+| `record_bytes_max` | The most bytes in one record that the store keeps: the record form of a write, an intent record, an audit record, or an outcome record. Give at least [`record_bytes_min`] of the [`Limits`] of the driver, which grows with the changes of one proposal. [`Driver::new`] refuses a smaller bound with [`driver::Error::RecordBound`]. [`Driver::submit`] refuses a proposal with a larger record, so the binding never gets it |
 
 The declaration selects the suite cases. A binding without crash injection skips the crash cases, and a binding
 without a journal skips the restore cases. [`Report::skipped`] names each case that the binding skips.
@@ -59,7 +59,10 @@ without a journal skips the restore cases. [`Report::skipped`] names each case t
 [`Store::declaration`]: rsauthnz::store::Store::declaration
 [`Declaration`]: rsauthnz::store::Declaration
 [`Profile::new`]: rsauthnz::store::Profile::new
-[`Profile::admit`]: rsauthnz::store::Profile::admit
+[`Profile`]: rsauthnz::store::Profile
+[`record_bytes_min`]: rsauthnz::store::driver::record_bytes_min
+[`Limits`]: rsauthnz::limits::Limits
+[`driver::Error::RecordBound`]: rsauthnz::store::driver::Error::RecordBound
 [`Isolation::Serializable`]: rsauthnz::store::Isolation::Serializable
 [`Isolation::AtomicConditional`]: rsauthnz::store::Isolation::AtomicConditional
 [`CrashLoss::Unsynced`]: rsauthnz::store::CrashLoss::Unsynced
@@ -281,12 +284,13 @@ async fn settle<B: Store + Journal>(driver: &mut Driver, binding: &mut B) -> Res
 }
 ```
 
-1. Accept the declaration of the binding with [`Profile::new`]. Then make the driver with [`Driver::new`].
+1. Make the driver with [`Driver::new`], from the [`Profile`] of the declaration of the binding and the [`Limits`].
+   It refuses a record bound below [`record_bytes_min`] ([step 1](#1-declare-the-guarantees)).
 2. Call [`Driver::start`] at first and after each crash, then settle. [`Driver::status`] gives
    [`Status::Serving`] when the store serves.
 3. After a restore of a snapshot, call [`Driver::restore`], never [`Driver::start`].
-4. Check each proposal with [`Profile::admit`]. Then submit it with [`Driver::submit`] and its [`Plan`], settle, and
-   take the answer with [`Driver::take`].
+4. Submit each proposal with [`Driver::submit`] and its [`Plan`], settle, and take the answer with
+   [`Driver::take`].
 5. Look up a lost outcome with [`Driver::lookup`].
 
 The documentation of the [`driver`] module gives each operation of the driver and its refusals.

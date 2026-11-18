@@ -11,12 +11,44 @@ use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{Link, Mark};
-use crate::store::{Kind, Record, Sequence};
-use crate::time::Reading;
+use crate::store::{Kind, Record, Sequence, audit_record};
+use crate::time::{Reading, ReadingSource};
 use crate::transition::{Audit, Change, Dependency, Key, OperationId, Proposal};
 
 /// The first item of the CBOR form of the mark record. Its number changes with the form.
 const FORM: &str = "rsauthnz.store.mark.1";
+
+/// The action of the commit that writes the mark record.
+pub(super) const MARK: &str = "store.mark";
+/// The action of the commit that writes the replay floor record.
+pub(super) const REPLAY_FLOOR: &str = "store.replay-floor";
+/// The action of the commit that ends a journal intent.
+pub(super) const INTENT: &str = "store.intent";
+/// The action of a commit of a restore, and of a completion.
+pub(super) const RESTORE: &str = "store.restore";
+
+/// The most bytes in a record that the driver writes for itself within `limits`. The driver reads its mark record
+/// back within `limits`, and the anchors of a restore and of a completion come from journal entries within `limits`,
+/// so each of them is at most `limits.bytes`. The replay floor and each outcome record are shorter than any audit
+/// record. The audit record of a commit of the driver holds the key of each of at most `limits.dependencies`
+/// changes: each key adds at most its bytes and a header of 3 bytes, and the header of the array grows by at most 8.
+pub(super) fn bytes_max(limits: Limits) -> usize {
+    let id = OperationId::new(&[0; 32]).expect("an identity of 32 bytes is valid");
+    // The longest time form: each part of each duration takes its widest CBOR head.
+    let now = Reading::new(Duration::MAX, Some(Duration::MAX), ReadingSource::Caller);
+    let base = [MARK, REPLAY_FLOOR, INTENT, RESTORE]
+        .map(|action| {
+            audit_record(&proposal(id.clone(), action, now, Limits::default()))
+                .1
+                .data
+                .len()
+        })
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let keys = limits.dependencies.saturating_mul(Key::BYTES_MAX.saturating_add(3));
+    limits.bytes.max(base.saturating_add(8).saturating_add(keys))
+}
 
 /// The state of the mark record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,8 +145,8 @@ impl State {
     }
 
     /// The commit that writes `self` as the next version of the mark record, with the operation `id` at `now`, or
-    /// `None` when `limits` admit no dependency or the stored version is not a version of the driver. `self` takes
-    /// the new version, so the next write follows this one.
+    /// `None` when `limits` admit no dependency, when the form is longer than `limits.bytes`, or when the stored
+    /// version is not a version of the driver. `self` takes the new version, so the next write follows this one.
     pub(super) fn write(&mut self, id: OperationId, now: Reading, limits: Limits) -> Option<Proposal> {
         let form = Value::Array(vec![
             Value::Text(FORM),
@@ -133,9 +165,11 @@ impl State {
             ),
         ]);
         let data = cbor::encode(&form).expect("the mark form has no map and no simple value");
+        // The driver reads the record back within `limits`, and `bytes_max` counts on it.
+        (data.len() <= limits.bytes).then_some(())?;
         let (proposal, version) = replace(
             id,
-            "store.mark",
+            MARK,
             now,
             limits,
             &mark_key(),
@@ -170,7 +204,7 @@ pub(super) fn replay_floor(
     let data = cbor::encode(&form).expect("the floor form has no map and no simple value");
     replace(
         id,
-        "store.replay-floor",
+        REPLAY_FLOOR,
         now,
         limits,
         &floor_key(),

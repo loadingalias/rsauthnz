@@ -12,7 +12,8 @@ binding](storage-binding.md) gives the steps from the primitives to a binding th
 
 ## Declare the binding
 
-A binding states its guarantees in a `Declaration`. `Profile::new(declaration)` accepts it or refuses it.
+A binding states its guarantees in a `Declaration`. `Profile::new(declaration)` accepts it or refuses it. The commit
+driver takes only an accepted `Profile` (`Driver::new(profile, limits)`), so no driver exists for a refused binding.
 
 | `Declaration` field | Meaning | Refusal |
 | --- | --- | --- |
@@ -22,7 +23,7 @@ A binding states its guarantees in a `Declaration`. `Profile::new(declaration)` 
 | `crash_injection` | `CrashInjection::Supported` when the binding injects a crash at each commit point, or `Unsupported` | — |
 | `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects. [Restore journal](restore.md) gives what the journal keeps | — |
 | `key_bytes_max` | The most bytes in a key that the binding stores | `Error::KeyBound` below 2048 (`transition::Key::BYTES_MAX`), the longest key of the core |
-| `record_bytes_max` | The most bytes in the record form of a write and in the payload of an intent | `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer one, before the commit |
+| `record_bytes_max` | The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit record, or an outcome record. The audit record holds the key of each change | `Driver::new(profile, limits)` gives `driver::Error::RecordBound(least)` below `driver::record_bytes_min(limits)`, the longest record that the driver writes for itself. `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer record. `driver.submit` calls it and refuses with `driver::Error::RecordBytes`, so the binding never gets the proposal |
 
 ## Primitives
 
