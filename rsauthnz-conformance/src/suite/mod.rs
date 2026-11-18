@@ -127,9 +127,9 @@ pub enum Case {
     /// restore: the delayed commit of an abandoned history. Between a restore and the next start, a commit with the
     /// instance number at the snapshot, or of a start after it, refuses too. Property: `NoStaleCommit`.
     Fencing,
-    /// An audit record and an outcome record stay readable until their retention end: the estimate of the audit time
-    /// of the proposal plus [`Declaration::outcome_retention`]. An expire before that end removes neither, so a
-    /// retried operation learns its outcome.
+    /// An audit record and an outcome record end at their retention end: the estimate of the audit time of the
+    /// proposal plus [`Declaration::outcome_retention`], rounded up by at most one second. An expire before that end
+    /// removes neither, so a retried operation learns its outcome.
     Retention,
     /// A commit whose response is lost landed: after the next start, its outcome record and its audit are readable.
     /// A commit that crashes before it lands writes nothing. Property: `MissingOutcomeUnknown`.

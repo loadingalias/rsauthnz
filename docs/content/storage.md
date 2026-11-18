@@ -139,7 +139,8 @@ binding of `proposal.operation()`: 32 bytes. `Store::outcome(&id)` reads this re
 - `keys` is the key of each change of the proposal, in order.
 
 The two records have no end. The binding sets the end of each one to the estimate of `audit.time` plus
-`outcome_retention`, or to `Duration::MAX` when the sum is past it.
+`outcome_retention`, or to `Duration::MAX` when the sum is past it. A store that keeps coarser times rounds the end
+up, by at most one second.
 
 ## Effect intents
 

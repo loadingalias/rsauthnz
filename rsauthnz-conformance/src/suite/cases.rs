@@ -5,7 +5,7 @@ use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use rsauthnz::store::journal::{self, Body, End, History};
-use rsauthnz::store::{Commit, CrashLoss, Entry, Instance, intent_records, policy_key};
+use rsauthnz::store::{Commit, CrashLoss, Entry, Instance, intent_records, outcome_record, policy_key};
 
 use super::{
     Answer, Build, Checked, DATA, EFFECTS_MAX, Effect, Fault, Journal, Key, Kind, Lookup, Next, Outcome, PAGE, Plan,
@@ -268,6 +268,9 @@ pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
     )
 }
 
+/// The most that a store rounds up the end of an audit or outcome record: a store that keeps whole seconds.
+const PRECISION_MAX: Duration = Duration::from_secs(1);
+
 pub(super) async fn retention<S: Subject>(mut binding: S) -> Checked {
     let instance = start(&mut binding).await?;
     let proposal = Build::new("t-1").writes(&key(Kind::Credential, "t-1"), 1).done();
@@ -280,10 +283,21 @@ pub(super) async fn retention<S: Subject>(mut binding: S) -> Checked {
         .time
         .estimate()
         .saturating_add(binding.declaration().outcome_retention);
+    let latest = end.saturating_add(PRECISION_MAX);
+    let (audit_key, audit) = audit_record(&proposal);
+    for (key, what) in [(&audit_key, "audit"), (&outcome_record(&proposal).0, "outcome")] {
+        let stored = Store::read(&mut binding, key).await.map_err(failed("read"))?;
+        ensure(
+            stored.is_some_and(|record| record.end.is_some_and(|stored| end <= stored && stored <= latest)),
+            &format!(
+                "the {what} record does not end at the estimate of the audit time plus the outcome retention, rounded \
+                 up by at most {PRECISION_MAX:?}"
+            ),
+        )?;
+    }
     for kind in [Kind::Audit, Kind::Outcome] {
         binding.expire(kind, end, PAGE).await.map_err(failed("expire"))?;
     }
-    let (audit_key, audit) = audit_record(&proposal);
     let stored = Store::read(&mut binding, &audit_key).await.map_err(failed("read"))?;
     ensure(
         same(stored.as_ref(), &audit),

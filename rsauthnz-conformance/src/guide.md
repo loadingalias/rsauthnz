@@ -169,9 +169,10 @@ Map the commit to the store:
 
 The records of [`audit_record`] and [`outcome_record`] have no end. When you write them, set their end to the
 estimate of the audit time of the proposal ([`Audit::time`], [`Reading::estimate`]) plus
-[`Declaration::outcome_retention`]. When the sum is past the largest `Duration`, set the end to `Duration::MAX`. The
-audit time is a [`Reading`] of the clock of the application, so [`store::expire`] compares like times, and the suite
-can check the end.
+[`Declaration::outcome_retention`]. When the sum is past the largest `Duration`, set the end to `Duration::MAX`. A
+store that keeps coarser times rounds the end up to its precision, by at most one second. The audit time is a
+[`Reading`] of the clock of the application, so [`store::expire`] compares like times, and the suite can check the
+end (selected on 2026-11-18).
 
 The retention starts at the decision, not at the commit, so the binding keeps the records for the retention minus the
 time from the decision to the commit (selected on 2026-11-18). Declare a retention that includes this time.
