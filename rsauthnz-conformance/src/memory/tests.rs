@@ -232,8 +232,8 @@ fn an_append_is_durable_only_after_its_sync_returns() {
     assert_eq!(ready(memory.append(b"third")), Ok(second));
 }
 
-/// A restart and a restore stop the binding as a crash does: each append after the last sync is lost, so a sync after
-/// the next start makes none of them durable.
+/// A restart and a restore each lose the appends after the last sync, as a crash does, so a sync after the next start
+/// makes none of them durable.
 #[test]
 fn a_restart_or_a_restore_loses_each_append_after_the_last_sync() {
     for stop in ["restart", "restore"] {

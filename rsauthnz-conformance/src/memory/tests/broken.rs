@@ -4,12 +4,13 @@
 //! Each broken binding is the memory binding with one defect in one primitive. It is in the test tree of the memory
 //! binding, so that a defect changes the private state of the binding, and no production code holds it.
 
+use core::mem;
 use core::num::NonZeroUsize;
 use core::ops::RangeBounds;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rsauthnz::limits::Limits;
 use rsauthnz::store::driver;
@@ -36,16 +37,23 @@ enum Defect {
     RetriedSync,
     /// The commit does not compare the store instance number.
     NoInstanceCheck,
+    /// The commit compares a copy of the instance number in the store, and a restore gives back the copy of the
+    /// snapshot. The counter keeps its number, so the next start writes a new one.
+    RestoredInstance,
+    /// The audit and outcome records end at the audit time, with no retention.
+    NoRetention,
 }
 
 impl Defect {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::NoAtomicCheck,
         Self::LostOutcomes,
         Self::WriteSkew,
         Self::NoJournal,
         Self::RetriedSync,
         Self::NoInstanceCheck,
+        Self::RestoredInstance,
+        Self::NoRetention,
     ];
 
     /// The case that names the defect.
@@ -56,7 +64,8 @@ impl Defect {
             Self::WriteSkew => Case::AbsenceRace,
             Self::NoJournal => Case::RestoreJournal,
             Self::RetriedSync => Case::FailedSync,
-            Self::NoInstanceCheck => Case::Fencing,
+            Self::NoInstanceCheck | Self::RestoredInstance => Case::Fencing,
+            Self::NoRetention => Case::Retention,
         }
     }
 }
@@ -66,6 +75,19 @@ impl Defect {
 struct Broken {
     memory: Memory,
     defect: Defect,
+    /// The counter of [`Defect::RestoredInstance`] between a restore and the next start, while the instance number of
+    /// the memory binding is the restored copy.
+    counter: Arc<Mutex<Option<Instance>>>,
+}
+
+impl Broken {
+    fn new(defect: Defect) -> Self {
+        Self {
+            memory: Memory::new(Schedule::None),
+            defect,
+            counter: Arc::default(),
+        }
+    }
 }
 
 impl Store for Broken {
@@ -76,6 +98,10 @@ impl Store for Broken {
     }
 
     async fn start(&mut self) -> Result<Instance, Error> {
+        let counter = self.counter.lock().unwrap().take();
+        if let Some(counter) = counter {
+            self.memory.lock().instance = counter;
+        }
         self.memory.start().await
     }
 
@@ -107,7 +133,14 @@ impl Store for Broken {
                 let current = binding.instance;
                 return binding.commit(request, current);
             }
-            Defect::LostOutcomes | Defect::NoJournal | Defect::RetriedSync => {
+            Defect::NoRetention => {
+                for (key, record) in &mut request.records {
+                    if matches!(Kind::of(key), Some(Kind::Audit | Kind::Outcome)) {
+                        record.end = Some(proposal.audit().time.estimate());
+                    }
+                }
+            }
+            Defect::LostOutcomes | Defect::NoJournal | Defect::RetriedSync | Defect::RestoredInstance => {
                 return self.memory.commit(proposal, instance).await;
             }
         }
@@ -146,8 +179,8 @@ impl Journal for Broken {
 }
 
 impl Subject for Broken {
-    /// The snapshot of the store, and the durable journal with its last sequence at the snapshot.
-    type Snapshot = (Snapshot, BTreeMap<Sequence, Box<[u8]>>, Sequence);
+    /// The snapshot of the store, the durable journal with its last sequence, and the instance number at the snapshot.
+    type Snapshot = (Snapshot, BTreeMap<Sequence, Box<[u8]>>, Sequence, Instance);
 
     fn inject(&self, fault: Fault) {
         self.memory.inject(fault);
@@ -159,15 +192,27 @@ impl Subject for Broken {
 
     fn snapshot(&self) -> Self::Snapshot {
         let binding = self.memory.lock();
-        (Snapshot(binding.store.clone()), binding.journal.clone(), binding.synced)
+        (
+            Snapshot(binding.store.clone()),
+            binding.journal.clone(),
+            binding.synced,
+            binding.instance,
+        )
     }
 
-    fn restore(&self, (snapshot, journal, synced): &Self::Snapshot) {
+    fn restore(&self, (snapshot, journal, synced, instance): &Self::Snapshot) {
         self.memory.restore(snapshot);
-        if self.defect == Defect::NoJournal {
-            let mut binding = self.memory.lock();
-            binding.journal = journal.clone();
-            binding.synced = *synced;
+        let mut binding = self.memory.lock();
+        match self.defect {
+            Defect::NoJournal => {
+                binding.journal = journal.clone();
+                binding.synced = *synced;
+            }
+            Defect::RestoredInstance => {
+                let counter = mem::replace(&mut binding.instance, *instance);
+                *self.counter.lock().unwrap() = Some(counter);
+            }
+            _ => {}
         }
     }
 
@@ -289,10 +334,7 @@ fn the_memory_binding_passes_every_case() {
 #[test]
 fn each_broken_binding_fails_the_case_that_names_its_defect() {
     for defect in Defect::ALL {
-        let report = ready(suite::run(|| Broken {
-            memory: Memory::new(Schedule::None),
-            defect,
-        }));
+        let report = ready(suite::run(|| Broken::new(defect)));
         let failed: Vec<Case> = report.failures.iter().map(|failure| failure.case).collect();
         assert!(failed.contains(&defect.case()), "{defect:?}:\n{report}");
         if defect == Defect::WriteSkew {

@@ -47,7 +47,7 @@ declaration that cannot keep the contract, and the driver takes only a [`Profile
 | --- | --- |
 | `isolation` | [`Isolation::Serializable`] for a serializable transaction. [`Isolation::AtomicConditional`] for one atomic write that checks each dependency, absences included. Never claim either one for snapshot isolation |
 | `crash_loss` | [`CrashLoss::Unsynced`] when a crash loses only the writes whose commit or sync did not return. [`CrashLoss::Everything`] when the store is in the memory of the process |
-| `outcome_retention` | The least time for which the binding keeps an outcome record ([step 5](#5-keep-audit-and-outcome-records-for-their-retention)) |
+| `outcome_retention` | The least time after the audit time of its proposal for which the binding keeps an outcome record ([step 5](#5-keep-audit-and-outcome-records-for-their-retention)) |
 | `crash_injection` | [`CrashInjection::Supported`] when the binding implements [`Subject::inject`] ([step 11](#11-implement-the-test-controls)) |
 | `restore` | [`Restore::Journal`] with the location and the failure domain of the journal, or [`Restore::Unsupported`] |
 | `key_bytes_max` | At least [`Key::BYTES_MAX`] |
@@ -88,6 +88,14 @@ late over the network.
 3. Write the new number durably before `start` returns. A client-server store also writes it into the store, so
    that each commit reads it in its atomic step. Either order of these two writes is safe, because no commit has the
    new number before `start` returns.
+4. As the last step of a restore of a snapshot, before the store takes a commit, take a fresh number from the
+   counter. Make it the number that each commit compares. A client-server store writes it into the store, because
+   the restore gave back the copy of the snapshot. Then the store refuses each commit of each earlier start
+   (selected on 2026-11-18).
+
+The number of the latest start before the restore is not enough, also when the restore keeps it. A delayed commit of
+that start, for example from an old process that connects again, lands on the restored state. The design model
+permits a restore only after a crash, and no commit of the run before the restore lands after it.
 
 One driver serves each store at a time. A start fences each commit of an earlier start, so a second driver on the
 same store makes the commits of the first one refuse.
@@ -159,15 +167,22 @@ Map the commit to the store:
 
 ## 5. Keep audit and outcome records for their retention
 
-The records of [`audit_record`] and [`outcome_record`] have no end. When you write them, set their end to the time of
-the commit plus [`Declaration::outcome_retention`]. Keep no end when the sum is past the largest `Duration`. Take the
-time from the clock of the [`Reading`] values of the application, so that [`store::expire`] compares like times.
+The records of [`audit_record`] and [`outcome_record`] have no end. When you write them, set their end to the
+estimate of the audit time of the proposal ([`Audit::time`], [`Reading::estimate`]) plus
+[`Declaration::outcome_retention`]. When the sum is past the largest `Duration`, set the end to `Duration::MAX`. The
+audit time is a [`Reading`] of the clock of the application, so [`store::expire`] compares like times, and the suite
+can check the end.
+
+The retention starts at the decision, not at the commit, so the binding keeps the records for the retention minus the
+time from the decision to the commit (selected on 2026-11-18). Declare a retention that includes this time.
 
 [`Store::outcome`] is a provided method. It reads the outcome record with [`Store::read`], so you implement nothing
 for it. A lookup after the retention gives an unknown outcome.
 
 [`Declaration::outcome_retention`]: rsauthnz::store::Declaration::outcome_retention
+[`Audit::time`]: rsauthnz::transition::Audit::time
 [`Reading`]: rsauthnz::time::Reading
+[`Reading::estimate`]: rsauthnz::time::Reading::estimate
 [`Store::outcome`]: rsauthnz::store::Store::outcome
 
 ## 6. Expire ended records
@@ -321,7 +336,7 @@ handles of one binding, and each control acts on all of them. Two cases commit f
 | [`Subject::inject`] | The next call of the primitive of the [`Fault`] takes the fault ([below](#faults)) |
 | [`Subject::restart`] | The process is lost. The store loses what `crash_loss` states. The journal keeps each entry whose sync returned, and loses each later append. The counter of instance numbers stays. The binding serves again after a start |
 | [`Subject::snapshot`] | It gives a consistent copy of the complete state of the store, the mark record included. The copy holds no journal entry |
-| [`Subject::restore`] | The state of the store is the copy again. The journal keeps its durable entries, and loses each append after the last sync. The counter of instance numbers stays. The binding serves again after a start |
+| [`Subject::restore`] | The state of the store is the copy again, with a fresh instance number ([step 2](#2-keep-the-store-instance-number)). The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync |
 | [`Subject::lose`] | The durable entries with a sequence in the range are gone. The next append still gets the sequence after the last durable entry before the loss, so no entry gets a lost sequence again |
 
 ### Faults
@@ -373,23 +388,24 @@ step. This table gives the step that each case checks first:
 | --- | --- |
 | `Commit` | [4](#4-commit-a-proposal), [3](#3-read-one-record) |
 | `DependencyConflict` | [4](#4-commit-a-proposal) |
-| `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees) |
-| `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees) |
+| `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
+| `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `Expiry` | [6](#6-expire-ended-records) |
 | `Fencing` | [2](#2-keep-the-store-instance-number), [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
-| `LostResponse` | [4](#4-commit-a-proposal), [5](#5-keep-audit-and-outcome-records-for-their-retention), [9](#9-stop-at-each-error) |
-| `FailedSync` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error) |
+| `Retention` | [5](#5-keep-audit-and-outcome-records-for-their-retention), [6](#6-expire-ended-records) |
+| `LostResponse` | [4](#4-commit-a-proposal), [5](#5-keep-audit-and-outcome-records-for-their-retention), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
+| `FailedSync` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
 | `Restart` | [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
-| `CrashPoints` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [7](#7-read-the-effect-intents) |
+| `CrashPoints` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [7](#7-read-the-effect-intents), [11](#11-implement-the-test-controls) |
 | `RefusalVoid` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
-| `RestoreJournal` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreJournal` | [8](#8-keep-the-restore-journal), [3](#3-read-one-record), [11](#11-implement-the-test-controls) |
 | `RestoreFloors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreRefusal` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreAnchors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreCompletions` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreEnds` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `StartAfterRestore` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
-| `Rebootstrap` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal) |
+| `Rebootstrap` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 
 The failure messages of the cases name these effects of the driver on the primitives:
 

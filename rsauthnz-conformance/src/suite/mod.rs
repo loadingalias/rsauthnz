@@ -79,8 +79,10 @@ pub trait Subject: Store + Journal + Clone {
     /// [`Restore::Journal`].
     fn snapshot(&self) -> Self::Snapshot;
 
-    /// Restores the state of the store from `snapshot`. The journal keeps its entries, and the binding serves again
-    /// after a start. The suite restores only a binding that declares [`Restore::Journal`].
+    /// Restores the state of the store from `snapshot`, and writes a fresh store instance number as its last step. The
+    /// restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses
+    /// each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last
+    /// sync. The suite restores only a binding that declares [`Restore::Journal`].
     fn restore(&self, snapshot: &Self::Snapshot);
 
     /// Removes the durable entries of the journal with a sequence in `sequences`: the loss of entries in the failure
@@ -122,8 +124,13 @@ pub enum Case {
     /// Expiry removes at most its limit of ended records of its kind, and no other record. Property: `NoLiveRemoved`.
     Expiry,
     /// A commit with the instance number of an earlier start refuses after a start, after a restart, and after a
-    /// restore: the delayed commit of an abandoned history. Property: `NoStaleCommit`.
+    /// restore: the delayed commit of an abandoned history. Between a restore and the next start, a commit with the
+    /// instance number at the snapshot, or of a start after it, refuses too. Property: `NoStaleCommit`.
     Fencing,
+    /// An audit record and an outcome record stay readable until their retention end: the estimate of the audit time
+    /// of the proposal plus [`Declaration::outcome_retention`]. An expire before that end removes neither, so a
+    /// retried operation learns its outcome.
+    Retention,
     /// A commit whose response is lost landed: after the next start, its outcome record and its audit are readable.
     /// A commit that crashes before it lands writes nothing. Property: `MissingOutcomeUnknown`.
     LostResponse,
@@ -168,13 +175,14 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::ConcurrentConsumption,
         Self::AbsenceRace,
         Self::Expiry,
         Self::Fencing,
+        Self::Retention,
         Self::LostResponse,
         Self::FailedSync,
         Self::Restart,
@@ -200,6 +208,7 @@ impl Case {
             | Self::AbsenceRace
             | Self::Expiry
             | Self::Fencing
+            | Self::Retention
             | Self::Restart => true,
             Self::LostResponse => crash,
             Self::RefusalVoid
@@ -222,6 +231,7 @@ impl Case {
             Self::AbsenceRace => cases::absence_race(make()).await,
             Self::Expiry => cases::expiry(make()).await,
             Self::Fencing => cases::fencing(make()).await,
+            Self::Retention => cases::retention(make()).await,
             Self::LostResponse => cases::lost_response(make()).await,
             Self::FailedSync => cases::failed_sync(make()).await,
             Self::Restart => cases::restart(make()).await,

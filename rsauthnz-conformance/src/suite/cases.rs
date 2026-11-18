@@ -220,6 +220,11 @@ pub(super) async fn expiry<S: Subject>(mut binding: S) -> Checked {
     Ok(())
 }
 
+/// Whether the commit of `proposal` with `instance` conflicted and wrote nothing.
+async fn fenced<S: Subject>(binding: &mut S, proposal: &Proposal, instance: Instance) -> Result<bool, String> {
+    Ok(committed(binding, proposal, instance).await? == Commit::Conflict && unrecorded(binding, proposal).await?)
+}
+
 pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
     let proposal = |name: &str| Build::new(name).writes(&key(Kind::Credential, name), 1).done();
     let first = start(&mut binding).await?;
@@ -233,20 +238,64 @@ pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
         let snapshot = binding.snapshot();
         let abandoned = start(&mut binding).await?;
         binding.restore(&snapshot);
+        // The restored store takes commits before the next start, for example a delayed commit of an old process.
+        for (index, (event, stale)) in [
+            ("at the snapshot", current),
+            ("of a start after the snapshot", abandoned),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ensure(
+                fenced(&mut binding, &proposal(&format!("f-r{index}")), stale).await?,
+                &format!(
+                    "between a restore and the next start, a commit with the instance number {event} did not refuse"
+                ),
+            )?;
+        }
         current = start(&mut binding).await?;
         rows.push(("a restore", abandoned));
     }
     for (index, (event, stale)) in rows.into_iter().enumerate() {
-        let proposal = proposal(&format!("f-{index}"));
         ensure(
-            committed(&mut binding, &proposal, stale).await? == Commit::Conflict
-                && unrecorded(&mut binding, &proposal).await?,
+            fenced(&mut binding, &proposal(&format!("f-{index}")), stale).await?,
             &format!("after {event}, a commit with the instance number of an earlier start did not refuse"),
         )?;
     }
     ensure(
         committed(&mut binding, &proposal("f-current"), current).await? == Commit::Accepted,
         "a commit with the instance number of the latest start refused",
+    )
+}
+
+pub(super) async fn retention<S: Subject>(mut binding: S) -> Checked {
+    let instance = start(&mut binding).await?;
+    let proposal = Build::new("t-1").writes(&key(Kind::Credential, "t-1"), 1).done();
+    ensure(
+        committed(&mut binding, &proposal, instance).await? == Commit::Accepted,
+        "a commit whose dependencies hold refused",
+    )?;
+    let end = proposal
+        .audit()
+        .time
+        .estimate()
+        .saturating_add(binding.declaration().outcome_retention);
+    for kind in [Kind::Audit, Kind::Outcome] {
+        binding.expire(kind, end, PAGE).await.map_err(failed("expire"))?;
+    }
+    let (audit_key, audit) = audit_record(&proposal);
+    let stored = Store::read(&mut binding, &audit_key).await.map_err(failed("read"))?;
+    ensure(
+        same(stored.as_ref(), &audit),
+        "an expire before the retention end removed the audit record",
+    )?;
+    let outcome = binding
+        .outcome(&proposal.operation().id)
+        .await
+        .map_err(failed("read"))?;
+    ensure(
+        outcome.as_ref() == Some(proposal.operation()),
+        "an expire before the retention end removed the outcome record, so a retried operation cannot learn its outcome",
     )
 }
 

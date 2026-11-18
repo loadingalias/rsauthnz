@@ -60,7 +60,7 @@ commit with two clones at the same time. Each control acts on the binding of all
 | `inject(fault)` | The next call of the primitive of `fault` takes the fault | Only when the declaration states `CrashInjection::Supported` |
 | `restart()` | The loss of the process. The store loses what `Declaration::crash_loss` states, and the journal keeps each entry whose sync returned. The binding serves again after a start | For each binding |
 | `snapshot()` | Gives a snapshot of the state of the store | Only when the declaration states `Restore::Journal` |
-| `restore(&snapshot)` | Restores the state of the store from the snapshot. The journal keeps its entries, and the binding serves again after a start | Only when the declaration states `Restore::Journal` |
+| `restore(&snapshot)` | Restores the state of the store from the snapshot, and writes a fresh store instance number as its last step. The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync | Only when the declaration states `Restore::Journal` |
 | `lose(sequences)` | Removes the durable journal entries with a sequence in the range. A later append does not get the sequence of a removed entry | Only when the declaration states `Restore::Journal` |
 
 The fault is a `rsauthnz_conformance::suite::Fault`, one of four:
@@ -87,7 +87,8 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | `ConcurrentConsumption` | Two consumptions of one value at the same time give one commit and one conflict | — | `OneUse`, `PendExact` |
 | `AbsenceRace` | A grant change and a revocation race. The revocation writes its record, and the change reads its absence. Only one commits | — | — |
 | `Expiry` | Expiry removes at most its limit of ended records of its kind, and no other record | — | `NoLiveRemoved` |
-| `Fencing` | A commit with the instance number of an earlier start refuses after a start, after a restart, and after a restore | — | `NoStaleCommit` |
+| `Fencing` | A commit with the instance number of an earlier start refuses after a start, after a restart, and after a restore. Between a restore and the next start, a commit with the instance number at the snapshot, or of a start after it, refuses too | — | `NoStaleCommit` |
+| `Retention` | An audit record and an outcome record stay readable until their retention end: the estimate of the audit time of the proposal plus `Declaration::outcome_retention`. An expire before that end removes neither, so a retried operation learns its outcome | — | — |
 | `LostResponse` | A commit whose response is lost landed: after the next start, its outcome record and its audit are readable. A commit that crashed before it landed wrote nothing | Crash | `MissingOutcomeUnknown` |
 | `FailedSync` | A failed sync gives its failure and stops the binding. No retried sync serves before a start, and no append since the last sync is durable | Crash, journal | — |
 | `Restart` | After the loss of the process, the store keeps what its declaration states, and the driver serves again. A store that loses everything gets its anchors back from the journal | — | `Recovers` |

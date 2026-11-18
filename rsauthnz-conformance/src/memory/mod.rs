@@ -15,8 +15,8 @@
 //! The binding implements [`Subject`], the controls of the conformance [suite](crate::suite), and passes each case.
 //! [`Subject::restart`] is the loss of the process: the store loses all its state, and the journal keeps its synced
 //! entries. The declaration states it with [`CrashLoss::Everything`]. [`Subject::snapshot`] and [`Subject::restore`]
-//! copy the state of the store, whose mark record holds its low-water mark. [`Subject::lose`] removes entries of the
-//! journal.
+//! copy the state of the store, whose mark record holds its low-water mark. A restore writes a fresh instance number,
+//! so the store refuses each commit of an earlier start at once. [`Subject::lose`] removes entries of the journal.
 //!
 //! Each future of the binding is ready at its first poll. A commit whose response is lost gives an error, and a lookup
 //! after the next start shows that it landed:
@@ -158,7 +158,7 @@ const SEEDED_ONE_IN: u8 = 8;
 /// The cause of a failed primitive. Each error is a crash with an unknown outcome: call [`Store::start`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The binding is new, or it had a restart or a restore, and it did not start after it.
+    /// The binding is new, or it had a restart, and it did not start after it.
     Stopped,
     /// The fault crashed the binding at this primitive or at an earlier one.
     Crash(Fault),
@@ -191,10 +191,13 @@ pub struct Snapshot(State);
 /// The state of the simulated store. A crash keeps it, and a restart loses it.
 #[derive(Clone, Debug, Default)]
 struct State {
-    /// The records, the policy, audit, outcome, and intent records included. The audit and outcome records have no
-    /// end ([`Declaration::outcome_retention`]).
+    /// The records, the policy, audit, outcome, and intent records included.
     records: BTreeMap<Key, Record>,
 }
+
+/// The outcome retention of the declaration. Each audit and outcome record ends at the estimate of the audit time of
+/// its proposal plus the retention, which saturates at `Duration::MAX`.
+const RETENTION: Duration = Duration::MAX;
 
 impl State {
     /// Whether `dependency` holds in the current state.
@@ -241,7 +244,8 @@ impl Request {
             .expect("an intent record has a key of at most 73 bytes and an encodable CBOR form");
         let outcome = store::outcome_record(proposal);
         let key = outcome.0.clone();
-        records.extend([store::audit_record(proposal), outcome]);
+        let end = Some(proposal.audit().time.estimate().saturating_add(RETENTION));
+        records.extend([store::audit_record(proposal), outcome].map(|(key, record)| (key, Record { end, ..record })));
         Self {
             id: proposal.operation().id.clone(),
             outcome: key,
@@ -263,8 +267,8 @@ struct Binding {
     synced: Sequence,
     /// The appends after the last sync. A crash loses them, so the next append gets the first sequence of them.
     unsynced: Vec<Entry>,
-    /// The instance number of the last start. It increases for the life of the binding, also across a restart and a
-    /// restore, so a commit from each earlier start refuses.
+    /// The instance number of the last start or restore. A start and a restore each write the next number, so it
+    /// increases for the life of the binding, and a commit from each earlier start refuses.
     instance: Instance,
     /// The error of each primitive until the next start, or `None` while the binding serves.
     stopped: Option<Error>,
@@ -421,12 +425,14 @@ impl Subject for Memory {
         Snapshot(self.lock().store.clone())
     }
 
-    /// Restores the state of the store from `snapshot`. The journal keeps its entries, and the appends after the last
-    /// sync are lost.
+    /// Restores the state of the store from `snapshot`, then writes the next instance number. The store takes commits
+    /// at once, and refuses each commit of an earlier start. The journal keeps its entries, and the appends after the
+    /// last sync are lost.
     fn restore(&self, snapshot: &Snapshot) {
         let mut binding = self.lock();
-        binding.stop(Error::Stopped);
+        binding.unsynced.clear();
         binding.store = snapshot.0.clone();
+        binding.instance = Instance(binding.instance.0.strict_add(1));
     }
 
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
@@ -441,7 +447,7 @@ impl Store for Memory {
         Declaration {
             isolation: Isolation::Serializable,
             crash_loss: CrashLoss::Everything,
-            outcome_retention: Duration::MAX,
+            outcome_retention: RETENTION,
             crash_injection: CrashInjection::Supported,
             restore: Restore::Journal {
                 location: "the memory of the process".into(),

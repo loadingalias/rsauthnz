@@ -115,11 +115,12 @@ These operations are the methods of `rsauthnz_conformance::suite::Subject`, the 
 | --- | --- |
 | `memory.restart()` | The loss of the process. The store loses all its records: the policy, audit, outcome, and intent records too. The binding stops |
 | `memory.snapshot()` | Gives a `Snapshot` of the state of the store. The mark record of the store (`Kind::Mark`) holds its low-water mark, so the snapshot holds it too ([Restore journal](restore.md)) |
-| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot. The binding stops. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
+| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, then writes the next instance number. The store takes commits at once, and refuses each commit of an earlier start. The appends after the last sync are lost. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
 
-A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start gives a larger instance number for
-the life of the binding, also after a restart and a restore. Thus a commit from each earlier start refuses.
+A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start and each restore writes a larger
+instance number for the life of the binding. Thus a commit from each earlier start refuses, also between a restore
+and the next start.
 
 ## Share the binding between callers
 
@@ -135,7 +136,7 @@ of one key give one commit and one conflict.
 | --- | --- |
 | `isolation` | `Isolation::Serializable` |
 | `crash_loss` | `CrashLoss::Everything`: the store is in the memory of the process |
-| `outcome_retention` | `Duration::MAX`: the binding has no clock, so outcome and audit records have no end |
+| `outcome_retention` | `Duration::MAX`: each audit and outcome record ends at the estimate of its audit time plus the retention, which saturates at `Duration::MAX`, so no expiry removes it |
 | `crash_injection` | `CrashInjection::Supported` |
 | `restore` | `Restore::Journal`, in the memory of the process, in a simulated domain apart from the store and its snapshots |
 | `key_bytes_max` | 2048 (`transition::Key::BYTES_MAX`) |

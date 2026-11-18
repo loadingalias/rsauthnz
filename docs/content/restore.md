@@ -178,7 +178,8 @@ outcome to the operation in progress, and serves again only after `driver.start(
    record and the journal after its mark, writes the missing creation entries and the voids of reconciliation, and
    then serves.
 2. After a restore of a snapshot, call `driver.restore(now)`, never `start`: a start voids the entries that a restore
-   applies. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
+   applies. The restore of the store writes a fresh store instance number as its last step, so a delayed commit of
+   an earlier start refuses also before `driver.restore`. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
    applies the activation and completes each in-doubt consumption. A start after a crash during the restore
    completes the rest before it serves.
 3. Submit a commit with `driver.submit(proposal, plan)`. The `Plan` gives the anchors of the owners that the store

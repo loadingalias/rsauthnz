@@ -353,7 +353,8 @@ pub struct Declaration {
     pub isolation: Isolation,
     /// What a crash can lose.
     pub crash_loss: CrashLoss,
-    /// The least time for which the binding keeps an outcome record. A lookup after it gives an unknown outcome.
+    /// The least time after the audit time of its proposal for which the binding keeps an audit and an outcome record.
+    /// A lookup after it gives an unknown outcome.
     pub outcome_retention: Duration,
     /// Whether the binding can inject a crash at each commit point for the conformance suite.
     pub crash_injection: CrashInjection,
