@@ -13,7 +13,7 @@ use rsauthnz::store::{Commit, Entry, Instance, Journal, Kind, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Proposal};
 
-use super::{Error, Fault, Memory, Schedule};
+use super::{Crash, Error, Fault, Memory, Schedule};
 use crate::suite::Subject;
 
 mod broken;
@@ -73,7 +73,8 @@ struct Run {
     memory: Memory,
     instance: Instance,
     calls: Vec<Call>,
-    faults: Vec<Fault>,
+    /// The error of each crash.
+    crashes: Vec<Error>,
     /// The entries whose sync returned.
     synced: Vec<Entry>,
     /// The entries whose append returned after the last sync.
@@ -131,15 +132,15 @@ impl Run {
 }
 
 /// Runs the steps on a binding with the schedule `Seeded(seed)`, and recovers after each crash and at the end. It
-/// gives each call with its result, and each fault.
-fn run(seed: u64) -> (Vec<Call>, Vec<Fault>) {
+/// gives each call with its result, and the error of each crash.
+fn run(seed: u64) -> (Vec<Call>, Vec<Error>) {
     let mut memory = Memory::new(Schedule::Seeded(seed));
     let instance = ready(memory.start()).unwrap();
     let mut run = Run {
         memory,
         instance,
         calls: vec![Call::Start(instance)],
-        faults: Vec::new(),
+        crashes: Vec::new(),
         synced: Vec::new(),
         unsynced: Vec::new(),
         commits: Vec::new(),
@@ -147,15 +148,15 @@ fn run(seed: u64) -> (Vec<Call>, Vec<Fault>) {
     for step in 0..STEPS {
         match run.step(step) {
             Ok(()) => {}
-            Err(Error::Crash(fault)) => {
-                run.faults.push(fault);
+            Err(Error::Stopped) => panic!("the run starts the binding after each crash"),
+            Err(crash) => {
+                run.crashes.push(crash);
                 run.recover();
             }
-            Err(Error::Stopped) => panic!("the run starts the binding after each crash"),
         }
     }
     run.recover();
-    (run.calls, run.faults)
+    (run.calls, run.crashes)
 }
 
 /// Each fault of a seeded schedule gives the outcome of the storage contract: a crash before a commit and a delayed
@@ -164,8 +165,11 @@ fn run(seed: u64) -> (Vec<Call>, Vec<Fault>) {
 #[test]
 fn each_fault_of_a_seeded_schedule_gives_its_outcome_and_a_seed_replays_its_results() {
     let runs: Vec<_> = (0..SEEDS).map(run).collect();
-    for fault in Fault::ALL {
-        assert!(runs.iter().any(|(_, faults)| faults.contains(&fault)), "{fault:?}");
+    for crash in Crash::ALL {
+        assert!(
+            runs.iter().any(|(_, crashes)| crashes.contains(&crash.error())),
+            "{crash:?}"
+        );
     }
     for (seed, first) in (0..SEEDS).zip(&runs) {
         assert_eq!(&run(seed), first, "seed {seed}");

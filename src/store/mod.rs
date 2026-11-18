@@ -291,6 +291,9 @@ pub trait Store {
     /// change, the audit record of [`audit_record`], each intent record of [`intent_records`], and the outcome record
     /// of [`outcome_record`] together. Otherwise it writes nothing. A commit is durable when it returns `Accepted`.
     /// An error is a crash, with an unknown outcome.
+    ///
+    /// An outcome record of the operation identity gives [`Commit::Recorded`], also when a dependency does not hold: a
+    /// second submission of a commit never finds its own dependencies.
     fn commit(&mut self, proposal: &Proposal, instance: Instance) -> impl Future<Output = Result<Commit, Self::Error>>;
 
     /// The outcome record of the operation identity `id`, or `None` when the store has none. It reads the record of

@@ -5,11 +5,12 @@
 //! each primitive is one atomic step and each commit is serializable. The clones of a [`Memory`] share one binding:
 //! give each concurrent caller its own clone.
 //!
-//! The binding simulates a durable store, and a restore journal in a separate failure domain. A [`Schedule`] injects
-//! each [`Fault`] at a primitive, and [`Subject::inject`] gives a fault to the next call of its primitive. The same
-//! faults and the same calls give the same results. A fault is a crash of the simulated store: the store keeps each
-//! commit that landed, and the journal keeps each entry whose sync returned. The crash loses the appends after the
-//! last sync. After a crash, each primitive except [`Store::start`] gives the [`Error`] of the crash.
+//! The binding simulates a durable store, and a restore journal in a separate failure domain. [`Subject::inject`] gives
+//! a [`Fault`] of the suite to the next call of its primitive. A [`Schedule`] injects crashes at the primitives: each
+//! fault, and two crashes of its own ([`Error::CrashAfterCommit`] and [`Error::DelayedCommit`]). The same faults and
+//! the same calls give the same results. A crash keeps each commit of the simulated store that landed, and each entry
+//! of the journal whose sync returned. It loses the appends after the last sync. After a crash, each primitive except
+//! [`Store::start`] gives the [`Error`] of the crash.
 //!
 //! The binding implements [`Subject`], the controls of the conformance [suite](crate::suite), and passes each case.
 //! [`Subject::restart`] is the loss of the process: the store loses all its state, and the journal keeps its synced
@@ -31,8 +32,8 @@
 //! use rsauthnz::store::{Kind, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
 //! use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
-//! use rsauthnz_conformance::memory::{Error, Fault, Memory, Schedule};
-//! use rsauthnz_conformance::suite::Subject;
+//! use rsauthnz_conformance::memory::{Error, Memory, Schedule};
+//! use rsauthnz_conformance::suite::{Fault, Subject};
 //!
 //! /// The output of a future of the memory binding.
 //! fn ready<F: Future>(future: F) -> F::Output {
@@ -87,45 +88,47 @@ use rsauthnz::store::{
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
 use rscrypto::RapidHash64;
 
-use crate::suite::Subject;
+use crate::suite::{Fault, Subject};
 
-/// A fault that a [`Schedule`] or [`Subject::inject`] gives to one primitive. Each fault crashes the binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Fault {
-    /// The binding crashes before a commit, so the commit writes nothing.
-    CrashBeforeCommit,
-    /// A commit writes everything, but its response is lost: the commit gives the error.
-    LostResponse,
-    /// The binding crashes after a commit gives its result.
-    CrashAfterCommit,
-    /// The binding crashes while a commit is in flight. The commit arrives after the next start, with the instance
-    /// number of the earlier start, so it refuses.
-    DelayedCommit,
-    /// The binding crashes after an append gives its sequence, before a sync. The crash loses the append.
-    CrashAfterAppend,
-    /// A sync fails, and no append since the last sync becomes durable.
-    FailedSync,
+/// A crash that the binding injects at one primitive: a fault of the suite, or a crash that only a seeded
+/// [`Schedule`] gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Crash {
+    Fault(Fault),
+    /// [`Error::CrashAfterCommit`].
+    AfterCommit,
+    /// [`Error::DelayedCommit`].
+    Delayed,
 }
 
-impl Fault {
-    /// Each fault.
+impl Crash {
+    /// Each crash that a seeded schedule can give.
     const ALL: [Self; 6] = [
-        Self::CrashBeforeCommit,
-        Self::LostResponse,
-        Self::CrashAfterCommit,
-        Self::DelayedCommit,
-        Self::CrashAfterAppend,
-        Self::FailedSync,
+        Self::Fault(Fault::CrashBeforeCommit),
+        Self::Fault(Fault::LostResponse),
+        Self::AfterCommit,
+        Self::Delayed,
+        Self::Fault(Fault::CrashAfterAppend),
+        Self::Fault(Fault::FailedSync),
     ];
 
-    /// The primitive that takes the fault.
+    /// The primitive that takes the crash.
     const fn primitive(self) -> Primitive {
         match self {
-            Self::CrashBeforeCommit | Self::LostResponse | Self::CrashAfterCommit | Self::DelayedCommit => {
+            Self::Fault(Fault::CrashBeforeCommit | Fault::LostResponse) | Self::AfterCommit | Self::Delayed => {
                 Primitive::Commit
             }
-            Self::CrashAfterAppend => Primitive::Append,
-            Self::FailedSync => Primitive::Sync,
+            Self::Fault(Fault::CrashAfterAppend) => Primitive::Append,
+            Self::Fault(Fault::FailedSync) => Primitive::Sync,
+        }
+    }
+
+    /// The error of each primitive after the crash.
+    const fn error(self) -> Error {
+        match self {
+            Self::Fault(fault) => Error::Crash(fault),
+            Self::AfterCommit => Error::CrashAfterCommit,
+            Self::Delayed => Error::DelayedCommit,
         }
     }
 }
@@ -143,9 +146,10 @@ enum Primitive {
 pub enum Schedule {
     /// No fault.
     None,
-    /// Faults from this seed. Each commit, append, and sync takes a fault with a chance of one in 8, and each fault
-    /// of its primitive has the same chance. The draw of a call is the RapidHash of its primitive and its number,
-    /// with the seed, so a seed gives the same faults at each run.
+    /// Faults from this seed. Each commit, append, and sync takes a crash with a chance of one in 8, and each crash
+    /// of its primitive has the same chance: each [`Fault`], [`Error::CrashAfterCommit`], and
+    /// [`Error::DelayedCommit`]. The draw of a call is the RapidHash of its primitive and its number, with the seed,
+    /// so a seed gives the same faults at each run.
     Seeded(u64),
 }
 
@@ -159,6 +163,12 @@ pub enum Error {
     Stopped,
     /// The fault crashed the binding at this primitive or at an earlier one.
     Crash(Fault),
+    /// A seeded schedule crashed the binding after a commit gave its result. The commit landed when its result was
+    /// [`Commit::Accepted`].
+    CrashAfterCommit,
+    /// A seeded schedule crashed the binding while a commit was in flight. The commit arrives after the next start,
+    /// with the instance number of the earlier start, so it refuses and writes nothing.
+    DelayedCommit,
 }
 
 impl fmt::Display for Error {
@@ -166,6 +176,8 @@ impl fmt::Display for Error {
         match self {
             Self::Stopped => f.write_str("the memory binding did not start"),
             Self::Crash(fault) => write!(f, "the memory binding crashed with the fault {fault:?}"),
+            Self::CrashAfterCommit => f.write_str("the memory binding crashed after a commit"),
+            Self::DelayedCommit => f.write_str("the memory binding crashed with a commit in flight"),
         }
     }
 }
@@ -257,7 +269,7 @@ struct Binding {
     instance: Instance,
     /// The error of each primitive until the next start, or `None` while the binding serves.
     stopped: Option<Error>,
-    /// A commit of [`Fault::DelayedCommit`] and its instance number. It lands after the next start.
+    /// A commit of [`Error::DelayedCommit`] and its instance number. It lands after the next start.
     delayed: Option<(Request, Instance)>,
     schedule: Schedule,
     /// The fault of [`Subject::inject`] for the next call of its primitive.
@@ -279,13 +291,16 @@ impl Binding {
         error
     }
 
-    /// Counts a call of `primitive`, and gives the fault that the schedule injects at it.
-    fn fault(&mut self, primitive: Primitive) -> Option<Fault> {
+    /// Counts a call of `primitive`, and gives the crash that [`Subject::inject`] or the schedule injects at it.
+    fn crash(&mut self, primitive: Primitive) -> Option<Crash> {
         let count = &mut self.calls[primitive as usize];
         let call = *count;
         *count = call.strict_add(1);
-        if let Some(fault) = self.injected.take_if(|fault| fault.primitive() == primitive) {
-            return Some(fault);
+        if let Some(fault) = self
+            .injected
+            .take_if(|fault| Crash::Fault(*fault).primitive() == primitive)
+        {
+            return Some(Crash::Fault(fault));
         }
         match self.schedule {
             Schedule::None => None,
@@ -296,10 +311,33 @@ impl Binding {
                 if rate % SEEDED_ONE_IN != 0 {
                     return None;
                 }
-                let mut faults = Fault::ALL.into_iter().filter(|fault| fault.primitive() == primitive);
-                let count = faults.clone().count();
-                faults.nth(usize::from(pick) % count)
+                let mut crashes = Crash::ALL.into_iter().filter(|crash| crash.primitive() == primitive);
+                let count = crashes.clone().count();
+                crashes.nth(usize::from(pick) % count)
             }
+        }
+    }
+
+    /// The commit of `request` with the instance number `instance`, after the crash that it takes.
+    fn commit(&mut self, request: Request, instance: Instance) -> Result<Commit, Error> {
+        self.serving()?;
+        match self.crash(Primitive::Commit) {
+            Some(crash @ Crash::Fault(Fault::CrashBeforeCommit)) => Err(self.stop(crash.error())),
+            Some(crash @ Crash::Fault(Fault::LostResponse)) => {
+                self.apply(request, instance);
+                Err(self.stop(crash.error()))
+            }
+            Some(crash @ Crash::AfterCommit) => {
+                let commit = self.apply(request, instance);
+                self.stop(crash.error());
+                Ok(commit)
+            }
+            Some(crash @ Crash::Delayed) => {
+                self.delayed = Some((request, instance));
+                Err(self.stop(crash.error()))
+            }
+            // A commit takes only the crashes of a commit.
+            Some(Crash::Fault(Fault::CrashAfterAppend | Fault::FailedSync)) | None => Ok(self.apply(request, instance)),
         }
     }
 
@@ -434,26 +472,7 @@ impl Store for Memory {
 
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
         let request = Request::new(proposal);
-        let mut binding = self.lock();
-        binding.serving()?;
-        match binding.fault(Primitive::Commit) {
-            Some(fault @ Fault::CrashBeforeCommit) => Err(binding.stop(Error::Crash(fault))),
-            Some(fault @ Fault::LostResponse) => {
-                binding.apply(request, instance);
-                Err(binding.stop(Error::Crash(fault)))
-            }
-            Some(fault @ Fault::CrashAfterCommit) => {
-                let commit = binding.apply(request, instance);
-                binding.stop(Error::Crash(fault));
-                Ok(commit)
-            }
-            Some(fault @ Fault::DelayedCommit) => {
-                binding.delayed = Some((request, instance));
-                Err(binding.stop(Error::Crash(fault)))
-            }
-            // A commit takes only the faults of a commit.
-            Some(Fault::CrashAfterAppend | Fault::FailedSync) | None => Ok(binding.apply(request, instance)),
-        }
+        self.lock().commit(request, instance)
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
@@ -496,8 +515,8 @@ impl Journal for Memory {
             sequence,
             data: entry.into(),
         });
-        if let Some(fault) = binding.fault(Primitive::Append) {
-            binding.stop(Error::Crash(fault));
+        if let Some(crash) = binding.crash(Primitive::Append) {
+            binding.stop(crash.error());
         }
         Ok(sequence)
     }
@@ -505,8 +524,8 @@ impl Journal for Memory {
     async fn sync(&mut self) -> Result<(), Error> {
         let mut binding = self.lock();
         binding.serving()?;
-        if let Some(fault) = binding.fault(Primitive::Sync) {
-            return Err(binding.stop(Error::Crash(fault)));
+        if let Some(crash) = binding.crash(Primitive::Sync) {
+            return Err(binding.stop(crash.error()));
         }
         let entries = mem::take(&mut binding.unsynced);
         if let Some(last) = entries.last() {

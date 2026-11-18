@@ -9,6 +9,8 @@ yet.
 
 ## Run the suite
 
+[Write a storage binding](storage-binding.md) gives each step of a new binding in detail.
+
 1. Implement `rsauthnz::store::Store` for the binding. Also implement `rsauthnz::store::Journal`. A binding with no
    journal declares `Restore::Unsupported`, and its `Journal` methods can give an error: the suite and the driver do
    not call them.
@@ -61,7 +63,7 @@ commit with two clones at the same time. Each control acts on the binding of all
 | `restore(&snapshot)` | Restores the state of the store from the snapshot. The journal keeps its entries, and the binding serves again after a start | Only when the declaration states `Restore::Journal` |
 | `lose(sequences)` | Removes the durable journal entries with a sequence in the range. A later append does not get the sequence of a removed entry | Only when the declaration states `Restore::Journal` |
 
-The fault is a `rsauthnz_conformance::memory::Fault`. The suite injects four faults:
+The fault is a `rsauthnz_conformance::suite::Fault`, one of four:
 
 | `Fault` | Primitive | The binding gives | Durable state after it |
 | --- | --- | --- | --- |

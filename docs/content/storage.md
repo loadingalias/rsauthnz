@@ -7,7 +7,8 @@ of the protocol. [Propose a transition](transitions.md) gives the proposal that 
 
 This release has the contract, its reference binding (the [memory binding](memory-binding.md)), and the commit driver
 `rsauthnz::store::driver`, which gives the binding each primitive call ([The commit driver](restore.md#the-commit-driver)).
-The [conformance suite](conformance.md) checks a binding against the contract.
+The [conformance suite](conformance.md) checks a binding against the contract. [Write a storage
+binding](storage-binding.md) gives the steps from the primitives to a binding that passes the suite.
 
 ## Declare the binding
 

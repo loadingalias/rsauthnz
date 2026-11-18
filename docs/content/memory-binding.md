@@ -32,8 +32,8 @@ use rsauthnz::limits::Limits;
 use rsauthnz::store::{Kind, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
-use rsauthnz_conformance::memory::{Error, Fault, Memory, Schedule};
-use rsauthnz_conformance::suite::Subject;
+use rsauthnz_conformance::memory::{Error, Memory, Schedule};
+use rsauthnz_conformance::suite::{Fault, Subject};
 
 /// The output of a future of the memory binding.
 fn ready<F: Future>(future: F) -> F::Output {
@@ -79,28 +79,29 @@ futures in an executor gets the same results.
 
 ## Inject faults
 
-`memory.inject(fault)` gives `fault` to the next call of its primitive. It is a method of
-`rsauthnz_conformance::suite::Subject`, so import the trait. `Schedule` selects the faults of the other calls:
+`memory.inject(fault)` gives `fault`, a `rsauthnz_conformance::suite::Fault`, to the next call of its primitive. It
+is a method of `rsauthnz_conformance::suite::Subject`, so import the trait. `Schedule` selects the crashes of the other
+calls:
 
 | `Schedule` | Faults |
 | --- | --- |
 | `Schedule::None` | No fault |
-| `Schedule::Seeded(seed)` | Each commit, append, and sync takes a fault with a chance of one in 8. Each fault of the primitive has the same chance. The draw of each call is the RapidHash of the call with the seed, so a seed gives the same faults at each run |
+| `Schedule::Seeded(seed)` | Each commit, append, and sync takes a crash with a chance of one in 8. Each crash of the primitive in the table below has the same chance. The draw of each call is the RapidHash of the call with the seed, so a seed gives the same crashes at each run |
 
-Each fault is a crash of the simulated store:
+Each crash stops the simulated store:
 
-| `Fault` | Primitive | Result | Durable state after the crash |
-| --- | --- | --- | --- |
-| `CrashBeforeCommit` | `Store::commit` | `Err(Error::Crash(fault))` | The commit wrote nothing |
-| `LostResponse` | `Store::commit` | `Err(Error::Crash(fault))` | The commit landed |
-| `CrashAfterCommit` | `Store::commit` | The result of the commit. The next primitive gives the error | The commit landed when its result is `Accepted` |
-| `DelayedCommit` | `Store::commit` | `Err(Error::Crash(fault))` | The commit arrives after the next start, with the earlier instance number, so it refuses and writes nothing |
-| `CrashAfterAppend` | `Journal::append` | The sequence of the append. The next primitive gives the error | The append is lost |
-| `FailedSync` | `Journal::sync` | `Err(Error::Crash(fault))` | No append since the last sync is durable |
+| Crash | Injected by | Primitive | Result | Durable state after the crash |
+| --- | --- | --- | --- | --- |
+| `Fault::CrashBeforeCommit` | `inject` or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit wrote nothing |
+| `Fault::LostResponse` | `inject` or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit landed |
+| `Error::CrashAfterCommit` | A seed only | `Store::commit` | The result of the commit. The next primitive gives the error | The commit landed when its result is `Accepted` |
+| `Error::DelayedCommit` | A seed only | `Store::commit` | `Err(Error::DelayedCommit)` | The commit arrives after the next start, with the earlier instance number, so it refuses and writes nothing |
+| `Fault::CrashAfterAppend` | `inject` or a seed | `Journal::append` | The sequence of the append. The next primitive gives the error | The append is lost |
+| `Fault::FailedSync` | `inject` or a seed | `Journal::sync` | `Err(Error::Crash(fault))` | No append since the last sync is durable |
 
 After a crash, the store keeps each commit that landed, and the journal keeps each entry whose sync returned. The
 crash loses each append after the last sync, and the next append gets the first sequence of the lost appends. Each
-primitive except `Store::start` gives `Error::Crash(fault)` until the next start.
+primitive except `Store::start` gives the error of the crash until the next start.
 
 ## Restart, restore, and the journal
 

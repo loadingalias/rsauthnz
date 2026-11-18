@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 
-use super::super::{Error, Fault, Memory, Primitive, Request, Schedule, Snapshot};
+use super::super::{Error, Fault, Memory, Request, Schedule, Snapshot};
 use super::ready;
 use crate::suite::{self, Case, Report, Subject};
 
@@ -63,32 +63,6 @@ struct Broken {
     defect: Defect,
 }
 
-impl Broken {
-    /// The commit of `request` with a defect of the commit. It takes the faults as the commit of the memory binding
-    /// does.
-    fn apply(&self, request: Request, instance: Instance) -> Result<Commit, Error> {
-        let mut binding = self.memory.lock();
-        binding.serving()?;
-        match binding.fault(Primitive::Commit) {
-            Some(fault @ Fault::CrashBeforeCommit) => Err(binding.stop(Error::Crash(fault))),
-            Some(fault @ Fault::LostResponse) => {
-                binding.apply(request, instance);
-                Err(binding.stop(Error::Crash(fault)))
-            }
-            Some(fault @ Fault::CrashAfterCommit) => {
-                let commit = binding.apply(request, instance);
-                binding.stop(Error::Crash(fault));
-                Ok(commit)
-            }
-            Some(fault @ Fault::DelayedCommit) => {
-                binding.delayed = Some((request, instance));
-                Err(binding.stop(Error::Crash(fault)))
-            }
-            Some(Fault::CrashAfterAppend | Fault::FailedSync) | None => Ok(binding.apply(request, instance)),
-        }
-    }
-}
-
 impl Store for Broken {
     type Error = Error;
 
@@ -124,14 +98,15 @@ impl Store for Broken {
                     .retain(|dependency| !matches!(dependency, Dependency::Absent(key) if !written.contains(key)));
             }
             Defect::NoInstanceCheck => {
-                let current = self.memory.lock().instance;
-                return self.apply(request, current);
+                let mut binding = self.memory.lock();
+                let current = binding.instance;
+                return binding.commit(request, current);
             }
             Defect::LostOutcomes | Defect::NoJournal | Defect::RetriedSync => {
                 return self.memory.commit(proposal, instance).await;
             }
         }
-        self.apply(request, instance)
+        self.memory.lock().commit(request, instance)
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

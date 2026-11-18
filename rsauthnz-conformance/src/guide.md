@@ -1,0 +1,435 @@
+# Write a storage binding
+
+This guide takes a backend author from an empty store to a binding that passes the [conformance suite]. A binding
+connects rsauthnz to the store that the application chooses, for example a transactional database or a store with a
+single writer. rsauthnz ships no storage backend, so a binding that passes the suite is the supported way to keep its
+state.
+
+You implement only primitives: one bounded effect for each call. The commit driver of the core ([`Driver`]) orders
+every write: the journal entries, the commits, the voids, the creation entries, and the acknowledgements. No step of
+this guide asks you to order two writes. Each step names the public items that it implements. The
+[memory binding] is the reference implementation of each primitive.
+
+[conformance suite]: crate::suite
+[memory binding]: crate::memory
+[`Driver`]: rsauthnz::store::driver::Driver
+
+## Prerequisites
+
+- A store with one atomic conditional commit over a set of keys: a serializable transaction, or one atomic write
+  that checks each condition first. A store with snapshot isolation or weaker cannot keep the contract.
+- For restore support, a place for the restore journal outside the failure domain of the snapshots of the store.
+  For example, use another host, disk, or bucket.
+- An executor for the futures of the binding. The core runs no executor.
+
+## Steps
+
+1. [Declare the guarantees](#1-declare-the-guarantees).
+2. [Keep the store instance number](#2-keep-the-store-instance-number).
+3. [Read one record](#3-read-one-record).
+4. [Commit a proposal](#4-commit-a-proposal).
+5. [Keep audit and outcome records for their retention](#5-keep-audit-and-outcome-records-for-their-retention).
+6. [Expire ended records](#6-expire-ended-records).
+7. [Read the effect intents](#7-read-the-effect-intents).
+8. [Keep the restore journal](#8-keep-the-restore-journal).
+9. [Stop at each error](#9-stop-at-each-error).
+10. [Run the commit driver](#10-run-the-commit-driver).
+11. [Implement the test controls](#11-implement-the-test-controls).
+12. [Run the suite](#12-run-the-suite).
+
+## 1. Declare the guarantees
+
+Give the guarantees of the binding in [`Store::declaration`], as a [`Declaration`]. [`Profile::new`] refuses a
+declaration that cannot keep the contract. The suite calls it before the cases, and the application calls it before
+it makes the driver ([step 10](#10-run-the-commit-driver)).
+
+| Field | Set it to |
+| --- | --- |
+| `isolation` | [`Isolation::Serializable`] for a serializable transaction. [`Isolation::AtomicConditional`] for one atomic write that checks each dependency, absences included. Never claim either one for snapshot isolation |
+| `crash_loss` | [`CrashLoss::Unsynced`] when a crash loses only the writes whose commit or sync did not return. [`CrashLoss::Everything`] when the store is in the memory of the process |
+| `outcome_retention` | The least time for which the binding keeps an outcome record ([step 5](#5-keep-audit-and-outcome-records-for-their-retention)) |
+| `crash_injection` | [`CrashInjection::Supported`] when the binding implements [`Subject::inject`] ([step 11](#11-implement-the-test-controls)) |
+| `restore` | [`Restore::Journal`] with the location and the failure domain of the journal, or [`Restore::Unsupported`] |
+| `key_bytes_max` | At least [`Key::BYTES_MAX`] |
+| `record_bytes_max` | The most bytes in one record form or intent payload that the store keeps. [`Profile::admit`] refuses a proposal with a larger one before its commit |
+
+The declaration selects the suite cases. A binding without crash injection skips the crash cases, and a binding
+without a journal skips the restore cases. [`Report::skipped`] names each case that the binding skips.
+
+[`Store::declaration`]: rsauthnz::store::Store::declaration
+[`Declaration`]: rsauthnz::store::Declaration
+[`Profile::new`]: rsauthnz::store::Profile::new
+[`Profile::admit`]: rsauthnz::store::Profile::admit
+[`Isolation::Serializable`]: rsauthnz::store::Isolation::Serializable
+[`Isolation::AtomicConditional`]: rsauthnz::store::Isolation::AtomicConditional
+[`CrashLoss::Unsynced`]: rsauthnz::store::CrashLoss::Unsynced
+[`CrashLoss::Everything`]: rsauthnz::store::CrashLoss::Everything
+[`CrashInjection::Supported`]: rsauthnz::store::CrashInjection::Supported
+[`Restore::Journal`]: rsauthnz::store::Restore::Journal
+[`Restore::Unsupported`]: rsauthnz::store::Restore::Unsupported
+[`Key::BYTES_MAX`]: rsauthnz::transition::Key::BYTES_MAX
+[`Report::skipped`]: crate::suite::Report::skipped
+[`Subject::inject`]: crate::suite::Subject::inject
+
+## 2. Keep the store instance number
+
+Implement [`Store::start`]. It gives a new [`Instance`], and each commit compares its instance with the number of
+the latest start ([step 4](#4-commit-a-proposal)). Thus a commit from an earlier start refuses, also when it arrives
+late over the network.
+
+1. Give a number that is larger than each number that an earlier start gave. This applies also after a restart and
+   after a restore.
+2. Keep the counter of the numbers where a restore cannot lower it: in the failure domain of the journal. A
+   restored lower number lets a delayed commit of the abandoned history land. A binding without a journal keeps the
+   counter where a restart does not lower it.
+3. Write the new number durably before `start` returns. A client-server store also writes it into the store, so
+   that each commit reads it in its atomic step. Either order of these two writes is safe, because no commit has the
+   new number before `start` returns.
+
+One driver serves each store at a time. A start fences each commit of an earlier start, so a second driver on the
+same store makes the commits of the first one refuse.
+
+[`Store::start`]: rsauthnz::store::Store::start
+[`Instance`]: rsauthnz::store::Instance
+
+## 3. Read one record
+
+Implement [`Store::read`]. It gives the current [`Record`] of a [`Key`]: its version, its end, and its record form.
+It gives `None` when no record has the key. It is a keyed read, and it never scans other records.
+
+Store each key and each record form as opaque bytes. The first byte of a key names the [`Kind`] of its record, and
+[`Kind::of`] gives it. The binding stores the records of every kind in the same way. These include the records that
+the driver writes for itself: the mark record ([`Kind::Mark`]) and the replay floor ([`Kind::ReplayFloor`]).
+
+[`Store::read`]: rsauthnz::store::Store::read
+[`Record`]: rsauthnz::store::Record
+[`Key`]: rsauthnz::transition::Key
+[`Kind`]: rsauthnz::store::Kind
+[`Kind::of`]: rsauthnz::store::Kind::of
+[`Kind::Mark`]: rsauthnz::store::Kind::Mark
+[`Kind::ReplayFloor`]: rsauthnz::store::Kind::ReplayFloor
+
+## 4. Commit a proposal
+
+Implement [`Store::commit`]. It is the only primitive that writes state, audit, or an outcome record. Do all of
+this in one atomic step:
+
+1. Compare the instance number of the call with the number of the latest start. When they differ, give
+   [`Commit::Conflict`].
+2. Read the outcome record of the operation identity: the key of [`outcome_record`]. When it exists, give
+   [`Commit::Recorded`] with the operation of [`outcome_of`]. Give it also when a dependency no longer holds: a
+   second submission of a commit never finds its own dependencies.
+3. Check each [`Dependency`] of [`Proposal::dependencies`]. `Version(key, version)` holds when the record of `key`
+   has that version. `Policy(version)` holds when the record of [`policy_key`] of its owner has that version.
+   `Absent(key)` holds when no record has `key`. When one does not hold, give [`Commit::Conflict`].
+4. Write each [`Change`] of [`Proposal::changes`], the record of [`audit_record`], each record of
+   [`intent_records`], and the record of [`outcome_record`]. `Change::End` removes its record.
+5. Make the writes durable, then give [`Commit::Accepted`].
+
+A conflict writes nothing. Give an error only when the outcome is unknown, for example after a lost connection or a
+timeout. An error is a crash ([step 9](#9-stop-at-each-error)).
+
+Map the commit to the store:
+
+- **Transactional database.** Run steps 1 to 5 in one transaction at serializable isolation. A
+  transaction that the database aborts, for example at a serialization failure, wrote nothing: give
+  [`Commit::Conflict`].
+- **Store with a single writer.** Hold the writer for the checks and the writes. Write all records in one batch, and
+  make the batch durable before you give the result.
+- **Atomic conditional write.** Put a condition for the instance number, for the absence of the outcome record, and
+  for each dependency in the write. When a condition fails, read the instance number and the outcome record. Give
+  the result of the first check above that fails.
+
+[`Store::commit`]: rsauthnz::store::Store::commit
+[`Commit::Conflict`]: rsauthnz::store::Commit::Conflict
+[`Commit::Recorded`]: rsauthnz::store::Commit::Recorded
+[`Commit::Accepted`]: rsauthnz::store::Commit::Accepted
+[`outcome_record`]: rsauthnz::store::outcome_record
+[`outcome_of`]: rsauthnz::store::outcome_of
+[`audit_record`]: rsauthnz::store::audit_record
+[`intent_records`]: rsauthnz::store::intent_records
+[`policy_key`]: rsauthnz::store::policy_key
+[`Dependency`]: rsauthnz::transition::Dependency
+[`Change`]: rsauthnz::transition::Change
+[`Proposal::dependencies`]: rsauthnz::transition::Proposal::dependencies
+[`Proposal::changes`]: rsauthnz::transition::Proposal::changes
+
+## 5. Keep audit and outcome records for their retention
+
+The records of [`audit_record`] and [`outcome_record`] have no end. When you write them, set their end to the time of
+the commit plus [`Declaration::outcome_retention`]. Keep no end when the sum is past the largest `Duration`. Take the
+time from the clock of the [`Reading`] values of the application, so that [`store::expire`] compares like times.
+
+[`Store::outcome`] is a provided method. It reads the outcome record with [`Store::read`], so you implement nothing
+for it. A lookup after the retention gives an unknown outcome.
+
+[`Declaration::outcome_retention`]: rsauthnz::store::Declaration::outcome_retention
+[`Reading`]: rsauthnz::time::Reading
+[`Store::outcome`]: rsauthnz::store::Store::outcome
+
+## 6. Expire ended records
+
+Implement [`Store::expire`]. It removes at most `limit` records of one kind whose end is before `before`, and it
+gives their number. It removes no record of another kind, no record with no end, and no record whose end is at
+`before` or later. Keep an index of the ends of each kind, so that the cost of a call follows `limit`, not the size
+of the store.
+
+The application runs [`store::expire`] in bounded passes. It calls [`Store::expire`] only for each kind that
+[`Kind::ends`] names.
+
+[`Store::expire`]: rsauthnz::store::Store::expire
+[`store::expire`]: rsauthnz::store::expire
+[`Kind::ends`]: rsauthnz::store::Kind::ends
+
+## 7. Read the effect intents
+
+Implement [`Store::intents`]. It gives at most `limit` records of [`Kind::Intent`] with a key after `after`, in the
+byte order of the keys. With `None`, it starts at the first key. [`Kind::key`] of an empty identifier gives the first
+key of a kind, so the intents are one range of keys. A worker of the application reads the intents after a crash,
+and the driver reads its own intents at each start.
+
+[`Store::intents`]: rsauthnz::store::Store::intents
+[`Kind::Intent`]: rsauthnz::store::Kind::Intent
+[`Kind::key`]: rsauthnz::store::Kind::key
+
+## 8. Keep the restore journal
+
+A binding that supports restore implements [`Journal`]. The driver writes the record format, checks the hash chain,
+and applies the rules ([`journal`]). The binding stores bytes.
+
+1. Keep the journal outside the failure domain of the snapshots, and declare it in [`Restore::Journal`].
+2. Implement [`Journal::append`]. Store the bytes as they are, and give the next [`Sequence`]: the first entry has
+   sequence 1, and each next entry adds one. An append is not durable before a later sync returns.
+3. Implement [`Journal::sync`]. It makes each earlier append durable. When it fails, give the error and do not
+   retry it. After a failed sync, the kernel can drop the data and clear the error, so a later sync that succeeds
+   does not show that the data is durable.
+4. Implement [`Journal::read`]. It gives at most `limit` durable entries ([`Entry`]) after the sequence `after`, in
+   the order of their sequences. Give no append whose sync did not return. Do not fill or renumber a gap.
+5. After a crash or a failed sync, drop each append after the last sync that returned. The next append gets the
+   sequence after the last durable entry.
+6. Frame each entry, for example with its length and a checksum. Then a start after a crash finds a torn last
+   append, which no sync made durable, and drops it.
+
+A binding with no journal declares [`Restore::Unsupported`]. It implements [`Journal`] with methods that give an
+error, because the driver and the suite never call them.
+
+[`Journal`]: rsauthnz::store::Journal
+[`journal`]: rsauthnz::store::journal
+[`Journal::append`]: rsauthnz::store::Journal::append
+[`Journal::sync`]: rsauthnz::store::Journal::sync
+[`Journal::read`]: rsauthnz::store::Journal::read
+[`Sequence`]: rsauthnz::store::Sequence
+[`Entry`]: rsauthnz::store::Entry
+
+## 9. Stop at each error
+
+An error of a primitive ([`Store::Error`] or [`Journal::Error`]) is a crash. Keep one state for the binding and
+all its handles:
+
+1. After an error of any primitive, give an error from each primitive except [`Store::start`].
+2. Serve again only after the next [`Store::start`].
+3. Do not retry a primitive inside the binding.
+
+Thus a failed sync stops the commits too, and no retried sync lets the binding serve again. Give no error for a
+result that the contract names: a conflict is [`Commit::Conflict`], not an error.
+
+[`Store::Error`]: rsauthnz::store::Store::Error
+[`Journal::Error`]: rsauthnz::store::Journal::Error
+
+## 10. Run the commit driver
+
+The application drives the binding with [`Driver`]. [`Driver::effect`] gives the next primitive call, an [`Effect`].
+Execute it on the binding, and give the [`Output`] to [`Driver::give`]. Give [`Output::Failed`] for an error. Do not
+retry the primitive. This function is the same for each binding, and `cargo xtask test` compiles it:
+
+```rust
+use rsauthnz::store::driver::{self, Driver, Effect, Output};
+use rsauthnz::store::{Journal, Store};
+
+/// The output of the primitive call `effect` on `binding`. A failed primitive gives `Output::Failed`.
+async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Output {
+    match effect {
+        Effect::Start => binding.start().await.map_or(Output::Failed, Output::Started),
+        Effect::Read(key) => Store::read(binding, key).await.map_or(Output::Failed, Output::Read),
+        Effect::Commit(proposal, instance) => binding
+            .commit(proposal, instance)
+            .await
+            .map_or(Output::Failed, Output::Committed),
+        Effect::Expire(kind, before, limit) => binding
+            .expire(kind, before, limit)
+            .await
+            .map_or(Output::Failed, Output::Expired),
+        Effect::Intents(after, limit) => binding
+            .intents(after, limit)
+            .await
+            .map_or(Output::Failed, Output::Intents),
+        Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
+        Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
+        Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
+            .await
+            .map_or(Output::Failed, Output::Journal),
+    }
+}
+
+/// Executes the effects of `driver` on `binding` until the driver waits for a request.
+async fn settle<B: Store + Journal>(driver: &mut Driver, binding: &mut B) -> Result<(), driver::Error> {
+    while let Some(effect) = driver.effect() {
+        let output = execute(binding, effect).await;
+        driver.give(output)?;
+    }
+    Ok(())
+}
+```
+
+1. Accept the declaration of the binding with [`Profile::new`]. Then make the driver with [`Driver::new`].
+2. Call [`Driver::start`] at first and after each crash, then settle. [`Driver::status`] gives
+   [`Status::Serving`] when the store serves.
+3. After a restore of a snapshot, call [`Driver::restore`], never [`Driver::start`].
+4. Check each proposal with [`Profile::admit`]. Then submit it with [`Driver::submit`] and its [`Plan`], settle, and
+   take the answer with [`Driver::take`].
+5. Look up a lost outcome with [`Driver::lookup`].
+
+The documentation of the [`driver`] module gives each operation of the driver and its refusals.
+
+[`driver`]: rsauthnz::store::driver
+[`Driver::effect`]: rsauthnz::store::driver::Driver::effect
+[`Driver::give`]: rsauthnz::store::driver::Driver::give
+[`Driver::new`]: rsauthnz::store::driver::Driver::new
+[`Driver::start`]: rsauthnz::store::driver::Driver::start
+[`Driver::status`]: rsauthnz::store::driver::Driver::status
+[`Driver::restore`]: rsauthnz::store::driver::Driver::restore
+[`Driver::submit`]: rsauthnz::store::driver::Driver::submit
+[`Driver::take`]: rsauthnz::store::driver::Driver::take
+[`Driver::lookup`]: rsauthnz::store::driver::Driver::lookup
+[`Status::Serving`]: rsauthnz::store::driver::Status::Serving
+[`Plan`]: rsauthnz::store::driver::Plan
+[`Effect`]: rsauthnz::store::driver::Effect
+[`Output`]: rsauthnz::store::driver::Output
+[`Output::Failed`]: rsauthnz::store::driver::Output::Failed
+
+## 11. Implement the test controls
+
+Implement [`Subject`] for the binding. It adds the controls of a test to the primitives. The clones of a subject are
+handles of one binding, and each control acts on all of them. Two cases commit from two clones at the same time.
+
+| Control | Implement it so that |
+| --- | --- |
+| [`Subject::inject`] | The next call of the primitive of the [`Fault`] takes the fault ([below](#faults)) |
+| [`Subject::restart`] | The process is lost. The store loses what `crash_loss` states. The journal keeps each entry whose sync returned, and loses each later append. The counter of instance numbers stays. The binding serves again after a start |
+| [`Subject::snapshot`] | It gives a consistent copy of the complete state of the store, the mark record included. The copy holds no journal entry |
+| [`Subject::restore`] | The state of the store is the copy again. The journal keeps its durable entries, and loses each append after the last sync. The counter of instance numbers stays. The binding serves again after a start |
+| [`Subject::lose`] | The durable entries with a sequence in the range are gone. The next append still gets the sequence after the last durable entry before the loss, so no entry gets a lost sequence again |
+
+### Faults
+
+The suite gives these faults to [`Subject::inject`]. Each one is a crash of the binding: after it, the binding stops
+as [step 9](#9-stop-at-each-error) states.
+
+| [`Fault`] | The next call of | The binding writes | The call gives |
+| --- | --- | --- | --- |
+| [`Fault::CrashBeforeCommit`] | [`Store::commit`] | Nothing | An error |
+| [`Fault::LostResponse`] | [`Store::commit`] | The commit, as a commit with no fault | An error |
+| [`Fault::CrashAfterAppend`] | [`Journal::append`] | No durable entry: the crash loses the append | Its sequence. The next primitive gives an error |
+| [`Fault::FailedSync`] | [`Journal::sync`] | No durable entry since the last sync | An error |
+
+Most bindings can inject these faults in their own code, before or after the call to the store. A binding that
+cannot inject them declares [`CrashInjection::Unsupported`], and carries its own evidence
+([Crash evidence without crash injection](#crash-evidence-without-crash-injection)).
+
+[`Subject`]: crate::suite::Subject
+[`Subject::restart`]: crate::suite::Subject::restart
+[`Subject::snapshot`]: crate::suite::Subject::snapshot
+[`Subject::restore`]: crate::suite::Subject::restore
+[`Subject::lose`]: crate::suite::Subject::lose
+[`Fault`]: crate::suite::Fault
+[`Fault::CrashBeforeCommit`]: crate::suite::Fault::CrashBeforeCommit
+[`Fault::LostResponse`]: crate::suite::Fault::LostResponse
+[`Fault::CrashAfterAppend`]: crate::suite::Fault::CrashAfterAppend
+[`Fault::FailedSync`]: crate::suite::Fault::FailedSync
+[`CrashInjection::Unsupported`]: rsauthnz::store::CrashInjection::Unsupported
+
+## 12. Run the suite
+
+Call [`suite::run`] in a test, in the executor of the binding. Give it a function that makes a new binding for each
+case: an empty store and an empty journal that no other caller uses, for example in a new temporary directory or a
+new database schema. The binding conforms when [`Report::failures`] is empty. Each [`Failure`] names its [`Case`]
+and the check that failed. The documentation of the [conformance suite] gives a complete example.
+
+[`suite::run`]: crate::suite::run
+[`Report::failures`]: crate::suite::Report::failures
+[`Failure`]: crate::suite::Failure
+[`Case`]: crate::suite::Case
+
+## Read a failed case
+
+The suite runs the driver on the primitives of the binding. A failed case shows a primitive that does not keep its
+step. This table gives the step that each case checks first:
+
+| [`Case`] | Step |
+| --- | --- |
+| `Commit` | [4](#4-commit-a-proposal), [3](#3-read-one-record) |
+| `DependencyConflict` | [4](#4-commit-a-proposal) |
+| `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees) |
+| `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees) |
+| `Expiry` | [6](#6-expire-ended-records) |
+| `Fencing` | [2](#2-keep-the-store-instance-number), [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
+| `LostResponse` | [4](#4-commit-a-proposal), [5](#5-keep-audit-and-outcome-records-for-their-retention), [9](#9-stop-at-each-error) |
+| `FailedSync` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error) |
+| `Restart` | [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
+| `CrashPoints` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [7](#7-read-the-effect-intents) |
+| `RefusalVoid` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreJournal` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreFloors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreRefusal` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreAnchors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreCompletions` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `RestoreEnds` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `StartAfterRestore` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `Rebootstrap` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal) |
+
+The failure messages of the cases name these effects of the driver on the primitives:
+
+- **The floor before a commit.** A commit can write a counter value, such as a session generation, from
+  [`Driver::allocate`]. When the value passes the durable floor, the driver appends a floor entry ([`Floor`]) and
+  syncs before the commit. Thus a restore never gives a released value again.
+- **The end entry before a commit.** Before a commit that removes authority, the driver appends an end entry and
+  syncs. A restore applies it, so a snapshot cannot make an unlinked passkey or a revoked session valid again.
+- **The creation entry before the answer.** After an accepted commit that creates an anchor, such as a passkey, the
+  driver appends its creation entry and syncs. Only then does it answer. A lookup reports the commit only after the
+  entry is durable.
+- **The void of a refusal.** After a conflict, or the outcome record of another request, the driver appends a void
+  of the end entry and syncs. Only then does it give the refusal. A restore ignores a voided entry, so the refusal stays true.
+- **Reconciliation at each start.** After [`Store::start`], the driver reads the mark record and the journal after
+  its mark. It writes the missing creation entry of each anchor commit that landed, and a void of each end entry
+  whose commit did not land.
+- **Restore.** [`Driver::restore`] applies each entry after the mark of the snapshot before the store serves. It
+  ends each record that a fact ends, writes each anchor that a creation entry made, raises each floor, and ends each
+  pending sign-in challenge and approval. Then it sets the replay floor.
+- **The completion of in-doubt consumptions.** A consumption that pays for an anchor, such as an enrollment, is in
+  doubt after a restore when the snapshot has no outcome record of it. The driver commits it again under its
+  operation identity before the store serves.
+
+The documentation of the [`journal`] module gives the entries and the rules.
+
+[`Driver::allocate`]: rsauthnz::store::driver::Driver::allocate
+[`Floor`]: rsauthnz::store::journal::Floor
+
+## Crash evidence without crash injection
+
+The suite skips each crash case of a binding that declares [`CrashInjection::Unsupported`]: `LostResponse`,
+`FailedSync`, `CrashPoints`, and `RestoreCompletions`. It also skips the crash parts of `RefusalVoid`,
+`RestoreAnchors`, and `Rebootstrap`. The author of such a binding gives evidence of the same outcomes:
+
+1. A commit whose response is lost landed. After the next start, a lookup finds its outcome record and its audit.
+2. A commit that crashed before it landed wrote nothing.
+3. A failed sync stops the binding. After the next start, the journal holds only the entries whose sync returned.
+4. After a crash at each effect of the driver, the next start gives the outcome of the case `CrashPoints`.
+
+One method is to run the driver in a child process, and stop the process at random effects. Then start again, and
+check each outcome.
+
+## Disk durability
+
+The suite runs in one process, so it cannot show that a durable commit or a sync survives the loss of power. That
+evidence is about the backend, and its author owns it. Record the settings of the store that make a commit and a
+sync durable when they return, and the evidence that the device keeps them.

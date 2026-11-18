@@ -54,8 +54,6 @@ use rsauthnz::transition::{
     Audit, Change, Dependency, Effect as Call, Intent, Key, Operation, OperationId, Outcome, Proposal,
 };
 
-use crate::memory::Fault;
-
 /// The most effects of one run of the driver until it waits. A run of a case needs far fewer, so more effects show a
 /// binding that does not end a step, for example an expiry that always reports a full page.
 const EFFECTS_MAX: usize = 10_000;
@@ -69,9 +67,8 @@ pub trait Subject: Store + Journal + Clone {
     /// The state of the store that a snapshot keeps.
     type Snapshot;
 
-    /// Gives `fault` to the next call of its primitive: a commit, an append, or a sync. The suite injects
-    /// [`Fault::CrashBeforeCommit`], [`Fault::LostResponse`], [`Fault::CrashAfterAppend`], and [`Fault::FailedSync`],
-    /// and only into a binding that declares [`CrashInjection::Supported`].
+    /// Gives `fault` to the next call of its primitive: a commit, an append, or a sync. The suite injects a fault only
+    /// into a binding that declares [`CrashInjection::Supported`].
     fn inject(&self, fault: Fault);
 
     /// The loss of the process. The store loses what [`Declaration::crash_loss`] states, and the journal keeps each
@@ -90,6 +87,20 @@ pub trait Subject: Store + Journal + Clone {
     /// domain of the journal. A later append does not get the sequence of a removed entry. The suite removes entries
     /// only of a binding that declares [`Restore::Journal`].
     fn lose(&self, sequences: impl RangeBounds<Sequence>);
+}
+
+/// A fault that the suite gives to one primitive of a binding with [`Subject::inject`]. Each fault is a crash: after
+/// it, each primitive except [`Store::start`] gives an error until the next start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fault {
+    /// The binding crashes before a commit, so the commit writes nothing and gives an error.
+    CrashBeforeCommit,
+    /// A commit writes everything, but its response is lost: the commit gives an error.
+    LostResponse,
+    /// The binding crashes after an append gives its sequence, before a sync. The crash loses the append.
+    CrashAfterAppend,
+    /// A sync fails and gives an error, and no append since the last sync becomes durable.
+    FailedSync,
 }
 
 /// A case of the suite. Its documentation states the contract that it checks, and the properties of the
