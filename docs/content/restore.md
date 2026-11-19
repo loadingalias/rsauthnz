@@ -117,6 +117,7 @@ whether each operation has an outcome record. Read each key of `history.keys()` 
 | `journal::low_water(&history, &reads)` | The history after an earlier mark, and the reads of the captured state | The low-water mark of the snapshot, across all owners, with its link. The newest floor of each counter stays after the mark |
 | `journal::restore(&history, &reads)` | The history after the mark of the snapshot, and the reads of the snapshot's state | `Activation`, below |
 | `journal::replay(entries)` | Entries in any order | `State`: the highest dead version of each record, the anchors, the creation entries, and the highest floor of each counter |
+| `history.state()` | A history, which can have new entries since the last call | The same `State` as `journal::replay(history.entries())`. It applies only the new entries, so its cost follows them. After a new void, it replays each entry again. The commit driver reads it before each commit |
 
 ## Restore decision
 

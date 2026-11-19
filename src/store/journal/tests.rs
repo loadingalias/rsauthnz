@@ -244,6 +244,44 @@ fn replay_in_every_order_and_twice_gives_one_state() {
 /// Each entry holds the link of the entry before it, and the first entry after the mark holds the link of the mark.
 /// So the history finds a changed entry at the entry after it, a removed entry at its sequence, and a journal of
 /// another history at its first entry.
+/// The driver reads the state of its history before each commit, and the history keeps it between reads. A void that
+/// arrives after a read cancels an entry that the state already holds: the unlink of a passkey that did not commit,
+/// and the creation of an anchor whose commit did not land. Thus the next read gives the state with no voided entry, or
+/// the last-anchor check counts an anchor that does not exist.
+#[test]
+fn a_void_after_a_read_of_the_state_cancels_its_entry() {
+    let passkey = key(Kind::Credential, "a1p");
+    let created = key(Kind::Credential, "a1q");
+    let bodies = [
+        (op("u-1"), end(unlink("u-1", &passkey, 1))),
+        (
+            op("c-1"),
+            creation(consume(
+                "c-1",
+                &key(Kind::Registration, "reg-1"),
+                1,
+                &[],
+                &[(created, Role::SignIn(account("a1")))],
+                &[],
+            )),
+        ),
+        (op("u-1"), Body::Void(Sequence(1))),
+        (op("c-1"), Body::Void(Sequence(2))),
+    ];
+    let stored = journal(&bodies);
+    let mut history = History::new(Mark::EMPTY);
+    history.extend(&stored[..2], Limits::default()).unwrap();
+    let state = history.state().unwrap();
+    assert!(state.ends(&passkey, &version(1)).unwrap());
+    assert_eq!(state.anchors().count(), 1);
+
+    history.extend(&stored[2..], Limits::default()).unwrap();
+    let state = history.state().unwrap().clone();
+    assert!(!state.ends(&passkey, &version(1)).unwrap());
+    assert_eq!(state.anchors().count(), 0);
+    assert_eq!(replay(history.entries()), Ok(state));
+}
+
 #[test]
 fn a_changed_removed_or_foreign_entry_fails_verification() {
     let passkey = key(Kind::Credential, "a1p");

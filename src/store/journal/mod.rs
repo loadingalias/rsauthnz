@@ -314,6 +314,30 @@ pub struct History {
     entries: Vec<Entry>,
     /// The link that each entry holds: the link of the entry before it.
     held: Vec<Link>,
+    /// The state of the first entries, which [`Self::state`] extends with the later ones.
+    replayed: Replayed,
+}
+
+/// The state of the first `count` entries of a history, and the sequences that their voids cancel.
+#[derive(Clone, Debug)]
+struct Replayed {
+    count: usize,
+    voided: BTreeSet<Sequence>,
+    state: State,
+}
+
+impl Replayed {
+    /// The state of no entry.
+    const EMPTY: Self = Self {
+        count: 0,
+        voided: BTreeSet::new(),
+        state: State {
+            dead: BTreeMap::new(),
+            anchors: BTreeMap::new(),
+            created: BTreeSet::new(),
+            floors: BTreeMap::new(),
+        },
+    };
 }
 
 impl History {
@@ -327,6 +351,7 @@ impl History {
             head: mark,
             entries: Vec::new(),
             held: Vec::new(),
+            replayed: Replayed::EMPTY,
         }
     }
 
@@ -380,7 +405,36 @@ impl History {
             head: self.head,
             entries: self.entries.get(from..).unwrap_or_default().to_vec(),
             held: self.held.get(from..).unwrap_or_default().to_vec(),
+            replayed: Replayed::EMPTY,
         }
+    }
+
+    /// The state of the entries, the same as [`replay`] of [`Self::entries`]. It applies only the entries after its
+    /// last call. After a new void, which can cancel an entry that it applied, it replays each entry again.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). It is linear in the new entries, or in all entries after a
+    /// new void or a move of the mark.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`replay`].
+    pub fn state(&mut self) -> Result<&State, Error> {
+        let new = self.entries.get(self.replayed.count..).unwrap_or_default();
+        if self.replayed.count == 0 || new.iter().any(|entry| matches!(entry.body, Body::Void(_))) {
+            self.replayed = Replayed {
+                voided: voids(&self.entries),
+                ..Replayed::EMPTY
+            };
+        }
+        for entry in self.entries.get(self.replayed.count..).unwrap_or_default() {
+            if let Err(error) = self.replayed.state.apply(entry, &self.replayed.voided) {
+                // The state now holds a part of an entry, so the next call replays each entry again.
+                self.replayed = Replayed::EMPTY;
+                return Err(error);
+            }
+        }
+        self.replayed.count = self.entries.len();
+        Ok(&self.replayed.state)
     }
 
     /// The mark before the entry at `index`.
@@ -530,6 +584,29 @@ impl State {
             .all(|operation| self.created.contains(operation))
     }
 
+    /// Adds the facts, the anchors, or the floor of `entry`, unless `voided` holds its sequence.
+    fn apply(&mut self, entry: &Entry, voided: &BTreeSet<Sequence>) -> Result<(), Error> {
+        match &entry.body {
+            Body::End(end) if !voided.contains(&entry.sequence) => {
+                for fact in &end.facts {
+                    self.kill(fact)?;
+                }
+            }
+            Body::Creation(anchors) if !voided.contains(&entry.sequence) => {
+                self.created.insert(entry.operation.clone());
+                for anchor in anchors {
+                    self.create(anchor)?;
+                }
+            }
+            Body::Floor(floor) => {
+                let value = self.floors.entry(floor.kind).or_insert(floor.value);
+                *value = (*value).max(floor.value);
+            }
+            Body::End(_) | Body::Creation(_) | Body::Void(_) => {}
+        }
+        Ok(())
+    }
+
     fn kill(&mut self, fact: &Fact) -> Result<(), Error> {
         match self.dead.get_mut(&fact.key) {
             None => {
@@ -572,24 +649,7 @@ pub fn replay(entries: &[Entry]) -> Result<State, Error> {
     let voided = voids(entries);
     let mut state = State::default();
     for entry in entries {
-        match &entry.body {
-            Body::End(end) if !voided.contains(&entry.sequence) => {
-                for fact in &end.facts {
-                    state.kill(fact)?;
-                }
-            }
-            Body::Creation(anchors) if !voided.contains(&entry.sequence) => {
-                state.created.insert(entry.operation.clone());
-                for anchor in anchors {
-                    state.create(anchor)?;
-                }
-            }
-            Body::Floor(floor) => {
-                let value = state.floors.entry(floor.kind).or_insert(floor.value);
-                *value = (*value).max(floor.value);
-            }
-            Body::End(_) | Body::Creation(_) | Body::Void(_) => {}
-        }
+        state.apply(entry, &voided)?;
     }
     Ok(state)
 }

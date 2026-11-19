@@ -289,7 +289,7 @@ impl Core {
     /// The commits that write the mark record, with `others` after it, and then the floor entry of the write, which
     /// shows each later start that the store state has this write.
     fn marking(&mut self, others: impl IntoIterator<Item = Proposal>) -> Result<Committing, Error> {
-        let journaled = written(&journal::replay(self.history.entries())?);
+        let journaled = written(self.history.state()?);
         self.record.written = self
             .record
             .written
@@ -1058,8 +1058,8 @@ impl Submitted {
             let operation = self.operation.id.clone();
             self.phase = match core::mem::replace(&mut self.phase, CommitPhase::Done) {
                 CommitPhase::Check => {
-                    let state = journal::replay(core.history.entries())?;
-                    if !journal::keeps_anchor(&self.entries, &self.held, &state)? {
+                    let state = core.history.state()?;
+                    if !journal::keeps_anchor(&self.entries, &self.held, state)? {
                         return Ok(Some(Some(Answer::Outcome(Outcome::Refused(
                             transition::Error::LastAnchor,
                         )))));
@@ -1335,7 +1335,8 @@ impl Start {
                     self.reconcile(core)?
                 }
                 StartPhase::Reconcile(_) => {
-                    let state = journal::replay(core.history.entries())?;
+                    // A copy, because each release changes the driver. A restore runs this once.
+                    let state = core.history.state()?.clone();
                     let mut releases = VecDeque::new();
                     for owed in &self.owed {
                         if state.acknowledges([&owed.operation]) {
@@ -1346,7 +1347,7 @@ impl Start {
                 }
                 StartPhase::Release(_) => self.close(core)?,
                 StartPhase::Close(_) => {
-                    let state = journal::replay(core.history.entries())?;
+                    let state = core.history.state()?;
                     core.counters.clear();
                     let journaled = state.floors().map(|floor| (floor.kind, floor.value));
                     let counters = journaled
@@ -1507,9 +1508,9 @@ impl Start {
     /// Refuses a start on a store state that a restore made: a later write of the mark record than the store holds,
     /// or a creation entry of an anchor with no end that the store lacks, shows a commit that the store lost. A crash
     /// loses no commit, so a start after a crash passes.
-    fn check(&self, core: &Core) -> Result<(), Error> {
-        let state = journal::replay(core.history.entries())?;
-        (written(&state) <= core.record.written).ok_or(Error::Restored)?;
+    fn check(&self, core: &mut Core) -> Result<(), Error> {
+        let state = core.history.state()?;
+        (written(state) <= core.record.written).ok_or(Error::Restored)?;
         if core.record.owed.is_empty() {
             for anchor in state.anchors().filter(|anchor| anchor.end.is_none()) {
                 let held = self.reads.records.get(&anchor.key).is_some_and(Option::is_some);
@@ -1587,7 +1588,7 @@ impl Advance {
                         // The newest floor of a counter holds the mark: a floor entry of each counter, with its
                         // value again, lets the mark pass the earlier floor entries.
                         let id = core.operation();
-                        let state = journal::replay(core.history.entries())?;
+                        let state = core.history.state()?;
                         let bodies: Vec<(OperationId, Body)> =
                             state.floors().map(|floor| (id.clone(), Body::Floor(floor))).collect();
                         Self::Restate(Writing::new(core, bodies)?, reading.reads)
