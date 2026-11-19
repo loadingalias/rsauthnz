@@ -1,12 +1,13 @@
 //! Measures the journal cost of each transition kind on the file binding: the journal entries and bytes of each
 //! commit, and the commit latency at p50 and p99, with restore support and without it. Each measured commit runs
-//! through the commit driver, after an untimed commit that writes the records that it reads.
+//! through the commit driver, after an untimed commit that writes the records that it reads. The rounds interleave
+//! the kinds and the two modes.
 //!
 //! Run it on a quiet host with an optimized build. The optional argument is the directory for the files, on the disk
 //! under test:
 //!
 //! ```sh
-//! cargo run --locked --release -p storage-binding --example journal_cost -- /tmp
+//! cargo run --locked --release -p storage-binding --example journal_cost -- "$HOME"
 //! ```
 
 use core::mem::DropGuard;
@@ -154,9 +155,24 @@ fn main() {
         location: journal.to_str().expect("the directory has a UTF-8 path").into(),
         failure_domain: "the disk under test".into(),
     };
-    let with = measure(&root.join("store-journal"), restore);
-    let without = measure(&root.join("store-plain"), Restore::Unsupported);
-    println!("{RUNS} commits of each kind in each mode. Latency in microseconds.");
+    let mut modes = [
+        Mode::new(&root.join("store-journal"), restore),
+        Mode::new(&root.join("store-plain"), Restore::Unsupported),
+    ];
+    // Each round measures each kind in each mode. The first kind and the order of the modes change from round to
+    // round, so a change of the disk over time affects each cell the same.
+    for run in 0..RUNS {
+        for offset in 0..TRANSITIONS.len() {
+            let index = (offset + run) % TRANSITIONS.len();
+            let id = format!("t{index}-{run}");
+            let order = if run % 2 == 0 { [0, 1] } else { [1, 0] };
+            for mode in order {
+                modes[mode].measure(index, &id);
+            }
+        }
+    }
+    let [with, without] = modes.map(Mode::rows);
+    println!("{RUNS} commits of each kind in each mode, interleaved. Latency in microseconds.");
     println!();
     println!("| Transition | Entries | Bytes | p50 journal | p99 journal | p50 no journal | p99 no journal |");
     println!("| --- | --- | --- | --- | --- | --- | --- |");
@@ -174,42 +190,61 @@ fn main() {
     }
 }
 
-/// The measurement of each transition kind on a binding with its store in `store` and `restore`.
-fn measure(store: &Path, restore: Restore) -> Vec<Row> {
-    let mut binding = Files::new(store.into(), restore, Duration::from_secs(86_400));
-    let profile = Profile::new(binding.declaration()).expect("the file binding declares a serializable commit");
-    let mut driver = Driver::new(profile, Limits::default()).expect("the record bound of the binding is enough");
-    driver.start(now());
-    settle(&mut driver, &mut binding, &mut Meter::default());
-    assert_eq!(driver.status(), Status::Serving);
-    TRANSITIONS
-        .iter()
-        .enumerate()
-        .map(|(index, (_, transition))| {
-            let mut meters = Vec::with_capacity(RUNS);
-            let mut latencies = Vec::with_capacity(RUNS);
-            for run in 0..RUNS {
-                let [seed, measured] = transition(&format!("t{index}-{run}"));
-                commit(&mut driver, &mut binding, seed, &mut Meter::default());
-                let mut meter = Meter::default();
-                let start = Instant::now();
-                commit(&mut driver, &mut binding, measured, &mut meter);
-                latencies.push(start.elapsed());
-                meters.push(meter);
-            }
-            latencies.sort_unstable();
-            let span = |of: fn(&Meter) -> usize| {
-                let values = meters.iter().map(of);
-                (values.clone().min().unwrap_or(0), values.max().unwrap_or(0))
-            };
-            Row {
-                entries: span(|meter| meter.entries),
-                bytes: span(|meter| meter.bytes),
-                p50: latencies[RUNS / 2],
-                p99: latencies[(RUNS * 99).div_ceil(100) - 1],
-            }
-        })
-        .collect()
+/// A binding under measurement, its driver, and the journal appends and the latency of each measured commit of each
+/// transition kind.
+struct Mode {
+    binding: Files,
+    driver: Driver,
+    samples: Vec<Vec<(Meter, Duration)>>,
+}
+
+impl Mode {
+    /// A started binding with its store in `store` and `restore`.
+    fn new(store: &Path, restore: Restore) -> Self {
+        let mut binding = Files::new(store.into(), restore, Duration::from_secs(86_400));
+        let profile = Profile::new(binding.declaration()).expect("the file binding declares a serializable commit");
+        let mut driver = Driver::new(profile, Limits::default()).expect("the record bound of the binding is enough");
+        driver.start(now());
+        settle(&mut driver, &mut binding, &mut Meter::default());
+        assert_eq!(driver.status(), Status::Serving);
+        let samples = TRANSITIONS.iter().map(|_| Vec::with_capacity(RUNS)).collect();
+        Self {
+            binding,
+            driver,
+            samples,
+        }
+    }
+
+    /// Commits the records of the transition kind `index` for the record identifier `id`, then measures its commit.
+    fn measure(&mut self, index: usize, id: &str) {
+        let [seed, measured] = TRANSITIONS[index].1(id);
+        commit(&mut self.driver, &mut self.binding, seed, &mut Meter::default());
+        let mut meter = Meter::default();
+        let start = Instant::now();
+        commit(&mut self.driver, &mut self.binding, measured, &mut meter);
+        self.samples[index].push((meter, start.elapsed()));
+    }
+
+    /// The row of each transition kind.
+    fn rows(self) -> Vec<Row> {
+        self.samples
+            .into_iter()
+            .map(|samples| {
+                let mut latencies: Vec<_> = samples.iter().map(|(_, latency)| *latency).collect();
+                latencies.sort_unstable();
+                let span = |of: fn(&Meter) -> usize| {
+                    let values = samples.iter().map(|(meter, _)| of(meter));
+                    (values.clone().min().unwrap_or(0), values.max().unwrap_or(0))
+                };
+                Row {
+                    entries: span(|meter| meter.entries),
+                    bytes: span(|meter| meter.bytes),
+                    p50: latencies[RUNS / 2],
+                    p99: latencies[(RUNS * 99).div_ceil(100) - 1],
+                }
+            })
+            .collect()
+    }
 }
 
 /// `low` alone when the span has one value, else `low–high`.

@@ -152,14 +152,19 @@ suite. The report has no failure and no skipped case.
 
 ## Journal cost
 
-The program `examples/journal_cost.rs` runs 500 commits of each transition kind through the commit driver, once with
-the journal and once with `Restore::Unsupported`. It counts the journal entries and bytes of each commit, and it times
-each commit from `Driver::submit` to its answer. Run it with an optimized build, and give a directory on the disk
-under test:
+The program `examples/journal_cost.rs` measures 500 commits of each transition kind through the commit driver, with
+the journal and with `Restore::Unsupported`. It counts the journal entries and bytes of each commit, and it times each
+commit from `Driver::submit` to its answer. Run it with an optimized build, and give a directory on the disk under
+test:
 
 ```sh
 cargo run --locked --release -p storage-binding --example journal_cost -- "$HOME"
 ```
+
+The program interleaves the cells: each round measures each kind in both modes, and the first kind and the order of
+the modes change from round to round. A disk can change its latency over time. For example, the EBS volume below
+changes between about 1.5 ms and 2.8 ms for each sync, for 0.5 to 2 seconds at a time. Thus each cell sees the same
+disk.
 
 The record of 2026-11-19:
 
@@ -170,27 +175,26 @@ The record of 2026-11-19:
 - **Host.** An ephemeral `aws-linux-x64-bench` host, c8i.xlarge, Ubuntu 26.04.1, Linux `7.0.0-1017-aws`, x86_64, with
   the files in `$HOME` on ext4 on a 40 GB EBS volume. No other work ran on the host.
 
-Each latency cell gives the range of the two runs, in milliseconds. The entries and bytes are equal in both runs.
+Each latency cell gives the range of the two runs, in milliseconds. The entries and bytes are equal in both runs. The
+p50 of each cell differs by at most 3 % between the runs.
 
 | Transition | Entries | Bytes | p50, journal | p99, journal | p50, no journal | p99, no journal |
 | --- | --- | --- | --- | --- | --- | --- |
-| Sign-in | 0 | 0 | 1.5–2.9 | 3.6 | 2.7–3.1 | 3.2–3.7 |
-| Approval consumption | 0 | 0 | 1.9–3.0 | 3.5–3.6 | 2.8–3.0 | 3.5–3.7 |
-| Session revocation | 1 | 93–99 | 5.6–5.8 | 6.8–7.0 | 2.7 | 3.5 |
-| Session renewal | 1 | 94–98 | 5.9–6.1 | 7.0–7.1 | 2.8–3.0 | 3.5–3.6 |
-| Grant revocation | 1 | 95–99 | 5.8–6.2 | 7.2 | 3.0–3.1 | 3.6 |
-| Grant change | 1 | 95–99 | 6.5–6.8 | 7.5 | 3.0 | 3.6–3.8 |
-| Passkey unlink | 1 | 97–101 | 7.0–7.2 | 8.2–8.7 | 2.9–3.0 | 3.5–3.6 |
-| Passkey enrollment | 2 | 325–345 | 10.5–11.0 | 12.1–12.3 | 2.7–3.1 | 3.5–3.7 |
+| Sign-in | 0 | 0 | 2.9 | 3.6–3.7 | 2.9 | 3.6–3.7 |
+| Approval consumption | 0 | 0 | 2.9 | 3.6–3.7 | 2.9 | 3.6 |
+| Session revocation | 1 | 93–99 | 6.1 | 7.2–7.3 | 2.9 | 3.6 |
+| Session renewal | 1 | 92–98 | 6.0 | 7.2–7.4 | 2.9 | 3.6 |
+| Grant revocation | 1 | 93–99 | 6.0 | 7.0–7.2 | 2.9 | 3.5–3.6 |
+| Grant change | 1 | 93–99 | 6.0 | 7.1–7.4 | 2.9 | 3.6 |
+| Passkey unlink | 1 | 95–101 | 6.0–6.1 | 7.1 | 2.9 | 3.6 |
+| Passkey enrollment | 2 | 321–345 | 9.0 | 10.4 | 2.9 | 3.7 |
 
-- A sign-in and an approval consumption write no journal entry. Each invalidation writes one entry. An enrollment
-  writes its consumption entry and its creation entry.
-- On this disk, one journal entry adds one sync of about 3 ms before the commit. So an invalidation has about two
-  times the latency of the same commit with no journal, and an enrollment has about 3.5 times.
-- The stop condition applies to two cells. A sign-in and an approval consumption with the journal had a p50 of 1.5 ms
-  and 1.9 ms in the first run, and 2.9 ms and 3.0 ms in the second run. These two kinds ran first on the new volume.
-  The cause of the lower values is not known. The second run is equal to the runs with no journal, as the entry count
-  of zero predicts.
+- A sign-in and an approval consumption write no journal entry, and the journal adds nothing to their latency.
+- Each invalidation writes one entry. On this disk, the entry adds one sync of about 3.1 ms before the commit, so an
+  invalidation has about two times the latency of the same commit with no journal.
+- An enrollment writes its consumption entry and its creation entry, so it adds two syncs.
+- The commit driver keeps the state of the journal between commits, so the cost of a commit does not grow with the
+  length of the journal.
 - The records of the measurement are small: 6 bytes in each record. A larger record makes each commit and each sync
   longer.
 
