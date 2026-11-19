@@ -20,3 +20,6 @@ cargo doc --locked --no-deps --package rsauthnz-conformance --open
 
 The source of the guide is the Markdown file `rsauthnz-conformance/src/guide.md`. Rustdoc checks each of its links
 to a public item, and `cargo xtask test` compiles its examples.
+
+[Walk through a file binding](storage-binding-walkthrough.md) follows each step of the guide with a complete binding
+that keeps its state in files and passes the suite.

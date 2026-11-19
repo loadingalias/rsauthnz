@@ -1,0 +1,18 @@
+[package]
+name = "storage-binding"
+version = "0.0.0"
+description = "A storage binding of rsauthnz on files with one writer: the example of the storage binding guide."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The storage contract that the binding implements.
+rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
+# The conformance suite, whose test controls the binding implements.
+rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
+# The only source of checksums. CRC-32C finds a torn write at the end of a file.
+rscrypto = { version = "=0.12.0", default-features = false, features = ["crc32"] }
+
+[lints]
+workspace = true
