@@ -1335,7 +1335,7 @@ impl Start {
                     self.reconcile(core)?
                 }
                 StartPhase::Reconcile(_) => {
-                    // A copy, because each release changes the driver. A restore runs this once.
+                    // A copy, because each release changes the driver. Each start runs this once.
                     let state = core.history.state()?.clone();
                     let mut releases = VecDeque::new();
                     for owed in &self.owed {

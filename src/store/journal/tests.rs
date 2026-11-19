@@ -241,15 +241,12 @@ fn replay_in_every_order_and_twice_gives_one_state() {
     });
 }
 
-/// Each entry holds the link of the entry before it, and the first entry after the mark holds the link of the mark.
-/// So the history finds a changed entry at the entry after it, a removed entry at its sequence, and a journal of
-/// another history at its first entry.
-/// The driver reads the state of its history before each commit, and the history keeps it between reads. A void that
-/// arrives after a read cancels an entry that the state already holds: the unlink of a passkey that did not commit,
-/// and the creation of an anchor whose commit did not land. Thus the next read gives the state with no voided entry, or
-/// the last-anchor check counts an anchor that does not exist.
+/// The driver reads the state of its history before each commit, and the history keeps it between reads. So each read
+/// must hold each entry since the last one: else the last-anchor check counts an unlinked passkey as a sign-in
+/// method, and accepts the unlink of the last one. A void after a read cancels an entry that the state already holds:
+/// the unlink of a passkey that did not commit, and the creation of an anchor whose commit did not land.
 #[test]
-fn a_void_after_a_read_of_the_state_cancels_its_entry() {
+fn the_state_after_each_extension_equals_a_replay() {
     let passkey = key(Kind::Credential, "a1p");
     let created = key(Kind::Credential, "a1q");
     let bodies = [
@@ -270,18 +267,20 @@ fn a_void_after_a_read_of_the_state_cancels_its_entry() {
     ];
     let stored = journal(&bodies);
     let mut history = History::new(Mark::EMPTY);
-    history.extend(&stored[..2], Limits::default()).unwrap();
-    let state = history.state().unwrap();
-    assert!(state.ends(&passkey, &version(1)).unwrap());
-    assert_eq!(state.anchors().count(), 1);
-
-    history.extend(&stored[2..], Limits::default()).unwrap();
-    let state = history.state().unwrap().clone();
-    assert!(!state.ends(&passkey, &version(1)).unwrap());
-    assert_eq!(state.anchors().count(), 0);
-    assert_eq!(replay(history.entries()), Ok(state));
+    // Each read: the entries up to it, whether the unlinked passkey is dead, and the number of anchors.
+    for (end, dead, anchors) in [(1, true, 0), (2, true, 1), (4, false, 0)] {
+        let from = history.entries().len();
+        history.extend(&stored[from..end], Limits::default()).unwrap();
+        let state = history.state().unwrap().clone();
+        assert_eq!(state.ends(&passkey, &version(1)), Ok(dead), "after {end} entries");
+        assert_eq!(state.anchors().count(), anchors, "after {end} entries");
+        assert_eq!(replay(history.entries()), Ok(state), "after {end} entries");
+    }
 }
 
+/// Each entry holds the link of the entry before it, and the first entry after the mark holds the link of the mark.
+/// So the history finds a changed entry at the entry after it, a removed entry at its sequence, and a journal of
+/// another history at its first entry.
 #[test]
 fn a_changed_removed_or_foreign_entry_fails_verification() {
     let passkey = key(Kind::Credential, "a1p");
