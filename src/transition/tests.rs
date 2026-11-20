@@ -13,6 +13,7 @@ use super::{
 };
 use crate::authz::{self, Permit, Policy, Request, Requirements};
 use crate::cbor::Value;
+use crate::crypto;
 use crate::evidence::{Evidence, Method};
 use crate::id::{Action, Agent, AuthorityVersion, Human, Id, Principal, Resource};
 use crate::limits::{Limit, Limits};
@@ -131,6 +132,23 @@ fn reuse_of_an_operation_identity_with_different_input_refuses() {
         assert_matches!(refused, Outcome::Refused(Error::Reuse));
     }
     assert_eq!(store.commits, 1);
+}
+
+/// The request binding is the SHA-256 digest of the canonical CBOR form `["rsauthnz.transition.binding.1", actor,
+/// action, request]`. An outcome record keeps the binding, so another form refuses the retry of a request that a
+/// store accepted before an upgrade.
+#[test]
+fn a_request_binding_is_the_digest_of_its_documented_form() {
+    let form = [
+        // An array of 4 items, then the form name in a text string of 29 bytes.
+        &b"\x84\x78\x1drsauthnz.transition.binding.1"[..],
+        b"\x83\x01\x64acme\x64u-17",
+        b"\x83\x06\x69acme.auth\x6bgrant.issue",
+        b"\x81\x66repo:x",
+    ]
+    .concat();
+    let proposal = proposal(b"op-1", human(), "grant.issue", "repo:x");
+    assert_eq!(proposal.operation().binding, crypto::sha256(&form));
 }
 
 /// The current state that a decision reads: the version of each record, and the policy. It logs each read.

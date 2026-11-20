@@ -56,7 +56,7 @@ macro_rules! kinds {
     ($($(#[$doc:meta])* $kind:ident = $tag:literal, $name:literal;)*) => {$(
         $(#[$doc])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub enum $kind {}
+        pub struct $kind(!);
 
         impl sealed::Sealed for $kind {}
 
