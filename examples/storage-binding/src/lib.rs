@@ -541,18 +541,22 @@ impl Store for Files {
         })
     }
 
-    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, Error> {
-        let first = Kind::Intent.key(&[]).expect("the first key of a kind has one byte");
+    async fn range(
+        &mut self,
+        prefix: &Key,
+        after: Option<&Key>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<(Key, Record)>, Error> {
         let from = match after {
-            Some(after) if *after >= first => Bound::Excluded(after),
-            _ => Bound::Included(&first),
+            Some(after) if after >= prefix => Bound::Excluded(after),
+            _ => Bound::Included(prefix),
         };
         self.lock()?.serve(|open| {
             Ok(open
                 .records
                 .by_key
                 .range::<Key, _>((from, Bound::Unbounded))
-                .take_while(|(key, _)| Kind::of(key) == Some(Kind::Intent))
+                .take_while(|(key, _)| key.as_bytes().starts_with(prefix.as_bytes()))
                 .take(limit.get())
                 .map(|(key, record)| (key.clone(), record.clone()))
                 .collect())

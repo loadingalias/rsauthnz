@@ -293,10 +293,10 @@ async fn execute(binding: &mut Files, effect: Effect<'_>) -> Output {
             .expire(kind, before, limit)
             .await
             .map_or(Output::Failed, Output::Expired),
-        Effect::Intents(after, limit) => binding
-            .intents(after, limit)
+        Effect::Range(prefix, after, limit) => binding
+            .range(prefix, after, limit)
             .await
-            .map_or(Output::Failed, Output::Intents),
+            .map_or(Output::Failed, Output::Range),
         Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
         Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)

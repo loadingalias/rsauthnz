@@ -168,7 +168,7 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Read(key)` | `Store::read` | `Read(record)` |
 | `Commit(proposal, instance)` | `Store::commit` | `Committed(commit)` |
 | `Expire(kind, before, limit)` | `Store::expire` | `Expired(count)` |
-| `Intents(after, limit)` | `Store::intents` | `Intents(records)` |
+| `Range(prefix, after, limit)` | `Store::range` | `Range(records)` |
 | `Append(entry)` | `Journal::append` | `Appended(sequence)` |
 | `Sync` | `Journal::sync` | `Synced` |
 | `ReadJournal(after, limit)` | `Journal::read` | `Journal(entries)` |

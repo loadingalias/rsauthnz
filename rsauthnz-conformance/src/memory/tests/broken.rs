@@ -6,7 +6,7 @@
 
 use core::mem;
 use core::num::NonZeroUsize;
-use core::ops::RangeBounds;
+use core::ops::{Bound, RangeBounds};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::BTreeMap;
@@ -42,10 +42,12 @@ enum Defect {
     RestoredInstance,
     /// The audit and outcome records end at the audit time, with no retention.
     NoRetention,
+    /// A range read has no end at its prefix: it also gives the records of the keys after the prefix.
+    OpenRange,
 }
 
 impl Defect {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::NoAtomicCheck,
         Self::LostOutcomes,
         Self::WriteSkew,
@@ -54,6 +56,7 @@ impl Defect {
         Self::NoInstanceCheck,
         Self::RestoredInstance,
         Self::NoRetention,
+        Self::OpenRange,
     ];
 
     /// The cases that name the defect. A commit with no atomic check is a check-then-write path, so two concurrent
@@ -67,6 +70,7 @@ impl Defect {
             Self::RetriedSync => &[Case::FailedSync],
             Self::NoInstanceCheck | Self::RestoredInstance => &[Case::Fencing],
             Self::NoRetention => &[Case::Retention],
+            Self::OpenRange => &[Case::Range],
         }
     }
 }
@@ -141,7 +145,11 @@ impl Store for Broken {
                     }
                 }
             }
-            Defect::LostOutcomes | Defect::NoJournal | Defect::RetriedSync | Defect::RestoredInstance => {
+            Defect::LostOutcomes
+            | Defect::NoJournal
+            | Defect::RetriedSync
+            | Defect::RestoredInstance
+            | Defect::OpenRange => {
                 return self.memory.commit(proposal, instance).await;
             }
         }
@@ -152,8 +160,28 @@ impl Store for Broken {
         self.memory.expire(kind, before, limit).await
     }
 
-    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, Error> {
-        self.memory.intents(after, limit).await
+    async fn range(
+        &mut self,
+        prefix: &Key,
+        after: Option<&Key>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<(Key, Record)>, Error> {
+        if self.defect != Defect::OpenRange {
+            return self.memory.range(prefix, after, limit).await;
+        }
+        let lower = match after {
+            Some(after) if after >= prefix => Bound::Excluded(after.clone()),
+            _ => Bound::Included(prefix.clone()),
+        };
+        let binding = self.memory.lock();
+        binding.serving()?;
+        Ok(binding
+            .store
+            .records
+            .range((lower, Bound::Unbounded))
+            .take(limit.get())
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect())
     }
 }
 
@@ -262,8 +290,13 @@ impl Store for Measured {
         self.memory.expire(kind, before, limit).await
     }
 
-    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, Error> {
-        self.memory.intents(after, limit).await
+    async fn range(
+        &mut self,
+        prefix: &Key,
+        after: Option<&Key>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<(Key, Record)>, Error> {
+        self.memory.range(prefix, after, limit).await
     }
 }
 

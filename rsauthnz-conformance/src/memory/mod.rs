@@ -212,17 +212,16 @@ impl State {
         }
     }
 
-    /// The records of `kind` with a key after `after`, in key order. The first byte of a key names its kind, so the
-    /// keys of one kind are one range, which starts at the key of the kind byte alone.
-    fn of_kind(&self, kind: Kind, after: Option<&Key>) -> impl Iterator<Item = (&Key, &Record)> {
-        let first = kind.key(&[]).expect("a key of one byte is valid");
+    /// The records whose key starts with `prefix` and comes after `after`, in key order. The keys of one prefix are one
+    /// range of the key order, which starts at the prefix.
+    fn range<'a>(&'a self, prefix: &'a Key, after: Option<&Key>) -> impl Iterator<Item = (&'a Key, &'a Record)> {
         let lower = match after {
-            Some(after) if *after >= first => Bound::Excluded(after.clone()),
-            _ => Bound::Included(first),
+            Some(after) if after >= prefix => Bound::Excluded(after.clone()),
+            _ => Bound::Included(prefix.clone()),
         };
         self.records
             .range((lower, Bound::Unbounded))
-            .take_while(move |(key, _)| Kind::of(key) == Some(kind))
+            .take_while(move |(key, _)| key.as_bytes().starts_with(prefix.as_bytes()))
     }
 }
 
@@ -483,9 +482,10 @@ impl Store for Memory {
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
         let mut binding = self.lock();
         binding.serving()?;
+        let prefix = kind.key(&[]).expect("a key of one byte is valid");
         let ended: Vec<Key> = binding
             .store
-            .of_kind(kind, None)
+            .range(&prefix, None)
             .filter(|(_, record)| record.end.is_some_and(|end| end < before))
             .map(|(key, _)| key.clone())
             .take(limit.get())
@@ -496,12 +496,17 @@ impl Store for Memory {
         Ok(ended.len())
     }
 
-    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, Error> {
+    async fn range(
+        &mut self,
+        prefix: &Key,
+        after: Option<&Key>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<(Key, Record)>, Error> {
         let binding = self.lock();
         binding.serving()?;
         Ok(binding
             .store
-            .of_kind(Kind::Intent, after)
+            .range(prefix, after)
             .take(limit.get())
             .map(|(key, record)| (key.clone(), record.clone()))
             .collect())

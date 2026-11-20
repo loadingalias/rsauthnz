@@ -98,8 +98,8 @@ pub enum Effect<'a> {
     Commit(&'a Proposal, Instance),
     /// [`Store::expire`](super::Store::expire). Give [`Output::Expired`].
     Expire(Kind, Duration, NonZeroUsize),
-    /// [`Store::intents`](super::Store::intents). Give [`Output::Intents`].
-    Intents(Option<&'a Key>, NonZeroUsize),
+    /// [`Store::range`](super::Store::range) of the prefix after the key. Give [`Output::Range`].
+    Range(&'a Key, Option<&'a Key>, NonZeroUsize),
     /// [`Journal::append`](super::Journal::append) of the entry. Give [`Output::Appended`].
     Append(&'a [u8]),
     /// [`Journal::sync`](super::Journal::sync). Give [`Output::Synced`].
@@ -119,8 +119,8 @@ pub enum Output {
     Committed(Commit),
     /// The number of removed records.
     Expired(usize),
-    /// The intent records.
-    Intents(Vec<(Key, Record)>),
+    /// The records of the range.
+    Range(Vec<(Key, Record)>),
     /// The sequence of the appended entry.
     Appended(Sequence),
     /// The sync returned.
@@ -269,6 +269,8 @@ struct Core {
     mark_key: Key,
     /// The key of the replay floor record.
     floor_key: Key,
+    /// The prefix of the intent records.
+    intent_prefix: Key,
     /// The journal entries after the mark at the last move of the mark.
     advanced: usize,
 }
@@ -320,8 +322,6 @@ fn written(state: &journal::State) -> u64 {
         .max()
         .unwrap_or(0)
 }
-
-impl Core {}
 
 /// One operation of the driver.
 #[derive(Debug)]
@@ -380,6 +380,7 @@ impl Driver {
                 commits: 0,
                 mark_key: record::mark_key(),
                 floor_key: record::floor_key(),
+                intent_prefix: Kind::Intent.key(&[]).expect("a key of one byte is valid"),
                 advanced: 0,
             },
             profile,
@@ -922,12 +923,12 @@ struct Scanning {
 }
 
 impl Scanning {
-    fn effect(&self) -> Option<Effect<'_>> {
-        (!self.done).then_some(Effect::Intents(self.after.as_ref(), PAGE))
+    fn effect<'a>(&'a self, core: &'a Core) -> Option<Effect<'a>> {
+        (!self.done).then_some(Effect::Range(&core.intent_prefix, self.after.as_ref(), PAGE))
     }
 
     fn give(&mut self, limits: Limits, output: Output) -> Result<(), Error> {
-        let Output::Intents(page) = output else {
+        let Output::Range(page) = output else {
             return Err(Error::Binding);
         };
         let Some((last, _)) = page.last() else {
@@ -1208,7 +1209,7 @@ impl Start {
             StartPhase::Instance => Some(Effect::Start),
             StartPhase::Mark => Some(Effect::Read(&core.mark_key)),
             StartPhase::Journal(paging) => paging.effect(),
-            StartPhase::Intents(scanning) => scanning.effect(),
+            StartPhase::Intents(scanning) => scanning.effect(core),
             StartPhase::Reads(reading) | StartPhase::Recheck(reading) => reading.effect(),
             StartPhase::Record(committing)
             | StartPhase::Apply(committing)

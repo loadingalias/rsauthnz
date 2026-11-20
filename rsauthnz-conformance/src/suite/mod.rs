@@ -124,6 +124,9 @@ pub enum Case {
     AbsenceRace,
     /// Expiry removes at most its limit of ended records of its kind, and no other record. Property: `NoLiveRemoved`.
     Expiry,
+    /// A range read gives the records of its prefix after its key, in key order, up to its limit. It gives no record of
+    /// another prefix, such as the administrator binding of another authority.
+    Range,
     /// A commit with the instance number of an earlier start refuses after a start, after a restart, and after a
     /// restore: the delayed commit of an abandoned history. Between a restore and the next start, a commit with the
     /// instance number at the snapshot, or of a start after it, refuses too. Property: `NoStaleCommit`.
@@ -179,18 +182,20 @@ pub enum Case {
     /// does not make the ended value valid again, and loses the new value. A lookup of a lost re-bootstrap shows its
     /// commit and no value, and the next issue ends that value. A restore completes an in-doubt bootstrap only when
     /// the snapshot holds its value and no re-bootstrap ended it, and the client of a completed bootstrap proves the
-    /// possession of its key. Properties: `OneBootValid`, `NothingEndedValid`, `AdminKeptP`.
+    /// possession of its key. After a restore, the report gives the live binding of an issue after the snapshot, and
+    /// that administrator unlinks an earlier one. Properties: `OneBootValid`, `NothingEndedValid`, `AdminKeptP`.
     Rebootstrap,
 }
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::ConcurrentConsumption,
         Self::AbsenceRace,
         Self::Expiry,
+        Self::Range,
         Self::Fencing,
         Self::Retention,
         Self::LostResponse,
@@ -218,6 +223,7 @@ impl Case {
             | Self::ConcurrentConsumption
             | Self::AbsenceRace
             | Self::Expiry
+            | Self::Range
             | Self::Fencing
             | Self::Retention
             | Self::Restart
@@ -242,6 +248,7 @@ impl Case {
             Self::ConcurrentConsumption => cases::concurrent_consumption(make()).await,
             Self::AbsenceRace => cases::absence_race(make()).await,
             Self::Expiry => cases::expiry(make()).await,
+            Self::Range => cases::range(make()).await,
             Self::Fencing => cases::fencing(make()).await,
             Self::Retention => cases::retention(make()).await,
             Self::LostResponse => cases::lost_response(make()).await,
@@ -565,10 +572,10 @@ pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output 
             .expire(kind, before, limit)
             .await
             .map_or(Output::Failed, Output::Expired),
-        Effect::Intents(after, limit) => binding
-            .intents(after, limit)
+        Effect::Range(prefix, after, limit) => binding
+            .range(prefix, after, limit)
             .await
-            .map_or(Output::Failed, Output::Intents),
+            .map_or(Output::Failed, Output::Range),
         Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
         Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)

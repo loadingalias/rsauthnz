@@ -41,7 +41,7 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
 | `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
 | `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |
-| `Store::intents(after, limit)` | Gives at most `limit` intent records with a key after `after`, in key order, or from the first key for `None` |
+| `Store::range(&prefix, after, limit)` | Gives the first `limit` records whose key starts with `prefix` and comes after `after`, in key order, or from the prefix for `None`. It gives fewer only when no more remain, and never a record of another prefix. See [Range reads](#range-reads) |
 | `Journal::append(&entry)` | Appends the entry after the last entry and gives its `Sequence`. The entry is durable only after a later sync returns |
 | `Journal::sync()` | Makes each earlier append durable. A failed sync is a crash: a retry that succeeds does not show that the data is durable |
 | `Journal::read(after, limit)` | Gives at most `limit` durable entries (`Entry`) after the sequence `after`, in sequence order |
@@ -151,13 +151,26 @@ The commit writes each intent of a proposal as a record of `Kind::Intent`. `stor
 them: the key of each one is its operation identity and its index, and its record holds `intent.version()` and the
 CBOR form `intent.to_cbor()`.
 
-After a crash, a worker finds each intent with bounded reads of `Store::intents(after, limit)`, a read after the
-other, and reads each one back with `Intent::from_cbor`. A change of the state of an intent is a commit: the
+After a crash, a worker finds each intent with bounded range reads of the prefix `Kind::Intent.key(&[])`
+(`Store::range(&prefix, after, limit)`), a read after the other, and reads each one back with `Intent::from_cbor`. A change of the state of an intent is a commit: the
 proposal reads the record at its version, and writes the intent at the version of its new state, which is later. After
 the worker observes the end of the call, a commit ends the record (`Change::End`).
 
 An intent of `Effect::Journal` belongs to the commit driver: it names the anchors whose creation entry the journal
 still owes. A worker skips it.
+
+## Range reads
+
+A range read gives the records of one key prefix in key order. It reads only the keys of the prefix, so an ordered
+index serves it without a scan of other records. The core reads two prefixes:
+
+| Prefix | Records | Reader |
+| --- | --- | --- |
+| `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each start, and a worker after a crash |
+| The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md) |
+
+A store that partitions its keys can use the first 33 bytes of a key as its partition key. A shorter key is its own
+partition key. Then each range read of the core reads one partition.
 
 ## Expiry
 

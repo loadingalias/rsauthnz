@@ -220,6 +220,58 @@ pub(super) async fn expiry<S: Subject>(mut binding: S) -> Checked {
     Ok(())
 }
 
+/// The keys of the range read of `prefix` after `after`, whose records hold what the suite wrote.
+async fn ranged<S: Subject>(
+    binding: &mut S,
+    prefix: &Key,
+    after: Option<&Key>,
+    limit: NonZeroUsize,
+) -> Result<Vec<Key>, String> {
+    let records = binding.range(prefix, after, limit).await.map_err(failed("range"))?;
+    ensure(
+        records
+            .iter()
+            .all(|(_, record)| record.version == version(1) && *record.data == *DATA),
+        "a range read did not give the records of its keys",
+    )?;
+    Ok(records.into_iter().map(|(key, _)| key).collect())
+}
+
+pub(super) async fn range<S: Subject>(mut binding: S) -> Checked {
+    let instance = start(&mut binding).await?;
+    // The administrator bindings of one authority, and the keys around its prefix: a shorter key before it, the binding
+    // of the next authority, and a record of the next kind.
+    let prefix = key(Kind::Administrator, "auth-1/");
+    let inside = ["auth-1/a", "auth-1/b", "auth-1/c"].map(|id| key(Kind::Administrator, id));
+    let before = key(Kind::Administrator, "auth-1");
+    let outside = [
+        before.clone(),
+        key(Kind::Administrator, "auth-2/a"),
+        key(Kind::Agent, "auth-1/a"),
+    ];
+    let mut build = Build::new("r-0");
+    for key in inside.iter().chain(&outside) {
+        build = build.writes(key, 1);
+    }
+    ensure(
+        committed(&mut binding, &build.done(), instance).await? == Commit::Accepted,
+        "a commit whose dependencies hold refused",
+    )?;
+    let two = NonZeroUsize::new(2).expect("two is not zero");
+    ensure(
+        ranged(&mut binding, &prefix, None, two).await? == inside[..2],
+        "a range read did not give the first records of its prefix in key order, up to its limit",
+    )?;
+    ensure(
+        ranged(&mut binding, &prefix, Some(&inside[1]), two).await? == inside[2..],
+        "a range read gave a record at or before its key, or of another prefix",
+    )?;
+    ensure(
+        ranged(&mut binding, &prefix, Some(&before), NonZeroUsize::MAX).await? == inside,
+        "a range read gave a record of another prefix",
+    )
+}
+
 /// Whether the commit of `proposal` with `instance` conflicted and wrote nothing.
 async fn fenced<S: Subject>(binding: &mut S, proposal: &Proposal, instance: Instance) -> Result<bool, String> {
     Ok(committed(binding, proposal, instance).await? == Commit::Conflict && unrecorded(binding, proposal).await?)
@@ -578,7 +630,8 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
         matches!(run.outcome(ticket).await?, Outcome::Accepted(_)),
         "cCreated: a commit with a durable creation entry was not accepted",
     )?;
-    let intents = run.binding.intents(None, PAGE).await.map_err(failed("intents"))?;
+    let prefix = Kind::Intent.key(&[]).expect("a key of one byte is valid");
+    let intents = run.binding.range(&prefix, None, PAGE).await.map_err(failed("range"))?;
     ensure(
         intents.is_empty(),
         "cCreated: the start did not end the journal intent of a commit with a durable creation entry",

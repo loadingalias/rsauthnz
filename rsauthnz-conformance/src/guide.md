@@ -30,7 +30,7 @@ this guide asks you to order two writes. Each step names the public items that i
 4. [Commit a proposal](#4-commit-a-proposal).
 5. [Keep audit and outcome records for their retention](#5-keep-audit-and-outcome-records-for-their-retention).
 6. [Expire ended records](#6-expire-ended-records).
-7. [Read the effect intents](#7-read-the-effect-intents).
+7. [Read one key prefix](#7-read-one-key-prefix).
 8. [Keep the restore journal](#8-keep-the-restore-journal).
 9. [Stop at each error](#9-stop-at-each-error).
 10. [Run the commit driver](#10-run-the-commit-driver).
@@ -200,14 +200,19 @@ The application runs [`store::expire`] in bounded passes. It calls [`Store::expi
 [`store::expire`]: rsauthnz::store::expire
 [`Kind::ends`]: rsauthnz::store::Kind::ends
 
-## 7. Read the effect intents
+## 7. Read one key prefix
 
-Implement [`Store::intents`]. It gives at most `limit` records of [`Kind::Intent`] with a key after `after`, in the
-byte order of the keys. With `None`, it starts at the first key. [`Kind::key`] of an empty identifier gives the first
-key of a kind, so the intents are one range of keys. A worker of the application reads the intents after a crash,
-and the driver reads its own intents at each start.
+Implement [`Store::range`]. It gives the first `limit` records whose key starts with `prefix` and comes after `after`,
+in the byte order of the keys. With `None`, it starts at the prefix. It gives fewer records only when no more remain,
+and never a record of another prefix. The keys of one prefix are one range of the key order, so an ordered index
+reads them without a scan of other records.
 
-[`Store::intents`]: rsauthnz::store::Store::intents
+The core reads two prefixes. [`Kind::key`] of an empty identifier is the prefix of a kind: the driver reads its
+intents ([`Kind::Intent`]) at each start, and a worker of the application reads them after a crash. A local authority
+reads its administrator bindings under a prefix of 33 bytes: the kind and the digest of the authority. A store that
+partitions its keys can use those 33 bytes as the partition key.
+
+[`Store::range`]: rsauthnz::store::Store::range
 [`Kind::Intent`]: rsauthnz::store::Kind::Intent
 [`Kind::key`]: rsauthnz::store::Kind::key
 
@@ -278,10 +283,10 @@ async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Out
             .expire(kind, before, limit)
             .await
             .map_or(Output::Failed, Output::Expired),
-        Effect::Intents(after, limit) => binding
-            .intents(after, limit)
+        Effect::Range(prefix, after, limit) => binding
+            .range(prefix, after, limit)
             .await
-            .map_or(Output::Failed, Output::Intents),
+            .map_or(Output::Failed, Output::Range),
         Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
         Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
@@ -392,12 +397,13 @@ step. This table gives the step that each case checks first:
 | `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `Expiry` | [6](#6-expire-ended-records) |
+| `Range` | [7](#7-read-one-key-prefix) |
 | `Fencing` | [2](#2-keep-the-store-instance-number), [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
 | `Retention` | [5](#5-keep-audit-and-outcome-records-for-their-retention), [6](#6-expire-ended-records) |
 | `LostResponse` | [4](#4-commit-a-proposal), [5](#5-keep-audit-and-outcome-records-for-their-retention), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
 | `FailedSync` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
 | `Restart` | [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
-| `CrashPoints` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [7](#7-read-the-effect-intents), [11](#11-implement-the-test-controls) |
+| `CrashPoints` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [7](#7-read-one-key-prefix), [11](#11-implement-the-test-controls) |
 | `RefusalVoid` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreJournal` | [8](#8-keep-the-restore-journal), [3](#3-read-one-record), [11](#11-implement-the-test-controls) |
 | `RestoreFloors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
@@ -406,7 +412,8 @@ step. This table gives the step that each case checks first:
 | `RestoreCompletions` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreEnds` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `StartAfterRestore` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
-| `Rebootstrap` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `Bootstrap` | [4](#4-commit-a-proposal), [3](#3-read-one-record), [7](#7-read-one-key-prefix) |
+| `Rebootstrap` | [4](#4-commit-a-proposal), [7](#7-read-one-key-prefix), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 
 The failure messages of the cases name these effects of the driver on the primitives:
 

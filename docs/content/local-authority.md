@@ -15,19 +15,22 @@ live administrator. If the owner loses the administrator, the owner issues a new
 - A **bootstrap value** (`Bootstrap`) is 32 random bytes. Its text is `rsauthnz-bootstrap-1-` and 64 lowercase
   hexadecimal digits. It names one administrator, it is valid for `LIFETIME` (15 minutes), and one bootstrap consumes
   it. At most one value of an authority is valid: each issue ends the earlier value that is not consumed.
-- An **administrator binding** is the record of one administrator. It holds the CLI credential that the bootstrap
-  issued. It is an authority anchor: a restore keeps it, and the unlink of the last one refuses.
+- An **administrator binding** is the record of one administrator. It holds the issue of the value that the bootstrap
+  consumed, and the CLI credential that the bootstrap issued. It is an authority anchor: a restore keeps it, and the
+  unlink of the last one refuses. An authority has at most `ADMINISTRATORS_MAX` (64) live bindings.
 - The **CLI credential** is a [credential](credential-format.md) of the purpose `rsauthnz:cli`, valid for
   `CLI_LIFETIME` (365 days). The issuer is the authority, the audience is the origin of the grant, the subject is the
   administrator, and the `cnf` key is the key of the client.
-- The **report** gives each issue in the log of the authority, with the state of its value.
+- The **report** gives each issue in the log of the authority and each live administrator binding, with the state of
+  its value.
 
 The store keeps no secret. The key of a value record is the SHA-256 digest of the authority, the issuer public key,
 and the secret. Thus a value of another authority, or of another issuer key, finds no record and refuses.
 
 ## Bootstrap the first administrator
 
-Each operation reads the store with `Store::read` and gives a proposal and its plan. Submit them to the commit
+Each operation reads the store with keyed reads (`Store::read`) and range reads (`Store::range`), and gives a proposal
+and its plan. Submit them to the commit
 [driver](restore.md), and take the outcome of the ticket. Only the receipt of the accepted commit gives the value or
 the credential.
 
@@ -172,19 +175,26 @@ unlink.
 - **A restore from an old snapshot.** A value that a later issue ended stays ended. A value issued after the snapshot
   is lost, and the owner issues again. A bootstrap that a crash left in doubt completes at the restore when the
   snapshot holds its value and no issue ended it. Then the client reads its credential from the binding and proves
-  possession with its stored key. Otherwise the value stays consumed, and the owner issues a new value.
+  possession with its stored key. Otherwise the value stays consumed, and the owner issues a new value. A binding that
+  a client made after the snapshot stays live. The report gives it with the issue of its value, and that administrator
+  can unlink a lost or compromised one.
 
 ## Remove an administrator
 
 `authority.unlink(store, &actor, &administrator, now, operation)` ends the binding of `administrator`. The actor is an
-`Admitted` administrator of the same authority. The plan holds each live binding, so the driver refuses the unlink of
+`Admitted` administrator of the same authority. The plan holds each live binding of the authority, from one range
+read, so the driver refuses the unlink of
 the last one with `transition::Error::LastAnchor`. An administrator can unlink its own binding while another one is
 live. After the unlink, `admit` refuses its credential.
 
 ## Read the report
 
-`authority.report(store, now)` gives each issue of the log, oldest first: the administrator, the time of the issue,
-the end of the value, and its `Status`.
+`authority.report(store, now)` gives each issue of the log, and each live administrator binding that the log does not
+name. It gives them oldest first, with the administrator, the time of the issue, the end of the value, and the
+`Status`. A binding holds
+the issue of its value. Thus after a restore from an older snapshot, the report still gives each live administrator,
+also one whose issue came after the snapshot. It does not give an issue after the snapshot that left no live binding:
+the restore lost its value, or an unlink ended its binding.
 
 | `Status` | Meaning |
 | --- | --- |
@@ -194,24 +204,27 @@ the end of the value, and its `Status`.
 | `Consumed { bound }` | Spent. `bound` is true while the administrator binding of the consumption is live, and false after an unlink. After a restore, a value whose end the restore applied also shows here, with `bound` false |
 
 The log holds at most `ISSUES_MAX` (64) issues. A full log drops the oldest issue whose value bound no live
-administrator. When each issue has a live binding, an issue refuses with `Error::Full`: unlink an administrator first.
+administrator. When each issue has a live binding, or the authority has `ADMINISTRATORS_MAX` (64) live bindings, an
+issue refuses with `Error::Full`: unlink an administrator first.
 
 ## Operations
 
 | Operation | Reads | Result |
 | --- | --- | --- |
 | `Authority::open(store, &grant, id, issuer, limits)` | The record of the authority | `Authority` |
-| `authority.issue(store, &grant, administrator, now, random, operation)` | The record of the authority, the current value, and the binding of `administrator` | `(Proposal, Plan)`. The receipt gives the text of the value |
+| `authority.issue(store, &grant, administrator, now, random, operation)` | The record of the authority, the current value, and the bindings of the authority | `(Proposal, Plan)`. The receipt gives the text of the value |
 | `authority.bootstrap(store, &value, holder, serial, now)` | The value record | `Pending` |
 | `pending.to_be_signed()` | — | The bytes that custody signs |
 | `pending.finish(signature, operation)` | — | `(Proposal, Plan)`. The receipt gives the CLI credential |
 | `authority.credential(store, &value, &administrator)` | The binding of `administrator` | The CLI credential |
 | `authority.admit(store, credential, proof, challenge, now)` | The binding of the subject of the credential | `Admitted` |
-| `authority.unlink(store, &actor, &administrator, now, operation)` | The binding of `administrator`, and each binding of the log | `(Proposal, Plan)` |
-| `authority.report(store, now)` | The record of the authority, and the records of its issues | `Report` |
+| `authority.unlink(store, &actor, &administrator, now, operation)` | The bindings of the authority | `(Proposal, Plan)` |
+| `authority.report(store, now)` | The record of the authority, the bindings of the authority, and the newest value | `Report` |
 | `authority.profile()` | — | The credential profile that verifies a CLI credential of the authority |
 
-Each read is a keyed read. An operation that reads gives `Failure::Refused(error)` for a refusal, or
+Each read is a keyed read, except the read of the bindings of the authority. That read is one range read of the
+prefix of the authority, and it gives at most `ADMINISTRATORS_MAX` bindings. An operation that reads gives
+`Failure::Refused(error)` for a refusal, or
 `Failure::Store(error)` for a failed read. A failed read is a crash of the binding: start the driver again.
 
 ## Errors
@@ -224,7 +237,7 @@ Each read is a keyed read. An operation that reads gives `Failure::Refused(error
 | `Unknown` | No valid record of the value: it is consumed or ended, or it is a value of another authority or issuer key | Ask the owner to issue a new value |
 | `Expired` | The end of the value passed | Ask the owner to issue a new value |
 | `Bound` | The administrator has a live binding | Name another administrator, or unlink the binding |
-| `Full` | Each issue of the full log bound a live administrator | Unlink an administrator, then issue again |
+| `Full` | The authority has `ADMINISTRATORS_MAX` live administrator bindings, or each issue of the full log bound a live administrator | Unlink an administrator, then issue again |
 | `NotEnrolled` | No live administrator binding holds the credential or the administrator | Refuse the call |
 | `Record` | A record of the authority has no valid form | Restore the store from a snapshot |
 | `Time` | The reading has no bound, or a time overflows | Use a reading with a bound |
@@ -236,8 +249,8 @@ Each read is a keyed read. An operation that reads gives `Failure::Refused(error
 | `Kind` | Key | Record |
 | --- | --- | --- |
 | `Local` | SHA-256 of the authority | The owner, the origin, the issuer key ID and public key, and the issue log. Only an issue writes it |
-| `Bootstrap` | SHA-256 of the authority, the issuer public key, and the secret | The administrator and the end of the value. It has no store end: an issue or a bootstrap ends it, each with a journal entry |
-| `Administrator` | SHA-256 of the authority and the administrator | The identity of the consumed value and the CLI credential. Its version is the serial of the credential |
+| `Bootstrap` | SHA-256 of the authority, the issuer public key, and the secret | The administrator, the time of the issue, and the end of the value. It has no store end: an issue or a bootstrap ends it, each with a journal entry |
+| `Administrator` | SHA-256 of the authority, then SHA-256 of the authority and the administrator. The kind and the first digest are the prefix of the authority | The issue of the consumed value (its identity, the administrator, the time of the issue, and the end) and the CLI credential. Its version is the serial of the credential |
 
 ## Limits
 
@@ -246,7 +259,3 @@ Each read is a keyed read. An operation that reads gives `Failure::Refused(error
 - The challenge of `admit` must be fresh for each call. The host chooses it and refuses its reuse.
 - The text of a value is a bearer secret in memory until the owner hands it over. The core does not clear it from
   memory.
-- After a restore from an older snapshot, the report can omit a live administrator. A restore loses the issues after
-  the snapshot, because an issue gives no journal fact. A consumption gives one, so the binding of a value that a
-  client consumed after the snapshot stays live. Keep the list of the administrators that you issued values for, and
-  unlink each one that you do not want after a restore. A later release closes this limit.

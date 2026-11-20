@@ -102,10 +102,10 @@ retention. A sum past the largest `Duration` gives `Duration::MAX`.
 The binding keeps an index of the ends of each kind: a `BTreeSet` of end and key. `Store::expire` reads the index in
 the order of the ends, so it reads only the records that it removes. It removes them in one frame, and syncs the log.
 
-### 7. Read the effect intents
+### 7. Read one key prefix
 
-The intent keys are one range of the map, from `Kind::Intent.key(&[])`. `Store::intents` reads at most `limit` keys of
-the range after `after`.
+The keys of one prefix are one range of the map, from the prefix. `Store::range` reads at most `limit` keys of the range
+after `after`, and stops at the first key that does not start with the prefix.
 
 ### 8. Keep the restore journal
 

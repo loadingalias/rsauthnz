@@ -1,11 +1,12 @@
 //! The storage contract: the primitives that a storage binding of the application implements, and its declaration.
 //!
-//! rsauthnz ships no storage backend. A binding implements [`Store`]: keyed reads of the current state, one
-//! conditional atomic commit of a [`Proposal`], the store instance number, and incremental expiry. The outcome lookup
-//! [`Store::outcome`] reads the outcome record of the commit with a keyed read. The current policy version of an owner
-//! is a record too ([`policy_key`]), so the commit checks it in the same atomic step. A binding that supports restore also implements [`Journal`]: a durable append, a sync, and a read of the
-//! restore journal. The commit driver of the core orders the primitives. A binding executes them and decides no step
-//! of the protocol.
+//! rsauthnz ships no storage backend. A binding implements [`Store`]: keyed reads of the current state, bounded reads
+//! of one key prefix, one conditional atomic commit of a [`Proposal`], the store instance number, and incremental
+//! expiry. The outcome lookup [`Store::outcome`] reads the outcome record of the commit with a keyed read. The current
+//! policy version of an owner is a record too ([`policy_key`]), so the commit checks it in the same atomic step. A
+//! binding that supports restore also implements [`Journal`]: a durable append, a sync, and a read of the restore
+//! journal. The commit driver of the core orders the primitives. A binding executes them and decides no step of the
+//! protocol.
 //!
 //! A [`Declaration`] states the isolation, what a crash can lose, the outcome retention, crash injection, restore
 //! support, and the key and record bounds of a binding. [`Profile::new`] refuses a binding without an atomic
@@ -337,11 +338,14 @@ pub trait Store {
         limit: NonZeroUsize,
     ) -> impl Future<Output = Result<usize, Self::Error>>;
 
-    /// Reads at most `limit` intent records ([`Kind::Intent`]) with a key after `after`, in key order, or from the
-    /// first key when `after` is `None`. A worker reads them after a crash, a pass after the other, and changes the
-    /// state of an intent with a commit.
-    fn intents(
+    /// Reads the first `limit` records whose key starts with `prefix` and comes after `after`, in key order. With
+    /// `None`, it starts at the first key of the prefix. It gives fewer only when no more remain, and never a record of
+    /// another prefix. A prefix is the key of a kind alone, such as the prefix of the intent records ([`Kind::Intent`])
+    /// that a worker reads after a crash. It can also be a kind and a 32-byte digest of an owner, such as the prefix of
+    /// the administrator bindings of one local authority.
+    fn range(
         &mut self,
+        prefix: &Key,
         after: Option<&Key>,
         limit: NonZeroUsize,
     ) -> impl Future<Output = Result<Vec<(Key, Record)>, Self::Error>>;

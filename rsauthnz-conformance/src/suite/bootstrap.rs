@@ -432,21 +432,53 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
     let third = issue(&mut run, &auth, &mut random, "carol", "r-3").await?;
     enroll(&mut run, &auth, &issuer, &third, &alice, "r-4").await?;
 
-    // A restore keeps the binding of a bootstrap after its snapshot, and the log of the snapshot does not name it. After
-    // the mark passes its creation entry, the unlink of that binding, the last one, still refuses.
+    // A restore keeps the binding of a bootstrap whose issue came after its snapshot, and the log of the snapshot does
+    // not name the issue. After the mark passes its creation entry, the report gives the issue with its live binding,
+    // and that administrator unlinks the earlier one. The unlink of the last binding still refuses.
     let fresh = open(&mut run, &issuer, "fresh").await?;
+    let (yves, zoe) = (Keys::new(8), Keys::new(6));
+    let value = issue(&mut run, &fresh, &mut random, "yves", "f-1").await?;
+    enroll(&mut run, &fresh, &issuer, &value, &yves, "f-2").await?;
     let snapshot = run.binding.snapshot();
-    let value = issue(&mut run, &fresh, &mut random, "zoe", "f-1").await?;
-    let zoe = Keys::new(6);
-    let credential = enroll(&mut run, &fresh, &issuer, &value, &zoe, "f-2").await?;
+    let value = issue(&mut run, &fresh, &mut random, "zoe", "f-3").await?;
+    let credential = enroll(&mut run, &fresh, &issuer, &value, &zoe, "f-4").await?;
     run.restore(&snapshot).await?;
     run.driver.advance(now());
     run.settle().await?;
+    let issued = Duration::from_secs(now().estimate().as_secs());
+    let row = |name: &str| Issue {
+        administrator: account(name),
+        issued,
+        expires: issued.saturating_add(local::LIFETIME),
+        status: BOUND,
+    };
+    let rows = fresh
+        .report(&mut run.binding, now())
+        .await
+        .map_err(refused("a report"))?
+        .issues;
+    ensure(
+        rows == [row("yves"), row("zoe")],
+        "after a restore, the report does not give an issue after the snapshot whose value a client consumed",
+    )?;
     let actor = admit(&mut run, &fresh, &credential, &zoe)
         .await?
         .map_err(refused("an admission"))?;
     let (proposal, plan) = fresh
-        .unlink(&mut run.binding, &actor, &account("zoe"), now(), op("f-3"))
+        .unlink(&mut run.binding, &actor, &account("yves"), now(), op("f-5"))
+        .await
+        .map_err(refused("an unlink"))?;
+    ensure(
+        matches!(submitted(&mut run, proposal, plan).await?, Outcome::Accepted(_)),
+        "after a restore, the administrator of an issue after the snapshot did not unlink an earlier one",
+    )?;
+    ensure(
+        report(&mut run, &fresh, now()).await?
+            == statuses(&[("yves", Status::Consumed { bound: false }), ("zoe", BOUND)]),
+        "the report does not give the unlink after a restore",
+    )?;
+    let (proposal, plan) = fresh
+        .unlink(&mut run.binding, &actor, &account("zoe"), now(), op("f-6"))
         .await
         .map_err(refused("an unlink"))?;
     ensure(

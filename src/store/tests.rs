@@ -185,7 +185,7 @@ impl Store for Ended {
         Ok(Commit::Conflict)
     }
 
-    async fn intents(&mut self, _: Option<&Key>, _: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
+    async fn range(&mut self, _: &Key, _: Option<&Key>, _: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
         Ok(Vec::new())
     }
 
@@ -270,11 +270,11 @@ impl Store for Records {
         Ok(Commit::Accepted)
     }
 
-    async fn intents(&mut self, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
+    async fn range(&mut self, prefix: &Key, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
         let records = self
             .0
             .iter()
-            .filter(|(key, _)| Kind::of(key) == Some(Kind::Intent) && after.is_none_or(|after| *key > after));
+            .filter(|(key, _)| key.as_bytes().starts_with(prefix.as_bytes()) && after.is_none_or(|after| *key > after));
         Ok(records
             .take(limit.get())
             .map(|(key, record)| (key.clone(), record.clone()))
@@ -308,11 +308,11 @@ fn a_worker_reads_the_intents_of_a_commit_in_bounded_passes() {
     let mut store = Records::default();
     assert_eq!(ready(store.commit(&proposal, Instance(1))), Ok(Commit::Accepted));
 
-    let limit = NonZeroUsize::new(1).unwrap();
+    let (intents, limit) = (Kind::Intent.key(&[]).unwrap(), NonZeroUsize::new(1).unwrap());
     let mut found = Vec::new();
     let mut after = None;
     loop {
-        let read = ready(store.intents(after.as_ref(), limit)).unwrap();
+        let read = ready(store.range(&intents, after.as_ref(), limit)).unwrap();
         assert!(read.len() <= 1);
         let Some((key, record)) = read.into_iter().next() else {
             break;
@@ -324,7 +324,7 @@ fn a_worker_reads_the_intents_of_a_commit_in_bounded_passes() {
     }
     assert_eq!(found, [notify, sign]);
 
-    let (key, record) = ready(store.intents(None, limit)).unwrap().remove(0);
+    let (key, record) = ready(store.range(&intents, None, limit)).unwrap().remove(0);
     let mut cancelled = found.remove(0);
     cancelled.cancel();
     let mut change = Proposal::new(

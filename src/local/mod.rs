@@ -12,16 +12,18 @@
 //! call is admitted only for the credential of a live administrator binding ([`Authority::admit`]). Thus remote access
 //! refuses before a separate identity enrolls.
 //!
-//! The store keeps no secret. A value record holds the administrator and the end of the value, under a key that the
-//! SHA-256 digest of the authority, the issuer public key, and the secret names. Thus a value of another authority, or
-//! of another issuer key, finds no record. The record of the authority ([`Kind::Local`]) holds the grant, the issuer
-//! key, and the log of the last [`ISSUES_MAX`] issues: the report of each issue and each consumption
-//! ([`Authority::report`]).
+//! The store keeps no secret. A value record holds the administrator, the time of the issue, and the end of the value,
+//! under a key that the SHA-256 digest of the authority, the issuer public key, and the secret names. Thus a value of
+//! another authority, or of another issuer key, finds no record. The record of the authority ([`Kind::Local`]) holds the
+//! grant, the issuer key, and the log of the last [`ISSUES_MAX`] issues. Each administrator binding holds the issue of
+//! the value that its consumption spent, under a key that starts with the digest of the authority. Thus one range read
+//! ([`Store::range`]) gives each live administrator. The report ([`Authority::report`]) gives each issue of the log and
+//! each live binding, also after a restore.
 //!
-//! Each operation reads the store with [`Store::read`] and gives a proposal and its plan. Submit them to the commit
-//! driver ([`Driver::submit`](crate::store::driver::Driver::submit)). Only the receipt of the accepted commit gives
-//! the bootstrap value or the credential. After a lost response, the outcome lookup shows the commit and no value:
-//! the owner issues again, and that issue ends the value of the lost commit.
+//! Each operation reads the store with [`Store::read`] and [`Store::range`], and gives a proposal and its plan. Submit
+//! them to the commit driver ([`Driver::submit`](crate::store::driver::Driver::submit)). Only the receipt of the
+//! accepted commit gives the bootstrap value or the credential. After a lost response, the outcome lookup shows the
+//! commit and no value: the owner issues again, and that issue ends the value of the lost commit.
 //!
 //! This example runs the journey on the memory binding of `rsauthnz-conformance`. rscrypto signs in place of custody,
 //! so that the example holds its keys.
@@ -149,11 +151,11 @@
 //! ```
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write as _};
+use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use rscrypto::ChaCha20Rng;
@@ -183,13 +185,17 @@ pub const CLI_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// administrator.
 pub const ISSUES_MAX: usize = 64;
 
+/// The most live administrator bindings of an authority. An issue refuses at it, and a report or an unlink reads at most
+/// this many.
+pub const ADMINISTRATORS_MAX: usize = 64;
+
 /// The text of a bootstrap value: this prefix and 64 lowercase hexadecimal digits.
 const PREFIX: &str = "rsauthnz-bootstrap-1-";
 /// The first item of each CBOR form of this module. The number changes with the form.
 const IDENTITY_FORM: &str = "rsauthnz.local.bootstrap.1";
 const RECORD_FORM: &str = "rsauthnz.local.1";
-const VALUE_FORM: &str = "rsauthnz.local.value.1";
-const BINDING_FORM: &str = "rsauthnz.local.administrator.1";
+const VALUE_FORM: &str = "rsauthnz.local.value.2";
+const BINDING_FORM: &str = "rsauthnz.local.administrator.2";
 /// The actions of the audit records.
 const ISSUE: &str = "bootstrap.issue";
 const CONSUME: &str = "bootstrap.consume";
@@ -339,15 +345,15 @@ impl Authority {
     /// Only the receipt of the accepted commit gives the value, as its artifact: the text of a [`Bootstrap`]. Give it
     /// to the client by a local path, never by a URL or a log. A lookup gives no value.
     ///
-    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). Three keyed reads, and one more for each issue that a
-    /// full log drops.
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). Two keyed reads, and one range read of the administrator
+    /// bindings.
     ///
     /// # Errors
     ///
     /// [`Error::Grant`] if `grant` is not the grant that opened the authority. [`Error::Bound`] if `administrator` has
-    /// a live binding. [`Error::Full`] if the log cannot drop an issue. [`Error::Time`] if the end of the value
-    /// overflows. The errors of [`Self::open`] for the record of the authority, and [`Error::Transition`] for the
-    /// proposal.
+    /// a live binding. [`Error::Full`] if the authority has [`ADMINISTRATORS_MAX`] live administrator bindings, or the
+    /// log cannot drop an issue. [`Error::Time`] if the end of the value overflows. The errors of [`Self::open`] for the
+    /// record of the authority and its bindings, and [`Error::Transition`] for the proposal.
     pub async fn issue<S: Store>(
         &self,
         store: &mut S,
@@ -369,6 +375,7 @@ impl Authority {
         let value_data = encode(&[
             Value::Text(VALUE_FORM),
             administrator.to_cbor(),
+            Value::Unsigned(issued),
             Value::Unsigned(expires),
         ]);
         let request = Value::Array(vec![
@@ -400,10 +407,12 @@ impl Authority {
                 State::Consumed
             };
         }
+        let live = self.administrators(store).await?;
         let binding = self.binding(&administrator);
-        if read(store, &binding).await?.is_some() {
+        if live.iter().any(|(key, ..)| *key == binding) {
             return Err(Error::Bound.into());
         }
+        (live.len() < ADMINISTRATORS_MAX).ok_or(Error::Full)?;
         proposal.read(Dependency::Absent(binding)).map_err(Error::Transition)?;
         log.push(Entry {
             identity,
@@ -412,7 +421,7 @@ impl Authority {
             expires,
             state: State::Open,
         });
-        let data = self.fit(store, &mut log).await?;
+        let data = self.fit(&mut log, &live)?;
         let version = self.next(stored.map(|record| record.version), &identity)?;
         proposal
             .change(Change::Write {
@@ -465,8 +474,8 @@ impl Authority {
         let identity = self.identity(value);
         let key = value_key(&identity);
         let record = read(store, &key).await?.ok_or(Error::Unknown)?;
-        let (administrator, expires) = self.value(&record).ok_or(Error::Record)?;
-        if expired(now, expires)? {
+        let (administrator, issued, ends) = self.value(&record).ok_or(Error::Record)?;
+        if expired(now, ends)? {
             return Err(Error::Expired.into());
         }
         let expires = now
@@ -487,8 +496,13 @@ impl Authority {
             authority: self,
             draft,
             value: (key, record.version),
-            administrator,
-            identity,
+            issue: Entry {
+                identity,
+                administrator,
+                issued,
+                expires: ends,
+                state: State::Consumed,
+            },
             serial,
             holder: crypto::sha256(holder),
             now,
@@ -513,8 +527,8 @@ impl Authority {
         administrator: &Id<Human>,
     ) -> Result<Vec<u8>, Failure<S::Error>> {
         let record = read(store, &self.binding(administrator)).await?.ok_or(Error::Unknown)?;
-        let (identity, credential) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
-        (identity == self.identity(value)).ok_or(Error::Unknown)?;
+        let (issue, credential) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
+        (issue.identity == self.identity(value)).ok_or(Error::Unknown)?;
         Ok(credential)
     }
 
@@ -566,14 +580,15 @@ impl Authority {
     /// the last one with [`transition::Error::LastAnchor`]. An administrator can unlink its own binding when another
     /// one is live.
     ///
-    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One keyed read of the record of the authority, and one of
-    /// each administrator binding in its log.
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One range read of the administrator bindings.
     ///
     /// # Errors
     ///
-    /// [`Error::NotEnrolled`] if `actor` is of another authority, or `administrator` has no live binding. The errors
-    /// of [`Self::open`] for the record of the authority, and [`Error::Transition`] for the proposal, such as
-    /// [`transition::Error::Changed`] when the binding of `actor` changed after its admission.
+    /// [`Error::NotEnrolled`] if `actor` is of another authority, or `administrator` has no live binding.
+    /// [`Error::Full`] if the authority has more than [`ADMINISTRATORS_MAX`] live bindings, which an issue prevents.
+    /// [`Error::Record`] if a binding has no valid form, [`Failure::Store`] if the read fails, and
+    /// [`Error::Transition`] for the proposal, such as [`transition::Error::Changed`] when the binding of `actor`
+    /// changed after its admission.
     pub async fn unlink<S: Store>(
         &self,
         store: &mut S,
@@ -584,7 +599,8 @@ impl Authority {
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
         (actor.authority == self.id).ok_or(Error::NotEnrolled)?;
         let key = self.binding(administrator);
-        let record = read(store, &key).await?.ok_or(Error::NotEnrolled)?;
+        let live = self.administrators(store).await?;
+        let (_, record, _) = live.iter().find(|(held, ..)| *held == key).ok_or(Error::NotEnrolled)?;
         let request = Value::Array(vec![administrator.to_cbor()]);
         let mut proposal = self.proposal(operation, &actor.administrator, UNLINK, &request, now)?;
         proposal
@@ -594,34 +610,19 @@ impl Authority {
             ))
             .map_err(Error::Transition)?;
         proposal
-            .read(Dependency::Version(key.clone(), record.version))
+            .read(Dependency::Version(key.clone(), record.version.clone()))
             .map_err(Error::Transition)?;
         proposal.change(Change::End(key)).map_err(Error::Transition)?;
-        // The bindings that the log names, and the binding that the unlink ends: a restore keeps a binding whose issue
-        // came after its snapshot, and the log of the snapshot does not name it. A binding that the plan lacks can
-        // only make the check refuse.
-        let log = match read(store, &self.key()).await? {
-            Some(record) => self.log(&record)?,
-            None => Vec::new(),
-        };
-        let administrators: BTreeSet<&Id<Human>> = log
-            .iter()
-            .map(|entry| &entry.administrator)
-            .chain([administrator])
+        let held = live
+            .into_iter()
+            .map(|(key, record, _)| Anchor {
+                key,
+                role: Role::Administrator(self.id.clone()),
+                version: record.version,
+                end: record.end,
+                data: record.data,
+            })
             .collect();
-        let mut held = Vec::new();
-        for administrator in administrators {
-            let key = self.binding(administrator);
-            if let Some(record) = read(store, &key).await? {
-                held.push(Anchor {
-                    key,
-                    role: Role::Administrator(self.id.clone()),
-                    version: record.version,
-                    end: record.end,
-                    data: record.data,
-                });
-            }
-        }
         Ok((
             proposal,
             Plan {
@@ -631,60 +632,96 @@ impl Authority {
         ))
     }
 
-    /// The report of the authority: each issue in its log, oldest first, with the state of its value at `now`.
+    /// The report of the authority, oldest first. It gives each issue in its log with the state of its value at `now`,
+    /// and each live administrator binding with the issue of its value. A restore keeps each live binding, but the log
+    /// of an older snapshot does not name the issues after it. Thus the report of a restored store still gives each
+    /// live administrator. It does not give an issue after the snapshot that left no live binding: the restore lost its
+    /// value, or an unlink ended its binding.
     ///
-    /// Limit: a restore from an older snapshot loses the issues after the snapshot, because an issue gives no journal
-    /// fact. The binding of a value from such an issue that a client consumed stays live, because a consumption gives
-    /// a journal fact, but the report does not show it. Keep the list of the administrators that you issued values
-    /// for, and unlink each one that you do not want after a restore.
-    ///
-    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One keyed read of the record of the authority, and at most
-    /// one more for each issue.
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One keyed read of the record of the authority, one range
+    /// read of the administrator bindings, and at most one keyed read of the newest value.
     ///
     /// # Errors
     ///
-    /// [`Error::Time`] if `now` has no bound and the newest value is not consumed. The errors of [`Self::open`] for the
-    /// record of the authority.
+    /// [`Error::Time`] if `now` has no bound and the newest value is not consumed. [`Error::Full`] if the authority has
+    /// more than [`ADMINISTRATORS_MAX`] live bindings, which an issue prevents. The errors of [`Self::open`] for the
+    /// record of the authority and its bindings.
     pub async fn report<S: Store>(&self, store: &mut S, now: Reading) -> Result<Report, Failure<S::Error>> {
         let log = match read(store, &self.key()).await? {
             Some(record) => self.log(&record)?,
             None => Vec::new(),
         };
-        let mut issues = Vec::with_capacity(log.len());
+        let mut live: Vec<Entry> = self
+            .administrators(store)
+            .await?
+            .into_iter()
+            .map(|(.., issue)| issue)
+            .collect();
+        let mut issues = Vec::with_capacity(log.len() + live.len());
         for entry in log {
-            let open = entry.state == State::Open && read(store, &value_key(&entry.identity)).await?.is_some();
+            let bound = live
+                .iter()
+                .position(|issue| issue.identity == entry.identity)
+                .map(|index| live.remove(index))
+                .is_some();
+            let open =
+                entry.state == State::Open && !bound && read(store, &value_key(&entry.identity)).await?.is_some();
             let status = match entry.state {
                 State::Ended => Status::Ended,
                 State::Open if open && expired(now, entry.expires)? => Status::Expired,
                 State::Open if open => Status::Valid,
-                State::Open | State::Consumed => Status::Consumed {
-                    bound: self.bound(store, &entry).await?,
-                },
+                State::Open | State::Consumed => Status::Consumed { bound },
             };
-            issues.push(Issue {
-                administrator: entry.administrator,
-                issued: Duration::from_secs(entry.issued),
-                expires: Duration::from_secs(entry.expires),
-                status,
-            });
+            issues.push(entry.issue(status));
         }
+        issues.extend(
+            live.into_iter()
+                .map(|issue| issue.issue(Status::Consumed { bound: true })),
+        );
+        issues.sort_by_key(|issue| issue.issued);
         Ok(Report { issues })
     }
 
-    /// The key of the record of the authority: [`Kind::Local`] with the SHA-256 digest of the canonical CBOR form of the
-    /// authority.
+    /// The SHA-256 digest of the canonical CBOR form of the authority.
+    fn digest(&self) -> [u8; 32] {
+        crypto::sha256(&encode(&[self.id.to_cbor()]))
+    }
+
+    /// The key of the record of the authority: [`Kind::Local`] with the digest of the authority.
     fn key(&self) -> Key {
-        Kind::Local
-            .key(&crypto::sha256(&encode(&[self.id.to_cbor()])))
+        Kind::Local.key(&self.digest()).expect("a key of 33 bytes is valid")
+    }
+
+    /// The prefix of the administrator bindings of the authority: [`Kind::Administrator`] with the digest of the
+    /// authority.
+    fn prefix(&self) -> Key {
+        Kind::Administrator
+            .key(&self.digest())
             .expect("a key of 33 bytes is valid")
     }
 
-    /// The key of the administrator binding of `administrator`: [`Kind::Administrator`] with the SHA-256 digest of the
-    /// authority and the administrator.
+    /// The key of the administrator binding of `administrator`: the prefix of the authority, then the SHA-256 digest of
+    /// the authority and the administrator.
     fn binding(&self, administrator: &Id<Human>) -> Key {
+        let digest = crypto::sha256(&encode(&[self.id.to_cbor(), administrator.to_cbor()]));
         Kind::Administrator
-            .key(&crypto::sha256(&encode(&[self.id.to_cbor(), administrator.to_cbor()])))
-            .expect("a key of 33 bytes is valid")
+            .key(&[self.digest(), digest].concat())
+            .expect("a key of 65 bytes is valid")
+    }
+
+    /// Each live administrator binding of the authority in key order, with the issue of its value: one range read of
+    /// the prefix of the authority. A binding under the key of another administrator has no valid form.
+    async fn administrators<S: Store>(&self, store: &mut S) -> Result<Vec<(Key, Record, Entry)>, Failure<S::Error>> {
+        let limit = NonZeroUsize::new(ADMINISTRATORS_MAX + 1).expect("the limit is not zero");
+        let records = store.range(&self.prefix(), None, limit).await.map_err(Failure::Store)?;
+        (records.len() <= ADMINISTRATORS_MAX).ok_or(Error::Full)?;
+        let mut live = Vec::with_capacity(records.len());
+        for (key, record) in records {
+            let (issue, _) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
+            (key == self.binding(&issue.administrator)).ok_or(Error::Record)?;
+            live.push((key, record, issue));
+        }
+        Ok(live)
     }
 
     /// The identity of `value`: the SHA-256 digest of the authority, the issuer public key, and the secret. Thus a value
@@ -763,9 +800,9 @@ impl Authority {
     }
 
     /// The record form of the authority with `log`. Each issue past [`ISSUES_MAX`] drops the oldest issue whose value
-    /// bound no live administrator, and so does a form that does not decode within the limits. The newest issue stays.
-    /// The loop ends: each step drops an issue or passes one.
-    async fn fit<S: Store>(&self, store: &mut S, log: &mut Vec<Entry>) -> Result<Box<[u8]>, Failure<S::Error>> {
+    /// bound no administrator of `live`, and so does a form that does not decode within the limits. The newest issue
+    /// stays. The loop ends: each step drops an issue or passes one.
+    fn fit(&self, log: &mut Vec<Entry>, live: &[(Key, Record, Entry)]) -> Result<Box<[u8]>, Error> {
         let (id, public) = (self.issuer.id().to_bytes(), self.issuer.public_key());
         let mut index = 0;
         loop {
@@ -783,7 +820,7 @@ impl Authority {
             }
             let (_, older) = log.split_last().expect("the log holds the new issue");
             let entry = older.get(index).ok_or(Error::Full)?;
-            if entry.state == State::Ended || !self.bound(store, entry).await? {
+            if entry.state == State::Ended || !live.iter().any(|(.., issue)| issue.identity == entry.identity) {
                 log.remove(index);
             } else {
                 index += 1;
@@ -791,25 +828,22 @@ impl Authority {
         }
     }
 
-    /// Whether the binding of the administrator of `entry` is live and holds the consumption of its value.
-    async fn bound<S: Store>(&self, store: &mut S, entry: &Entry) -> Result<bool, Failure<S::Error>> {
-        let Some(record) = read(store, &self.binding(&entry.administrator)).await? else {
-            return Ok(false);
-        };
-        let (identity, _) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
-        Ok(identity == entry.identity)
-    }
-
-    /// The administrator and the end of the value record `record`.
-    fn value(&self, record: &Record) -> Option<(Id<Human>, u64)> {
+    /// The administrator, the time of the issue, and the end of the value record `record`.
+    fn value(&self, record: &Record) -> Option<(Id<Human>, u64, u64)> {
         let value = cbor::decode(&record.data, self.limits).ok()?;
         let Value::Array(items) = &value else {
             return None;
         };
-        let [Value::Text(VALUE_FORM), administrator, Value::Unsigned(expires)] = items.as_slice() else {
+        let [
+            Value::Text(VALUE_FORM),
+            administrator,
+            Value::Unsigned(issued),
+            Value::Unsigned(expires),
+        ] = items.as_slice()
+        else {
             return None;
         };
-        Some((Id::from_cbor(administrator).ok()?, *expires))
+        Some((Id::from_cbor(administrator).ok()?, *issued, *expires))
     }
 }
 
@@ -819,8 +853,7 @@ pub struct Pending<'a> {
     authority: &'a Authority,
     draft: Draft,
     value: (Key, AuthorityVersion),
-    administrator: Id<Human>,
-    identity: [u8; 32],
+    issue: Entry,
     serial: Serial,
     holder: [u8; 32],
     now: Reading,
@@ -852,22 +885,23 @@ impl Pending<'_> {
             .draft
             .finish(signature, &mut SignatureBudget::new(&authority.limits))
             .map_err(Error::Credential)?;
-        let request = Value::Array(vec![Value::Bytes(&self.identity), Value::Bytes(&self.holder)]);
-        let mut proposal = authority.proposal(operation, &self.administrator, CONSUME, &request, self.now)?;
+        let request = Value::Array(vec![Value::Bytes(&self.issue.identity), Value::Bytes(&self.holder)]);
+        let mut proposal = authority.proposal(operation, &self.issue.administrator, CONSUME, &request, self.now)?;
         let (value, version) = self.value;
         proposal
             .read(Dependency::Version(value.clone(), version))
             .map_err(Error::Transition)?;
         proposal.change(Change::End(value)).map_err(Error::Transition)?;
-        let key = authority.binding(&self.administrator);
+        let key = authority.binding(&self.issue.administrator);
         proposal
             .read(Dependency::Absent(key.clone()))
             .map_err(Error::Transition)?;
         // The version is the serial, so a binding of the same administrator after an unlink has a later version than
-        // the end entry of the unlink.
+        // the end entry of the unlink. The binding keeps the issue of the value, so a restore that keeps the binding
+        // keeps the issue in the report.
         let data = encode(&[
             Value::Text(BINDING_FORM),
-            Value::Bytes(&self.identity),
+            self.issue.to_cbor(),
             Value::Bytes(credential.as_bytes()),
         ]);
         proposal
@@ -966,7 +1000,8 @@ pub enum Error {
     Expired,
     /// The administrator has a live binding. Name another administrator, or unlink the binding.
     Bound,
-    /// Each issue of the full log bound a live administrator. Unlink an administrator, then issue again.
+    /// The authority has [`ADMINISTRATORS_MAX`] live administrator bindings, or each issue of the full log bound a live
+    /// administrator. Unlink an administrator, then issue again.
     Full,
     /// No live administrator binding holds the credential or the administrator. Refuse the call.
     NotEnrolled,
@@ -989,7 +1024,9 @@ impl fmt::Display for Error {
             Self::Unknown => f.write_str("the authority holds no valid bootstrap value of this text"),
             Self::Expired => f.write_str("the bootstrap value expired"),
             Self::Bound => f.write_str("the administrator has a live binding"),
-            Self::Full => f.write_str("each issue of the log bound a live administrator"),
+            Self::Full => {
+                f.write_str("the authority has the most live administrators, or each issue of its log bound one")
+            }
             Self::NotEnrolled => f.write_str("no live administrator binding holds the credential"),
             Self::Record => f.write_str("a record of the authority has no valid form"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
@@ -1038,7 +1075,8 @@ enum State {
     Ended,
 }
 
-/// An issue in the log of the record of the authority.
+/// An issue in the log of the record of the authority, or in an administrator binding.
+#[derive(Debug)]
 struct Entry {
     identity: [u8; 32],
     administrator: Id<Human>,
@@ -1048,6 +1086,16 @@ struct Entry {
 }
 
 impl Entry {
+    /// The issue of the report with `status`.
+    fn issue(self, status: Status) -> Issue {
+        Issue {
+            administrator: self.administrator,
+            issued: Duration::from_secs(self.issued),
+            expires: Duration::from_secs(self.expires),
+            status,
+        }
+    }
+
     /// The form `[identity, administrator, issued, expires, state]`, with the state 0 for open, 1 for consumed, and 2
     /// for ended.
     fn to_cbor(&self) -> Value<'_> {
@@ -1098,21 +1146,16 @@ fn value_key(identity: &[u8; 32]) -> Key {
     Kind::Bootstrap.key(identity).expect("a key of 33 bytes is valid")
 }
 
-/// The identity of the value and the credential of the administrator binding `record`.
-fn decode_binding(record: &Record, limits: Limits) -> Option<([u8; 32], Vec<u8>)> {
+/// The issue of the value and the credential of the administrator binding `record`.
+fn decode_binding(record: &Record, limits: Limits) -> Option<(Entry, Vec<u8>)> {
     let value = cbor::decode(&record.data, limits).ok()?;
     let Value::Array(items) = &value else {
         return None;
     };
-    let [
-        Value::Text(BINDING_FORM),
-        Value::Bytes(identity),
-        Value::Bytes(credential),
-    ] = items.as_slice()
-    else {
+    let [Value::Text(BINDING_FORM), issue, Value::Bytes(credential)] = items.as_slice() else {
         return None;
     };
-    Some(((*identity).try_into().ok()?, credential.to_vec()))
+    Some((Entry::from_cbor(issue)?, credential.to_vec()))
 }
 
 /// The read of `key` as a dependency: its version, or its absence.

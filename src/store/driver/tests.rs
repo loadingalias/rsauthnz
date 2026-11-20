@@ -172,7 +172,7 @@ enum Event {
     Read(Key),
     Commit(OperationId, Instance),
     Expire(Kind),
-    Intents,
+    Range,
     Append(Written, OperationId),
     Sync,
     ReadJournal,
@@ -187,7 +187,7 @@ impl Event {
             Effect::Read(key) => Self::Read((*key).clone()),
             Effect::Commit(proposal, instance) => Self::Commit(proposal.operation().id.clone(), *instance),
             Effect::Expire(kind, ..) => Self::Expire(*kind),
-            Effect::Intents(..) => Self::Intents,
+            Effect::Range(..) => Self::Range,
             Effect::Append(bytes) => {
                 // The stored form is `[form, sequence, link, operation, [tag, ...]]`.
                 let Value::Array(items) = cbor::decode(bytes, Limits::default()).unwrap() else {
@@ -281,10 +281,12 @@ impl Double {
                 }
                 Output::Expired(ended.len())
             }
-            Effect::Intents(after, limit) => Output::Intents(
+            Effect::Range(prefix, after, limit) => Output::Range(
                 self.records
                     .iter()
-                    .filter(|(key, _)| Kind::of(key) == Some(Kind::Intent) && after.is_none_or(|after| *key > after))
+                    .filter(|(key, _)| {
+                        key.as_bytes().starts_with(prefix.as_bytes()) && after.is_none_or(|after| *key > after)
+                    })
                     .take(limit.get())
                     .map(|(key, record)| (key.clone(), record.clone()))
                     .collect(),
