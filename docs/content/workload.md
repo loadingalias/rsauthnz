@@ -28,10 +28,12 @@ Thus each later version is greater than the version before it, also after a rest
 | Record | Add its first write with | Key | Holds |
 | --- | --- | --- | --- |
 | Issuer | `Issuer::new(authority, key, audiences, ceiling)?.register(&mut proposal, &mut driver)` | `Issuer::store_key(&authority)`: `Kind::Issuer` | The authority, its current key and its previous key, its audiences, and its ceiling |
-| Registration | `Registration::register(&mut proposal, workload, key, owner, &mut driver)` | `Registration::store_key(&workload)`: `Kind::Workload` | The workload, its registered proof key, and its generation |
+| Registration | `Registration::register(&mut proposal, workload, key, &issuer, &mut driver)` | `Registration::store_key(&workload)`: `Kind::Workload` | The workload, its registered proof key, its generation, and its revoked credentials |
 
 Each `register` adds the absence of the record and its write to the proposal. `from_record(data, limits)` reads a
-record. `owner` is the `Id<Authority>` that owns the versions of the registration record.
+record. The authority of `issuer` owns the versions of the registration record, so the registration names its
+issuer. An issuance of another issuer refuses with `Error::Issuer`, and a credential of another issuer refuses at a
+verifier.
 
 - The algorithm of the issuer key is the profile that each audience of the issuer declares
   ([Declare the profile of an audience](credential-format.md#declare-the-profile-of-an-audience)). The registered key
@@ -79,11 +81,14 @@ The proposal reads these dependencies, so a concurrent change between the decisi
 | `Policy(version)` of the permit | A policy change refuses the issuance |
 | `Version` of the issuer record | A rotation of the issuer key, or a change of its audiences or its ceiling, refuses the issuance |
 | `Version` of the registration record | A rotation, a recovery, a revocation, or another issuance of the workload refuses the issuance |
-| `Absent` of the credential record | A serial commits once |
+| `Absent` of the issuance record | A serial commits once |
 
-The commit writes the credential record (`workload::credential_key(serial)`), a new version of the registration
-record, the audit record, and the outcome record together. The credential record holds the issuer, the workload,
-the audience, and the end, but not the credential. It ends when the credential ends, so expiry removes it.
+The commit writes the issuance record of the credential (`credential::record_key(serial)`,
+[Issue a credential](credential-format.md#issue-a-credential)), a new version of the registration record, the audit
+record, and the outcome record together. The issuance record holds the issuer, the workload, the audience, the
+purpose, and the end, but not the credential. It ends when the credential ends, so expiry removes it. The proposal
+has the deadline of its checked scope: the earliest end of the permit, of the maximum age of the evidence, and of the
+credential of the evidence. A commit after it refuses with `Error::Transition(transition::Error::Expired)`.
 
 Each issuance writes the registration record, so that an issuance and a revocation that race cannot both commit.
 Two issuances of one workload at the same time conflict too. The second one refuses with `Error::Conflict`, and the
@@ -94,14 +99,21 @@ workload asks again as a new operation. Read the registration record again befor
 The workload renews its credential at `credential.renew_at()`: half its lifetime after its issue time.
 
 1. The issuer service gives the workload a challenge for one proof.
-2. The workload signs a proof of possession of its key over the challenge, for its credential and its audience
+2. The workload makes the binding of the challenge to its request:
+   `workload::binding(challenge, &operation, &issuer_authority, &workload, &audience, None)`.
+3. The workload signs a proof of possession of its key over that binding, for its credential and its audience
    (`credential::ProofDraft`, [Prove possession](credential-format.md#prove-possession)).
-3. The issuer service makes the `Request` with `By::Renew { credential, proof, challenge }` and the same audience.
-   Then it follows the steps of [Issue the first credential](#issue-the-first-credential) from step 3.
+4. The issuer service makes the `Request` with `By::Renew { credential, proof, challenge }`, the same operation, and
+   the same audience. Then it follows the steps of [Issue the first credential](#issue-the-first-credential) from
+   step 3.
+
+The binding is the SHA-256 digest of `["rsauthnz.workload.proof.1", challenge, operation, issuer, workload, audience,
+kid]`, where `kid` is the COSE Key Thumbprint of the new key of a rotation or a recovery, or `null`. Each proof of a
+request binds it, so a proof gives no authority for another operation, issuer, workload, audience, or new key.
 
 For a renewal, `Pending::new` verifies the current credential with the profile of the issuer for the audience. The
 credential must name the registered workload, and its `cnf` key must be the registered key. Its serial must not be
-below the generation, so a revoked credential cannot renew. Then it checks the proof of possession, and the evidence
+below the generation or revoked, so a revoked credential cannot renew. Then it checks the proof of possession, and the evidence
 of the proof is the evidence of the policy check. A credential that ended refuses, so an operator issues the first
 credential again.
 
@@ -117,17 +129,21 @@ The workload replaces its registered key with a new key that it holds.
 
 1. The workload makes the new key in its custody.
 2. The issuer service gives the workload two challenges, one for each proof.
-3. The workload signs a proof by its current key over its credential, as for a renewal.
-4. The workload makes the key binding: `let binding = workload::key_binding(&workload, &new_key)`.
-5. The workload signs a proof by its new key over the binding, for the audience of the request:
-   `ProofDraft::new(&new_key, &binding, &audience, &challenge, now)`.
+3. The workload signs a proof by its current key over its credential, as for a renewal, over
+   `workload::binding(challenge, &operation, &issuer_authority, &workload, &audience, Some(&new_key))`. Thus the current
+   key signs the choice of the new key.
+4. The workload makes the key binding: `let key_binding = workload::key_binding(&workload, &new_key)`.
+5. The workload signs a proof by its new key over the key binding and the binding of the second challenge, for the
+   audience of the request: `ProofDraft::new(&new_key, &key_binding, &audience, &bound, now)`, where `bound` is
+   `workload::binding(new_challenge, &operation, &issuer_authority, &workload, &audience, Some(&new_key))`.
 6. The issuer service makes the `Request` with `By::Renew { .. }` and
-   `replace: Some(Replace { key: new_key, proof, challenge })`.
+   `replace: Some(Replace { key: new_key, proof, challenge: new_challenge })`.
 7. The issuer service follows the steps of [Issue the first credential](#issue-the-first-credential) from step 3.
 
 The key binding is the canonical CBOR array `["rsauthnz.workload.key.1", workload, kid]`, where `kid` is the COSE Key
-Thumbprint of the new key. The proof binds its SHA-256 digest, the audience, and the challenge. Thus, as for a
-certificate signing request, the issuer binds no key that the workload does not hold.
+Thumbprint of the new key. The proof binds its SHA-256 digest, the audience, and the binding of the challenge. Thus,
+as for a certificate signing request, the issuer binds no key that the workload does not hold. A new key that is the
+registered key refuses with `Error::Unchanged`.
 
 The commit writes the new key to the registration, and it raises the generation to the serial of the new
 credential. Thus each earlier credential of the workload is dead. A renewal with the old key refuses. A verifier
@@ -139,8 +155,10 @@ When a host is lost, an operator moves the workload to a new host under the auth
 
 1. The new host makes its key in its custody.
 2. The issuer service gives the new host a challenge.
-3. The new host signs a proof by its key over the key binding, as in steps 4 and 5 of
-   [Rotate the proof key](#rotate-the-proof-key).
+3. The new host signs a proof by its key over the key binding and the binding of the challenge, as in steps 4 and 5
+   of [Rotate the proof key](#rotate-the-proof-key).
+   The new key must not be the registered key: the recovery ends the key of the old host, so that key refuses with
+   `Error::Unchanged`.
 4. The operator asks with `By::Issue(&evidence)` and `replace: Some(Replace { key, proof, challenge })`.
 5. The operator follows the steps of [Issue the first credential](#issue-the-first-credential) from step 3.
 
@@ -157,16 +175,20 @@ policy must permit the principal `Mode::Revoke` on the resource of the workload.
 
 | `Target` | Ends |
 | --- | --- |
-| `Target::Credential(serial)` | The credential of this serial, and each earlier credential of the workload. A later credential, for example for another audience, stays valid |
+| `Target::Credential(serial, &record)` | The credential of this serial, and no other. `record` is its issuance record, from a keyed read of `credential::record_key(serial)` |
 | `Target::All` | Each credential of the workload that a commit before the revocation released |
 
-1. Read the registration record of the workload.
+1. Read the registration record of the workload, and for one credential its issuance record.
 2. Call `revocation.proposal(&registration_record, &policy, &mut driver, now, limits)`. It gives the `Proposal` and
    its `Plan`.
 3. Submit the proposal with the plan, and run the driver. An accepted outcome is the revocation.
 
-The registered key stays, so an operator can issue a new credential after the revocation. A revocation of a serial
-that the driver did not give yet refuses with `Error::Target`, because it would end later credentials too.
+A revocation of one credential checks that its issuance record names the issuer of the registration, the workload,
+and the workload purpose, and that the credential did not end. Otherwise it refuses with `Error::Target`. Its commit
+ends the issuance record and adds the serial and the end of the credential to the registration. The registration
+holds at most `workload::REVOKED_MAX` (16) revoked credentials that did not end, and a credential leaves the list when
+it ends. One more refuses with `Error::Revocations`: revoke all credentials. A revocation of all credentials raises
+the generation. The registered key stays, so an operator can issue a new credential after the revocation.
 
 ## Rotate the issuer key
 
@@ -184,6 +206,8 @@ algorithm of the current key. The policy must permit the principal `Mode::Rotate
 | --- | --- |
 | `Retire::AfterLifetime` | Becomes the previous key until its end: the lesser of the rotation time plus `lifetime_max` and `not_after`. After its end, it verifies nothing. Use it for a routine rotation |
 | `Retire::Now` | Refuses at once, and so does an earlier previous key. Use it for a key that an attacker can have |
+
+The new key must not be the current key or the previous key: such a key refuses with `Error::Unchanged`.
 
 Each credential names its issuer key with its `kid` ([The format](credential-format.md#the-format)), and the
 profile of the issuer holds the current key and the previous key. A credential that names no key of the profile
@@ -227,8 +251,10 @@ A verifier chooses what it reads:
 | Reads nothing | Its configuration, to make `Issuer` with `Issuer::new`. During a routine issuer rotation, it adds the previous key with `profile.with_previous(previous_key, until)` | When the credential ends |
 
 A verifier that reads the current state makes two keyed reads, and then calls
-`workload::admits(&verified, registration_record.as_ref(), limits)`. It gives `Error::Revoked` for a serial below
-the generation, `Error::Unregistered` for no record, and `Error::Possession` for a record of another workload. The
+`workload::admits(&verified, registration_record.as_ref(), limits)`. The credential must be a workload credential of
+the issuer of the registration, for its workload, with the registered key as its `cnf` key. It gives
+`Error::Possession` for another purpose, issuer, workload, or `cnf` key, such as a signed receipt with no `cnf` key.
+It gives `Error::Revoked` for a serial below the generation or revoked, and `Error::Unregistered` for no record. The
 check is local, and it makes no other read. For a verifier that reads nothing, the lifetime of a credential is the
 longest time that a revocation needs to reach it. Choose the lifetime with that cost.
 
@@ -343,7 +369,7 @@ let version = AuthorityVersion::new(authority.clone(), &[1])?;
 setup.change(Change::Write { key: policy_key, version, end: None, data: Box::from(*b"policy 1") })?;
 issuer.register(&mut setup, &mut driver)?;
 let runner_key = PublicKey::MlDsa65Ed25519(&runner_public);
-Registration::register(&mut setup, runner.clone(), runner_key, authority.clone(), &mut driver)?;
+Registration::register(&mut setup, runner.clone(), runner_key, &issuer, &mut driver)?;
 assert!(matches!(commit(&mut driver, &mut memory, setup, Plan::default())?, Outcome::Accepted(_)));
 
 // 2. An operator asks for the first credential. `policy` permits it `Mode::Issue`, and `operator` is its evidence.
@@ -375,12 +401,13 @@ assert_eq!(evidence.subject(), &Principal::Workload(runner.clone()));
 let current = ready(memory.read(&Registration::store_key(&runner)))?;
 workload::admits(&verified, current.as_ref(), Limits::default())?;
 
-// 5. At half its lifetime, the workload renews with its credential and a proof over the challenge of the issuer.
-// Each issuance writes the registration, so read it again.
+// 5. At half its lifetime, the workload renews with its credential and a proof over the binding of the challenge of
+// the issuer to its request. Each issuance writes the registration, so read it again.
 let later = Reading::new(credential.renew_at(), Some(Duration::from_secs(1)), ReadingSource::Caller);
-let proof = prove(b"challenge-2", later)?;
+let operation = OperationId::new(b"renew-1")?;
+let proof = prove(&workload::binding(b"challenge-2", &operation, &authority, &runner, &build, None), later)?;
 let by = By::Renew { credential: credential.as_bytes(), proof: &proof, challenge: b"challenge-2" };
-let request = Request { operation: OperationId::new(b"renew-1")?, by, audience: &build, lifetime: None, replace: None };
+let request = Request { operation, by, audience: &build, lifetime: None, replace: None };
 let registration_record = current.ok_or("no registration")?;
 let pending =
     Pending::new(request, &issuer_record, &registration_record, &policy, &mut driver, later, Limits::default())?;
@@ -390,17 +417,19 @@ let renewed = awaiting.release(commit(&mut driver, &mut memory, proposal, plan)?
 assert!(renewed.serial() > credential.serial());
 
 // 6. The host is lost. The operator recovers the workload on a new host, which proves its new key over the key
-// binding. One commit issues to the new host and ends each credential of the old host.
+// binding and the binding of its challenge. One commit issues to the new host and ends each credential of the old
+// host.
 let (host_public, host_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(4)))?;
 let host_public = host_public.to_bytes();
 let host_key = PublicKey::MlDsa65Ed25519(&host_public);
-let binding = workload::key_binding(&runner, &host_key);
-let draft = ProofDraft::new(&trusted(host_key.clone())?, &binding, &build, b"challenge-3", later)?;
+let operation = OperationId::new(b"recover-1")?;
+let bound = workload::binding(b"challenge-3", &operation, &authority, &runner, &build, Some(&host_key));
+let key_binding = workload::key_binding(&runner, &host_key);
+let draft = ProofDraft::new(&trusted(host_key.clone())?, &key_binding, &build, &bound, later)?;
 let signature = host_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
 let proof = draft.finish(signature.as_bytes(), &mut budget())?;
 let replace = Replace { key: host_key, proof: &proof, challenge: b"challenge-3" };
 let by = By::Issue(&operator);
-let operation = OperationId::new(b"recover-1")?;
 let request = Request { operation, by, audience: &build, lifetime: None, replace: Some(replace) };
 let registration_record = ready(memory.read(&Registration::store_key(&runner)))?.ok_or("no registration")?;
 let pending =
@@ -428,10 +457,13 @@ Each refusal is a `workload::Error`. Refuse the request unless the table gives a
 | `Record` | A record is not the record form of its kind, or rsauthnz did not write its version | Register the issuer or the workload with `register` |
 | `Audience` | The audience is not an audience of the issuer | Refuse |
 | `Ceiling` | The lifetime is past `lifetime_max`, or the end is past `not_after` | Ask for a shorter lifetime, or give the issuer a new ceiling |
-| `Possession` | The current credential of a renewal names another workload or another `cnf` key than the registration, or `admits` got the registration of another workload | Refuse |
-| `Revoked` | The serial of the credential is below the generation: a rotation, a recovery, or a revocation ended it | An operator issues a new credential |
+| `Possession` | The current credential of a renewal names another workload or another `cnf` key than the registration, or `admits` got a credential of another purpose, issuer, workload, or `cnf` key | Refuse |
+| `Revoked` | The serial of the credential is below the generation or revoked: a rotation, a recovery, or a revocation ended it | An operator issues a new credential |
 | `Unregistered` | `admits` got no registration record | An operator registers the workload again ([After a restore](#after-a-restore)) |
-| `Target` | A revocation names a serial that the driver did not give yet | Name an issued serial, or `Target::All` |
+| `Target` | The issuance record of a revocation of one credential names another issuer, workload, or purpose, the credential ended, or a revocation ended it | Name a live credential of the workload, or `Target::All` |
+| `Revocations` | The registration holds `REVOKED_MAX` revoked credentials that did not end | Revoke all credentials, or wait for one of them to end |
+| `Unchanged` | The new key is the key that the operation retires: the registered key, or the current or previous issuer key | Give a new key |
+| `Issuer` | The registration names another issuer than the issuer record of the request | Use the issuer of the registration |
 | `Algorithm` | The new issuer key has another algorithm than the current key | Use a key of the declared profile, or a new issuer with its own authority |
 | `Overlap { until }` | A routine issuer rotation while the previous key still verifies | Rotate at `until` or later, or with `Retire::Now` |
 | `Credential(credential::Error)` | The format refused the draft, the current credential, a proof, or the signature of custody | Refuse |
@@ -450,8 +482,8 @@ Each form is canonical CBOR ([Parser limits](parser-limits.md)). The first item 
 | Record | Key | Form |
 | --- | --- | --- |
 | Issuer | `Kind::Issuer`, then the SHA-256 digest of the CBOR form of the authority | `["rsauthnz.workload.issuer.2", authority, key, previous, audiences, lifetime_max, not_after]`. `previous` is `null`, or `[key, until]` during a rotation |
-| Registration | `Kind::Workload`, then the SHA-256 digest of the CBOR form of the workload | `["rsauthnz.workload.registration.2", workload, key, generation]` |
-| Credential | `Kind::Credential`, then the 8 bytes of the serial, the most significant byte first | `["rsauthnz.workload.credential.1", issuer, workload, audience, expires]` |
+| Registration | `Kind::Workload`, then the SHA-256 digest of the CBOR form of the workload | `["rsauthnz.workload.registration.3", workload, key, generation, revoked]`. `revoked` is an array of `[serial, expires]`, sorted by serial |
+| Credential | `Kind::Credential`, then the 8 bytes of the serial, the most significant byte first | The issuance record of [Issue a credential](credential-format.md#issue-a-credential): `["rsauthnz.credential.record.1", issuer, subject, audience, purpose, expires]` |
 
 Each identifier has its CBOR form of [Vocabulary](vocabulary.md#cbor-forms). A key is the byte string of an encoded
 `COSE_Key` with its `alg`. The times are whole seconds since the Unix epoch, and the lifetime is whole seconds.
@@ -459,7 +491,7 @@ Each identifier has its CBOR form of [Vocabulary](vocabulary.md#cbor-forms). A k
 | Record | Version |
 | --- | --- |
 | Issuer | The owner of its first version, and 8 bytes of a value of the `Kind::Issuer` counter |
-| Registration | The owner of its first version, and 8 bytes of a value of the `Kind::Credential` counter |
+| Registration | The issuer authority, and 8 bytes of a value of the `Kind::Credential` counter |
 | Credential | The issuer authority, and the 8 bytes of the serial |
 
 The request binding of an issuance holds `[workload, audience, lifetime, kid]`. `lifetime` is `null` for no
@@ -473,3 +505,5 @@ lifetime, and `kid` is the thumbprint of the new key, or `null` with no `replace
   ends.
 - A profile holds at most two issuer keys: the current key and the previous key.
 - Each issuance writes the registration record, so two issuances of one workload at the same time conflict.
+- A registration holds at most `workload::REVOKED_MAX` (16) revoked credentials that did not end. With more, revoke
+  all credentials of the workload.

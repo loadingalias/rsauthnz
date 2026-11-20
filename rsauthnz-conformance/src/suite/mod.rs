@@ -90,6 +90,11 @@ pub trait Subject: Store + Journal + Clone {
     /// domain of the journal. A later append does not get the sequence of a removed entry. The suite removes entries
     /// only of a binding that declares [`Restore::Journal`].
     fn lose(&self, sequences: impl RangeBounds<Sequence>);
+
+    /// The reading of the clock of the host, which [`execute`] gives to the driver for [`Effect::Clock`]: the fresh
+    /// reading just before a commit with a deadline. A binding for production reads the system clock with its bound.
+    /// The suite gives the clock of its own fixed times, so it does not read this one.
+    fn clock(&self) -> Reading;
 }
 
 /// A fault that the suite gives to one primitive of a binding with [`Subject::inject`]. Each fault is a crash: after
@@ -581,6 +586,7 @@ pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output 
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
+        Effect::Clock => Output::Clock(binding.clock()),
     }
 }
 
@@ -692,7 +698,11 @@ impl<S: Subject> Run<S> {
         if let Some(fault) = fault {
             self.binding.inject(fault);
         }
-        let output = execute(&mut self.binding, effect).await;
+        // The cases run at the fixed time of `now`, so the clock of a commit is that time.
+        let output = match effect {
+            Effect::Clock => Output::Clock(now()),
+            effect => execute(&mut self.binding, effect).await,
+        };
         self.driver
             .give(output)
             .map_err(|error| format!("the driver refused an output of the binding: {error}"))?;

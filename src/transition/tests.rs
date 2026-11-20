@@ -343,7 +343,9 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
         })
         .unwrap();
     proposal.intend(Intent::new(Effect::Provider, SECRET.into())).unwrap();
-    proposal.prepare(Prepared::new(SECRET.into()));
+    proposal
+        .prepare(Prepared::new(SECRET.into(), key("session"), version("auth", 1)))
+        .unwrap();
 
     let operation = proposal.operation().clone();
     let shown = format!("{proposal:?}");
@@ -361,6 +363,36 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
     }
     // The control: the receipt holds the secret that its `Debug` output does not show.
     assert_eq!(receipt.artifact(), Some(SECRET));
+}
+
+/// A prepared artifact names its issuance record. A proposal that does not write that record at that version refuses
+/// the artifact, so a credential never commits with an unrelated transition. A second artifact refuses too.
+#[test]
+fn a_prepared_artifact_refuses_a_proposal_that_does_not_write_its_issuance_record() {
+    let issued = || Prepared::new(Box::new(*b"credential 9"), key("credential/9"), version("auth", 9));
+    let mut unrelated = proposal(b"op-1", human(), "credential.issue", "repo:x");
+    unrelated.read(Dependency::Absent(key("credential/1"))).unwrap();
+    unrelated
+        .change(Change::Write {
+            key: key("credential/1"),
+            version: version("auth", 1),
+            end: None,
+            data: Box::new(*b"serial 1"),
+        })
+        .unwrap();
+    assert_eq!(unrelated.prepare(issued()), Err(Error::Prepared));
+    // The control: the proposal that writes the issuance record at its version takes the artifact once.
+    unrelated.read(Dependency::Absent(key("credential/9"))).unwrap();
+    unrelated
+        .change(Change::Write {
+            key: key("credential/9"),
+            version: version("auth", 9),
+            end: None,
+            data: Box::new(*b"serial 9"),
+        })
+        .unwrap();
+    assert_eq!(unrelated.prepare(issued()), Ok(()));
+    assert_eq!(unrelated.prepare(issued()), Err(Error::Prepared));
 }
 
 /// A cancel stops new calls, and the record stays until the application observes that the call completed or that

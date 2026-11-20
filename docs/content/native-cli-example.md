@@ -92,8 +92,9 @@ One test passes: `tests::the_journey_refuses_a_second_bootstrap_and_a_replay_and
 - The program takes the seed of its random generator (`rscrypto::ChaCha20Rng`) from the entropy source of the OS,
   through `ChaCha20Rng::try_generate_with` and `std::random::SystemRng`. `SystemRng` is unstable, so the program
   needs a nightly toolchain and `#![feature(random)]`. The test gives the journey a fixed seed.
-- The example reads the system clock once, and gives the reading a bound of one second. A host reads its clock for
-  each request, with the bound of its time source.
+- The example reads the system clock once for its requests, and gives the reading a bound of one second. It reads
+  the clock again for each commit with a deadline (`Effect::Clock`). A host reads its clock for each request, with the
+  bound of its time source.
 
 ## Support
 

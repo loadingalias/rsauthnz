@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use rsauthnz::limits::Limits;
 use rsauthnz::store::driver;
 use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::time::Reading;
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 
 use super::super::{Error, Fault, Memory, Request, Schedule, Snapshot};
@@ -248,6 +249,10 @@ impl Subject for Broken {
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
         self.memory.lose(sequences);
     }
+
+    fn clock(&self) -> Reading {
+        self.memory.clock()
+    }
 }
 
 /// The memory binding, which keeps the length of the longest record that a commit gives it.
@@ -337,6 +342,10 @@ impl Subject for Measured {
 
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
         self.memory.lose(sequences);
+    }
+
+    fn clock(&self) -> Reading {
+        self.memory.clock()
     }
 }
 

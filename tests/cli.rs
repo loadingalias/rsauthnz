@@ -19,11 +19,11 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Handle, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Error, Failure, HostGrant};
+use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Error, Failure, HostGrant, Unlink};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
-use rsauthnz::store::{Kind, Profile, Store};
+use rsauthnz::store::{self, Kind, Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::{OperationId, Outcome, Proposal};
+use rsauthnz::transition::{self, Change, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule, Snapshot};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
 use rscrypto::ChaCha20Rng;
@@ -98,11 +98,19 @@ struct World<'c> {
 impl<'c> World<'c> {
     /// A started driver on an empty store, and the issuer key in `custody`.
     fn new(custody: &'c dyn Custody) -> Self {
-        let memory = Memory::new(Schedule::None);
-        let driver = Driver::new(Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
         let mut random = ChaCha20Rng::from_seed([5; 32]);
         let id = KeyId::random(&mut random);
         let issuer = custody.enroll(id, Algorithm::MlDsa65Ed25519, &mut random).unwrap();
+        let mut world = Self::with(custody, issuer, random);
+        world.keys.push(id);
+        world
+    }
+
+    /// A started driver on an empty store, with the issuer key `issuer` in `custody`, as a second store of the same
+    /// authority and issuer key has.
+    fn with(custody: &'c dyn Custody, issuer: Handle, random: ChaCha20Rng) -> Self {
+        let memory = Memory::new(Schedule::None);
+        let driver = Driver::new(Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
         let grant = HostGrant {
             owner: Id::new("acme", "owner").unwrap(),
             origin: Id::new("acme", "build-app").unwrap(),
@@ -114,7 +122,7 @@ impl<'c> World<'c> {
             grant,
             issuer,
             random,
-            keys: vec![id],
+            keys: Vec::new(),
         };
         world.start();
         world
@@ -187,32 +195,46 @@ impl<'c> World<'c> {
             .unwrap()
     }
 
-    /// The proposal of the bootstrap of a value that the owner issued for `administrator`, with the CLI key `key`.
-    fn propose(&mut self, auth: &Authority, administrator: &str, key: &Handle) -> (Proposal, Plan) {
+    /// The value that the commit of an issue by the owner for `administrator` at `at` gives.
+    fn issue(&mut self, auth: &Authority, administrator: &str, at: Reading) -> Result<Bootstrap, Error> {
         let administrator = Id::new("acme", administrator).unwrap();
         let operation = self.operation();
         let issue = ready(auth.issue(
             &mut self.memory,
             &self.grant,
             administrator,
-            now(),
+            at,
             &mut self.random,
             operation,
         ));
-        let text = String::from_utf8(self.artifact(issue.unwrap())).unwrap();
+        let issue = issue.map_err(|failure| match failure {
+            Failure::Refused(error) => error,
+            Failure::Store(error) => panic!("a read failed: {error}"),
+        })?;
+        let text = String::from_utf8(self.artifact(issue)).unwrap();
+        Ok(Bootstrap::parse(&text).unwrap())
+    }
+
+    /// The signature of the issuer key in custody over `message`.
+    fn sign(&mut self, message: &[u8]) -> Vec<u8> {
+        self.custody
+            .sign(&self.issuer, Algorithm::MlDsa65Ed25519, message, &mut self.random)
+            .unwrap()
+    }
+
+    /// The proposal of the bootstrap at `at` of a value that the owner issued for `administrator` at `at`, with the CLI
+    /// key `key`.
+    fn propose_at(&mut self, auth: &Authority, administrator: &str, key: &Handle, at: Reading) -> (Proposal, Plan) {
+        let value = self.issue(auth, administrator, at).unwrap();
         let serial = Serial(self.driver.allocate(Kind::Credential).unwrap());
-        let value = Bootstrap::parse(&text).unwrap();
-        let pending = ready(auth.bootstrap(&mut self.memory, &value, &holder(key), serial, now())).unwrap();
-        let signature = self
-            .custody
-            .sign(
-                &self.issuer,
-                Algorithm::MlDsa65Ed25519,
-                &pending.to_be_signed(),
-                &mut self.random,
-            )
-            .unwrap();
+        let pending = ready(auth.bootstrap(&mut self.memory, &value, &holder(key), serial, at)).unwrap();
+        let signature = self.sign(&pending.to_be_signed());
         pending.finish(&signature, self.operation()).unwrap()
+    }
+
+    /// The proposal of the bootstrap of a value that the owner issued for `administrator`, with the CLI key `key`.
+    fn propose(&mut self, auth: &Authority, administrator: &str, key: &Handle) -> (Proposal, Plan) {
+        self.propose_at(auth, administrator, key, now())
     }
 
     /// The key of a new CLI in custody, and the credential that its bootstrap as `administrator` gives.
@@ -221,6 +243,47 @@ impl<'c> World<'c> {
         let bootstrap = self.propose(auth, administrator, &key);
         let credential = self.artifact(bootstrap);
         (key, credential)
+    }
+
+    /// The credential of the binding of `administrator` with the CLI key `key`, which custody signs again: the
+    /// recovery of a CLI whose response was lost.
+    fn recover(&mut self, auth: &Authority, administrator: &str, key: &Handle) -> Result<Vec<u8>, Error> {
+        let administrator = Id::new("acme", administrator).unwrap();
+        let reissue =
+            ready(auth.credential(&mut self.memory, &administrator, &holder(key), now())).map_err(|failure| {
+                match failure {
+                    Failure::Refused(error) => error,
+                    Failure::Store(error) => panic!("a read failed: {error}"),
+                }
+            })?;
+        let signature = self.sign(&reissue.to_be_signed());
+        reissue.finish(&signature)
+    }
+
+    /// The proposal of the unlink of the binding of `target` by the CLI of `administrator`, whose key `key` proves the
+    /// unlink, with a challenge that the commit of an issue gives.
+    fn unlink(
+        &mut self,
+        auth: &Authority,
+        (key, credential, administrator): (&Handle, &[u8], &str),
+        target: &str,
+        at: Reading,
+    ) -> Result<(Proposal, Plan, Admission), Error> {
+        let challenge = self.challenge(auth, administrator, at);
+        let unlink = Unlink::new(
+            challenge,
+            self.operation(),
+            Id::new("acme", target).unwrap(),
+            Limits::default(),
+        )
+        .unwrap();
+        let proof = self.prove(key, credential, unlink.call());
+        ready(auth.unlink(&mut self.memory, credential, &proof, &unlink, at, &mut self.random)).map_err(|failure| {
+            match failure {
+                Failure::Refused(error) => error,
+                Failure::Store(error) => panic!("a read failed: {error}"),
+            }
+        })
     }
 
     /// The challenge that the commit of an issue for `administrator` at `at` gives.
@@ -350,13 +413,9 @@ fn a_cli_whose_bootstrap_response_was_lost_reads_its_credential_and_proves_posse
     world.start();
 
     // The CLI keeps no secret: it gives its administrator and its public key. Another key finds no credential.
-    let alice = Id::new("acme", "alice").unwrap();
-    let stranger = holder(&world.key());
-    assert_matches!(
-        ready(auth.credential(&mut world.memory, &alice, &stranger, now())),
-        Err(Failure::Refused(Error::Unknown))
-    );
-    let credential = ready(auth.credential(&mut world.memory, &alice, &holder(&key), now())).unwrap();
+    let stranger = world.key();
+    assert_matches!(world.recover(&auth, "alice", &stranger), Err(Error::Unknown));
+    let credential = world.recover(&auth, "alice", &key).unwrap();
     let first = call(world.challenge(&auth, "alice", now()), "call-1", "status");
     let proof = world.prove(&key, &credential, &first);
     world.call(&auth, &credential, &proof, &first);
@@ -395,11 +454,18 @@ fn a_cli_credential_outside_its_scope_refuses() {
     let auth = world.open("auth");
     let (key, credential) = world.enroll(&auth, "alice");
     let late = at(local::CLI_LIFETIME);
-    let first = call(world.challenge(&auth, "alice", late), "call-1", "status");
+    let first = call(world.challenge(&auth, "alice", now()), "call-1", "status");
     let proof = world.prove(&key, &credential, &first);
     assert_matches!(
         world.admit(&auth, &credential, &proof, &first, late),
         Err(Failure::Refused(Error::Credential(_)))
+    );
+    // A binding whose credential ended is no administrator, so it gets no challenge.
+    let alice = Id::new("acme", "alice").unwrap();
+    let operation = world.operation();
+    assert_matches!(
+        ready(auth.challenge(&mut world.memory, &alice, late, &mut world.random, operation)),
+        Err(Failure::Refused(Error::NotEnrolled))
     );
 
     let other = world.open("other");
@@ -409,5 +475,221 @@ fn a_cli_credential_outside_its_scope_refuses() {
     assert_matches!(
         world.admit(&auth, &foreign, &proof, &second, now()),
         Err(Failure::Refused(Error::Credential(_)))
+    );
+}
+
+/// An unlink is a call of its own: its proof binds its challenge, its operation, and its target. A proof of another
+/// call, such as a status call, refuses, and so does a proof of the unlink of another administrator. One commit
+/// consumes the challenge and ends the binding, so the same proof cannot unlink twice.
+#[test]
+fn an_unlink_takes_only_a_proof_of_that_unlink_and_runs_once() {
+    let files = Files::new("unlink");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let (_, alice) = world.enroll(&auth, "alice");
+    let (bob_key, bob) = world.enroll(&auth, "bob");
+    let (_, carol) = world.enroll(&auth, "carol");
+    let carol_id = Id::new("acme", "carol").unwrap();
+
+    // A proof of a status call under an operation, given as the proof of an unlink under that operation.
+    let challenge = world.challenge(&auth, "bob", now());
+    let status = call(challenge, "op-1", "status");
+    let proof = world.prove(&bob_key, &bob, &status);
+    let unlink = Unlink::new(
+        challenge,
+        op("op-1"),
+        Id::new("acme", "alice").unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_matches!(
+        ready(auth.unlink(&mut world.memory, &bob, &proof, &unlink, now(), &mut world.random)),
+        Err(Failure::Refused(Error::Credential(credential::Error::Proof)))
+    );
+    // A proof of the unlink of alice, given for the unlink of carol.
+    let proof = world.prove(&bob_key, &bob, unlink.call());
+    let other = Unlink::new(challenge, op("op-1"), carol_id, Limits::default()).unwrap();
+    assert_matches!(
+        ready(auth.unlink(&mut world.memory, &bob, &proof, &other, now(), &mut world.random)),
+        Err(Failure::Refused(Error::Credential(credential::Error::Proof)))
+    );
+
+    let (proposal, plan, admission) =
+        ready(auth.unlink(&mut world.memory, &bob, &proof, &unlink, now(), &mut world.random)).unwrap();
+    let outcome = world.commit((proposal, plan));
+    assert_matches!(outcome, Outcome::Accepted(_));
+    assert!(admission.release(&outcome).is_some());
+    let stranger = world.key();
+    assert_matches!(world.recover(&auth, "alice", &stranger), Err(Error::Unknown));
+    // The proof of the unlink is spent with its challenge.
+    assert_matches!(
+        ready(auth.unlink(&mut world.memory, &bob, &proof, &unlink, now(), &mut world.random)),
+        Err(Failure::Refused(Error::Challenge))
+    );
+    let _ = (alice, carol);
+}
+
+/// The proposal of a bootstrap holds no signed CLI credential outside its prepared artifact: the binding keeps the
+/// credential without its signature. Only the receipt of the commit gives the credential, and a later recovery signs
+/// the binding again.
+#[test]
+fn the_proposal_of_a_bootstrap_holds_no_signed_credential() {
+    let files = Files::new("unsigned");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let key = world.key();
+    let (proposal, plan) = world.propose(&auth, "alice", &key);
+    let records: Vec<Vec<u8>> = proposal
+        .changes()
+        .iter()
+        .filter_map(|change| match change {
+            Change::Write { data, .. } => Some(data.to_vec()),
+            Change::End(_) => None,
+        })
+        .collect();
+    let credential = world.artifact((proposal, plan));
+    // The last 64 bytes of the credential are the Ed25519 part of its composite signature.
+    let signature = &credential[credential.len() - 64..];
+    for data in &records {
+        assert!(
+            !data.windows(64).any(|window| window == signature),
+            "a record holds the signature"
+        );
+    }
+    // The control: the recovery gives a credential with the same claims and a signature of its own.
+    let recovered = world.recover(&auth, "alice", &key).unwrap();
+    assert_eq!(recovered.len(), credential.len());
+    assert_eq!(
+        recovered[..recovered.len() - 3_373],
+        credential[..credential.len() - 3_373]
+    );
+}
+
+/// A restore from a snapshot from before the first issue keeps the administrator binding of a later bootstrap and
+/// loses the record of the authority. The binding names the grant and the issuer key that bound it, so an open with
+/// another grant or another issuer key refuses, and the open of the authority still works.
+#[test]
+fn an_authority_whose_record_a_restore_lost_refuses_another_grant_or_issuer_key() {
+    let files = Files::new("identity");
+    let mut world = World::new(&files.custody);
+    let snapshot = world.memory.snapshot();
+    let auth = world.open("auth");
+    world.enroll(&auth, "alice");
+    world.restore(&snapshot);
+
+    let id = Id::new("acme", "auth").unwrap();
+    let mallory = HostGrant {
+        owner: Id::new("acme", "mallory").unwrap(),
+        ..world.grant.clone()
+    };
+    let open = |world: &mut World<'_>, grant: &HostGrant, issuer: Handle| {
+        ready(Authority::open(
+            &mut world.memory,
+            grant,
+            id.clone(),
+            issuer,
+            Limits::default(),
+        ))
+    };
+    let (issuer, grant) = (world.issuer.clone(), world.grant.clone());
+    assert_matches!(
+        open(&mut world, &mallory, issuer.clone()),
+        Err(Failure::Refused(Error::Grant))
+    );
+    let other = world.key();
+    assert_matches!(open(&mut world, &grant, other), Err(Failure::Refused(Error::Issuer)));
+    assert_matches!(open(&mut world, &grant, issuer), Ok(_));
+}
+
+/// The commit of a bootstrap and of an admission refuses after the end of the authority that the decision read: the
+/// end of the value, and the end of the challenge. The clock of the commit is a fresh reading, so a proposal that was
+/// made before the end does not commit after it.
+#[test]
+fn a_bootstrap_or_an_admission_after_its_deadline_does_not_commit() {
+    let files = Files::new("deadline");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let key = world.key();
+    let bootstrap = world.propose(&auth, "alice", &key);
+    world.memory.set_clock(at(local::LIFETIME));
+    assert_matches!(world.commit(bootstrap), Outcome::Refused(transition::Error::Expired));
+    world.memory.set_clock(now());
+    let (key, credential) = world.enroll(&auth, "alice");
+
+    let first = call(world.challenge(&auth, "alice", now()), "call-1", "status");
+    let proof = world.prove(&key, &credential, &first);
+    let (proposal, admission) = world.admit(&auth, &credential, &proof, &first, now()).unwrap();
+    world.memory.set_clock(at(cli::CHALLENGE_LIFETIME));
+    let outcome = world.commit((proposal, Plan::default()));
+    assert_matches!(outcome, Outcome::Refused(transition::Error::Expired));
+    assert!(admission.release(&outcome).is_none());
+    // The control: before the end, the same call commits.
+    world.memory.set_clock(now());
+    let second = call(world.challenge(&auth, "alice", now()), "call-2", "status");
+    let proof = world.prove(&key, &credential, &second);
+    world.call(&auth, &credential, &proof, &second);
+}
+
+/// A binding whose CLI credential ended is no administrator. A sole administrator with a valid credential cannot
+/// unlink itself when the other binding has ended. The owner issues a value for an administrator whose credential
+/// ended, and its bootstrap binds a new credential. At the most bindings, an issue refuses until an expiry pass removes
+/// each binding whose credential ended.
+#[test]
+fn an_ended_binding_counts_as_no_administrator_and_the_owner_rebinds_it() {
+    let files = Files::new("ended");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let key = world.key();
+    let bootstrap = world.propose(&auth, "alice", &key);
+    let alice = world.artifact(bootstrap);
+    let later = Duration::from_secs(10 * 24 * 60 * 60);
+    let bootstrap = world.propose_at(&auth, "bob", &key, at(later));
+    let bob = world.artifact(bootstrap);
+    let ended = at(local::CLI_LIFETIME + Duration::from_secs(60));
+    world.memory.set_clock(ended);
+    assert_matches!(
+        world.unlink(&auth, (&key, &bob, "bob"), "bob", ended),
+        Err(Error::Transition(transition::Error::LastAnchor))
+    );
+
+    // The owner issues a value for alice again, and the bootstrap gives alice a new credential.
+    let bootstrap = world.propose_at(&auth, "alice", &key, ended);
+    let rebound = world.artifact(bootstrap);
+    assert_ne!(rebound, alice);
+    let first = call(world.challenge(&auth, "alice", ended), "call-1", "status");
+    let proof = world.prove(&key, &rebound, &first);
+    let (proposal, admission) = world.admit(&auth, &rebound, &proof, &first, ended).unwrap();
+    assert!(admission.release(&world.commit((proposal, Plan::default()))).is_some());
+
+    // Other names fill the bindings of the authority. An issue refuses, and an expiry pass removes the ended binding of
+    // alice, so the owner issues again.
+    for n in 3..local::ADMINISTRATORS_MAX {
+        let bootstrap = world.propose_at(&auth, &format!("a-{n}"), &key, ended);
+        world.artifact(bootstrap);
+    }
+    assert_matches!(world.issue(&auth, "zoe", ended), Err(Error::Full));
+    let limit = core::num::NonZeroUsize::new(16).unwrap();
+    while ready(store::expire(&mut world.memory, ended, limit)).unwrap() == store::Progress::More {}
+    world.issue(&auth, "zoe", ended).unwrap();
+}
+
+/// A credential of another store of the same authority and issuer key can have the serial of a binding of this one.
+/// The binding keeps the credential that it bound, so the other credential refuses although it names the same
+/// administrator and serial.
+#[test]
+fn a_credential_with_the_serial_of_a_binding_but_other_bytes_refuses() {
+    let files = Files::new("serial");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    world.enroll(&auth, "alice");
+    let mut twin = World::with(&files.custody, world.issuer.clone(), ChaCha20Rng::from_seed([6; 32]));
+    let twin_authority = twin.open("auth");
+    let (mallory, forged) = twin.enroll(&twin_authority, "alice");
+
+    let first = call(world.challenge(&auth, "alice", now()), "call-1", "status");
+    let proof = world.prove(&mallory, &forged, &first);
+    assert_matches!(
+        world.admit(&auth, &forged, &proof, &first, now()),
+        Err(Failure::Refused(Error::NotEnrolled))
     );
 }

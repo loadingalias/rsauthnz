@@ -172,6 +172,11 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Append(entry)` | `Journal::append` | `Appended(sequence)` |
 | `Sync` | `Journal::sync` | `Synced` |
 | `ReadJournal(after, limit)` | `Journal::read` | `Journal(entries)` |
+| `Clock` | A fresh reading of the clock of the host, with the bound of its time source | `Clock(reading)` |
+
+`Effect::Clock` comes just before the commit of a proposal with a deadline (`proposal.until`). A production executor
+reads the system clock. A test gives a controlled clock: the memory binding gives the reading of
+`memory.set_clock(reading)` through `Subject::clock`.
 
 Give `Output::Failed` when a primitive fails. It is a crash: the driver stops (`Status::Down`), gives an unknown
 outcome to the operation in progress, and serves again only after `driver.start(now)`. Do not retry the primitive.
@@ -196,10 +201,12 @@ The driver runs one operation at a time, a start first. A commit goes through th
 1. The last-anchor check, with no effect. A refusal gives `Outcome::Refused(Error::LastAnchor)`.
 2. A floor entry for each counter whose allocated value passes its durable floor (`driver.allocate(kind)`), the end
    entry, and one sync. A binding with no journal keeps the floors in the mark record, in a commit before this one.
-3. The conditional commit, with the instance number of the latest start.
-4. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
+3. For a proposal with a deadline: the clock effect. A reading that can be at or after the deadline gives
+   `Outcome::Refused(Error::Expired)` with no commit, and the void of the end entry and a sync come first.
+4. The conditional commit, with the instance number of the latest start.
+5. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
    also carries an intent of `Effect::Journal`, and a commit of the driver ends it after the creation entry.
-5. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
+6. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
    answer.
 
 A start refuses with `Error::Restored` (`Status::Refused`) when the journal shows a commit that the store lost: a

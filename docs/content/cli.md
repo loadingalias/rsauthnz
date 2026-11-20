@@ -46,11 +46,17 @@ when the CLI lost the response, or when a restore completed the bootstrap.
    operation identity, and the request.
 4. The authority makes the same call from the values that it received, with `Call::new`. Then
    `authority.admit(store, &credential, &proof, &call, now, random)` gives the proposal and the admission.
-5. The authority adds the reads and the changes of the call to the proposal, and submits it with an empty `Plan`.
+5. The authority adds the reads and the changes of the call to the proposal, and submits it with an empty `Plan`. The
+   proposal has the end of the challenge or of the credential as its deadline, so a commit after either one refuses
+   with `transition::Error::Expired`.
 6. `admission.release(&outcome)` gives `Admitted` only for the accepted commit of this proposal. Then the authority
    does the call, and gives the CLI `admitted.next()` in the response.
 7. For its next call, the CLI uses that challenge, with no issue. In steady state, a call costs one round trip, one
    commit, one custody signature, and the checks of the credential and the proof.
+
+An unlink of an administrator binding is a call of its own: the CLI proves `local::Unlink::new(challenge, operation,
+administrator, limits).call()`, and the authority calls `authority.unlink`. The proof of another call refuses for it
+([Remove an administrator](local-authority.md#remove-an-administrator)).
 
 This example is the rustdoc example of `rsauthnz::cli`, and `cargo xtask test` runs it. It needs the feature
 `native-custody`, on Linux, macOS, or Windows. It runs the journey on the [memory binding](memory-binding.md), with the
@@ -179,10 +185,12 @@ zeroization, its recovery, and the isolation that the OS enforces.
 
 ## Lost responses and restore
 
-- **A lost response of a bootstrap.** The CLI keeps no secret for the recovery. It calls
-  `authority.credential(store, &administrator, &holder, now)` through the authority, with its public key. The result
-  is the credential of the binding whose `cnf` key is that key. `local::Error::Unknown` shows that the bootstrap did
-  not commit. A bootstrap that a restore completed gives its credential in the same way.
+- **A lost response of a bootstrap.** The CLI keeps no secret for the recovery. It asks the authority, with the name
+  of its administrator and its public key. The authority calls `authority.credential(store, &administrator, &holder,
+  now)`, has custody sign `reissue.to_be_signed()` with the issuer key, and gives the CLI `reissue.finish(signature)`:
+  the credential of the binding whose `cnf` key is that key. The binding keeps no signed credential, so each recovery
+  costs one issuer signature. `local::Error::Unknown` shows that the bootstrap did not commit. A bootstrap that a
+  restore completed gives its credential in the same way.
 - **A lost response of an issue of a challenge.** Ask for a challenge again. The new issue replaces the challenge of
   the lost one.
 - **A lost response of a call.** The outcome is unknown, and the call can have committed. The authority looks up the
@@ -202,10 +210,12 @@ zeroization, its recovery, and the isolation that the OS enforces.
 | `authority.admit(store, &credential, &proof, &call, now, random)` | Authority | `(Proposal, Admission)` |
 | `admission.release(&outcome)` | Authority | `Some(Admitted)` for the accepted commit of the proposal, else `None` |
 | `admitted.administrator()`, `admitted.evidence()`, `admitted.next()` | Authority | The administrator, the evidence of the possession, and the challenge of the next call |
-| `authority.credential(store, &administrator, &holder, now)` | Authority | The CLI credential whose `cnf` key is `holder` |
+| `authority.credential(store, &administrator, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential whose `cnf` key is `holder`, which custody signs again |
+| `local::Unlink::new(challenge, operation, administrator, limits)`, `unlink.call()` | Both | The unlink, and the call that the CLI proves |
 
-`authority.admit` reads the administrator binding and its challenge record. `authority.challenge` reads them too.
-Each read is a keyed read.
+`authority.admit` reads the administrator binding of the serial of the credential and its challenge record, with keyed
+reads. `authority.challenge` reads the bindings of the administrator with one range read, and the challenge record
+with a keyed read.
 
 ## Errors
 
@@ -215,7 +225,7 @@ Each read is a keyed read.
 | `cli::Error::Custody` | Custody refused to sign | Follow the recovery of the `custody::Error` |
 | `cli::Error::Credential` | The proof can be longer than its bound, or the signature of custody does not verify with the key of the handle | A refused signature shows a fault of custody or another key |
 | `local::Error::Challenge` | The binding holds no pending challenge, another one, or one whose end passed | Refuse the call. The CLI asks for a new challenge, and makes a new call |
-| `local::Error::NotEnrolled` | No live administrator binding holds the credential or the administrator | Refuse the call |
+| `local::Error::NotEnrolled` | No administrator binding with a valid CLI credential holds the credential or the administrator, or the binding of its serial holds another credential | Refuse the call |
 | `local::Error::Credential` | The credential or the proof refuses: another request or operation, another key, or a credential after its end or of another authority | Refuse the call |
 
 [Open a local authority](local-authority.md#errors) gives each other `local::Error`.
@@ -225,6 +235,8 @@ Each read is a keyed read.
 - The issue of a challenge authenticates no caller, and its audit names the administrator. A caller that reaches the
   issue can replace the pending challenge, and the call of the CLI then refuses. Give the issue only to the clients
   of the authority.
+- The recovery of a credential authenticates no caller either, and each recovery costs one signature of the issuer
+  key. The credential gives nothing without the CLI key. Limit the rate of recoveries of one administrator.
 - A binding has one pending challenge. Two calls of one CLI at the same time conflict: one commits, and the other
   refuses with `local::Error::Challenge` or a conflict. Make the calls of one CLI one at a time.
 - The proposal of an admission carries the next challenge as its prepared artifact. Thus a call that releases its

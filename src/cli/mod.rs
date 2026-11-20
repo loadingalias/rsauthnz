@@ -7,7 +7,8 @@
 //!
 //! 1. The CLI draws a key ID, records it, and enrolls its key in custody before it submits a bootstrap value
 //!    ([`local::Authority::bootstrap`]). Thus a bootstrap that commits binds a key that the CLI has, also when the
-//!    CLI lost the response. It then reads its credential with [`local::Authority::credential`].
+//!    CLI lost the response. After a lost response, custody signs its credential again
+//!    ([`local::Authority::credential`]).
 //! 2. For its first call, the CLI asks the authority for a [`Challenge`] ([`local::Authority::challenge`]). A
 //!    challenge is valid for [`CHALLENGE_LIFETIME`]. A binding has at most one: a new issue replaces it.
 //! 3. The CLI makes the [`Call`]: the challenge, an operation identity, and its request as a CBOR value. [`prove`]

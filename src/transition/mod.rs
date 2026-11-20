@@ -449,6 +449,7 @@ pub struct Proposal {
     changes: Vec<Change>,
     intents: Vec<Intent>,
     artifact: Option<Prepared>,
+    deadline: Option<Duration>,
     limits: Limits,
 }
 
@@ -477,6 +478,7 @@ impl Proposal {
             changes: Vec::new(),
             intents: Vec::new(),
             artifact: None,
+            deadline: None,
             limits,
         })
     }
@@ -539,12 +541,41 @@ impl Proposal {
     }
 
     /// Sets the prepared artifact, for example a credential that [`Draft::finish`](crate::credential::Draft::finish)
-    /// gives. It stays private until the acceptance of this exact proposal, and only the receipt of that acceptance
-    /// releases it.
+    /// gives. The artifact names its issuance record: the record that the transition that issues it writes, such as
+    /// the record of the serial of a credential ([`Draft::record`](crate::credential::Draft::record)). The proposal
+    /// must already write that record at that version, so an artifact never commits with an unrelated transition. It
+    /// stays private until the acceptance of this exact proposal, and only the receipt of that acceptance releases
+    /// it.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    pub fn prepare(&mut self, artifact: Prepared) {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Prepared`] if the proposal has an artifact, or no change writes the issuance record of `artifact` at
+    /// its version.
+    pub fn prepare(&mut self, artifact: Prepared) -> Result<(), Error> {
+        let issued = self.changes.iter().any(|change| {
+            matches!(change, Change::Write { key, version, .. } if *key == artifact.record && *version == artifact.version)
+        });
+        (self.artifact.is_none() && issued).ok_or(Error::Prepared)?;
         self.artifact = Some(artifact);
+        Ok(())
+    }
+
+    /// Sets the deadline of the commit, as the time since the Unix epoch: the end of the authority that the decision
+    /// read, such as the end of a one-use value, of a challenge, or of a checked scope. A proposal keeps its earliest
+    /// deadline. The commit driver reads a fresh clock reading just before the commit, and it refuses the commit with
+    /// [`Error::Expired`] when that reading can be at or after the deadline.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    pub fn until(&mut self, deadline: Duration) {
+        self.deadline = Some(self.deadline.map_or(deadline, |earlier| earlier.min(deadline)));
+    }
+
+    /// The deadline of the commit, or `None` for a commit with no deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Duration> {
+        self.deadline
     }
 
     /// The operation: its identity and its request binding.
@@ -587,6 +618,7 @@ impl Proposal {
             changes: Vec::new(),
             intents: Vec::new(),
             artifact: None,
+            deadline: None,
             limits,
         }
     }
@@ -619,7 +651,7 @@ impl Receipt {
     /// store never keeps the artifact.
     #[must_use]
     pub fn artifact(&self) -> Option<&[u8]> {
-        self.artifact.as_ref().map(|artifact| &*artifact.0)
+        self.artifact.as_ref().map(|artifact| &*artifact.bytes)
     }
 }
 
@@ -684,6 +716,11 @@ pub enum Error {
     /// The change ends the last sign-in method of an account, or the last administrator binding of the authority, that
     /// the restore journal records as live.
     LastAnchor,
+    /// The proposal has an artifact, or no change writes the issuance record of the artifact at its version.
+    Prepared,
+    /// The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound.
+    /// Nothing committed.
+    Expired,
 }
 
 impl Error {
@@ -699,7 +736,9 @@ impl Error {
             | Self::Change
             | Self::Reuse
             | Self::Intent
-            | Self::LastAnchor => Recovery::Refuse,
+            | Self::LastAnchor
+            | Self::Prepared
+            | Self::Expired => Recovery::Refuse,
         }
     }
 }
@@ -718,6 +757,8 @@ impl fmt::Display for Error {
             Self::Reuse => f.write_str("the operation identity is in use for another request"),
             Self::Intent => f.write_str("the stored form of the intent is not valid"),
             Self::LastAnchor => f.write_str("the change ends the last sign-in method or administrator binding"),
+            Self::Prepared => f.write_str("the proposal does not write the issuance record of the artifact"),
+            Self::Expired => f.write_str("the commit can be at or after the deadline of the proposal"),
         }
     }
 }
@@ -725,26 +766,30 @@ impl fmt::Display for Error {
 impl core::error::Error for Error {}
 
 /// A prepared artifact: a signed result, such as a credential, that gives authority only after its transition commits.
-/// It has no public constructor and no accessor of its bytes. [`Proposal::prepare`] takes it, and only
-/// [`Receipt::artifact`] of the accepted proposal gives its bytes. Thus no caller can release it before the commit.
-pub struct Prepared(Box<[u8]>);
+/// It names its issuance record: the key and the version of the record that its transition writes. It has no public
+/// constructor and no accessor of its bytes. [`Proposal::prepare`] takes it only for a proposal that writes its
+/// issuance record, and only [`Receipt::artifact`] of the accepted proposal gives its bytes. Thus no caller can
+/// release it before the commit, or with another transition.
+pub struct Prepared {
+    bytes: Box<[u8]>,
+    record: Key,
+    version: AuthorityVersion,
+}
 
 impl Prepared {
-    /// The prepared artifact with the bytes `bytes`.
-    pub(crate) const fn new(bytes: Box<[u8]>) -> Self {
-        Self(bytes)
-    }
-
-    /// The bytes of the artifact, for a record that its own transition commits, such as the administrator binding
-    /// that holds its CLI credential.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
+    /// The prepared artifact with the bytes `bytes`, whose transition writes the record `record` at `version`.
+    pub(crate) const fn new(bytes: Box<[u8]>, record: Key, version: AuthorityVersion) -> Self {
+        Self { bytes, record, version }
     }
 }
 
 impl fmt::Debug for Prepared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Hidden(&self.0).fmt(f)
+        f.debug_struct("Prepared")
+            .field("bytes", &Hidden(&self.bytes))
+            .field("record", &self.record)
+            .field("version", &self.version)
+            .finish()
     }
 }
 

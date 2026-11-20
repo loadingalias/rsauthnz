@@ -176,6 +176,7 @@ enum Event {
     Append(Written, OperationId),
     Sync,
     ReadJournal,
+    Clock,
     Crash,
     Answer(Ticket),
 }
@@ -206,6 +207,7 @@ impl Event {
             }
             Effect::Sync => Self::Sync,
             Effect::ReadJournal(..) => Self::ReadJournal,
+            Effect::Clock => Self::Clock,
         }
     }
 }
@@ -222,6 +224,8 @@ struct Double {
     journal: Vec<store::Entry>,
     synced: usize,
     instance: u64,
+    /// The seconds since the Unix epoch of each reading of the clock, with no uncertainty.
+    clock: u64,
 }
 
 impl Double {
@@ -268,6 +272,11 @@ impl Double {
             }
             Effect::Read(key) => Output::Read(self.records.get(key).cloned()),
             Effect::Commit(proposal, instance) => Output::Committed(self.commit(proposal, instance)),
+            Effect::Clock => Output::Clock(Reading::new(
+                Duration::from_secs(self.clock),
+                Some(Duration::ZERO),
+                ReadingSource::Caller,
+            )),
             Effect::Expire(kind, before, limit) => {
                 let ended: Vec<Key> = self
                     .records
@@ -572,6 +581,38 @@ fn a_refusal_voids_its_end_entry_before_its_answer() {
                 answer,
                 Some(Answer::Outcome(Outcome::Refused(crate::transition::Error::Reuse)))
             );
+        }
+    }
+}
+
+/// A proposal with a deadline commits only with a fresh clock reading before it. The driver reads the clock after the
+/// journal entries and just before the commit. A reading that can be at the deadline refuses with no commit, and the
+/// void of the end entry comes before the answer, so a restore does not apply the end.
+#[test]
+fn a_commit_at_or_after_the_deadline_of_its_proposal_refuses_with_no_commit() {
+    let a1p = key(Kind::Credential, "a1p");
+    for (clock, commits) in [(1_059, true), (1_060, false)] {
+        let mut harness = Harness::serving(true);
+        harness.double.clock = clock;
+        let mut proposal = proposal("u-1", &[&a1p], &[]);
+        proposal.until(Duration::from_secs(1_060));
+        let ticket = harness.submit(proposal, plan(&passkeys(), &[]));
+        harness.run(|_| None);
+        let clocked = harness.at(&Event::Clock);
+        assert!(harness.at(&appended(Written::End, "u-1")) < clocked, "{clock}");
+        let answer = harness.answers.remove(&ticket);
+        if commits {
+            assert_eq!(harness.events[clocked + 1], Event::Commit(op("u-1"), Instance(1)));
+            assert_matches!(answer, Some(Answer::Outcome(Outcome::Accepted(_))));
+            assert!(!harness.holds(&a1p));
+        } else {
+            assert!(!harness.has(&Event::Commit(op("u-1"), Instance(1))), "{clock}");
+            assert!(harness.at(&appended(Written::Void, "u-1")) < harness.at(&Event::Answer(ticket)));
+            assert_matches!(
+                answer,
+                Some(Answer::Outcome(Outcome::Refused(crate::transition::Error::Expired)))
+            );
+            assert!(harness.holds(&a1p));
         }
     }
 }

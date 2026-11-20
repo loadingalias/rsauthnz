@@ -80,7 +80,7 @@ pub enum Kind {
     Recovery = 9,
     /// A bootstrap value of an authority. Its consumption pays for an anchor.
     Bootstrap = 10,
-    /// An administrator binding of an authority.
+    /// An administrator binding of an authority. It ends with its CLI credential, so expiry removes it.
     Administrator = 11,
     /// An agent identity.
     Agent = 12,
@@ -190,7 +190,6 @@ impl Kind {
         !matches!(
             self,
             Self::ProviderLink
-                | Self::Administrator
                 | Self::Agent
                 | Self::ReplayFloor
                 | Self::Intent

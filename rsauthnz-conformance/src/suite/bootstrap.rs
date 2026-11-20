@@ -11,9 +11,9 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::{Limits, SignatureBudget};
-use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Issue, Status};
+use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Issue, Status, Unlink};
 use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::OperationId;
+use rsauthnz::transition::{self, OperationId};
 use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
@@ -205,6 +205,34 @@ fn drawn(random: &mut ChaCha20Rng) -> OperationId {
     OperationId::new(&id).expect("an identity of 16 bytes is valid")
 }
 
+/// The challenge that the commit of an issue for the administrator `administrator` gives.
+async fn challenge<S: Subject>(
+    run: &mut Run<S>,
+    auth: &Authority,
+    administrator: &str,
+    random: &mut ChaCha20Rng,
+) -> Result<Result<Challenge, local::Error>, String> {
+    let operation = drawn(random);
+    let issued = match auth
+        .challenge(&mut run.binding, &account(administrator), now(), random, operation)
+        .await
+    {
+        Ok((proposal, plan)) => artifact(submitted(run, proposal, plan).await?, "the issue of a challenge")?,
+        Err(failure) => return refusal_of(failure),
+    };
+    let challenge = <[u8; 32]>::try_from(issued.as_slice())
+        .map_err(|_| "the artifact of an issue is not a challenge".to_owned())?;
+    Ok(Ok(Challenge::from_bytes(challenge)))
+}
+
+/// The refusal of an operation of the local authority, or `Err` for a failed read.
+fn refusal_of<E: core::fmt::Display, T>(failure: Failure<E>) -> Result<Result<T, local::Error>, String> {
+    match failure {
+        Failure::Refused(error) => Ok(Err(error)),
+        Failure::Store(error) => Err(format!("a read failed with no fault: {error}")),
+    }
+}
+
 /// The admission of one remote call of the administrator `administrator` with `credential` and a proof by `client`:
 /// the issue of a challenge, the proof over the call, and the commit of the admission.
 async fn admit<S: Subject>(
@@ -215,34 +243,19 @@ async fn admit<S: Subject>(
     administrator: &str,
     random: &mut ChaCha20Rng,
 ) -> Result<Result<Admitted, local::Error>, String> {
-    let refusal = |failure| match failure {
-        Failure::Refused(error) => Ok(Err(error)),
-        Failure::Store(error) => Err(format!("a read failed with no fault: {error}")),
+    let challenge = match challenge(run, auth, administrator, random).await? {
+        Ok(challenge) => challenge,
+        Err(error) => return Ok(Err(error)),
     };
-    let operation = drawn(random);
-    let issued = match auth
-        .challenge(&mut run.binding, &account(administrator), now(), random, operation)
-        .await
-    {
-        Ok((proposal, plan)) => artifact(submitted(run, proposal, plan).await?, "the issue of a challenge")?,
-        Err(failure) => return refusal(failure),
-    };
-    let challenge = <[u8; 32]>::try_from(issued.as_slice())
-        .map_err(|_| "the artifact of an issue is not a challenge".to_owned())?;
-    let call = Call::new(
-        Challenge::from_bytes(challenge),
-        drawn(random),
-        &Value::Text("status"),
-        Limits::default(),
-    )
-    .map_err(refused("a call"))?;
+    let call =
+        Call::new(challenge, drawn(random), &Value::Text("status"), Limits::default()).map_err(refused("a call"))?;
     let proof = client.proof(credential, call.binding());
     let (proposal, admission) = match auth
         .admit(&mut run.binding, credential, &proof, &call, now(), random)
         .await
     {
         Ok(admission) => admission,
-        Err(failure) => return refusal(failure),
+        Err(failure) => return refusal_of(failure),
     };
     let outcome = submitted(run, proposal, Plan::default()).await?;
     admission
@@ -250,6 +263,65 @@ async fn admit<S: Subject>(
         .map(Ok)
         .ok_or_else(|| format!("the commit of an admission did not land: {outcome:?}"))
 }
+
+/// The proposal of the unlink of the binding of `target` by the administrator `administrator` with `credential` and
+/// a proof by `client`: the issue of a challenge, and the proof over the unlink.
+async fn propose_unlink<S: Subject>(
+    run: &mut Run<S>,
+    auth: &Authority,
+    (credential, client, administrator): (&[u8], &Keys, &str),
+    target: &str,
+    random: &mut ChaCha20Rng,
+) -> Result<Result<(Proposal, Plan), local::Error>, String> {
+    let challenge = match challenge(run, auth, administrator, random).await? {
+        Ok(challenge) => challenge,
+        Err(error) => return Ok(Err(error)),
+    };
+    let unlink =
+        Unlink::new(challenge, drawn(random), account(target), Limits::default()).map_err(refused("an unlink"))?;
+    let proof = client.proof(credential, unlink.call().binding());
+    match auth
+        .unlink(&mut run.binding, credential, &proof, &unlink, now(), random)
+        .await
+    {
+        Ok((proposal, plan, _)) => Ok(Ok((proposal, plan))),
+        Err(failure) => refusal_of(failure),
+    }
+}
+
+/// The outcome of the unlink of the binding of `target` by an administrator ([`propose_unlink`]), or its refusal.
+async fn unlink<S: Subject>(
+    run: &mut Run<S>,
+    auth: &Authority,
+    caller: (&[u8], &Keys, &str),
+    target: &str,
+    random: &mut ChaCha20Rng,
+) -> Result<Result<Outcome, local::Error>, String> {
+    match propose_unlink(run, auth, caller, target, random).await? {
+        Ok((proposal, plan)) => Ok(Ok(submitted(run, proposal, plan).await?)),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+/// The credential of the binding of `administrator` with the key `client`, which `issuer` signs again: the recovery of
+/// a client whose response was lost.
+async fn recover<S: Subject>(
+    run: &mut Run<S>,
+    auth: &Authority,
+    issuer: &Keys,
+    client: &Keys,
+    administrator: &str,
+) -> Result<Vec<u8>, String> {
+    let reissue = auth
+        .credential(&mut run.binding, &account(administrator), &client.public, now())
+        .await
+        .map_err(refused("a recovery"))?;
+    let signature = issuer.sign(&reissue.to_be_signed());
+    reissue.finish(&signature).map_err(refused("a recovery"))
+}
+
+/// The refusal of the last administrator binding: the core keeps an administrator whose credential is valid.
+const LAST: local::Error = local::Error::Transition(transition::Error::LastAnchor);
 
 /// The administrator and the state of each issue of the report at `at`.
 async fn report<S: Subject>(run: &mut Run<S>, auth: &Authority, at: Reading) -> Result<Vec<(String, Status)>, String> {
@@ -359,11 +431,8 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
         refusal(&mut run, &auth, &first, &alice, now()).await? == Some(local::Error::Unknown),
         "a consumed value did not refuse",
     )?;
-    let recovered = auth
-        .credential(&mut run.binding, &account("alice"), &alice.public, now())
-        .await;
     ensure(
-        recovered.as_ref().is_ok_and(|recovered| *recovered == credential),
+        recover(&mut run, &auth, &issuer, &alice, "alice").await? == credential,
         "the binding does not give the credential of the consumption",
     )?;
     ensure(
@@ -387,16 +456,19 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
         "the report does not give each issue and each consumption",
     )?;
 
-    // The new administrator ends the earlier binding with an unlink, and the last binding stays.
-    let actor = admit(&mut run, &auth, &credential_b, &bob, "bob", &mut random)
-        .await?
-        .map_err(refused("an admission"))?;
-    let (proposal, plan) = auth
-        .unlink(&mut run.binding, &actor, &account("alice"), now(), op("x-1"))
-        .await
-        .map_err(refused("an unlink"))?;
+    // The administrator ends the earlier binding with an unlink.
+    let fourth = issue(&mut run, &auth, &mut random, "dora", "i-4").await?;
+    let dora = Keys::new(10);
+    let credential_d = enroll(&mut run, &auth, &issuer, &fourth, &dora, "u-4").await?;
+    let (bob_call, dora_call) = (
+        (credential_b.as_slice(), &bob, "bob"),
+        (credential_d.as_slice(), &dora, "dora"),
+    );
     ensure(
-        matches!(submitted(&mut run, proposal, plan).await?, Outcome::Accepted(_)),
+        matches!(
+            unlink(&mut run, &auth, bob_call, "alice", &mut random).await?,
+            Ok(Outcome::Accepted(_))
+        ),
         "the unlink of an earlier administrator did not commit",
     )?;
     ensure(
@@ -406,14 +478,30 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
         ),
         "an unlinked administrator was admitted",
     )?;
-    let (proposal, plan) = auth
-        .unlink(&mut run.binding, &actor, &account("bob"), now(), op("x-2"))
-        .await
+
+    // The last two administrators each unlink their own binding, and each one reads the bindings before either
+    // commits. Only the first commits, also when the mark of the journal passes it, so the authority keeps an
+    // administrator. The unlink of the last binding refuses.
+    let first = propose_unlink(&mut run, &auth, bob_call, "bob", &mut random)
+        .await?
+        .map_err(refused("an unlink"))?;
+    let second = propose_unlink(&mut run, &auth, dora_call, "dora", &mut random)
+        .await?
         .map_err(refused("an unlink"))?;
     ensure(
+        matches!(submitted(&mut run, first.0, first.1).await?, Outcome::Accepted(_)),
+        "the unlink of an administrator by itself did not commit",
+    )?;
+    run.driver.advance(now());
+    run.settle().await?;
+    ensure(
+        !matches!(submitted(&mut run, second.0, second.1).await?, Outcome::Accepted(_)),
+        "two concurrent unlinks of the last two administrators both committed",
+    )?;
+    ensure(
         matches!(
-            submitted(&mut run, proposal, plan).await?,
-            Outcome::Refused(rsauthnz::transition::Error::LastAnchor)
+            unlink(&mut run, &auth, dora_call, "dora", &mut random).await?,
+            Err(LAST)
         ),
         "the unlink of the last administrator did not refuse",
     )?;
@@ -421,19 +509,20 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
         report(&mut run, &auth, later()).await?
             == statuses(&[
                 ("alice", Status::Consumed { bound: false }),
-                ("bob", BOUND),
-                ("carol", Status::Expired),
+                ("bob", Status::Consumed { bound: false }),
+                ("carol", Status::Ended),
+                ("dora", BOUND),
             ]),
-        "the report does not give the unlink and the expiry",
+        "the report does not give the unlinks and the end of a value",
     )?;
 
-    // A full log drops the oldest issues whose value bound no live administrator, and keeps the live binding of bob.
+    // A full log drops the oldest issues whose value bound no live administrator, and keeps the live binding of dora.
     for n in 0..local::ISSUES_MAX {
         issue(&mut run, &auth, &mut random, &format!("a-{n}"), &format!("l-{n}")).await?;
     }
     let log = report(&mut run, &auth, now()).await?;
     ensure(
-        log.len() == local::ISSUES_MAX && log.first() == Some(&("bob".to_owned(), BOUND)),
+        log.len() == local::ISSUES_MAX && log.first() == Some(&("dora".to_owned(), BOUND)),
         "a full log did not keep the live binding and drop the oldest other issues",
     )
 }
@@ -496,15 +585,12 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
         rows == [row("yves"), row("zoe")],
         "after a restore, the report does not give an issue after the snapshot whose value a client consumed",
     )?;
-    let actor = admit(&mut run, &fresh, &credential, &zoe, "zoe", &mut random)
-        .await?
-        .map_err(refused("an admission"))?;
-    let (proposal, plan) = fresh
-        .unlink(&mut run.binding, &actor, &account("yves"), now(), op("f-5"))
-        .await
-        .map_err(refused("an unlink"))?;
+    let zoe_call = (credential.as_slice(), &zoe, "zoe");
     ensure(
-        matches!(submitted(&mut run, proposal, plan).await?, Outcome::Accepted(_)),
+        matches!(
+            unlink(&mut run, &fresh, zoe_call, "yves", &mut random).await?,
+            Ok(Outcome::Accepted(_))
+        ),
         "after a restore, the administrator of an issue after the snapshot did not unlink an earlier one",
     )?;
     ensure(
@@ -512,15 +598,8 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
             == statuses(&[("yves", Status::Consumed { bound: false }), ("zoe", BOUND)]),
         "the report does not give the unlink after a restore",
     )?;
-    let (proposal, plan) = fresh
-        .unlink(&mut run.binding, &actor, &account("zoe"), now(), op("f-6"))
-        .await
-        .map_err(refused("an unlink"))?;
     ensure(
-        matches!(
-            submitted(&mut run, proposal, plan).await?,
-            Outcome::Refused(rsauthnz::transition::Error::LastAnchor)
-        ),
+        matches!(unlink(&mut run, &fresh, zoe_call, "zoe", &mut random).await?, Err(LAST)),
         "after a restore, the unlink of the last administrator did not refuse",
     )?;
     if !crash {
@@ -595,10 +674,7 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
     run.submit(proposal, plan)?;
     run.drive(at_commit("r-13", Fault::LostResponse)).await?;
     run.restore(&snapshot).await?;
-    let credential = auth
-        .credential(&mut run.binding, &account("gina"), &gina.public, now())
-        .await
-        .map_err(refused("the recovery of a completed bootstrap"))?;
+    let credential = recover(&mut run, &auth, &issuer, &gina, "gina").await?;
     ensure(
         admit(&mut run, &auth, &credential, &gina, "gina", &mut random)
             .await?

@@ -84,6 +84,7 @@ use rsauthnz::store::{
     self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
     Sequence, Store,
 };
+use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
 use rscrypto::RapidHash64;
 
@@ -278,6 +279,8 @@ struct Binding {
     injected: Option<Fault>,
     /// The number of calls of each primitive that can take a fault, in the order of [`Primitive`].
     calls: [u64; 3],
+    /// The reading of [`Subject::clock`].
+    clock: Reading,
 }
 
 impl Binding {
@@ -395,7 +398,15 @@ impl Memory {
             schedule,
             injected: None,
             calls: [0; 3],
+            clock: Reading::new(Duration::ZERO, Some(Duration::ZERO), ReadingSource::Caller),
         })))
+    }
+
+    /// Sets the reading of the clock that the binding gives for [`Effect::Clock`](rsauthnz::store::driver::Effect):
+    /// the controlled clock of a test. The first reading is the start of the Unix epoch, before each deadline of a
+    /// test at a fixed time.
+    pub fn set_clock(&self, now: Reading) {
+        self.lock().clock = now;
     }
 
     /// The shared state. No step of the binding panics while it holds the lock, so a poisoned lock holds a
@@ -436,6 +447,11 @@ impl Subject for Memory {
 
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
         self.lock().journal.retain(|sequence, _| !sequences.contains(sequence));
+    }
+
+    /// The reading of [`Memory::set_clock`].
+    fn clock(&self) -> Reading {
+        self.lock().clock
     }
 }
 

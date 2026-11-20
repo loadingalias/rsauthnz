@@ -106,6 +106,9 @@ pub enum Effect<'a> {
     Sync,
     /// [`Journal::read`](super::Journal::read) after the sequence. Give [`Output::Journal`].
     ReadJournal(Sequence, NonZeroUsize),
+    /// A fresh reading of the clock of the host, just before the commit of a proposal with a deadline
+    /// ([`Proposal::until`]). Give [`Output::Clock`]. A production executor reads the system clock with its bound.
+    Clock,
 }
 
 /// The result of an [`Effect`].
@@ -127,6 +130,8 @@ pub enum Output {
     Synced,
     /// The journal entries.
     Journal(Vec<super::Entry>),
+    /// The reading of the clock.
+    Clock(Reading),
     /// The primitive failed. It is a crash, and the binding does not retry it.
     Failed,
 }
@@ -1006,6 +1011,10 @@ enum CommitPhase {
     Floor(Committing),
     /// The floor entries and the end entry, then a sync.
     Entries(Writing),
+    /// The reading of the clock before the commit of a proposal with a deadline.
+    Clock,
+    /// The reading can be at or after the deadline, so the commit does not run.
+    Expired,
     /// The conditional commit.
     Commit,
     /// The result of the commit.
@@ -1026,11 +1035,12 @@ impl Submitted {
             CommitPhase::Entries(writing) | CommitPhase::Creation(writing) | CommitPhase::Void(writing) => {
                 writing.effect()
             }
+            CommitPhase::Clock => Some(Effect::Clock),
             CommitPhase::Commit => self
                 .proposal
                 .as_ref()
                 .map(|proposal| Effect::Commit(proposal, core.instance)),
-            CommitPhase::Check | CommitPhase::Result(_) | CommitPhase::Done => None,
+            CommitPhase::Check | CommitPhase::Expired | CommitPhase::Result(_) | CommitPhase::Done => None,
         }
     }
 
@@ -1040,6 +1050,19 @@ impl Submitted {
             CommitPhase::Entries(writing) | CommitPhase::Creation(writing) | CommitPhase::Void(writing) => {
                 writing.give(core, output)
             }
+            CommitPhase::Clock => {
+                let Output::Clock(reading) = output else {
+                    return Err(Error::Binding);
+                };
+                let deadline = self.proposal.as_ref().and_then(Proposal::deadline);
+                let before = deadline.is_some_and(|deadline| reading.latest().is_ok_and(|latest| latest < deadline));
+                self.phase = if before {
+                    CommitPhase::Commit
+                } else {
+                    CommitPhase::Expired
+                };
+                Ok(())
+            }
             CommitPhase::Commit => {
                 let Output::Committed(result) = output else {
                     return Err(Error::Binding);
@@ -1047,7 +1070,19 @@ impl Submitted {
                 self.phase = CommitPhase::Result(result);
                 Ok(())
             }
-            CommitPhase::Check | CommitPhase::Result(_) | CommitPhase::Done => Err(Error::Binding),
+            CommitPhase::Check | CommitPhase::Expired | CommitPhase::Result(_) | CommitPhase::Done => {
+                Err(Error::Binding)
+            }
+        }
+    }
+
+    /// The phase of the commit after its journal entries: the clock reading for a proposal with a deadline, else the
+    /// commit.
+    fn commit(&self) -> CommitPhase {
+        if self.proposal.as_ref().and_then(Proposal::deadline).is_some() {
+            CommitPhase::Clock
+        } else {
+            CommitPhase::Commit
         }
     }
 
@@ -1085,7 +1120,7 @@ impl Submitted {
                         }
                         CommitPhase::Entries(Writing::new(core, bodies)?)
                     } else if floors.is_empty() {
-                        CommitPhase::Commit
+                        self.commit()
                     } else {
                         core.record
                             .floors
@@ -1093,14 +1128,23 @@ impl Submitted {
                         CommitPhase::Floor(core.marking([])?)
                     }
                 }
-                CommitPhase::Floor(_) => CommitPhase::Commit,
+                CommitPhase::Floor(_) => self.commit(),
                 CommitPhase::Entries(_) => {
                     if self.entries.end.is_some() {
                         self.end = Some(core.history.head().sequence);
                     }
-                    CommitPhase::Commit
+                    self.commit()
                 }
+                CommitPhase::Clock => CommitPhase::Clock,
                 CommitPhase::Commit => CommitPhase::Commit,
+                CommitPhase::Expired => {
+                    // The commit did not run, so the refusal stays true: the void of the end entry comes first.
+                    self.outcome = Some(Outcome::Refused(transition::Error::Expired));
+                    match self.end {
+                        Some(end) => CommitPhase::Void(Writing::new(core, [(operation, Body::Void(end))])?),
+                        None => return Ok(Some(self.outcome.take().map(Answer::Outcome))),
+                    }
+                }
                 CommitPhase::Result(Commit::Accepted) => {
                     self.outcome = self
                         .proposal

@@ -153,6 +153,11 @@ impl<'a> Sign1<'a> {
         &self.protected
     }
 
+    /// The encoded protected bucket, as the signature covers it.
+    pub(crate) const fn protected_bytes(&self) -> &'a [u8] {
+        self.protected_bytes
+    }
+
     /// The unprotected bucket. The signature does not cover it.
     #[must_use]
     pub const fn unprotected(&self) -> &Header<'a> {

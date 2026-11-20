@@ -123,7 +123,8 @@ drops each write after the durable lengths, so a write whose sync failed does no
 ### 10. Run the commit driver
 
 The binding needs no code for this step. The measurement program `examples/journal_cost.rs` of the example has the
-`execute` function and the loop of the guide.
+`execute` function and the loop of the guide. It answers `Effect::Clock` with its own fixed reading, as a measurement
+needs. A host answers it with the system clock, as the guide does.
 
 ### 11. Implement the test controls
 
@@ -139,6 +140,7 @@ Each fault of the suite takes a real failure path of the binding:
 - `Subject::restart` stops the binding, as a crash does.
 - `Subject::snapshot` gives the store log of the current records.
 - `Subject::restore` writes a snapshot as the store log, then opens the files as a start does.
+- `Subject::clock` reads the system clock with a bound of one second.
 - `Subject::lose` writes the journal again without the lost entries. Each entry keeps its sequence in its frame, so no
   sequence is used again while later entries remain. A loss of the last entries followed by a start gives their
   sequences again, because the file cannot tell a lost entry from a torn append. The suite never makes this sequence

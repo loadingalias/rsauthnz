@@ -3,8 +3,11 @@
 
 use core::num::NonZeroUsize;
 use core::ops::RangeBounds;
+use core::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsauthnz::store::Sequence;
+use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz_conformance::suite::{Fault, Subject};
 
 use crate::{Durable, Error, Files, Inner, JOURNAL_FILE, Log, STORE_FILE, State, form, replace};
@@ -74,5 +77,14 @@ impl Subject for Files {
                 Ok::<_, Error>(())
             })
             .unwrap_or_default();
+    }
+
+    /// A reading of the system clock with a bound of one second (guide step 10). A clock before the Unix epoch reads as
+    /// the epoch with no bound, so each deadline refuses.
+    fn clock(&self) -> Reading {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(since) => Reading::new(since, Some(Duration::from_secs(1)), ReadingSource::SystemClock),
+            Err(_) => Reading::new(Duration::ZERO, None, ReadingSource::SystemClock),
+        }
     }
 }

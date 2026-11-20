@@ -264,11 +264,17 @@ result that the contract names: a conflict is [`Commit::Conflict`], not an error
 
 The application drives the binding with [`Driver`]. [`Driver::effect`] gives the next primitive call, an [`Effect`].
 Execute it on the binding, and give the [`Output`] to [`Driver::give`]. Give [`Output::Failed`] for an error. Do not
-retry the primitive. This function is the same for each binding, and `cargo xtask test` compiles it:
+retry the primitive. [`Effect::Clock`] asks for a fresh reading of the clock of the host, just before the commit of a
+proposal with a deadline: give the system clock with the bound of its time source. This function is the same for
+each binding, and `cargo xtask test` compiles it:
 
 ```rust
+use core::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rsauthnz::store::driver::{self, Driver, Effect, Output};
 use rsauthnz::store::{Journal, Store};
+use rsauthnz::time::{Reading, ReadingSource};
 
 /// The output of the primitive call `effect` on `binding`. A failed primitive gives `Output::Failed`.
 async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Output {
@@ -292,6 +298,16 @@ async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Out
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
+        Effect::Clock => Output::Clock(clock()),
+    }
+}
+
+/// A fresh reading of the system clock, with a bound of one second for its time source. A clock before the Unix epoch
+/// gives a reading with no bound, so the commit of each proposal with a deadline refuses.
+fn clock() -> Reading {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => Reading::new(since, Some(Duration::from_secs(1)), ReadingSource::SystemClock),
+        Err(_) => Reading::new(Duration::ZERO, None, ReadingSource::SystemClock),
     }
 }
 
@@ -329,6 +345,7 @@ The documentation of the [`driver`] module gives each operation of the driver an
 [`Status::Serving`]: rsauthnz::store::driver::Status::Serving
 [`Plan`]: rsauthnz::store::driver::Plan
 [`Effect`]: rsauthnz::store::driver::Effect
+[`Effect::Clock`]: rsauthnz::store::driver::Effect::Clock
 [`Output`]: rsauthnz::store::driver::Output
 [`Output::Failed`]: rsauthnz::store::driver::Output::Failed
 

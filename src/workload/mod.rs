@@ -116,7 +116,7 @@
 //! #     let (public, secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(3)))?;
 //! #     let public = public.to_bytes();
 //! #     let (console, purpose) = (Id::new("acme", "console")?, Id::new("acme", "operator")?);
-//! #     let expires = now.estimate() + Duration::from_secs(600);
+//! #     let expires = now.estimate() + Duration::from_secs(3_600);
 //! #     let human = Id::new("acme", "operator-1")?;
 //! #     let subject = Subject::Human(human.clone());
 //! #     let claims = Claims::new(Id::new("acme", "issuer")?, console.clone(), subject, purpose.clone(), Serial(0), expires);
@@ -124,7 +124,8 @@
 //! #     let signature = issuer_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
 //! #     let audit = Audit { actor: Principal::Human(human), action: Id::new("acme", "operator.sign-in")?, time: now };
 //! #     let mut proposal = Proposal::new(OperationId::new(b"sign-in-1")?, audit, &Value::Null, Limits::default())?;
-//! #     proposal.prepare(draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?);
+//! #     draft.record(&mut proposal)?;
+//! #     proposal.prepare(draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?)?;
 //! #     let Outcome::Accepted(receipt) = commit(driver, memory, proposal, Plan::default())? else {
 //! #         return Err("the sign-in did not commit".into());
 //! #     };
@@ -166,7 +167,7 @@
 //! setup.change(Change::Write { key: policy_key, version, end: None, data: Box::from(*b"policy 1") })?;
 //! issuer.register(&mut setup, &mut driver)?;
 //! let runner_key = PublicKey::MlDsa65Ed25519(&runner_public);
-//! Registration::register(&mut setup, runner.clone(), runner_key, authority.clone(), &mut driver)?;
+//! Registration::register(&mut setup, runner.clone(), runner_key, &issuer, &mut driver)?;
 //! assert!(matches!(commit(&mut driver, &mut memory, setup, Plan::default())?, Outcome::Accepted(_)));
 //!
 //! // 2. An operator asks for the first credential. `policy` permits it `Mode::Issue`, and `operator` is its evidence.
@@ -198,12 +199,13 @@
 //! let current = ready(memory.read(&Registration::store_key(&runner)))?;
 //! workload::admits(&verified, current.as_ref(), Limits::default())?;
 //!
-//! // 5. At half its lifetime, the workload renews with its credential and a proof over the challenge of the issuer.
-//! // Each issuance writes the registration, so read it again.
+//! // 5. At half its lifetime, the workload renews with its credential and a proof over the binding of the challenge of
+//! // the issuer to its request. Each issuance writes the registration, so read it again.
 //! let later = Reading::new(credential.renew_at(), Some(Duration::from_secs(1)), ReadingSource::Caller);
-//! let proof = prove(b"challenge-2", later)?;
+//! let operation = OperationId::new(b"renew-1")?;
+//! let proof = prove(&workload::binding(b"challenge-2", &operation, &authority, &runner, &build, None), later)?;
 //! let by = By::Renew { credential: credential.as_bytes(), proof: &proof, challenge: b"challenge-2" };
-//! let request = Request { operation: OperationId::new(b"renew-1")?, by, audience: &build, lifetime: None, replace: None };
+//! let request = Request { operation, by, audience: &build, lifetime: None, replace: None };
 //! let registration_record = current.ok_or("no registration")?;
 //! let pending =
 //!     Pending::new(request, &issuer_record, &registration_record, &policy, &mut driver, later, Limits::default())?;
@@ -213,17 +215,19 @@
 //! assert!(renewed.serial() > credential.serial());
 //!
 //! // 6. The host is lost. The operator recovers the workload on a new host, which proves its new key over the key
-//! // binding. One commit issues to the new host and ends each credential of the old host.
+//! // binding and the binding of its challenge. One commit issues to the new host and ends each credential of the old
+//! // host.
 //! let (host_public, host_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(4)))?;
 //! let host_public = host_public.to_bytes();
 //! let host_key = PublicKey::MlDsa65Ed25519(&host_public);
-//! let binding = workload::key_binding(&runner, &host_key);
-//! let draft = ProofDraft::new(&trusted(host_key.clone())?, &binding, &build, b"challenge-3", later)?;
+//! let operation = OperationId::new(b"recover-1")?;
+//! let bound = workload::binding(b"challenge-3", &operation, &authority, &runner, &build, Some(&host_key));
+//! let key_binding = workload::key_binding(&runner, &host_key);
+//! let draft = ProofDraft::new(&trusted(host_key.clone())?, &key_binding, &build, &bound, later)?;
 //! let signature = host_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
 //! let proof = draft.finish(signature.as_bytes(), &mut budget())?;
 //! let replace = Replace { key: host_key, proof: &proof, challenge: b"challenge-3" };
 //! let by = By::Issue(&operator);
-//! let operation = OperationId::new(b"recover-1")?;
 //! let request = Request { operation, by, audience: &build, lifetime: None, replace: Some(replace) };
 //! let registration_record = ready(memory.read(&Registration::store_key(&runner)))?.ok_or("no registration")?;
 //! let pending =
@@ -255,7 +259,7 @@ use crate::cose::{self, Key, PublicKey, TrustedKey};
 use crate::credential::{self, Claims, Draft, Serial, Subject};
 use crate::crypto;
 use crate::evidence::Evidence;
-use crate::id::{Action, Audience, Authority, AuthorityVersion, Id, Purpose, Resource, Workload};
+use crate::id::{Action, Audience, Authority, AuthorityVersion, Id, Principal, Purpose, Resource, Workload};
 use crate::limits::{Limits, SignatureBudget};
 use crate::store::driver::{self, Driver, Plan};
 use crate::store::{Kind, Record};
@@ -274,13 +278,18 @@ pub const AUDIENCES_MAX: usize = 16;
 const ISSUER_FORM: &str = "rsauthnz.workload.issuer.2";
 
 /// The first item of the CBOR form of a registration record. Its number changes with the form.
-const REGISTRATION_FORM: &str = "rsauthnz.workload.registration.2";
-
-/// The first item of the CBOR form of a credential record. Its number changes with the form.
-const CREDENTIAL_FORM: &str = "rsauthnz.workload.credential.1";
+const REGISTRATION_FORM: &str = "rsauthnz.workload.registration.3";
 
 /// The first item of the CBOR form of a key binding ([`key_binding`]). Its number changes with the form.
 const KEY_FORM: &str = "rsauthnz.workload.key.1";
+
+/// The first item of the CBOR form of the binding of a proof to its request ([`binding`]). Its number changes with
+/// the form.
+const PROOF_FORM: &str = "rsauthnz.workload.proof.1";
+
+/// The most credentials of one workload that a revocation of one credential ends, before they end by time. A
+/// revocation of one more credential refuses: revoke all credentials ([`Target::All`]).
+pub const REVOKED_MAX: usize = 16;
 
 /// The purpose of each workload credential: `rsauthnz:workload`. A workload credential never verifies for another
 /// purpose, such as an agent credential of the same issuer key.
@@ -309,21 +318,11 @@ pub fn issuer_resource(authority: &Id<Authority>) -> Id<Resource> {
     Id::new(authority.namespace(), authority.value()).expect("a resource has the rules of an authority identifier")
 }
 
-/// The key of the record of the workload credential with the serial `serial`: [`Kind::Credential`] with the 8 bytes of
-/// the serial, the most significant byte first.
-///
-/// Cost class: [`Parse`](crate::limits::Class::Parse).
-#[must_use]
-pub fn credential_key(serial: Serial) -> transition::Key {
-    Kind::Credential
-        .key(&serial.0.to_be_bytes())
-        .expect("a key of 9 bytes is valid")
-}
-
 /// The key binding of `workload` and its new key `key`, for a rotation or a recovery ([`Replace`]). A proof of
 /// possession of the new key binds these bytes in place of a credential. They are the canonical CBOR array
-/// `["rsauthnz.workload.key.1", workload, kid]`, where `kid` is the COSE Key Thumbprint of `key` ([`TrustedKey::kid`]). The holder of the new key makes the proof over these bytes with
-/// [`credential::ProofDraft::new`]. The proof is for the audience of the request and the challenge of the issuer.
+/// `["rsauthnz.workload.key.1", workload, kid]`, where `kid` is the COSE Key Thumbprint of `key`
+/// ([`TrustedKey::kid`]). The holder of the new key makes the proof over these bytes with
+/// [`credential::ProofDraft::new`], for the audience of the request and the [`binding`] of its challenge.
 ///
 /// Cost class: [`Parse`](crate::limits::Class::Parse).
 #[must_use]
@@ -335,6 +334,38 @@ pub fn key_binding(workload: &Id<Workload>, key: &PublicKey<'_>) -> Vec<u8> {
         Value::Bytes(&kid),
     ]))
     .expect("the form has no map and no simple value")
+}
+
+/// The binding of a proof to its request: the SHA-256 digest of the canonical CBOR array `["rsauthnz.workload.proof.1",
+/// challenge, operation, issuer, workload, audience, kid]`. `kid` is the COSE Key Thumbprint of the new key `key` of a
+/// rotation or a recovery, or `null` with no new key. Each proof of a request binds this digest in place of the bare
+/// challenge ([`credential::ProofDraft::new`]): the proof by the current key of a renewal or a rotation, and the proof
+/// by the new key of a rotation or a recovery. Thus a proof gives no authority for another operation, issuer,
+/// workload, audience, or new key, and the current key of a rotation signs the choice of the new key.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse). One SHA-256 digest of the bounded form.
+#[must_use]
+pub fn binding(
+    challenge: &[u8],
+    operation: &OperationId,
+    issuer: &Id<Authority>,
+    workload: &Id<Workload>,
+    audience: &Id<Audience>,
+    key: Option<&PublicKey<'_>>,
+) -> [u8; 32] {
+    let kid = key.map(PublicKey::thumbprint);
+    crypto::sha256(
+        &cbor::encode(&Value::Array(vec![
+            Value::Text(PROOF_FORM),
+            Value::Bytes(challenge),
+            Value::Bytes(operation.as_bytes()),
+            issuer.to_cbor(),
+            workload.to_cbor(),
+            audience.to_cbor(),
+            kid.as_ref().map_or(Value::Null, |kid| Value::Bytes(kid)),
+        ]))
+        .expect("the form has no map and no simple value"),
+    )
 }
 
 /// The kind of an operation, and its action in the policy.
@@ -640,24 +671,30 @@ impl fmt::Debug for Issuer {
     }
 }
 
-/// The registration of a workload: its identifier, its registered proof key, and its generation. Each credential of
-/// the workload has this key as its `cnf` key. The store keeps it as a [`Kind::Workload`] record.
+/// The registration of a workload: its identifier, its registered proof key, its generation, and its revoked
+/// credentials. Each credential of the workload has this key as its `cnf` key. The store keeps it as a
+/// [`Kind::Workload`] record, whose version names the issuer of the workload.
 ///
 /// The generation is a serial: each credential of the workload with a lower serial is dead. A rotation, a recovery,
-/// and a revocation each raise it in the commit that makes the change. A verifier that reads the current registration
-/// refuses a dead credential ([`admits`]).
+/// and a revocation of all credentials each raise it in the commit that makes the change. A revocation of one
+/// credential adds its serial and its end to the revoked credentials, at most [`REVOKED_MAX`] of them. A credential
+/// leaves the list when it ends. A verifier that reads the current registration refuses a dead or a revoked
+/// credential ([`admits`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Registration {
     workload: Id<Workload>,
     key: RecordKey,
     generation: Serial,
+    /// The revoked credentials at or above the generation, with their ends, sorted by serial.
+    revoked: Vec<(Serial, Duration)>,
 }
 
 impl Registration {
     /// Adds the first write of the registration of `workload` with the proof key `key` to `proposal`. It adds the
     /// absence of the record, and its write at [`Self::store_key`]. The generation is a new value of the
     /// [`Kind::Credential`] counter of `driver`. Thus a credential of an earlier registration of the same workload
-    /// never verifies again. The version is `owner` and the generation. `owner` owns each later version of the record.
+    /// never verifies again. The version is the authority of `issuer` and the generation, so the registration names its
+    /// issuer: an issuance of another issuer refuses, and so does a credential of another issuer at a verifier.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). The key checks as [`TrustedKey::new`] checks it.
     ///
@@ -669,7 +706,7 @@ impl Registration {
         proposal: &mut Proposal,
         workload: Id<Workload>,
         key: PublicKey<'_>,
-        owner: Id<Authority>,
+        issuer: &Issuer,
         driver: &mut Driver,
     ) -> Result<Self, Error> {
         let key = RecordKey::new(key)?;
@@ -678,12 +715,13 @@ impl Registration {
             workload,
             key,
             generation,
+            revoked: Vec::new(),
         };
         let store_key = Self::store_key(&registration.workload);
         proposal.read(Dependency::Absent(store_key.clone()))?;
         proposal.change(Change::Write {
             key: store_key,
-            version: version(owner, generation.0),
+            version: version(issuer.authority.clone(), generation.0),
             end: None,
             data: registration.to_record(),
         })?;
@@ -698,17 +736,22 @@ impl Registration {
     ///
     /// [`Error::Record`] if `data` is not the record form of a registration.
     pub fn from_record(data: &[u8], limits: Limits) -> Result<Self, Error> {
-        let (workload, key, generation) = Self::fields(data, limits)?;
+        let (workload, key, generation, revoked) = Self::fields(data, limits)?;
         Ok(Self {
             workload,
             key: RecordKey::decode(key, limits)?,
             generation,
+            revoked,
         })
     }
 
-    /// The workload, the encoded key, and the generation of the record form `data`. The check of [`admits`] reads no
-    /// key, so it makes no trusted key.
-    fn fields(data: &[u8], limits: Limits) -> Result<(Id<Workload>, &[u8], Serial), Error> {
+    /// The workload, the encoded key, the generation, and the revoked credentials of the record form `data`. The check
+    /// of [`admits`] compares the thumbprint of the key, so it makes no trusted key.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the four fields of the record form, which only two callers read"
+    )]
+    fn fields(data: &[u8], limits: Limits) -> Result<(Id<Workload>, &[u8], Serial, Vec<(Serial, Duration)>), Error> {
         let value = cbor::decode(data, limits).map_err(|_| Error::Record)?;
         let Value::Array(items) = &value else {
             return Err(Error::Record);
@@ -718,21 +761,42 @@ impl Registration {
             workload,
             Value::Bytes(key),
             Value::Unsigned(generation),
+            Value::Array(revoked),
         ] = items.as_slice()
         else {
             return Err(Error::Record);
         };
+        (revoked.len() <= REVOKED_MAX).ok_or(Error::Record)?;
+        let revoked = revoked
+            .iter()
+            .map(|entry| match entry {
+                Value::Array(pair) => match pair.as_slice() {
+                    [Value::Unsigned(serial), Value::Unsigned(expires)] => {
+                        Ok((Serial(*serial), Duration::from_secs(*expires)))
+                    }
+                    _ => Err(Error::Record),
+                },
+                _ => Err(Error::Record),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let workload = Id::from_cbor(workload).map_err(|_| Error::Record)?;
-        Ok((workload, key, Serial(*generation)))
+        Ok((workload, key, Serial(*generation), revoked))
     }
 
-    /// The record form: the canonical CBOR array `["rsauthnz.workload.registration.2", workload, key, generation]`.
+    /// The record form: the canonical CBOR array `["rsauthnz.workload.registration.3", workload, key, generation,
+    /// revoked]`. `revoked` is an array of `[serial, expires]` pairs, sorted by serial, with `expires` in whole seconds.
     fn to_record(&self) -> Box<[u8]> {
+        let revoked = self
+            .revoked
+            .iter()
+            .map(|(serial, expires)| Value::Array(vec![Value::Unsigned(serial.0), Value::Unsigned(expires.as_secs())]))
+            .collect();
         let form = Value::Array(vec![
             Value::Text(REGISTRATION_FORM),
             self.workload.to_cbor(),
             Value::Bytes(&self.key.encoded),
             Value::Unsigned(self.generation.0),
+            Value::Array(revoked),
         ]);
         cbor::encode(&form)
             .expect("the form has no map and no simple value")
@@ -741,8 +805,13 @@ impl Registration {
 
     /// Adds the write of this registration to `proposal`. `record` is the current record of the registration, and
     /// `value` is a new value of the [`Kind::Credential`] counter. It adds the dependency on the version of `record`.
-    /// It adds the write at the version of the owner of `record` and `value`.
-    fn rewrite(&self, proposal: &mut Proposal, record: &Record, value: u64) -> Result<(), Error> {
+    /// It adds the write at the version of the owner of `record` and `value`. The write drops each revoked credential
+    /// that is below the generation, or past its end at each time that `now` permits.
+    fn rewrite(&mut self, proposal: &mut Proposal, record: &Record, value: u64, now: Reading) -> Result<(), Error> {
+        let earliest = now.earliest().map_err(|error| Error::Refusal(Refusal::Time(error)))?;
+        let generation = self.generation;
+        self.revoked
+            .retain(|(serial, expires)| *serial >= generation && *expires > earliest);
         let key = Self::store_key(&self.workload);
         proposal.read(Dependency::Version(key.clone(), record.version.clone()))?;
         proposal.change(Change::Write {
@@ -752,6 +821,11 @@ impl Registration {
             data: self.to_record(),
         })?;
         Ok(())
+    }
+
+    /// Whether the credential with the serial `serial` is dead or revoked.
+    fn ended(&self, serial: Serial) -> bool {
+        serial < self.generation || self.revoked.iter().any(|(revoked, _)| *revoked == serial)
     }
 
     /// The key of the record of `workload`: [`Kind::Workload`] with the SHA-256 digest of the canonical CBOR form of
@@ -782,34 +856,49 @@ impl fmt::Debug for Registration {
             .field("workload", &self.workload)
             .field("key", &self.key.trusted)
             .field("generation", &self.generation)
+            .field("revoked", &self.revoked)
             .finish()
     }
 }
 
-/// Checks the verified workload credential `verified` against `registration`, the current registration record of its
-/// workload, which the application reads with a keyed read of [`Registration::store_key`]. Give `None` when the store
-/// has no record. A verifier that makes this check after [`credential::Profile::verify`] refuses each credential that
-/// a rotation, a recovery, or a revocation ended. The check is local: it reads only `registration`. The decode uses
+/// Checks the verified credential `verified` against `registration`, the current registration record of its workload,
+/// which the application reads with a keyed read of [`Registration::store_key`]. Give `None` when the store has no
+/// record. A verifier that makes this check after [`credential::Profile::verify`] refuses each credential that a
+/// rotation, a recovery, or a revocation ended. The check is local: it reads only `registration`. The decode uses
 /// `limits`.
 ///
-/// Cost class: [`Parse`](crate::limits::Class::Parse). The check makes no trusted key of the registered key. Each
-/// credential at or above the generation has the registered key as its `cnf` key. The reason: a change of the key
-/// raises the generation in the same commit.
+/// The credential must be a workload credential ([`purpose`]) of the issuer of the registration, for its workload,
+/// with the registered key as its `cnf` key. Its serial must be at or above the generation, and not revoked. Thus a
+/// receipt, a credential of another issuer, or a credential of another key refuses.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse). The check compares the COSE Key Thumbprint of the registered
+/// key with the `cnf` key, so it makes no trusted key.
 ///
 /// # Errors
 ///
 /// [`Error::Unregistered`] for no record, [`Error::Record`] for a record that is not the form of a registration,
-/// [`Error::Possession`] if the credential names another workload, and [`Error::Revoked`] if its serial is below the
-/// generation.
+/// [`Error::Possession`] if the credential is of another purpose, issuer, workload, or `cnf` key, and
+/// [`Error::Revoked`] if its serial is below the generation or revoked.
 pub fn admits(
     verified: &credential::Verified<'_, '_>,
     registration: Option<&Record>,
     limits: Limits,
 ) -> Result<(), Error> {
-    let (workload, _, generation) = Registration::fields(&registration.ok_or(Error::Unregistered)?.data, limits)?;
+    let registration = registration.ok_or(Error::Unregistered)?;
+    let (workload, key, generation, revoked) = Registration::fields(&registration.data, limits)?;
     let claims = verified.claims();
-    matches!(&claims.subject, Subject::Workload(named) if *named == workload).ok_or(Error::Possession)?;
-    (claims.serial >= generation).ok_or(Error::Revoked)
+    let registered = Key::decode(key, limits).map_err(|_| Error::Record)?.public.thumbprint();
+    let named = matches!(&claims.subject, Subject::Workload(named) if *named == workload);
+    (claims.purpose == purpose() && claims.issuer == *registration.version.owner() && named)
+        .ok_or(Error::Possession)?;
+    let ended = claims.serial < generation || revoked.iter().any(|(serial, _)| *serial == claims.serial);
+    (!ended).ok_or(Error::Revoked)?;
+    // Each credential at or above the generation has the registered key, so another key is no credential of the
+    // registration.
+    let bound = verified
+        .confirmation()
+        .is_some_and(|confirmation| *confirmation.kid() == registered);
+    bound.ok_or(Error::Possession)
 }
 
 /// A request for a workload credential.
@@ -918,29 +1007,34 @@ impl Pending {
     /// workload, as the store holds them. `driver` gives the serial of the credential, so that a restore never gives
     /// one serial twice. The decode, the proof checks, and the proposal use `limits`.
     ///
-    /// The issuance checks the audience and the ceiling of the issuer. For a renewal or a rotation, it verifies the
-    /// current credential with [`Issuer::profile`]. The credential must name the registered workload and the
-    /// registered key, and its serial must not be below the generation. Then it checks the proof of possession. For a
-    /// rotation or a recovery, it checks the proof of possession of the new key. Then [`authz::check`] checks the
-    /// evidence for the action of the mode on the [`resource`] of the workload under `policy`.
+    /// The issuance checks that the registration names this issuer, and it checks the audience and the ceiling of the
+    /// issuer. For a renewal or a rotation, it verifies the current credential with [`Issuer::profile`]. The
+    /// credential must name the registered workload and the registered key, and it must not be dead or revoked. Then
+    /// it checks the proof of possession over the [`binding`] of its challenge. For a rotation or a recovery, it
+    /// checks the proof of possession of the new key over the [`binding`] of its challenge, and the new key must not
+    /// be the registered key. Then [`authz::check`] checks the evidence for the action of the mode on the
+    /// [`resource`] of the workload under `policy`.
     ///
     /// The proposal reads the policy version of the permit, and the issuer record and the registration record at
-    /// their versions. It reads the absence of the credential record ([`credential_key`]). It writes the credential
-    /// record, which ends when the credential ends, and a new version of the registration record. Thus a concurrent
-    /// rotation, recovery, or revocation conflicts with the issuance. A rotation and a recovery write the new key, with
-    /// the serial of the credential as the generation. Thus each earlier credential of the workload is dead.
+    /// their versions. It writes the issuance record of the credential ([`Draft::record`]), which ends when the
+    /// credential ends, and a new version of the registration record. Thus a concurrent rotation, recovery, or
+    /// revocation conflicts with the issuance. A rotation and a recovery write the new key, with the serial of the
+    /// credential as the generation. Thus each earlier credential of the workload is dead. The deadline of the proposal
+    /// is the deadline of the checked scope ([`authz::Checked::deadline`]), so its commit refuses after the permit,
+    /// the maximum age of the evidence, or the current credential ends.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify): a renewal verifies two signatures, of the current
     /// credential and of its proof, and a rotation three. The call of `policy` is the cost of the application.
     ///
     /// # Errors
     ///
-    /// [`Error::Record`] if a record is not its form, and [`Error::Audience`] for an audience that the issuer does not
-    /// have. [`Error::Ceiling`] for a lifetime past `lifetime_max`, or an end past `not_after`. [`Error::Credential`]
-    /// if the current credential or a proof refuses, or if the key of the credential has another class than the key of
-    /// the issuer. [`Error::Possession`] if the current credential names another workload or another `cnf` key than
-    /// the registration, and [`Error::Revoked`] if its serial is below the generation. [`Error::Key`] if the new key
-    /// refuses as a trusted key. [`Error::Refusal`] if the policy refuses, [`Error::Driver`] if the driver gives no
+    /// [`Error::Record`] if a record is not its form, [`Error::Issuer`] if the registration names another issuer, and
+    /// [`Error::Audience`] for an audience that the issuer does not have. [`Error::Ceiling`] for a lifetime past
+    /// `lifetime_max`, or an end past `not_after`. [`Error::Credential`] if the current credential or a proof refuses,
+    /// or if the key of the credential has another class than the key of the issuer. [`Error::Possession`] if the
+    /// current credential names another workload or another `cnf` key than the registration, and [`Error::Revoked`]
+    /// if it is dead or revoked. [`Error::Key`] if the new key refuses as a trusted key, and [`Error::Unchanged`] if it
+    /// is the registered key. [`Error::Refusal`] if the policy refuses, [`Error::Driver`] if the driver gives no
     /// serial, and [`Error::Transition`] if the proposal refuses.
     pub fn new(
         request: Request<'_>,
@@ -962,6 +1056,7 @@ impl Pending {
         let (issuer_record, registration_record) = (issuer, registration);
         let issuer = Issuer::from_record(&issuer_record.data, limits)?;
         let mut registration = Registration::from_record(&registration_record.data, limits)?;
+        (*registration_record.version.owner() == issuer.authority).ok_or(Error::Issuer)?;
         let profile = issuer.profile(audience, limits)?;
         let ceiling = issuer.ceiling;
         let new_key = replace
@@ -969,6 +1064,8 @@ impl Pending {
             .map(|replace| RecordKey::new(replace.key.clone()))
             .transpose()?;
         let new_kid = new_key.as_ref().map(|key| *key.trusted.kid());
+        // A replacement of the registered key by itself would keep the key that the operation retires.
+        (new_kid.as_ref() != Some(registration.key.trusted.kid())).ok_or(Error::Unchanged)?;
         // The request binding holds what the requester asks, so a new proposal of the same request after a lost
         // response binds the same request. The serial and the times are not part of it.
         let asked = Value::Array(vec![
@@ -985,6 +1082,17 @@ impl Pending {
             .map(|expires| Duration::from_secs(expires.as_secs()))
             .filter(|expires| lifetime <= ceiling.lifetime_max && *expires <= ceiling.not_after)
             .ok_or(Error::Ceiling)?;
+        let replaced = replace.as_ref().map(|replace| &replace.key);
+        let bound = |challenge: &[u8]| {
+            binding(
+                challenge,
+                &operation,
+                &issuer.authority,
+                &registration.workload,
+                audience,
+                replaced,
+            )
+        };
         let evidence = match by {
             By::Issue(evidence) => evidence.clone(),
             By::Renew {
@@ -997,8 +1105,8 @@ impl Pending {
                 let named =
                     matches!(&claims.subject, Subject::Workload(workload) if *workload == registration.workload);
                 (named && verified.confirmation() == Some(&registration.key.trusted)).ok_or(Error::Possession)?;
-                (claims.serial >= registration.generation).ok_or(Error::Revoked)?;
-                verified.possession(proof, challenge, now, &mut SignatureBudget::new(&limits))?
+                (!registration.ended(claims.serial)).ok_or(Error::Revoked)?;
+                verified.possession(proof, &bound(challenge), now, &mut SignatureBudget::new(&limits))?
             }
         };
         if let (Some(replace), Some(key)) = (&replace, &new_key) {
@@ -1007,21 +1115,18 @@ impl Pending {
                 &key_binding(&registration.workload, &replace.key),
                 &audience.to_string(),
                 replace.proof,
-                replace.challenge,
+                &bound(replace.challenge),
                 limits,
                 &mut SignatureBudget::new(&limits),
             )?;
         }
-        let permit = authz::check(
+        let checked = authz::check(
             &evidence,
             &mode.action(),
             &resource(&registration.workload),
             policy,
             now,
-        )?
-        .permit()
-        .version
-        .clone();
+        )?;
         let serial = Serial(driver.allocate(Kind::Credential)?);
         let claims = Claims::new(
             issuer.authority.clone(),
@@ -1049,28 +1154,14 @@ impl Pending {
             time: now,
         };
         let mut proposal = Proposal::new(operation, audit, &asked, limits)?;
-        let key = credential_key(serial);
-        proposal.read(Dependency::Policy(permit))?;
+        proposal.read(Dependency::Policy(checked.permit().version.clone()))?;
+        proposal.until(checked.deadline());
         proposal.read(Dependency::Version(
             Issuer::store_key(&issuer.authority),
             issuer_record.version.clone(),
         ))?;
-        registration.rewrite(&mut proposal, registration_record, serial.0)?;
-        proposal.read(Dependency::Absent(key.clone()))?;
-        let record = cbor::encode(&Value::Array(vec![
-            Value::Text(CREDENTIAL_FORM),
-            issuer.authority.to_cbor(),
-            registration.workload.to_cbor(),
-            audience.to_cbor(),
-            Value::Unsigned(expires.as_secs()),
-        ]))
-        .expect("the form has no map and no simple value");
-        proposal.change(Change::Write {
-            key,
-            version: version(issuer.authority, serial.0),
-            end: Some(expires),
-            data: record.into_boxed_slice(),
-        })?;
+        registration.rewrite(&mut proposal, registration_record, serial.0, now)?;
+        draft.record(&mut proposal)?;
         let awaiting = Awaiting {
             operation: proposal.operation().id.clone(),
             serial,
@@ -1111,7 +1202,7 @@ impl Pending {
             plan,
             awaiting,
         } = self;
-        proposal.prepare(draft.finish(signature, budget)?);
+        proposal.prepare(draft.finish(signature, budget)?)?;
         Ok((proposal, plan, awaiting))
     }
 }
@@ -1126,7 +1217,8 @@ pub struct Awaiting {
 }
 
 impl Awaiting {
-    /// The serial of the credential. The commit writes the credential record of this serial ([`credential_key`]).
+    /// The serial of the credential. The commit writes the issuance record of this serial
+    /// ([`credential::record_key`]).
     #[must_use]
     pub const fn serial(&self) -> Serial {
         self.serial
@@ -1206,17 +1298,19 @@ impl fmt::Debug for Credential {
 }
 
 /// The credentials that a revocation ends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Target {
-    /// The credential of this serial, and each earlier credential of the workload. A later credential stays valid.
-    Credential(Serial),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// The credential of this serial, and no other. The record is its issuance record, as the store holds it: a keyed
+    /// read of [`credential::record_key`] of the serial.
+    Credential(Serial, &'a Record),
     /// Each credential of the workload that a commit before the revocation released.
     All,
 }
 
-/// A revocation of credentials of a workload. It raises the generation of the registration in one commit, so each
-/// verifier that reads the current registration refuses the credentials of its target. The registered key stays, so
-/// the issuer can issue again.
+/// A revocation of credentials of a workload, in one commit. A revocation of one credential ends its issuance record
+/// and adds it to the revoked credentials of the registration. A revocation of all credentials raises the generation
+/// of the registration. Each verifier that reads the current registration refuses the credentials of its target. The
+/// registered key stays, so the issuer can issue again.
 #[derive(Clone, Debug)]
 pub struct Revocation<'a> {
     /// The identity of the operation. After an unknown outcome, look up this identity.
@@ -1225,15 +1319,17 @@ pub struct Revocation<'a> {
     /// [`Mode::Revoke`] on the [`resource`] of the workload.
     pub by: &'a Evidence,
     /// The credentials that the revocation ends.
-    pub target: Target,
+    pub target: Target<'a>,
 }
 
 impl Revocation<'_> {
     /// The proposal of the revocation, and the plan of its commit. `registration` is the current registration record of
     /// the workload. The proposal reads the policy version of the permit and the version of `registration`, and it
-    /// writes the registration with its new generation. The journal of the store records the end of the earlier
-    /// version, so a restore from an older snapshot ends the registration. Submit the proposal with the plan. A
-    /// revocation releases no artifact: its accepted outcome is the revocation.
+    /// writes the registration with its new generation or its new revoked credential. Thus a racing issuance
+    /// conflicts. A revocation of one credential also reads its issuance record and ends it. The journal of the store
+    /// records the end of the earlier version of the registration, so a restore from an older snapshot ends the
+    /// registration. Submit the proposal with the plan. A revocation releases no artifact: its accepted outcome is the
+    /// revocation. Its deadline is the deadline of the checked scope.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify): the decode of the registered key. The call of `policy` is
     /// the cost of the application.
@@ -1241,8 +1337,9 @@ impl Revocation<'_> {
     /// # Errors
     ///
     /// [`Error::Record`] if `registration` is not the form of a registration, [`Error::Refusal`] if the policy
-    /// refuses, [`Error::Target`] if the target serial is not a serial that the driver gave yet, [`Error::Driver`] if
-    /// the driver gives no value, and [`Error::Transition`] if the proposal refuses.
+    /// refuses, [`Error::Target`] if the target credential is not a live credential of the workload from the issuer
+    /// of the registration, [`Error::Revocations`] if the registration holds [`REVOKED_MAX`] revoked credentials that
+    /// did not end, [`Error::Driver`] if the driver gives no value, and [`Error::Transition`] if the proposal refuses.
     pub fn proposal(
         self,
         registration: &Record,
@@ -1256,35 +1353,43 @@ impl Revocation<'_> {
         let asked = Value::Array(vec![
             workload.to_cbor(),
             match self.target {
-                Target::Credential(serial) => Value::Unsigned(serial.0),
+                Target::Credential(serial, _) => Value::Unsigned(serial.0),
                 Target::All => Value::Null,
             },
         ]);
-        let permit = authz::check(self.by, &Mode::Revoke.action(), &resource(&workload), policy, now)?
-            .permit()
-            .version
-            .clone();
+        let checked = authz::check(self.by, &Mode::Revoke.action(), &resource(&workload), policy, now)?;
         let value = driver.allocate(Kind::Credential)?;
-        revoked.generation = match self.target {
-            // A generation past `value` would end credentials that the driver did not give yet.
-            Target::Credential(serial) => {
-                let end = serial
-                    .0
-                    .checked_add(1)
-                    .filter(|end| *end <= value)
-                    .ok_or(Error::Target)?;
-                revoked.generation.max(Serial(end))
-            }
-            Target::All => Serial(value),
-        };
         let audit = Audit {
             actor: self.by.subject().clone(),
             action: Mode::Revoke.action(),
             time: now,
         };
         let mut proposal = Proposal::new(self.operation, audit, &asked, limits)?;
-        proposal.read(Dependency::Policy(permit))?;
-        revoked.rewrite(&mut proposal, registration, value)?;
+        proposal.read(Dependency::Policy(checked.permit().version.clone()))?;
+        proposal.until(checked.deadline());
+        match self.target {
+            Target::Credential(serial, record) => {
+                // The issuance record names the issuer, the workload, the purpose, and the end of the credential.
+                let issuer = registration.version.owner();
+                let issued = credential::Issued::from_record(&record.data, limits).ok_or(Error::Target)?;
+                let live = now.earliest().is_ok_and(|earliest| earliest < issued.expires);
+                let exact = record.version == version(issuer.clone(), serial.0)
+                    && issued.issuer == *issuer
+                    && issued.subject == Principal::Workload(workload.clone())
+                    && issued.purpose == purpose();
+                (exact && live && !revoked.ended(serial)).ok_or(Error::Target)?;
+                (revoked.revoked.len() < REVOKED_MAX).ok_or(Error::Revocations)?;
+                let at = revoked.revoked.partition_point(|(other, _)| *other < serial);
+                revoked.revoked.insert(at, (serial, issued.expires));
+                let key = credential::record_key(serial);
+                proposal.read(Dependency::Version(key.clone(), record.version.clone()))?;
+                proposal.change(Change::End(key))?;
+            }
+            Target::All => {
+                revoked.generation = Serial(value);
+            }
+        }
+        revoked.rewrite(&mut proposal, registration, value, now)?;
         let plan = Plan {
             replaced: vec![Registration::store_key(&workload)],
             ..Plan::default()
@@ -1322,7 +1427,7 @@ impl IssuerRotation<'_> {
     /// The proposal of the rotation, and the plan of its commit. `issuer` is the current issuer record. The proposal
     /// reads the policy version of the permit and the version of `issuer`, and it writes the issuer record with the
     /// new key. The journal of the store records the end of the earlier version, so a restore from an older snapshot
-    /// ends the issuer record. Submit the proposal with the plan.
+    /// ends the issuer record. Submit the proposal with the plan. Its deadline is the deadline of the checked scope.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify): the check of the new key. The call of `policy` is the
     /// cost of the application.
@@ -1330,7 +1435,8 @@ impl IssuerRotation<'_> {
     /// # Errors
     ///
     /// [`Error::Record`] if `issuer` is not the form of an issuer, [`Error::Key`] if the new key refuses as a trusted
-    /// key, and [`Error::Algorithm`] if it has another algorithm than the current key. [`Error::Overlap`] for
+    /// key, [`Error::Algorithm`] if it has another algorithm than the current key, and [`Error::Unchanged`] if it is
+    /// the current or the previous key. [`Error::Overlap`] for
     /// [`Retire::AfterLifetime`] while the previous key still verifies. [`Error::Refusal`] if the policy refuses,
     /// [`Error::Driver`] if the driver gives no value, and [`Error::Transition`] if the proposal refuses.
     pub fn proposal(
@@ -1345,6 +1451,16 @@ impl IssuerRotation<'_> {
         let issuer = Issuer::from_record(&record.data, limits)?;
         let key = RecordKey::new(self.key)?;
         (key.trusted.algorithm() == issuer.current.trusted.algorithm()).ok_or(Error::Algorithm)?;
+        // The new key must not be a key that the rotation retires or that an earlier rotation retired.
+        let retired = [
+            Some(&issuer.current),
+            issuer.previous.as_ref().map(|(previous, _)| previous),
+        ];
+        (!retired
+            .into_iter()
+            .flatten()
+            .any(|old| old.trusted.kid() == key.trusted.kid()))
+        .ok_or(Error::Unchanged)?;
         let now_whole = Duration::from_secs(now.estimate().as_secs());
         let previous = match self.retire {
             Retire::AfterLifetime => {
@@ -1369,10 +1485,7 @@ impl IssuerRotation<'_> {
             }),
         ]);
         let resource = issuer_resource(&issuer.authority);
-        let permit = authz::check(self.by, &Mode::RotateIssuer.action(), &resource, policy, now)?
-            .permit()
-            .version
-            .clone();
+        let checked = authz::check(self.by, &Mode::RotateIssuer.action(), &resource, policy, now)?;
         let audit = Audit {
             actor: self.by.subject().clone(),
             action: Mode::RotateIssuer.action(),
@@ -1385,7 +1498,8 @@ impl IssuerRotation<'_> {
             ..issuer
         };
         let store_key = Issuer::store_key(&rotated.authority);
-        proposal.read(Dependency::Policy(permit))?;
+        proposal.read(Dependency::Policy(checked.permit().version.clone()))?;
+        proposal.until(checked.deadline());
         proposal.read(Dependency::Version(store_key.clone(), record.version.clone()))?;
         proposal.change(Change::Write {
             key: store_key.clone(),
@@ -1441,14 +1555,23 @@ pub enum Error {
     /// The current credential of a renewal names another workload or another `cnf` key than the registration. Or the
     /// credential of a check names another workload.
     Possession,
-    /// The serial of the credential is below the generation of the registration: a rotation, a recovery, or a
-    /// revocation ended it. An operator issues a new credential.
+    /// The serial of the credential is below the generation of the registration, or a revocation of the credential
+    /// ended it. An operator issues a new credential.
     Revoked,
     /// The store has no registration of the workload. For example, a restore from a snapshot older than a rotation, a
     /// recovery, or a revocation ends the registration. An operator registers the workload again.
     Unregistered,
-    /// The target serial of a revocation is not a serial that the driver gave yet.
+    /// The target of a revocation is not a live credential of the workload from the issuer of the registration: its
+    /// issuance record names another issuer, workload, or purpose, or the credential ended, or a revocation ended it.
     Target,
+    /// The registration holds [`REVOKED_MAX`] revoked credentials that did not end. Revoke all credentials
+    /// ([`Target::All`]), or wait for one of them to end.
+    Revocations,
+    /// The new key is the key that the operation retires: the registered key of a rotation or a recovery, or the
+    /// current or the previous key of an issuer rotation. Give a new key.
+    Unchanged,
+    /// The registration names another issuer than the issuer of the request.
+    Issuer,
     /// The new issuer key has another algorithm than the current key. A new profile needs a new issuer, with its own
     /// authority.
     Algorithm,
@@ -1492,7 +1615,13 @@ impl fmt::Display for Error {
             }
             Self::Revoked => f.write_str("the credential is of an earlier generation of the workload"),
             Self::Unregistered => f.write_str("the store has no registration of the workload"),
-            Self::Target => f.write_str("the revocation names a serial that the driver did not give yet"),
+            Self::Target => f.write_str("the revocation names no live credential of the workload from its issuer"),
+            Self::Revocations => write!(
+                f,
+                "the registration holds {REVOKED_MAX} revoked credentials that did not end"
+            ),
+            Self::Unchanged => f.write_str("the new key is the key that the operation retires"),
+            Self::Issuer => f.write_str("the registration names another issuer"),
             Self::Algorithm => f.write_str("the new issuer key has another algorithm than the current key"),
             Self::Overlap { until } => write!(
                 f,

@@ -32,7 +32,7 @@ use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
 use rsauthnz::local::{self, Authority, Bootstrap, HostGrant};
-use rsauthnz::store::driver::{Answer, Driver, Plan};
+use rsauthnz::store::driver::{Answer, Driver, Effect, Output, Plan};
 use rsauthnz::store::{Kind, Profile, Store as _};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
@@ -61,13 +61,27 @@ fn ready<F: Future>(future: F) -> F::Output {
     .expect("the memory binding does no I/O")
 }
 
-/// Gives each effect of the driver to the memory binding, until the driver waits.
+/// Gives each effect of the driver to the memory binding, until the driver waits. The clock of a commit is a fresh
+/// reading of the system clock.
 fn settle(memory: &mut Memory, driver: &mut Driver) -> Result<(), Failure> {
     while let Some(effect) = driver.effect() {
-        let output = ready(execute(memory, effect));
+        let output = match effect {
+            Effect::Clock => Output::Clock(clock()?),
+            effect => ready(execute(memory, effect)),
+        };
         driver.give(output)?;
     }
     Ok(())
+}
+
+/// A reading of the system clock, with the bound of its time source: here one second.
+fn clock() -> Result<Reading, Failure> {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(Reading::new(
+        since_epoch,
+        Some(Duration::from_secs(1)),
+        ReadingSource::SystemClock,
+    ))
 }
 
 /// The outcome of the commit of `proposal` with `plan`.
@@ -92,9 +106,9 @@ fn artifact(outcome: Outcome) -> Result<Vec<u8>, Failure> {
 /// directory at its end, also after a failure.
 #[expect(clippy::print_stdout, reason = "the example prints each step of its journey")]
 fn journey(dir: PathBuf, mut random: ChaCha20Rng) -> Result<(), Failure> {
-    // A host reads its clock for each request, with the bound of its time source. This journey takes one reading.
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let now = Reading::new(since_epoch, Some(Duration::from_secs(1)), ReadingSource::Caller);
+    // A host reads its clock for each request, with the bound of its time source. This journey takes one reading for
+    // its requests, and a fresh one for each commit.
+    let now = clock()?;
     let limits = Limits::default();
 
     fs::create_dir(&dir)?;

@@ -10,12 +10,12 @@ use rsauthnz::cose::{self, Key, PublicKey, TrustedKey};
 use rsauthnz::credential::{Claims, Draft, Error, Profile, ProofDraft, Serial, Subject};
 use rsauthnz::crypto::{Algorithm, Authentication};
 use rsauthnz::evidence::Method;
-use rsauthnz::id::{AuthorityVersion, Id, Kind, Principal};
+use rsauthnz::id::{Id, Kind, Principal};
 use rsauthnz::limits::{Limits, SignatureBudget};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{self, Store};
 use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Outcome, Prepared, Proposal};
+use rsauthnz::transition::{Audit, OperationId, Outcome, Prepared, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
 use rscrypto::auth::{
@@ -166,9 +166,9 @@ fn ready<F: Future>(future: F) -> F::Output {
     output
 }
 
-/// The bytes of `prepared`, which only the receipt of its accepted transition gives. The transition records the
-/// credential, and the driver commits it on a memory binding.
-fn released(prepared: Prepared) -> Vec<u8> {
+/// The bytes of the credential of `draft`, which `issuer` signs. Only the receipt of its accepted transition gives
+/// them: the transition writes the issuance record of the draft, and the driver commits it on a memory binding.
+fn released(issuer: &Custody, draft: Draft) -> Vec<u8> {
     let mut memory = Memory::new(Schedule::None);
     let profile = store::Profile::new(memory.declaration()).expect("the memory binding has a profile");
     let mut driver = Driver::new(profile, Limits::default()).expect("a driver");
@@ -192,18 +192,10 @@ fn released(prepared: Prepared) -> Vec<u8> {
         Limits::default(),
     )
     .expect("proposal");
-    let record = store::Kind::Credential.key(b"1").expect("key");
-    proposal.read(Dependency::Absent(record.clone())).expect("read");
-    let version = AuthorityVersion::new(id("authority"), &[1]).expect("version");
+    draft.record(&mut proposal).expect("the issuance record");
     proposal
-        .change(Change::Write {
-            key: record,
-            version,
-            end: None,
-            data: Box::new(*b"serial 1"),
-        })
-        .expect("change");
-    proposal.prepare(prepared);
+        .prepare(issuer.finish(draft).expect("credential"))
+        .expect("the proposal writes the issuance record");
     let ticket = driver.submit(proposal, Plan::default()).expect("submit");
     settle(&mut driver);
     match driver.take(ticket) {
@@ -250,7 +242,7 @@ fn claims(audience: &str) -> Claims {
 /// Issues `claims` with the key of `issuer`, with the `cnf` key of `holder`.
 fn issue(issuer: &Custody, claims: &Claims, holder: Option<&Custody>) -> Vec<u8> {
     let draft = Draft::credential(&issuer.key(), claims, holder.map(Custody::public), now()).expect("draft");
-    released(issuer.finish(draft).expect("credential"))
+    released(issuer, draft)
 }
 
 /// The profile of the issuer, the audience, and the purpose of `claims`.

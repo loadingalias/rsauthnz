@@ -3,16 +3,19 @@
 //! [`Evidence`] records the principal, the method, the time, and each property that the
 //! authentication established: user verification, phishing resistance, recovery, a device or
 //! hardware binding of the key, and the authentication of the signature: hybrid, post-quantum, or
-//! classical. It has no strength score, and a recovery never records phishing resistance. Only the
-//! verifiers of this crate make evidence, so a caller cannot mark an unverified claim as proved.
+//! classical. Evidence of a credential also keeps the credential: its verified claims and the digest
+//! of its bytes ([`Artifact`]). It has no strength score, and a recovery never records phishing
+//! resistance. Only the verifiers of this crate make evidence, so a caller cannot mark an unverified
+//! claim as proved.
 
 use alloc::vec;
 use core::fmt;
 use core::time::Duration;
 
 use crate::cbor::Value;
+use crate::credential::{Claims, Serial, Subject};
 use crate::crypto::Authentication;
-use crate::id::{IdError, Principal};
+use crate::id::{Id, IdError, Principal};
 use crate::time::{Reading, ReadingSource};
 
 /// The facts that one authentication proved.
@@ -25,6 +28,30 @@ pub struct Evidence {
     phishing_resistant: bool,
     binding: Option<Binding>,
     authentication: Option<Authentication>,
+    /// The credential of the authentication, or `None` when it used no credential.
+    pub(crate) artifact: Option<Artifact>,
+}
+
+/// The credential that an authentication used: its verified claims and the SHA-256 digest of its exact bytes. The
+/// claims hold the issuer, the audience, the purpose, the serial, the validity interval, and the owner of an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Artifact {
+    pub(crate) claims: Claims,
+    pub(crate) digest: [u8; 32],
+}
+
+impl Artifact {
+    /// The verified claims of the credential.
+    #[must_use]
+    pub const fn claims(&self) -> &Claims {
+        &self.claims
+    }
+
+    /// The SHA-256 digest of the exact bytes of the credential.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
 }
 
 /// How the authentication proved the principal.
@@ -75,6 +102,7 @@ impl Evidence {
             phishing_resistant: phishing_resistant && method != Method::Recovery,
             binding,
             authentication,
+            artifact: None,
         }
     }
 
@@ -130,11 +158,27 @@ impl Evidence {
         self.authentication
     }
 
+    /// The credential of the authentication, or `None` when it used no credential, as for a passkey assertion.
+    #[must_use]
+    pub const fn artifact(&self) -> Option<&Artifact> {
+        self.artifact.as_ref()
+    }
+
+    /// The end of the authority of the evidence, as the time since the Unix epoch: the end of its credential, or
+    /// `None` for evidence with no credential. A check of the evidence is not valid at this time and after it.
+    #[must_use]
+    pub fn expires(&self) -> Option<Duration> {
+        self.artifact.as_ref().map(|artifact| artifact.claims.expires)
+    }
+
     /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
-    /// resistant, binding, authentication]`. The method, the binding, and the authentication are
-    /// numbers, with `null` for no binding and for no authentication. The time is `[estimate, bound,
-    /// source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the bound in the same
-    /// form or `null` when it is unknown, and the source as a number.
+    /// resistant, binding, authentication, artifact]`. The method, the binding, and the
+    /// authentication are numbers, with `null` for no binding and for no authentication. The time is
+    /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
+    /// bound in the same form or `null` when it is unknown, and the source as a number. The artifact
+    /// is `null`, or `[issuer, audience, subject, owner, purpose, serial, not before, expires,
+    /// digest]`, with `null` for no owner and for no start, and each time as `[seconds,
+    /// nanoseconds]`.
     #[must_use]
     pub fn to_cbor(&self) -> Value<'_> {
         Value::Array(vec![
@@ -160,6 +204,25 @@ impl Evidence {
                 Some(Authentication::PostQuantum) => Value::Unsigned(2),
                 Some(Authentication::Classical) => Value::Unsigned(3),
             },
+            self.artifact
+                .as_ref()
+                .map_or(Value::Null, |Artifact { claims, digest }| {
+                    let owner = match &claims.subject {
+                        Subject::Agent { owner, .. } => owner.to_cbor(),
+                        Subject::Human(_) | Subject::Workload(_) => Value::Null,
+                    };
+                    Value::Array(vec![
+                        claims.issuer.to_cbor(),
+                        claims.audience.to_cbor(),
+                        claims.subject.to_cbor(),
+                        owner,
+                        claims.purpose.to_cbor(),
+                        Value::Unsigned(claims.serial.0),
+                        claims.not_before.map_or(Value::Null, duration_to_cbor),
+                        duration_to_cbor(claims.expires),
+                        Value::Bytes(digest),
+                    ])
+                }),
         ])
     }
 
@@ -189,6 +252,7 @@ impl Evidence {
             Value::Bool(phishing_resistant),
             binding,
             authentication,
+            artifact,
         ] = items.as_slice()
         else {
             return Err(EvidenceError::Form);
@@ -225,8 +289,58 @@ impl Evidence {
             phishing_resistant: *phishing_resistant,
             binding,
             authentication,
+            artifact: match artifact {
+                Value::Null => None,
+                artifact => Some(artifact_from_cbor(artifact).ok_or(EvidenceError::Form)?),
+            },
         })
     }
+}
+
+/// Reads the form of an artifact of [`Evidence::to_cbor`].
+fn artifact_from_cbor(value: &Value<'_>) -> Option<Artifact> {
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let [
+        issuer,
+        audience,
+        subject,
+        owner,
+        purpose,
+        Value::Unsigned(serial),
+        not_before,
+        expires,
+        Value::Bytes(digest),
+    ] = items.as_slice()
+    else {
+        return None;
+    };
+    let subject = match (Principal::from_cbor(subject).ok()?, owner) {
+        (Principal::Human(human), Value::Null) => Subject::Human(human),
+        (Principal::Workload(workload), Value::Null) => Subject::Workload(workload),
+        (Principal::Agent(agent), owner) => Subject::Agent {
+            agent,
+            owner: Id::from_cbor(owner).ok()?,
+        },
+        _ => return None,
+    };
+    let mut claims = Claims::new(
+        Id::from_cbor(issuer).ok()?,
+        Id::from_cbor(audience).ok()?,
+        subject,
+        Id::from_cbor(purpose).ok()?,
+        Serial(*serial),
+        duration_from_cbor(expires)?,
+    );
+    claims.not_before = match not_before {
+        Value::Null => None,
+        not_before => Some(duration_from_cbor(not_before)?),
+    };
+    Some(Artifact {
+        claims,
+        digest: (*digest).try_into().ok()?,
+    })
 }
 
 /// The cause of refused evidence.

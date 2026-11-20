@@ -82,7 +82,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 
 | `Kind` | Record | `consumption()` |
 | --- | --- | --- |
-| `Credential` | A passkey, a CLI credential, or the credential of a workload or an agent | `None` |
+| `Credential` | A passkey, or the issuance record of a credential or a receipt of the format: the record of its serial ([Issue a credential](credential-format.md#issue-a-credential)) | `None` |
 | `ProviderLink` | The link of an account to the subject of an external identity provider | `None` |
 | `Registration` | A pending passkey registration ceremony | `Pays::Anchor` |
 | `SignIn` | A pending sign-in challenge, or the challenge of the next call of a [CLI](cli.md) | `Pays::Nothing` |
@@ -92,7 +92,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Session` | A session family and its current generation | `None` |
 | `Recovery` | A recovery value | `Pays::Anchor` |
 | `Bootstrap` | A bootstrap value of an authority | `Pays::Anchor` |
-| `Administrator` | An administrator binding of an authority | `None` |
+| `Administrator` | An administrator binding of an authority. It ends with its CLI credential, so expiry removes it | `None` |
 | `Agent` | An agent identity | `None` |
 | `Grant` | A grant and its current revision | `None` |
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
@@ -162,12 +162,13 @@ still owes. A worker skips it.
 ## Range reads
 
 A range read gives the records of one key prefix in key order. It reads only the keys of the prefix, so an ordered
-index serves it without a scan of other records. The core reads two prefixes:
+index serves it without a scan of other records. The core reads three prefixes:
 
 | Prefix | Records | Reader |
 | --- | --- | --- |
 | `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each start, and a worker after a crash |
-| The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md) |
+| The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md), and its open after a restore lost its record |
+| That prefix and the SHA-256 digest of the authority and an administrator: 65 bytes | The bindings of the administrator | The bootstrap, the challenge, and the recovery of a credential of a [local authority](local-authority.md) |
 
 A store that partitions its keys can use the first 33 bytes of a key as its partition key. A shorter key is its own
 partition key. Then each range read of the core reads one partition.

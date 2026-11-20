@@ -94,6 +94,8 @@ let version = AuthorityVersion::new(owner, &7_u64.to_be_bytes())?;
 | Recovery | `recovery()` |
 | A device or hardware binding of the key | `binding()` |
 | The authentication of the signature: `Hybrid`, `PostQuantum`, or `Classical` (`crypto::Authentication`), or `None` when rsauthnz verified no signature | `authentication()` |
+| The credential of the authentication: its verified claims, with the issuer, the audience, the purpose, the serial, the validity interval, and the owner of an agent, and the SHA-256 digest of its bytes (`evidence::Artifact`), or `None` with no credential | `artifact()` |
+| The end of the credential, after which the evidence gives no authority | `expires()` |
 
 A `Classical` authentication gives no post-quantum guarantee. Post-quantum key exchange is a separate
 guarantee of the transport, and the evidence does not record it. Evidence has no strength score. A recovery never records phishing resistance. Only the verifiers of
@@ -115,7 +117,7 @@ type except `Evidence`, which only rsauthnz reads:
 | `Id<K>` | `[kind, namespace, value]`. The kinds are numbers: human 1, workload 2, agent 3, authority 4, tenant 5, action 6, resource 7, audience 8, purpose 9 |
 | `Principal` | The form of its identifier |
 | `AuthorityVersion` | `[owner, coordinate]`, with the coordinate as a byte string |
-| `Evidence` | `[subject, method, time, user verified, phishing resistant, binding, authentication]`. The authentication is hybrid 1, post-quantum 2, classical 3, or `null` |
+| `Evidence` | `[subject, method, time, user verified, phishing resistant, binding, authentication, artifact]`. The authentication is hybrid 1, post-quantum 2, classical 3, or `null`. The artifact is `null`, or `[issuer, audience, subject, owner, purpose, serial, not before, expires, digest]`, with `null` for no owner and for no start |
 
 A form of another kind refuses: for example, the form of an `Id<Agent>` does not read as an
 `Id<Human>`.

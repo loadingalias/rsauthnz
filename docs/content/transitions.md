@@ -20,8 +20,11 @@ commit that a storage binding implements.
 3. Add each state change with `proposal.change(change)`. A read of the proposal must allow it.
 4. Add each notification, signer, or provider call that must survive a crash with `proposal.intend(intent)`.
 5. Set a prepared artifact, for example the credential that `credential::Draft::finish` gives, with
-   `proposal.prepare(prepared)`. A `Prepared` value has no accessor of its bytes. Only the receipt of the accepted
-   commit gives them, with `receipt.artifact()`.
+   `proposal.prepare(prepared)?`. A `Prepared` value names its issuance record, and the proposal must already write
+   that record at its version, for example with `draft.record(&mut proposal)`. A `Prepared` value has no accessor of
+   its bytes. Only the receipt of the accepted commit gives them, with `receipt.artifact()`.
+6. Set the deadline of the authority that the decision read, if it has one: `proposal.until(deadline)`. The
+   proposal keeps its earliest deadline ([Deadlines](#deadlines)).
 
 This example is also the example of the `rsauthnz::transition` module documentation, and `cargo xtask test` runs
 it. The decision consumes an invitation and creates a credential:
@@ -128,7 +131,17 @@ Never submit the request of an unknown outcome as a new operation. The first att
 new operation can, for example, issue a second grant. A lookup of the same identity gives the first commit.
 
 `receipt.artifact()` gives the prepared artifact. Only the acceptance of the exact proposal releases it: a
-proposal has no accessor for it. The store never keeps the artifact, so the receipt of a lookup has none.
+proposal has no accessor for it, and only a proposal that writes its issuance record takes it. The store never keeps
+the artifact, so the receipt of a lookup has none.
+
+## Deadlines
+
+A decision can read authority with an end: a one-use value, a challenge, the credential of evidence, or a checked
+scope (`authz::Checked::deadline`). `proposal.until(deadline)` gives the proposal that end. The commit driver asks
+the executor for a fresh reading of the clock just before the commit (`Effect::Clock`, [The commit driver](restore.md#the-commit-driver)).
+When the reading can be at or after the deadline, or has no bound, the commit does not run: the outcome is
+`Refused(Error::Expired)`, and the driver voids the end entry of the proposal before the answer. A proposal with no
+deadline gets no clock effect.
 
 ## Effect intents
 
@@ -161,6 +174,8 @@ Each `rsauthnz::transition::Error` is a small `Copy` value with no secret. `erro
 | `Change` | No read of the proposal allows the change, or another change names its record | `Refuse` |
 | `Reuse` | The operation identity has the outcome record of another request | `Refuse` |
 | `LastAnchor` | The change ends the last sign-in method of an account, or the last administrator binding, that the restore journal records as live | `Refuse` |
+| `Prepared` | The proposal has an artifact, or no change writes the issuance record of the artifact at its version | `Refuse` |
+| `Expired` | The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound. Nothing committed | `Refuse` |
 
 ## Limits
 

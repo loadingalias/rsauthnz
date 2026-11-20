@@ -35,21 +35,20 @@
 //! use rsauthnz::credential::{Claims, Draft, Profile, ProofDraft, Serial, Subject};
 //! use rsauthnz::crypto::Algorithm;
 //! use rsauthnz::evidence::Method;
-//! # use rsauthnz::id::{AuthorityVersion, Principal};
+//! # use rsauthnz::id::Principal;
 //! use rsauthnz::id::Id;
 //! use rsauthnz::limits::{Limits, SignatureBudget};
 //! # use rsauthnz::store::driver::{Answer, Driver, Plan};
-//! # use rsauthnz::store::{self, Kind, Store};
+//! # use rsauthnz::store::{self, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
-//! use rsauthnz::transition::Prepared;
-//! # use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Outcome, Proposal};
+//! # use rsauthnz::transition::{Audit, OperationId, Outcome, Prepared, Proposal};
 //! # use rsauthnz_conformance::memory::{Memory, Schedule};
 //! # use rsauthnz_conformance::suite::execute;
 //! use rscrypto::auth::MlDsa65Ed25519;
 //!
 //! # type Failure = Box<dyn core::error::Error>;
-//! # /// Commits the issuance transition, which carries `prepared`, with the driver on a memory binding.
-//! # fn issue(prepared: Prepared, now: Reading) -> Result<Vec<u8>, Failure> {
+//! # /// Commits the issuance transition of `draft`, which carries its artifact, with the driver on a memory binding.
+//! # fn issue(draft: Draft, signature: &[u8], now: Reading) -> Result<Vec<u8>, Failure> {
 //! #     fn ready<F: Future>(future: F) -> F::Output {
 //! #         let Poll::Ready(output) = pin!(future).poll(&mut Context::from_waker(Waker::noop())) else {
 //! #             unreachable!("the memory binding does no I/O")
@@ -73,11 +72,9 @@
 //! #         time: now,
 //! #     };
 //! #     let mut proposal = Proposal::new(OperationId::new(b"issue-1")?, audit, &Value::Null, Limits::default())?;
-//! #     let record = Kind::Credential.key(b"1")?;
-//! #     proposal.read(Dependency::Absent(record.clone()))?;
-//! #     let version = AuthorityVersion::new(Id::new("acme", "authority")?, &[1])?;
-//! #     proposal.change(Change::Write { key: record, version, end: None, data: Box::new(*b"serial 1") })?;
-//! #     proposal.prepare(prepared);
+//! #     draft.record(&mut proposal)?;
+//! #     let prepared: Prepared = draft.finish(signature, &mut SignatureBudget::new(&Limits::default()))?;
+//! #     proposal.prepare(prepared)?;
 //! #     let ticket = driver.submit(proposal, Plan::default())?;
 //! #     settle(&mut driver)?;
 //! #     match driver.take(ticket) {
@@ -100,7 +97,8 @@
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //!
 //! // 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the
-//! // prepared artifact. The issuance transition carries it, and only the receipt of its commit gives the bytes.
+//! // prepared artifact. The issuance transition writes the issuance record of the draft and carries the artifact,
+//! // and only the receipt of its commit gives the bytes.
 //! let claims = Claims::new(
 //!     Id::new("acme", "authority")?,
 //!     Id::new("acme", "build-api")?,
@@ -111,8 +109,7 @@
 //! );
 //! let draft = Draft::credential(&issuer_key, &claims, Some(PublicKey::MlDsa65Ed25519(&holder_public)), now)?;
 //! let signature = issuer_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
-//! let prepared: Prepared = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
-//! let credential = issue(prepared, now)?;
+//! let credential = issue(draft, signature.as_bytes(), now)?;
 //!
 //! // 2. The verifier fixes the issuer, the audience, and the purpose, and verifies the credential.
 //! let (issuer, audience, purpose) = (claims.issuer.clone(), claims.audience.clone(), claims.purpose.clone());
@@ -142,13 +139,14 @@ use core::fmt;
 use core::time::Duration;
 
 use crate::cbor::{self, Value};
-use crate::cose::{self, Confirmation, Key, PublicKey, Sign1, TrustedKey};
+use crate::cose::{self, Confirmation, Key as CoseKey, PublicKey, Sign1, TrustedKey};
 use crate::crypto::{self, Algorithm, Authentication, Report};
-use crate::evidence::{Evidence, Method};
-use crate::id::{Agent, Audience, Authority, Human, Id, Principal, Purpose, Workload};
+use crate::evidence::{Artifact, Evidence, Method};
+use crate::id::{Agent, Audience, Authority, AuthorityVersion, Human, Id, Principal, Purpose, Workload};
 use crate::limits::{Limits, SignatureBudget};
+use crate::store::Kind;
 use crate::time::Reading;
-use crate::transition::Prepared;
+use crate::transition::{self, Change, Dependency, Key, Prepared, Proposal};
 
 /// The most bytes of an encoded credential, receipt, or proof. A draft that can be longer refuses before custody signs
 /// it, and verification refuses a longer input before it decodes it.
@@ -161,6 +159,9 @@ const SIGNATURE_BYTES_MAX: usize = 3_381;
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
 const SIGN1_TAG: u64 = 18;
+
+/// The first item of the CBOR form of an issuance record ([`Draft::record`]). Its number changes with the form.
+const RECORD_FORM: &str = "rsauthnz.credential.record.1";
 
 // The claim keys of this format are in the private-use range of RFC 8392 section 9.1, which is less than -65536.
 // Each constant is the `n` of `Value::Negative(n)`, which is the key `-1 - n`.
@@ -251,7 +252,7 @@ impl Subject {
     }
 
     /// The canonical CBOR form of the principal.
-    fn to_cbor(&self) -> Value<'_> {
+    pub(crate) fn to_cbor(&self) -> Value<'_> {
         match self {
             Self::Human(human) => human.to_cbor(),
             Self::Workload(workload) => workload.to_cbor(),
@@ -266,15 +267,83 @@ impl Subject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Serial(pub u64);
 
-/// A credential or a receipt that custody did not sign yet. [`Draft::finish`] consumes it, so one draft gives at most
-/// one artifact. [`ProofDraft`] is the draft of a proof.
-pub struct Draft {
+/// The key of the issuance record of the artifact with the serial `serial`: [`Kind::Credential`] with the 8 bytes of
+/// the serial, the most significant byte first. The transition that issues an artifact writes it
+/// ([`Draft::record`]), so one serial gives at most one artifact.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn record_key(serial: Serial) -> Key {
+    Kind::Credential
+        .key(&serial.0.to_be_bytes())
+        .expect("a key of 9 bytes is valid")
+}
+
+/// The issuance record of an artifact: the record that the transition that issues it writes.
+#[derive(Clone, PartialEq, Eq)]
+struct Issuance {
+    key: Key,
+    version: AuthorityVersion,
+    end: Duration,
+    data: Box<[u8]>,
+}
+
+/// The fields of an issuance record that a check reads: the issuer, the subject, the audience, the purpose, and the
+/// end of the artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Issued {
+    pub(crate) issuer: Id<Authority>,
+    pub(crate) subject: Principal,
+    pub(crate) audience: Id<Audience>,
+    pub(crate) purpose: Id<Purpose>,
+    pub(crate) expires: Duration,
+}
+
+impl Issued {
+    /// Reads the record form `data` of an issuance record ([`Draft::record`]) within `limits`, or `None` for another
+    /// form.
+    pub(crate) fn from_record(data: &[u8], limits: Limits) -> Option<Self> {
+        let value = cbor::decode(data, limits).ok()?;
+        let Value::Array(items) = &value else {
+            return None;
+        };
+        let [
+            Value::Text(RECORD_FORM),
+            issuer,
+            subject,
+            audience,
+            purpose,
+            Value::Unsigned(expires),
+        ] = items.as_slice()
+        else {
+            return None;
+        };
+        Some(Self {
+            issuer: Id::from_cbor(issuer).ok()?,
+            subject: Principal::from_cbor(subject).ok()?,
+            audience: Id::from_cbor(audience).ok()?,
+            purpose: Id::from_cbor(purpose).ok()?,
+            expires: Duration::from_secs(*expires),
+        })
+    }
+}
+
+/// The bytes that a key signs, before the signature: the encoded protected bucket and the encoded claims.
+#[derive(Clone)]
+pub(crate) struct Unsigned {
     /// The public key of the signer.
     key: TrustedKey,
     /// The encoded protected bucket: `alg`, and the `kid` of the issuer key for a credential or a receipt.
     protected: Vec<u8>,
     /// The encoded claims.
     payload: Vec<u8>,
+}
+
+/// A credential or a receipt that custody did not sign yet. [`Draft::finish`] consumes it, so one draft gives at most
+/// one artifact. [`ProofDraft`] is the draft of a proof.
+pub struct Draft {
+    unsigned: Unsigned,
+    issuance: Issuance,
 }
 
 impl Draft {
@@ -333,7 +402,7 @@ impl Draft {
             // A key whose P-256 point is not on the curve refuses here, before custody signs.
             TrustedKey::new(
                 confirmation_algorithm(key.algorithm(), &public)?,
-                &Key {
+                &CoseKey {
                     kid: None,
                     alg: None,
                     public,
@@ -343,11 +412,95 @@ impl Draft {
             entries.push((Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(1), cnf)])));
         }
         let payload = cbor::encode(&Value::Map(entries)).expect("the claims have distinct keys and no simple value");
-        Self::new(key, payload, Some(key.kid()))
+        let data = cbor::encode(&Value::Array(vec![
+            Value::Text(RECORD_FORM),
+            claims.issuer.to_cbor(),
+            claims.subject.to_cbor(),
+            claims.audience.to_cbor(),
+            claims.purpose.to_cbor(),
+            Value::Unsigned(expires),
+        ]))
+        .expect("the form has no map and no simple value");
+        let issuance = Issuance {
+            key: record_key(claims.serial),
+            version: AuthorityVersion::new(claims.issuer.clone(), &serial).expect("an 8-byte coordinate is valid"),
+            end: Duration::from_secs(expires),
+            data: data.into_boxed_slice(),
+        };
+        Ok(Self {
+            unsigned: Unsigned::new(key, payload, Some(key.kid()))?,
+            issuance,
+        })
     }
 
-    /// The draft of the encoded claims `payload` that `key` signs. The protected bucket holds `alg`, and `kid` when
-    /// `kid` is not `None`.
+    /// Adds the issuance record of the artifact to `proposal`: the absence of the record of its serial
+    /// ([`record_key`]), and its write. The record holds no signature. Its version is the issuer of the claims and the
+    /// serial, and it ends when the artifact ends. Its record form is the canonical CBOR array
+    /// `["rsauthnz.credential.record.1", issuer, subject, audience, purpose, expires]`. Add it before
+    /// [`Proposal::prepare`] of the artifact of [`Self::finish`]: thus one serial gives one artifact, and the artifact
+    /// commits only with its own issuance.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Proposal::read`] and [`Proposal::change`].
+    pub fn record(&self, proposal: &mut Proposal) -> Result<(), transition::Error> {
+        let Issuance {
+            key,
+            version,
+            end,
+            data,
+        } = self.issuance.clone();
+        proposal.read(Dependency::Absent(key.clone()))?;
+        proposal.change(Change::Write {
+            key,
+            version,
+            end: Some(end),
+            data,
+        })
+    }
+
+    /// The bytes that custody signs: the `Sig_structure` of RFC 9052 section 4.4, with an empty external AAD. Custody
+    /// signs them with the algorithm of the key. ML-DSA-65 and the composites use the empty context.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn to_be_signed(&self) -> Vec<u8> {
+        self.unsigned.to_be_signed()
+    }
+
+    /// Verifies `signature`, the signature of custody over [`Self::to_be_signed`], with the key of the draft. Then it
+    /// gives the encoded artifact as a [`Prepared`] artifact: a `COSE_Sign1` with the tag 18 and an empty unprotected
+    /// bucket. Give it to [`Proposal::prepare`] of the transition that writes its issuance record ([`Self::record`]).
+    /// Only the receipt of the accepted transition gives its bytes, so a credential never gives authority before its
+    /// commit. The check charges `budget`, the budget of the artifact. A refusal gives no artifact.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cose`] with [`cose::Error::Signature`] if the signature does not verify with the key of the draft, for
+    /// example because custody signed with another key. [`Error::Cose`] with [`cose::Error::Limit`] if the check
+    /// costs more than `budget` has.
+    pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Prepared, Error> {
+        let artifact = self.unsigned.sign(signature, budget)?;
+        Ok(Prepared::new(
+            artifact.into_boxed_slice(),
+            self.issuance.key,
+            self.issuance.version,
+        ))
+    }
+
+    /// The bytes that custody signs, before the signature, for a record that keeps the artifact without its signature.
+    pub(crate) const fn unsigned(&self) -> &Unsigned {
+        &self.unsigned
+    }
+}
+
+impl Unsigned {
+    /// The unsigned bytes of the encoded claims `payload` that `key` signs. The protected bucket holds `alg`, and `kid`
+    /// when `kid` is not `None`.
     fn new(key: &TrustedKey, payload: Vec<u8>, kid: Option<&[u8; 32]>) -> Result<Self, Error> {
         class(key.algorithm())?;
         let alg = cose::alg(key.algorithm()).ok_or(Error::Profile)?;
@@ -367,35 +520,34 @@ impl Draft {
         })
     }
 
-    /// The bytes that custody signs: the `Sig_structure` of RFC 9052 section 4.4, with an empty external AAD. Custody
-    /// signs them with the algorithm of the key. ML-DSA-65 and the composites use the empty context.
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    #[must_use]
-    pub fn to_be_signed(&self) -> Vec<u8> {
+    /// The unsigned bytes that a record keeps: the encoded protected bucket and the encoded claims, which `key` signs.
+    /// The record that keeps them is the record of this crate, so the bytes are the bytes of an earlier draft.
+    pub(crate) fn from_parts(key: TrustedKey, protected: &[u8], payload: &[u8]) -> Self {
+        Self {
+            key,
+            protected: protected.to_vec(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// The encoded protected bucket.
+    pub(crate) fn protected(&self) -> &[u8] {
+        &self.protected
+    }
+
+    /// The encoded claims.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// The `Sig_structure` that the key signs.
+    pub(crate) fn to_be_signed(&self) -> Vec<u8> {
         cose::to_be_signed(&self.protected, &self.payload)
     }
 
-    /// Verifies `signature`, the signature of custody over [`Self::to_be_signed`], with the key of the draft. Then it
-    /// gives the encoded artifact as a [`Prepared`] artifact: a `COSE_Sign1` with the tag 18 and an empty unprotected
-    /// bucket. Give it to [`Proposal::prepare`](crate::transition::Proposal::prepare) of the transition that issues
-    /// it. Only the receipt of the accepted transition gives its bytes, so a credential never gives authority before
-    /// its commit. The check charges `budget`, the budget of the artifact. A refusal gives no artifact.
-    ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Cose`] with [`cose::Error::Signature`] if the signature does not verify with the key of the draft, for
-    /// example because custody signed with another key. [`Error::Cose`] with [`cose::Error::Limit`] if the check
-    /// costs more than `budget` has.
-    pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Prepared, Error> {
-        self.sign(signature, budget)
-            .map(|artifact| Prepared::new(artifact.into_boxed_slice()))
-    }
-
-    /// The encoded `COSE_Sign1` of the draft and `signature`, after the check of [`Self::finish`].
-    fn sign(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
+    /// The encoded `COSE_Sign1` of the unsigned bytes and `signature`, after a check of `signature` with the key that
+    /// charges `budget`.
+    pub(crate) fn sign(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
         self.key.verify(&self.to_be_signed(), signature, budget)?;
         let artifact = cbor::encode(&Value::Tag(
             SIGN1_TAG,
@@ -416,9 +568,9 @@ impl Draft {
 }
 
 // The payload can hold a bearer receipt. Thus the output shows the algorithm and only the length of each part.
-impl fmt::Debug for Draft {
+impl fmt::Debug for Unsigned {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Draft")
+        f.debug_struct("Unsigned")
             .field("key", &self.key)
             .field("protected_len", &self.protected.len())
             .field("payload_len", &self.payload.len())
@@ -426,10 +578,19 @@ impl fmt::Debug for Draft {
     }
 }
 
+impl fmt::Debug for Draft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Draft")
+            .field("unsigned", &self.unsigned)
+            .field("record", &self.issuance.key)
+            .finish()
+    }
+}
+
 /// A proof of possession that the holder key did not sign yet. A proof gives no authority, so [`ProofDraft::finish`]
 /// gives its bytes at once. [`ProofDraft::finish`] consumes the draft, so one draft gives at most one proof.
 #[derive(Debug)]
-pub struct ProofDraft(Draft);
+pub struct ProofDraft(Unsigned);
 
 impl ProofDraft {
     /// The draft of a proof of possession that the holder key `key`, the `cnf` key of `credential`, signs. The proof
@@ -458,7 +619,7 @@ impl ProofDraft {
             (Value::Negative(PROOF_CHALLENGE), Value::Bytes(challenge)),
         ]))
         .expect("the claims have distinct keys and no simple value");
-        Draft::new(key, payload, None).map(Self)
+        Unsigned::new(key, payload, None).map(Self)
     }
 
     /// The bytes that custody signs with the holder key, as [`Draft::to_be_signed`] gives them.
@@ -708,8 +869,11 @@ impl<'a> Verified<'a, '_> {
     ///
     /// The challenge makes the proof fresh. Issue each challenge for one proof, and consume it in the transition that
     /// uses the evidence. The evidence records the subject, [`Method::KeyPossession`], `now`, and the
-    /// [`Authentication`] of the `cnf` key. It records no user verification, no phishing resistance, and no device or
-    /// hardware binding, because the proof does not show them.
+    /// [`Authentication`] of the `cnf` key. It also keeps the credential ([`Evidence::artifact`]): its verified claims,
+    /// with the issuer, the audience, the purpose, the serial, the end, and the owner of an agent, and the SHA-256
+    /// digest of its bytes. Thus a check of the evidence ends with the credential ([`authz::check`](crate::authz::check)).
+    /// It records no user verification, no phishing resistance, and no device or hardware binding, because the proof
+    /// does not show them.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -740,7 +904,7 @@ impl<'a> Verified<'a, '_> {
             cose.limits,
             budget,
         )?;
-        Ok(Evidence::new(
+        let mut evidence = Evidence::new(
             self.claims.subject.principal(),
             Method::KeyPossession,
             now,
@@ -748,7 +912,12 @@ impl<'a> Verified<'a, '_> {
             false,
             None,
             Some(key.algorithm().report().authentication),
-        ))
+        );
+        evidence.artifact = Some(Artifact {
+            claims: self.claims.clone(),
+            digest: crypto::sha256(self.artifact),
+        });
+        Ok(evidence)
     }
 }
 

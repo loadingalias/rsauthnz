@@ -126,7 +126,9 @@ pub struct Requirements {
 /// [`Refusal::Denied`] if the policy gives no permit, and [`Refusal::Scope`] if the permit names another principal,
 /// action, or resource. [`Refusal::Stale`] if the permit is not of the current policy version, and
 /// [`Refusal::Requirements`] if the evidence does not meet its requirements. [`Refusal::Expired`] if `now` permits a
-/// time at or after the deadline, and [`Refusal::Time`] if `now` or the time of the evidence has no known bound.
+/// time at or after the deadline, and [`Refusal::Time`] if `now` or the time of the evidence has no known bound. The
+/// deadline is the earliest of the end of the permit, the end of the maximum age of the evidence, and the end of the
+/// credential of the evidence ([`Evidence::expires`]).
 pub fn check(
     evidence: &Evidence,
     action: &Id<Action>,
@@ -149,12 +151,14 @@ pub fn check(
     {
         return Err(Refusal::Requirements);
     }
-    // A sum past the last representable time is no bound, so the end of the permit is the deadline.
+    // A sum past the last representable time is no bound, so the end of the permit is the deadline. The evidence of a
+    // credential gives no authority after the credential ends.
     let deadline = evidence
         .time()
         .earliest()?
         .checked_add(requires.max_age)
         .map_or(permit.expires, |end| end.min(permit.expires));
+    let deadline = evidence.expires().map_or(deadline, |end| end.min(deadline));
     let checked = Checked {
         evidence: evidence.clone(),
         permit,
@@ -208,8 +212,10 @@ impl Checked {
         &self.permit
     }
 
-    /// The deadline: the earlier of the end of the permit and the end of the maximum age of the evidence. The scope
-    /// is not valid at this time and after it.
+    /// The deadline: the earliest of the end of the permit, the end of the maximum age of the evidence, and the end of
+    /// the credential of the evidence. The scope is not valid at this time and after it. A transition that the scope
+    /// permits carries it as its deadline ([`Proposal::until`](crate::transition::Proposal::until)), so its commit
+    /// refuses after it.
     #[must_use]
     pub const fn deadline(&self) -> Duration {
         self.deadline
