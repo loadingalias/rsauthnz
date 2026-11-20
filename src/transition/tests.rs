@@ -8,8 +8,8 @@ use core::cell::RefCell;
 use core::time::Duration;
 
 use super::{
-    Audit, Change, Dependency, Effect, Ended, Error, Intent, Key, Operation, OperationId, Outcome, Proposal, Recovery,
-    State,
+    Audit, Change, Dependency, Effect, Ended, Error, Intent, Key, Operation, OperationId, Outcome, Prepared, Proposal,
+    Recovery, State,
 };
 use crate::authz::{self, Permit, Policy, Request, Requirements};
 use crate::cbor::Value;
@@ -343,7 +343,7 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
         })
         .unwrap();
     proposal.intend(Intent::new(Effect::Provider, SECRET.into())).unwrap();
-    proposal.prepare(SECRET.into());
+    proposal.prepare(Prepared::new(SECRET.into()));
 
     let operation = proposal.operation().clone();
     let shown = format!("{proposal:?}");

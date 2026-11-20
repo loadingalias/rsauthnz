@@ -1,16 +1,23 @@
 //! The contracts of the library-issued credential format: issuance in two steps, verification for one issuer,
 //! audience, purpose, and declared profile, the declared size bound, and proof of possession by the `cnf` key.
 
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cose::{self, Key, PublicKey, TrustedKey};
-use rsauthnz::credential::{Claims, Draft, Error, Profile, Serial, Subject};
+use rsauthnz::credential::{Claims, Draft, Error, Profile, ProofDraft, Serial, Subject};
 use rsauthnz::crypto::{Algorithm, Authentication};
 use rsauthnz::evidence::Method;
-use rsauthnz::id::{Id, Kind, Principal};
+use rsauthnz::id::{AuthorityVersion, Id, Kind, Principal};
 use rsauthnz::limits::{Limits, SignatureBudget};
+use rsauthnz::store::driver::{Answer, Driver, Plan};
+use rsauthnz::store::{self, Store};
 use rsauthnz::time::{Reading, ReadingSource};
+use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Outcome, Prepared, Proposal};
+use rsauthnz_conformance::memory::{Memory, Schedule};
+use rsauthnz_conformance::suite::execute;
 use rscrypto::auth::{
     CompositeMlDsaError, EcdsaP256SecretKey, Ed25519SecretKey, MlDsa65EcdsaP256, MlDsa65EcdsaP256SecretKey,
     MlDsa65Ed25519, MlDsa65Ed25519SecretKey, MlDsa65SecretKey, MlDsa65Seed,
@@ -139,9 +146,69 @@ impl Custody {
     }
 
     /// Signs `draft` with this key, and finishes it.
-    fn finish(&self, draft: Draft) -> Result<Vec<u8>, Error> {
+    fn finish(&self, draft: Draft) -> Result<Prepared, Error> {
         let signature = self.sign(&draft.to_be_signed());
         draft.finish(&signature, &mut budget())
+    }
+
+    /// Signs the proof `draft` with this key, and finishes it.
+    fn finish_proof(&self, draft: ProofDraft) -> Result<Vec<u8>, Error> {
+        let signature = self.sign(&draft.to_be_signed());
+        draft.finish(&signature, &mut budget())
+    }
+}
+
+/// The output of a future of the memory binding, which does no I/O.
+fn ready<F: Future>(future: F) -> F::Output {
+    let Poll::Ready(output) = pin!(future).poll(&mut Context::from_waker(Waker::noop())) else {
+        panic!("the memory binding does no I/O")
+    };
+    output
+}
+
+/// The bytes of `prepared`, which only the receipt of its accepted transition gives. The transition records the
+/// credential, and the driver commits it on a memory binding.
+fn released(prepared: Prepared) -> Vec<u8> {
+    let mut memory = Memory::new(Schedule::None);
+    let profile = store::Profile::new(memory.declaration()).expect("the memory binding has a profile");
+    let mut driver = Driver::new(profile, Limits::default()).expect("a driver");
+    let mut settle = |driver: &mut Driver| {
+        while let Some(effect) = driver.effect() {
+            let output = ready(execute(&mut memory, effect));
+            driver.give(output).expect("an output of the binding");
+        }
+    };
+    driver.start(now());
+    settle(&mut driver);
+    let audit = Audit {
+        actor: Principal::Human(id("u-17")),
+        action: Id::new("acme.auth", "credential.issue").expect("identifier"),
+        time: now(),
+    };
+    let mut proposal = Proposal::new(
+        OperationId::new(b"issue-1").expect("identity"),
+        audit,
+        &Value::Null,
+        Limits::default(),
+    )
+    .expect("proposal");
+    let record = store::Kind::Credential.key(b"1").expect("key");
+    proposal.read(Dependency::Absent(record.clone())).expect("read");
+    let version = AuthorityVersion::new(id("authority"), &[1]).expect("version");
+    proposal
+        .change(Change::Write {
+            key: record,
+            version,
+            end: None,
+            data: Box::new(*b"serial 1"),
+        })
+        .expect("change");
+    proposal.prepare(prepared);
+    let ticket = driver.submit(proposal, Plan::default()).expect("submit");
+    settle(&mut driver);
+    match driver.take(ticket) {
+        Some(Answer::Outcome(Outcome::Accepted(receipt))) => receipt.artifact().expect("the artifact").to_vec(),
+        answer => panic!("the issuance did not commit: {answer:?}"),
     }
 }
 
@@ -183,7 +250,7 @@ fn claims(audience: &str) -> Claims {
 /// Issues `claims` with the key of `issuer`, with the `cnf` key of `holder`.
 fn issue(issuer: &Custody, claims: &Claims, holder: Option<&Custody>) -> Vec<u8> {
     let draft = Draft::credential(&issuer.key(), claims, holder.map(Custody::public), now()).expect("draft");
-    issuer.finish(draft).expect("credential")
+    released(issuer.finish(draft).expect("credential"))
 }
 
 /// The profile of the issuer, the audience, and the purpose of `claims`.
@@ -200,8 +267,8 @@ fn profile(issuer: &Custody, claims: &Claims) -> Profile {
 
 /// The proof of `holder` for `credential` and `challenge`.
 fn prove(holder: &Custody, credential: &[u8], challenge: &[u8]) -> Vec<u8> {
-    let draft = Draft::proof(&holder.key(), credential, &id("build-api"), challenge, now()).expect("draft");
-    holder.finish(draft).expect("proof")
+    let draft = ProofDraft::new(&holder.key(), credential, &id("build-api"), challenge, now()).expect("draft");
+    holder.finish_proof(draft).expect("proof")
 }
 
 #[test]

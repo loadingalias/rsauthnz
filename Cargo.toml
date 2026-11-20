@@ -19,6 +19,11 @@ rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", 
 # `alloc` builds each secret key in place in its allocation.
 native-custody = ["rscrypto/alloc"]
 
+[dev-dependencies]
+# The memory binding and the effect executor commit the transitions of the tests and of the doctests: only the
+# receipt of an accepted transition gives a prepared artifact.
+rsauthnz-conformance = { path = "rsauthnz-conformance" }
+
 [lints]
 workspace = true
 

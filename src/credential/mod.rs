@@ -14,21 +14,72 @@
 //!
 //! Issuance has two steps, so the issuer key stays in custody. [`Draft::credential`] makes a draft, and custody signs
 //! the bytes of [`Draft::to_be_signed`]. [`Draft::finish`] verifies the signature with the issuer key, and only then
-//! gives the encoded artifact. [`Profile::verify`] gives [`Verified`] evidence. The holder makes a proof with
-//! [`Draft::proof`] in the same two steps. [`Verified::possession`] checks the proof against the `cnf` key and gives
+//! gives the artifact, as a [`Prepared`] artifact of the transition that issues it. Only the receipt of the accepted
+//! transition gives its bytes, so a credential gives no authority before its commit. [`Profile::verify`] gives
+//! [`Verified`] evidence. The holder makes a proof with [`ProofDraft::new`] in the same two steps; a proof gives no
+//! authority, so [`ProofDraft::finish`] gives its bytes. [`Verified::possession`] checks the proof against the `cnf` key and gives
 //! authentication [`Evidence`]. An encoded artifact or proof has at most [`MAX_BYTES`] bytes.
 //!
 //! ```
 //! use core::time::Duration;
+//! # use core::pin::pin;
+//! # use core::task::{Context, Poll, Waker};
+//! # use rsauthnz::cbor::Value;
 //! use rsauthnz::cose::{Key, PublicKey, TrustedKey};
-//! use rsauthnz::credential::{Claims, Draft, Profile, Serial, Subject};
+//! use rsauthnz::credential::{Claims, Draft, Profile, ProofDraft, Serial, Subject};
 //! use rsauthnz::crypto::Algorithm;
 //! use rsauthnz::evidence::Method;
+//! # use rsauthnz::id::{AuthorityVersion, Principal};
 //! use rsauthnz::id::Id;
 //! use rsauthnz::limits::{Limits, SignatureBudget};
+//! # use rsauthnz::store::driver::{Answer, Driver, Plan};
+//! # use rsauthnz::store::{self, Kind, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
+//! use rsauthnz::transition::Prepared;
+//! # use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Outcome, Proposal};
+//! # use rsauthnz_conformance::memory::{Memory, Schedule};
+//! # use rsauthnz_conformance::suite::execute;
 //! use rscrypto::auth::MlDsa65Ed25519;
 //!
+//! # type Failure = Box<dyn core::error::Error>;
+//! # /// Commits the issuance transition, which carries `prepared`, with the driver on a memory binding.
+//! # fn issue(prepared: Prepared, now: Reading) -> Result<Vec<u8>, Failure> {
+//! #     fn ready<F: Future>(future: F) -> F::Output {
+//! #         let Poll::Ready(output) = pin!(future).poll(&mut Context::from_waker(Waker::noop())) else {
+//! #             unreachable!("the memory binding does no I/O")
+//! #         };
+//! #         output
+//! #     }
+//! #     let mut memory = Memory::new(Schedule::None);
+//! #     let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+//! #     let mut settle = |driver: &mut Driver| -> Result<(), Failure> {
+//! #         while let Some(effect) = driver.effect() {
+//! #             let output = ready(execute(&mut memory, effect));
+//! #             driver.give(output)?;
+//! #         }
+//! #         Ok(())
+//! #     };
+//! #     driver.start(now);
+//! #     settle(&mut driver)?;
+//! #     let audit = Audit {
+//! #         actor: Principal::Human(Id::new("acme", "u-17")?),
+//! #         action: Id::new("acme.auth", "credential.issue")?,
+//! #         time: now,
+//! #     };
+//! #     let mut proposal = Proposal::new(OperationId::new(b"issue-1")?, audit, &Value::Null, Limits::default())?;
+//! #     let record = Kind::Credential.key(b"1")?;
+//! #     proposal.read(Dependency::Absent(record.clone()))?;
+//! #     let version = AuthorityVersion::new(Id::new("acme", "authority")?, &[1])?;
+//! #     proposal.change(Change::Write { key: record, version, end: None, data: Box::new(*b"serial 1") })?;
+//! #     proposal.prepare(prepared);
+//! #     let ticket = driver.submit(proposal, Plan::default())?;
+//! #     settle(&mut driver)?;
+//! #     match driver.take(ticket) {
+//! #         Some(Answer::Outcome(Outcome::Accepted(receipt))) => Ok(receipt.artifact().ok_or("no artifact")?.to_vec()),
+//! #         answer => Err(format!("the issuance did not commit: {answer:?}").into()),
+//! #     }
+//! # }
+//! #
 //! fn trusted(public: PublicKey<'_>) -> Result<TrustedKey, rsauthnz::cose::Error> {
 //!     TrustedKey::new(Algorithm::MlDsa65Ed25519, &Key { kid: None, alg: None, public })
 //! }
@@ -42,7 +93,8 @@
 //! let holder_key = trusted(PublicKey::MlDsa65Ed25519(&holder_public))?;
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //!
-//! // 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the bytes.
+//! // 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the
+//! // prepared artifact. The issuance transition carries it, and only the receipt of its commit gives the bytes.
 //! let claims = Claims::new(
 //!     Id::new("acme", "authority")?,
 //!     Id::new("acme", "build-api")?,
@@ -53,7 +105,8 @@
 //! );
 //! let draft = Draft::credential(&issuer_key, &claims, Some(PublicKey::MlDsa65Ed25519(&holder_public)), now)?;
 //! let signature = issuer_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
-//! let credential = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+//! let prepared: Prepared = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+//! let credential = issue(prepared, now)?;
 //!
 //! // 2. The verifier fixes the issuer, the audience, and the purpose, and verifies the credential.
 //! let (issuer, audience, purpose) = (claims.issuer.clone(), claims.audience.clone(), claims.purpose.clone());
@@ -63,12 +116,12 @@
 //!
 //! // 3. The holder signs a proof over the challenge of the verifier, and the verifier checks it.
 //! let challenge = [7; 32];
-//! let draft = Draft::proof(&holder_key, &credential, &claims.audience, &challenge, now)?;
+//! let draft = ProofDraft::new(&holder_key, &credential, &claims.audience, &challenge, now)?;
 //! let signature = holder_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
 //! let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
 //! let evidence = verified.possession(&proof, &challenge, now, &mut SignatureBudget::new(&Limits::default()))?;
 //! assert_eq!(evidence.method(), Method::KeyPossession);
-//! # Ok::<(), Box<dyn core::error::Error>>(())
+//! # Ok::<(), Failure>(())
 //! ```
 //!
 //! [RFC 9052]: https://www.rfc-editor.org/rfc/rfc9052
@@ -89,6 +142,7 @@ use crate::evidence::{Evidence, Method};
 use crate::id::{Agent, Audience, Authority, Human, Id, Principal, Purpose, Workload};
 use crate::limits::{Limits, SignatureBudget};
 use crate::time::Reading;
+use crate::transition::Prepared;
 
 /// The most bytes of an encoded credential, receipt, or proof. A draft that can be longer refuses before custody signs
 /// it, and verification refuses a longer input before it decodes it.
@@ -206,8 +260,8 @@ impl Subject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Serial(pub u64);
 
-/// An artifact that custody did not sign yet: a credential, a receipt, or a proof. [`Draft::finish`] consumes it, so
-/// one draft gives at most one artifact.
+/// A credential or a receipt that custody did not sign yet. [`Draft::finish`] consumes it, so one draft gives at most
+/// one artifact. [`ProofDraft`] is the draft of a proof.
 pub struct Draft {
     /// The public key of the signer.
     key: TrustedKey,
@@ -286,35 +340,6 @@ impl Draft {
         Self::new(key, payload)
     }
 
-    /// The draft of a proof of possession that the holder key `key`, the `cnf` key of `credential`, signs. The proof
-    /// binds the SHA-256 digest of the exact bytes of `credential`, the audience `audience` of the verifier, the
-    /// challenge `challenge` of the verifier, and the time `iat`: the whole seconds of `now.estimate()`.
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Profile`] if `key` is a trust-root key, and [`Error::Size`] if the proof can be longer than
-    /// [`MAX_BYTES`].
-    pub fn proof(
-        key: &TrustedKey,
-        credential: &[u8],
-        audience: &Id<Audience>,
-        challenge: &[u8],
-        now: Reading,
-    ) -> Result<Self, Error> {
-        let digest = crypto::sha256(credential);
-        let audience = audience.to_string();
-        let payload = cbor::encode(&Value::Map(vec![
-            (Value::Unsigned(3), Value::Text(&audience)),
-            (Value::Unsigned(6), Value::Unsigned(now.estimate().as_secs())),
-            (Value::Negative(PROOF_CREDENTIAL), Value::Bytes(&digest)),
-            (Value::Negative(PROOF_CHALLENGE), Value::Bytes(challenge)),
-        ]))
-        .expect("the claims have distinct keys and no simple value");
-        Self::new(key, payload)
-    }
-
     /// The draft of the encoded claims `payload` that `key` signs.
     fn new(key: &TrustedKey, payload: Vec<u8>) -> Result<Self, Error> {
         class(key.algorithm())?;
@@ -343,8 +368,10 @@ impl Draft {
     }
 
     /// Verifies `signature`, the signature of custody over [`Self::to_be_signed`], with the key of the draft. Then it
-    /// gives the encoded artifact: a `COSE_Sign1` with the tag 18 and an empty unprotected bucket. The check charges
-    /// `budget`, the budget of the artifact. A refusal gives no bytes.
+    /// gives the encoded artifact as a [`Prepared`] artifact: a `COSE_Sign1` with the tag 18 and an empty unprotected
+    /// bucket. Give it to [`Proposal::prepare`](crate::transition::Proposal::prepare) of the transition that issues
+    /// it. Only the receipt of the accepted transition gives its bytes, so a credential never gives authority before
+    /// its commit. The check charges `budget`, the budget of the artifact. A refusal gives no artifact.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -353,7 +380,13 @@ impl Draft {
     /// [`Error::Cose`] with [`cose::Error::Signature`] if the signature does not verify with the key of the draft, for
     /// example because custody signed with another key. [`Error::Cose`] with [`cose::Error::Limit`] if the check
     /// costs more than `budget` has.
-    pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
+    pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Prepared, Error> {
+        self.sign(signature, budget)
+            .map(|artifact| Prepared::new(artifact.into_boxed_slice()))
+    }
+
+    /// The encoded `COSE_Sign1` of the draft and `signature`, after the check of [`Self::finish`].
+    fn sign(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
         self.key.verify(&self.to_be_signed(), signature, budget)?;
         let artifact = cbor::encode(&Value::Tag(
             SIGN1_TAG,
@@ -381,6 +414,63 @@ impl fmt::Debug for Draft {
             .field("protected_len", &self.protected.len())
             .field("payload_len", &self.payload.len())
             .finish()
+    }
+}
+
+/// A proof of possession that the holder key did not sign yet. A proof gives no authority, so [`ProofDraft::finish`]
+/// gives its bytes at once. [`ProofDraft::finish`] consumes the draft, so one draft gives at most one proof.
+#[derive(Debug)]
+pub struct ProofDraft(Draft);
+
+impl ProofDraft {
+    /// The draft of a proof of possession that the holder key `key`, the `cnf` key of `credential`, signs. The proof
+    /// binds the SHA-256 digest of the exact bytes of `credential`, the audience `audience` of the verifier, the
+    /// challenge `challenge` of the verifier, and the time `iat`: the whole seconds of `now.estimate()`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Profile`] if `key` is a trust-root key, and [`Error::Size`] if the proof can be longer than
+    /// [`MAX_BYTES`].
+    pub fn new(
+        key: &TrustedKey,
+        credential: &[u8],
+        audience: &Id<Audience>,
+        challenge: &[u8],
+        now: Reading,
+    ) -> Result<Self, Error> {
+        let digest = crypto::sha256(credential);
+        let audience = audience.to_string();
+        let payload = cbor::encode(&Value::Map(vec![
+            (Value::Unsigned(3), Value::Text(&audience)),
+            (Value::Unsigned(6), Value::Unsigned(now.estimate().as_secs())),
+            (Value::Negative(PROOF_CREDENTIAL), Value::Bytes(&digest)),
+            (Value::Negative(PROOF_CHALLENGE), Value::Bytes(challenge)),
+        ]))
+        .expect("the claims have distinct keys and no simple value");
+        Draft::new(key, payload).map(Self)
+    }
+
+    /// The bytes that custody signs with the holder key, as [`Draft::to_be_signed`] gives them.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn to_be_signed(&self) -> Vec<u8> {
+        self.0.to_be_signed()
+    }
+
+    /// Verifies `signature`, the signature of custody over [`Self::to_be_signed`], with the holder key. Then it gives
+    /// the encoded proof: a `COSE_Sign1` with the tag 18. The check charges `budget`. A refusal gives no bytes.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cose`] with [`cose::Error::Signature`] if the signature does not verify with the holder key.
+    /// [`Error::Cose`] with [`cose::Error::Limit`] if the check costs more than `budget` has.
+    pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
+        self.0.sign(signature, budget)
     }
 }
 

@@ -19,7 +19,9 @@ commit that a storage binding implements.
    and each absence that the decision used, also when the transition does not change that record.
 3. Add each state change with `proposal.change(change)`. A read of the proposal must allow it.
 4. Add each notification, signer, or provider call that must survive a crash with `proposal.intend(intent)`.
-5. Set a prepared artifact, for example a signed session, with `proposal.prepare(artifact)`.
+5. Set a prepared artifact, for example the credential that `credential::Draft::finish` gives, with
+   `proposal.prepare(prepared)`. A `Prepared` value has no accessor of its bytes. Only the receipt of the accepted
+   commit gives them, with `receipt.artifact()`.
 
 This example is also the example of the `rsauthnz::transition` module documentation, and `cargo xtask test` runs
 it. The decision consumes an invitation and creates a credential:

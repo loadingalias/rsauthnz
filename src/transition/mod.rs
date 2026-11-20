@@ -448,7 +448,7 @@ pub struct Proposal {
     dependencies: Vec<Dependency>,
     changes: Vec<Change>,
     intents: Vec<Intent>,
-    artifact: Option<Artifact>,
+    artifact: Option<Prepared>,
     limits: Limits,
 }
 
@@ -538,12 +538,13 @@ impl Proposal {
         Ok(())
     }
 
-    /// Sets the prepared artifact, for example a signed session or credential. It stays private until the acceptance
-    /// of this exact proposal, and only the receipt of that acceptance releases it.
+    /// Sets the prepared artifact, for example a credential that [`Draft::finish`](crate::credential::Draft::finish)
+    /// gives. It stays private until the acceptance of this exact proposal, and only the receipt of that acceptance
+    /// releases it.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    pub fn prepare(&mut self, artifact: Box<[u8]>) {
-        self.artifact = Some(Artifact(artifact));
+    pub fn prepare(&mut self, artifact: Prepared) {
+        self.artifact = Some(artifact);
     }
 
     /// The operation: its identity and its request binding.
@@ -604,7 +605,7 @@ impl Proposal {
 #[derive(Debug)]
 pub struct Receipt {
     operation: OperationId,
-    artifact: Option<Artifact>,
+    artifact: Option<Prepared>,
 }
 
 impl Receipt {
@@ -723,10 +724,19 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// A prepared artifact. Only [`Receipt::artifact`] gives its bytes.
-struct Artifact(Box<[u8]>);
+/// A prepared artifact: a signed result, such as a credential, that gives authority only after its transition commits.
+/// It has no public constructor and no accessor of its bytes. [`Proposal::prepare`] takes it, and only
+/// [`Receipt::artifact`] of the accepted proposal gives its bytes. Thus no caller can release it before the commit.
+pub struct Prepared(Box<[u8]>);
 
-impl fmt::Debug for Artifact {
+impl Prepared {
+    /// The prepared artifact with the bytes `bytes`.
+    pub(crate) const fn new(bytes: Box<[u8]>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for Prepared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Hidden(&self.0).fmt(f)
     }

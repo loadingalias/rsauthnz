@@ -109,10 +109,13 @@ proof for each check of possession.
    holder key for a receipt. `issuer_key` is the `cose::TrustedKey` of the issuer key in custody.
 3. Give the bytes of `draft.to_be_signed()` to custody. Custody signs them with the issuer key.
 4. Call `draft.finish(&signature, &mut budget)`. It verifies the signature with the issuer key, and then gives the
-   encoded artifact.
+   artifact as a `transition::Prepared` value. That value has no accessor of its bytes.
+5. Give the value to `proposal.prepare(prepared)` of the transition that issues the credential, and submit the
+   proposal to the driver ([Make a transition](transitions.md)). Only the receipt of the accepted commit gives the
+   bytes: `receipt.artifact()`. After a lost response, look up the outcome. The receipt of a lookup has no bytes.
 
-`finish` refuses a signature that does not verify, for example a signature by another custody key. A refusal
-gives no bytes. It consumes the draft, so one draft gives at most one artifact. The issue time `iat` is the whole
+Thus a credential gives no authority before its commit. `finish` refuses a signature that does not verify, for
+example a signature by another custody key. A refusal gives no artifact. It consumes the draft, so one draft gives at most one artifact. The issue time `iat` is the whole
 seconds of `now.estimate()`. Issuance rounds `expires` down and `not_before` up to whole seconds, so the artifact
 is never valid outside the interval that you gave.
 
@@ -120,18 +123,21 @@ Run the signature of custody in the `External` cost class of [Admit rsauthnz wor
 `Verify` work of `finish`.
 
 This example issues a workload credential, verifies it, and checks a proof of possession. rscrypto signs in place
-of custody. It is also the example of the `rsauthnz::credential` module documentation, and `cargo xtask test` runs
-it:
+of custody. `issue` stands for the commit of the issuance transition: it submits a proposal that carries the
+prepared artifact, and it gives the bytes of the receipt. The example is also the example of the
+`rsauthnz::credential` module documentation, where `issue` commits on the memory binding, and `cargo xtask test`
+runs it:
 
 ```rust
 use core::time::Duration;
 use rsauthnz::cose::{Key, PublicKey, TrustedKey};
-use rsauthnz::credential::{Claims, Draft, Profile, Serial, Subject};
+use rsauthnz::credential::{Claims, Draft, Profile, ProofDraft, Serial, Subject};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::evidence::Method;
 use rsauthnz::id::Id;
 use rsauthnz::limits::{Limits, SignatureBudget};
 use rsauthnz::time::{Reading, ReadingSource};
+use rsauthnz::transition::Prepared;
 use rscrypto::auth::MlDsa65Ed25519;
 
 fn trusted(public: PublicKey<'_>) -> Result<TrustedKey, rsauthnz::cose::Error> {
@@ -147,7 +153,8 @@ let issuer_key = trusted(PublicKey::MlDsa65Ed25519(&issuer_public))?;
 let holder_key = trusted(PublicKey::MlDsa65Ed25519(&holder_public))?;
 let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 
-// 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the bytes.
+// 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the
+// prepared artifact. The issuance transition carries it, and only the receipt of its commit gives the bytes.
 let claims = Claims::new(
     Id::new("acme", "authority")?,
     Id::new("acme", "build-api")?,
@@ -158,7 +165,8 @@ let claims = Claims::new(
 );
 let draft = Draft::credential(&issuer_key, &claims, Some(PublicKey::MlDsa65Ed25519(&holder_public)), now)?;
 let signature = issuer_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
-let credential = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+let prepared: Prepared = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+let credential = issue(prepared, now)?;
 
 // 2. The verifier fixes the issuer, the audience, and the purpose, and verifies the credential.
 let (issuer, audience, purpose) = (claims.issuer.clone(), claims.audience.clone(), claims.purpose.clone());
@@ -168,7 +176,7 @@ assert_eq!(verified.claims(), &claims);
 
 // 3. The holder signs a proof over the challenge of the verifier, and the verifier checks it.
 let challenge = [7; 32];
-let draft = Draft::proof(&holder_key, &credential, &claims.audience, &challenge, now)?;
+let draft = ProofDraft::new(&holder_key, &credential, &claims.audience, &challenge, now)?;
 let signature = holder_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
 let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
 let evidence = verified.possession(&proof, &challenge, now, &mut SignatureBudget::new(&Limits::default()))?;
@@ -211,8 +219,9 @@ current permission. Keep the evidence with the claims that a later authorization
 A credential is not a bearer token. Its holder proves possession of the `cnf` key for each check:
 
 1. The verifier issues a challenge for one proof.
-2. The holder calls `Draft::proof(&holder_key, &credential, &audience, &challenge, now)`. Custody signs
-   `draft.to_be_signed()` with the `cnf` key, and `draft.finish(&signature, &mut budget)` gives the proof.
+2. The holder calls `ProofDraft::new(&holder_key, &credential, &audience, &challenge, now)`. Custody signs
+   `draft.to_be_signed()` with the `cnf` key, and `draft.finish(&signature, &mut budget)` gives the proof. A proof
+   gives no authority, so `finish` gives its bytes at once.
 3. The verifier calls `verified.possession(&proof, &challenge, now, &mut budget)`. Give a new budget for the
    proof, because it is a separate artifact.
 4. The verifier consumes the challenge in the transition that uses the evidence.

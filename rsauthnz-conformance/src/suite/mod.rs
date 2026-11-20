@@ -538,8 +538,9 @@ fn seed() -> (Proposal, Plan) {
     (build.done(), plan)
 }
 
-/// The output of the primitive call `effect` on `binding`. A failed primitive gives [`Output::Failed`].
-async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output {
+/// The output of the primitive call `effect` on `binding`, for [`Driver::give`]. A failed primitive gives
+/// [`Output::Failed`]. A test or an example that drives a [`Driver`] on a binding gives each effect to this function.
+pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output {
     match effect {
         Effect::Start => binding.start().await.map_or(Output::Failed, Output::Started),
         Effect::Read(key) => Store::read(binding, key).await.map_or(Output::Failed, Output::Read),
