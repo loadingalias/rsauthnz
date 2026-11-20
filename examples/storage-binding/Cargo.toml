@@ -12,7 +12,7 @@ rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
 # The conformance suite, whose test controls the binding implements.
 rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
 # The only source of checksums. CRC-32C finds a torn write at the end of a file.
-rscrypto = { version = "=0.12.0", default-features = false, features = ["crc32"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["crc32"] }
 
 [lints]
 workspace = true

@@ -8,11 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# The physical-time reading of the family, which evidence times use. The alpha is frozen and
-# pinned to its exact version.
-rstypes = { version = "=0.1.0-alpha.2", default-features = false }
-# The only source of signatures and digests. The owned crate is pinned to its exact release.
-rscrypto = { version = "=0.12.0", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa", "sha2"] }
+# The physical-time reading of the family, which evidence times use. Like each owned crate,
+# rstypes and rscrypto come from their Git `main`.
+rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
+# The only source of signatures and digests.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa", "sha2"] }
 
 [lints]
 workspace = true

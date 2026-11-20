@@ -11,7 +11,7 @@ publish.workspace = true
 # The storage contract that the memory binding implements.
 rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
 # The only source of hashes. The seeded fault schedule draws from RapidHash.
-rscrypto = { version = "=0.12.0", default-features = false, features = ["rapidhash"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["rapidhash"] }
 
 [lints]
 workspace = true
