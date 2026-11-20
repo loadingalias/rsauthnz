@@ -101,6 +101,9 @@ pub enum Kind {
     /// The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number
     /// of its write, and the completions that a restore still owes. The commit driver writes it, and it has no end.
     Mark = 21,
+    /// The record of a local authority ([`crate::local`]): its host grant, its issuer key, and the log of its bootstrap
+    /// values. Only an issue of a bootstrap value writes it, and it has no end.
+    Local = 22,
     /// An issuer of workload credentials: its authority, its public key, its audiences, and its ceiling
     /// ([`workload::Issuer`](crate::workload::Issuer)).
     Issuer = 23,
@@ -121,7 +124,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -143,6 +146,7 @@ impl Kind {
         Self::Intent,
         Self::Policy,
         Self::Mark,
+        Self::Local,
         Self::Issuer,
         Self::Workload,
     ];
@@ -171,6 +175,7 @@ impl Kind {
             | Self::Intent
             | Self::Policy
             | Self::Mark
+            | Self::Local
             | Self::Issuer
             | Self::Workload => None,
         }
@@ -189,6 +194,7 @@ impl Kind {
                 | Self::Intent
                 | Self::Policy
                 | Self::Mark
+                | Self::Local
                 | Self::Issuer
                 | Self::Workload
         )

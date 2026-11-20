@@ -56,16 +56,17 @@ impl Defect {
         Self::NoRetention,
     ];
 
-    /// The case that names the defect.
-    const fn case(self) -> Case {
+    /// The cases that name the defect. A commit with no atomic check is a check-then-write path, so two concurrent
+    /// uses of one bootstrap value both commit.
+    const fn cases(self) -> &'static [Case] {
         match self {
-            Self::NoAtomicCheck => Case::ConcurrentConsumption,
-            Self::LostOutcomes => Case::LostResponse,
-            Self::WriteSkew => Case::AbsenceRace,
-            Self::NoJournal => Case::RestoreJournal,
-            Self::RetriedSync => Case::FailedSync,
-            Self::NoInstanceCheck | Self::RestoredInstance => Case::Fencing,
-            Self::NoRetention => Case::Retention,
+            Self::NoAtomicCheck => &[Case::ConcurrentConsumption, Case::Bootstrap],
+            Self::LostOutcomes => &[Case::LostResponse],
+            Self::WriteSkew => &[Case::AbsenceRace],
+            Self::NoJournal => &[Case::RestoreJournal],
+            Self::RetriedSync => &[Case::FailedSync],
+            Self::NoInstanceCheck | Self::RestoredInstance => &[Case::Fencing],
+            Self::NoRetention => &[Case::Retention],
         }
     }
 }
@@ -329,14 +330,15 @@ fn the_memory_binding_passes_every_case() {
     assert_eq!(report, Report::default(), "{report}");
 }
 
-/// Each broken binding fails the case that names its defect. The write-skew binding passes each other case, so the
+/// Each broken binding fails each case that names its defect. The write-skew binding passes each other case, so the
 /// suite needs its absence-race case.
 #[test]
 fn each_broken_binding_fails_the_case_that_names_its_defect() {
     for defect in Defect::ALL {
         let report = ready(suite::run(|| Broken::new(defect)));
         let failed: Vec<Case> = report.failures.iter().map(|failure| failure.case).collect();
-        assert!(failed.contains(&defect.case()), "{defect:?}:\n{report}");
+        let named = defect.cases().iter().all(|case| failed.contains(case));
+        assert!(named, "{defect:?}:\n{report}");
         if defect == Defect::WriteSkew {
             assert_eq!(failed, [Case::AbsenceRace], "{report}");
         }

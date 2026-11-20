@@ -993,39 +993,3 @@ pub(super) async fn start_after_restore<S: Subject>(binding: S) -> Checked {
         "a second restore made the passkey of an unlink valid again",
     )
 }
-
-pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
-    let crash = crashes(&binding.declaration());
-    let mut run = Run::seeded(binding).await?;
-    let (first, second, administrator) = (
-        key(Kind::Bootstrap, "b-1"),
-        key(Kind::Bootstrap, "b-2"),
-        key(Kind::Administrator, "adm-1"),
-    );
-    let snapshot = run.binding.snapshot();
-    let reissue = Build::new("o-1").ends(&first, 1).writes(&second, 1).done();
-    run.commit(reissue, Plan::default(), "an owner re-bootstrap").await?;
-    ensure(
-        !run.holds(&first).await? && run.holds(&second).await?,
-        "an owner re-bootstrap did not end the earlier bootstrap value and add one",
-    )?;
-    if crash {
-        // A bootstrap that read the earlier value before the re-bootstrap crashes before its commit. Its fact holds,
-        // so the start keeps its entry.
-        run.submit(
-            Build::new("o-2").ends(&first, 1).writes(&administrator, 1).done(),
-            plan(&[], &[], &[(&administrator, Role::Administrator(authority()))]),
-        )?;
-        run.drive(at_commit("o-2", Fault::CrashBeforeCommit)).await?;
-        run.start().await?;
-    }
-    run.restore(&snapshot).await?;
-    ensure(
-        !run.holds(&first).await?,
-        "a restore made a bootstrap value that a re-bootstrap ended valid again",
-    )?;
-    ensure(
-        !run.holds(&administrator).await?,
-        "a restore completed a bootstrap from a value that a re-bootstrap ended",
-    )
-}

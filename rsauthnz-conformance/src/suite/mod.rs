@@ -29,6 +29,7 @@
 //! assert!(report.skipped.is_empty(), "{report}");
 //! ```
 
+mod bootstrap;
 mod cases;
 
 use core::fmt;
@@ -168,14 +169,23 @@ pub enum Case {
     RestoreEnds,
     /// A normal start after a restore voids no entry that the restore applied. Property: `NothingEndedValid`.
     StartAfterRestore,
-    /// An owner re-bootstrap ends the earlier bootstrap value and adds one. No restore makes the ended value valid
-    /// again, or completes a bootstrap from it. Properties: `OneBootValid`, `NothingEndedValid`, `AdminKeptP`.
+    /// The local authority ([`rsauthnz::local`]) on the binding: a bootstrap value of one authority refuses at another,
+    /// and after its end. Two concurrent uses of one value give one commit and one conflict or refusal, and a used
+    /// value refuses. A remote call is admitted only for a live administrator binding. An owner re-bootstrap gives a
+    /// new administrator, which ends the earlier binding with an unlink, and the last binding stays. The report gives
+    /// each issue and each consumption. Properties: `OneUse`, `OneBootValid`, `AdminKeptP`.
+    Bootstrap,
+    /// An owner re-bootstrap of the local authority ends the earlier bootstrap value. A restore from a snapshot before it
+    /// does not make the ended value valid again, and loses the new value. A lookup of a lost re-bootstrap shows its
+    /// commit and no value, and the next issue ends that value. A restore completes an in-doubt bootstrap only when
+    /// the snapshot holds its value and no re-bootstrap ended it, and the client of a completed bootstrap proves the
+    /// possession of its key. Properties: `OneBootValid`, `NothingEndedValid`, `AdminKeptP`.
     Rebootstrap,
 }
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::ConcurrentConsumption,
@@ -195,6 +205,7 @@ impl Case {
         Self::RestoreCompletions,
         Self::RestoreEnds,
         Self::StartAfterRestore,
+        Self::Bootstrap,
         Self::Rebootstrap,
     ];
 
@@ -209,7 +220,8 @@ impl Case {
             | Self::Expiry
             | Self::Fencing
             | Self::Retention
-            | Self::Restart => true,
+            | Self::Restart
+            | Self::Bootstrap => true,
             Self::LostResponse => crash,
             Self::RefusalVoid
             | Self::RestoreJournal
@@ -244,7 +256,8 @@ impl Case {
             Self::RestoreCompletions => cases::restore_completions(make()).await,
             Self::RestoreEnds => cases::restore_ends(make()).await,
             Self::StartAfterRestore => cases::start_after_restore(make()).await,
-            Self::Rebootstrap => cases::rebootstrap(make()).await,
+            Self::Bootstrap => bootstrap::bootstrap(make).await,
+            Self::Rebootstrap => bootstrap::rebootstrap(make()).await,
         }
     }
 }

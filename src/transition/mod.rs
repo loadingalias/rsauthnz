@@ -734,6 +734,12 @@ impl Prepared {
     pub(crate) const fn new(bytes: Box<[u8]>) -> Self {
         Self(bytes)
     }
+
+    /// The bytes of the artifact, for a record that its own transition commits, such as the administrator binding
+    /// that holds its CLI credential.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for Prepared {

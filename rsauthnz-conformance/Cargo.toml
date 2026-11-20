@@ -10,8 +10,9 @@ publish.workspace = true
 [dependencies]
 # The storage contract that the memory binding implements.
 rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
-# The only source of hashes. The seeded fault schedule draws from RapidHash.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["rapidhash"] }
+# The only source of hashes and signatures. The seeded fault schedule draws from RapidHash. The cases of the local
+# authority sign with composite keys in place of custody, and draw bootstrap values from ChaCha20.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "mldsa65-ed25519", "rapidhash"] }
 
 [lints]
 workspace = true
