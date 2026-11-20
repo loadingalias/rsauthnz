@@ -640,6 +640,11 @@ impl<'a> Verified<'a, '_> {
         self.issued
     }
 
+    /// The `cnf` key of a credential, or `None` for a receipt.
+    pub(crate) const fn confirmation(&self) -> Option<&TrustedKey> {
+        self.confirmation.as_ref()
+    }
+
     /// The report of the profile of the issuer signature. Its `authentication` says if the artifact has post-quantum
     /// authentication. A `cnf` key has the same class, so the evidence of [`Self::possession`] has the same
     /// authentication.

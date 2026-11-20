@@ -48,6 +48,10 @@ let resource: Id<Resource> = Id::new("acme.repo", "repo:x")?;
 
 There is no default tenant. Each tenant is an identifier that the application chooses.
 
+The namespace `rsauthnz` holds the identifiers that rsauthnz fixes, such as the purpose `rsauthnz:workload` and the
+actions `rsauthnz:workload.issue` and `rsauthnz:workload.renew` ([Issue and renew workload
+credentials](workload.md#the-policy)). Do not use it for identifiers of the application.
+
 ## Principals
 
 A `Principal` is `Principal::Human`, `Principal::Workload`, or `Principal::Agent`, each with the

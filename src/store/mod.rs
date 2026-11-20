@@ -101,6 +101,12 @@ pub enum Kind {
     /// The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number
     /// of its write, and the completions that a restore still owes. The commit driver writes it, and it has no end.
     Mark = 21,
+    /// An issuer of workload credentials: its authority, its public key, its audiences, and its ceiling
+    /// ([`workload::Issuer`](crate::workload::Issuer)).
+    Issuer = 23,
+    /// The registration of a workload: its identifier and its registered proof key
+    /// ([`workload::Registration`](crate::workload::Registration)).
+    Workload = 24,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -115,7 +121,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -137,6 +143,8 @@ impl Kind {
         Self::Intent,
         Self::Policy,
         Self::Mark,
+        Self::Issuer,
+        Self::Workload,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -162,7 +170,9 @@ impl Kind {
             | Self::Outcome
             | Self::Intent
             | Self::Policy
-            | Self::Mark => None,
+            | Self::Mark
+            | Self::Issuer
+            | Self::Workload => None,
         }
     }
 
@@ -179,6 +189,8 @@ impl Kind {
                 | Self::Intent
                 | Self::Policy
                 | Self::Mark
+                | Self::Issuer
+                | Self::Workload
         )
     }
 

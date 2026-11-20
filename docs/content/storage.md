@@ -103,6 +103,8 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Intent` | An effect intent that the application did not end yet | `None` |
 | `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
 | `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number of its write, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
+| `Issuer` | An issuer of workload credentials: its authority, its public key, its audiences, and its ceiling ([Issue and renew workload credentials](workload.md)) | `None` |
+| `Workload` | The registration of a workload: the workload and its registered proof key | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for
@@ -180,7 +182,8 @@ async fn expire_all<S: Store>(binding: &mut S, now: Reading) -> Result<(), Expir
 
 One pass of `store::expire(binding, now, limit)` makes one `Store::expire` call for each kind that can end
 (`kind.ends()`). No call goes to the provider links, administrator bindings, agent identities, the replay floor, the
-intents, or the policy records, because their records have no end. Each call removes
+intents, the policy records, the mark record, the issuers, or the workload registrations, because their records have
+no end. Each call removes
 at most `limit` records whose end is before the earliest time of `now`, so a record that a check can still accept
 stays. The pass gives `Progress::More` while a kind can have more ended records. A reading with no known bound
 gives `ExpiryError::Time` and removes nothing. The host chooses when to run each pass, and its cost class is

@@ -14,6 +14,7 @@ pub mod json;
 pub mod limits;
 pub mod store;
 pub mod transition;
+pub mod workload;
 
 /// Physical time: the reading of the family's shared types, which evidence times, expiry, and
 /// retention use. A reading has an estimate, an uncertainty bound or "unknown", and its source.

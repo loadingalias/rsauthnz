@@ -19,8 +19,10 @@ issuer key can sign each kind, and an artifact of one purpose does not verify fo
 | Enrollment receipt | None | The principal that enrolled |
 | Approval receipt | None | The principal that approved |
 
-The application chooses the purpose of each kind, as an `Id<Purpose>`. A receipt has no `cnf` key, so it cannot
-prove possession.
+The application chooses the purpose of each kind, as an `Id<Purpose>`, except for a workload credential. The
+`rsauthnz::workload` module issues each workload credential with the purpose `rsauthnz:workload`, through its
+transition ([Issue and renew workload credentials](workload.md)). A receipt has no `cnf` key, so it cannot prove
+possession.
 
 ## Declare the profile of an audience
 
