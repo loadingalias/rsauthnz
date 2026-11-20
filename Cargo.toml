@@ -11,8 +11,13 @@ publish.workspace = true
 # The physical-time reading of the family, which evidence times use. Like each owned crate,
 # rstypes and rscrypto come from their Git `main`.
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
-# The only source of signatures and digests.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2"] }
+# The only source of signatures, digests, and the seeded random generator.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2"] }
+
+[features]
+# The native custody binding: key files under OS file permissions, on Linux, macOS, and Windows only. rscrypto
+# `alloc` builds each secret key in place in its allocation.
+native-custody = ["rscrypto/alloc"]
 
 [lints]
 workspace = true

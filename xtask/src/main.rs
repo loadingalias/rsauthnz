@@ -38,7 +38,8 @@ Commands
                        Check the TLA+ models in models/; with no argument, every profile
 
 fix, check, and test select the whole workspace unless their arguments select
-packages with -p or --package.
+packages with -p or --package. They build all features; check also lints the
+default features.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -177,6 +178,7 @@ impl Repo {
     /// Applies the machine-applicable Clippy fixes, then formats the code.
     /// `clippy --fix` reports each lint that it cannot fix as a warning and
     /// still succeeds. Thus a last pass that changes nothing fails on them.
+    /// Both passes lint all features, so they also see the optional bindings.
     fn fix(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step(
@@ -187,6 +189,7 @@ impl Repo {
                 "--locked",
                 "--allow-dirty",
                 "--all-targets",
+                "--all-features",
                 "--quiet",
             ])
             .args(&scope),
@@ -194,12 +197,14 @@ impl Repo {
         step("fmt", &mut self.cargo(&["fmt", "--all"]))?;
         step(
             "clippy",
-            self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
+            self.cargo(&["clippy", "--locked", "--all-targets", "--all-features", "--quiet"])
                 .args(&scope),
         )
     }
 
-    /// Checks formatting, lints, and rustdoc. It changes no file.
+    /// Checks formatting, lints, and rustdoc. It changes no file. Clippy
+    /// lints the default features, which a portable build uses, and all
+    /// features, which add the optional bindings.
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
@@ -209,22 +214,32 @@ impl Repo {
                 .args(&scope),
         )?;
         step(
+            "clippy --all-features",
+            self.cargo(&["clippy", "--locked", "--all-targets", "--all-features", "--quiet"])
+                .args(&scope),
+        )?;
+        step(
             "rustdoc",
-            self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),
+            self.cargo(&["doc", "--locked", "--no-deps", "--all-features", "--quiet"])
+                .args(&scope),
         )
     }
 
-    /// Runs the tests with Nextest, in the whole workspace unless the
-    /// arguments select packages. With no arguments, it then runs the
-    /// doctests, which Nextest does not run.
+    /// Runs the tests with Nextest, with all features, in the whole workspace
+    /// unless the arguments select packages. With no arguments, it then runs
+    /// the doctests, which Nextest does not run.
     fn test(&self, args: &[String]) -> Result<(), Failure> {
-        step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(scope(args)))?;
+        step(
+            "nextest",
+            self.cargo(&["nextest", "run", "--locked", "--all-features"])
+                .args(scope(args)),
+        )?;
         if !args.is_empty() {
             return Ok(());
         }
         step(
             "doctest",
-            &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
+            &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--all-features", "--quiet"]),
         )
     }
 
@@ -1137,9 +1152,9 @@ mod tests {
     }
 
     /// A feature, target, or filter argument keeps the whole workspace:
-    /// without `--workspace`, `cargo xtask check --all-features`, the musl
-    /// step of CI, and a named test cover only the root package. Each package
-    /// flag keeps its own selection.
+    /// without `--workspace`, a feature selection, the musl step of CI, and a
+    /// named test cover only the root package. Each package flag keeps its
+    /// own selection.
     #[test]
     fn only_package_flags_narrow_the_scope() {
         let joined = |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).join(" ");

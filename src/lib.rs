@@ -7,6 +7,7 @@ pub mod cbor;
 pub mod cose;
 pub mod credential;
 pub mod crypto;
+pub mod custody;
 pub mod evidence;
 pub mod id;
 pub mod json;

@@ -11,9 +11,9 @@ cannot delay durable commits. rsauthnz does no admission itself. The host owns a
 | Class | Work | Example |
 | --- | --- | --- |
 | `Parse` | A cheap parse or refusal. The work is linear in input that the limit set bounds. It does no signature, KDF, storage, or network work | `cbor::decode`, `json::decode`, `cose::Sign1::decode`, `id::Id::new`, `transition::Proposal::new` |
-| `Verify` | Signature or KDF work on input that the parse admitted | `cose::Profile::verify`, `cose::Sign1::verify`, `cose::TrustedKey::new` |
+| `Verify` | Signature or KDF work on input that the parse admitted | `cose::Profile::verify`, `cose::Sign1::verify`, `cose::TrustedKey::new`, `custody::Handle::verify` |
 | `Mutate` | One atomic commit or bounded expiry pass in the storage binding of the application | `store::expire` ([Storage contract](storage.md)) |
-| `External` | Slow custody or provider work, such as a hardware key or an external identity provider | No operation yet |
+| `External` | Slow custody or provider work, such as a hardware key or an external identity provider | The operations of `custody::Custody` and `custody::FileCustody::open` ([Hold keys in custody](custody.md)) |
 
 The documentation of each public operation names its class, in the form "Cost class: `Parse`". A method that
 takes only `&self` and returns no `Result` reads a value that is already bounded. It names no class, unless it

@@ -1,4 +1,5 @@
-//! Signature profiles, and the facade of [rscrypto]: the only module of the core that calls it.
+//! Signature profiles, and the facade of [rscrypto]: the only module of the core that calls its signatures,
+//! digests, and secret keys. Other modules use only its random generator.
 //!
 //! [`Algorithm`] is the registry of the trusted signature profiles, and [`Algorithm::report`] gives the guarantee of
 //! each profile. The default profile is composite ML-DSA-65 + Ed25519. Each signature check of the crate goes through
@@ -24,7 +25,11 @@
 //! [LAMPS composite signatures]: https://datatracker.ietf.org/doc/draft-ietf-lamps-pq-composite-sigs/
 //! [JOSE and COSE composite draft]: https://datatracker.ietf.org/doc/draft-ietf-jose-pq-composite-sigs/
 
+#[cfg(all(feature = "native-custody", any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) mod secret;
+
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use rscrypto::auth::{
     EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
@@ -175,6 +180,18 @@ impl Verifier {
     pub(crate) fn ml_dsa_65_ecdsa_p256(public: &[u8; 2017]) -> Option<Self> {
         let key = MlDsa65EcdsaP256PublicKey::from_bytes(public).ok()?;
         Some(Self::MlDsa65EcdsaP256(Box::new(key)))
+    }
+
+    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, and the
+    /// encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite key.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Ed25519(key) => key.as_bytes().to_vec(),
+            Self::Es256(key) => key.to_sec1_bytes().to_vec(),
+            Self::MlDsa65(key) => key.as_bytes().to_vec(),
+            Self::MlDsa65Ed25519(key) => key.to_bytes().to_vec(),
+            Self::MlDsa65EcdsaP256(key) => key.to_bytes().to_vec(),
+        }
     }
 
     /// The algorithm of the key.
