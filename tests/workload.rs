@@ -1,6 +1,9 @@
-//! The contracts of workload issuance and renewal: a credential is released only by the accepted commit of its own
-//! operation, it verifies only for its audience and its issuer key with a proof by its registered key, a request past
-//! the ceiling or outside the policy refuses, and a restore releases no serial twice.
+//! The contracts of workload credentials: a credential is released only by the accepted commit of its own operation,
+//! it verifies only for its audience and its issuer key with a proof by its registered key, a request past the ceiling
+//! or outside the policy refuses, and a restore releases no serial twice. A rotation, a recovery, and a revocation end
+//! the earlier credentials of the workload at each verifier that reads the current registration, also when they race
+//! an issuance or a restore follows them. An issuer-key rotation keeps the credentials of the old key until they end,
+//! unless it retires the old key at once.
 
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
@@ -20,11 +23,12 @@ use rsauthnz::store::{self, Journal, Kind, Profile, Record, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, OperationId, Outcome, Proposal};
 use rsauthnz::workload::{
-    self, Awaiting, By, Ceiling, Credential, Error, Issuer, LIFETIME_DEFAULT, Mode, Pending, Registration, Request,
+    self, Awaiting, By, Ceiling, Credential, Error, Issuer, IssuerRotation, LIFETIME_DEFAULT, Mode, Pending,
+    Registration, Replace, Request, Retire, Revocation, Target,
 };
 use rsauthnz_conformance::memory::{Memory, Schedule, Snapshot};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
-use rscrypto::auth::{CompositeMlDsaError, MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
+use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 /// The time of the first request.
 const START: Duration = Duration::from_secs(1_800_000_000);
@@ -102,6 +106,15 @@ impl Custody {
         let signature = self.sign(&draft.to_be_signed());
         draft.finish(&signature, &mut budget()).unwrap()
     }
+
+    /// The proof of possession of this key, signed by `signer`, as the new key of the workload `workload` for a
+    /// rotation or a recovery at `build-api`, over `challenge`.
+    fn prove_new(&self, signer: &Self, workload: &Id<Workload>, challenge: &[u8], now: Reading) -> Vec<u8> {
+        let binding = workload::key_binding(workload, &self.public());
+        let draft = ProofDraft::new(&signer.trusted(), &binding, &audience("build-api"), challenge, now).unwrap();
+        let signature = signer.sign(&draft.to_be_signed());
+        draft.finish(&signature, &mut budget()).unwrap()
+    }
 }
 
 fn authority() -> Id<Authority> {
@@ -136,7 +149,8 @@ fn ceiling() -> Ceiling {
     }
 }
 
-/// The policy of the tests: the operator can issue, and the workload can renew, on the resource of the workload.
+/// The policy of the tests: the operator can issue, recover, and revoke on the resource of the workload, and rotate the
+/// key of the issuer. The workload can renew and rotate on its resource.
 struct Permits;
 
 impl Policy for Permits {
@@ -146,12 +160,17 @@ impl Policy for Permits {
     }
 
     fn resolve(&self, request: &authz::Request<'_>) -> Option<Permit> {
-        let permitted = match request.principal {
-            Principal::Human(human) => *human == operator() && *request.action == Mode::Issue.action(),
-            Principal::Workload(workload) => *workload == runner_id() && *request.action == Mode::Renew.action(),
-            Principal::Agent(_) => false,
+        let modes: &[Mode] = match request.principal {
+            Principal::Human(human) if *human == operator() => &[Mode::Issue, Mode::Recover, Mode::Revoke],
+            Principal::Workload(workload) if *workload == runner_id() => &[Mode::Renew, Mode::Rotate],
+            _ => &[],
         };
-        (permitted && *request.resource == workload::resource(&runner_id())).then(|| Permit {
+        let on_workload = *request.resource == workload::resource(&runner_id())
+            && modes.iter().any(|mode| mode.action() == *request.action);
+        let on_issuer = *request.resource == workload::issuer_resource(&authority())
+            && *request.principal == Principal::Human(operator())
+            && *request.action == Mode::RotateIssuer.action();
+        (on_workload || on_issuer).then(|| Permit {
             principal: request.principal.clone(),
             action: request.action.clone(),
             resource: request.resource.clone(),
@@ -213,8 +232,8 @@ impl Node {
         self.run();
     }
 
-    fn commit(&mut self, proposal: Proposal) -> Outcome {
-        let ticket = self.driver.submit(proposal, Plan::default()).unwrap();
+    fn commit(&mut self, proposal: Proposal, plan: Plan) -> Outcome {
+        let ticket = self.driver.submit(proposal, plan).unwrap();
         self.run();
         match self.driver.take(ticket) {
             Some(Answer::Outcome(outcome)) => outcome,
@@ -244,28 +263,20 @@ impl Host {
         let (issuer, runner, operator) = (Custody::new(1), Custody::new(2), Custody::new(3));
         let audiences = vec![audience("build-api"), audience("deploy-api")];
         let mut setup = proposal("setup");
-        for (key, data) in [
-            (store::policy_key(&authority()), Box::from(*b"the policy")),
-            (
-                Issuer::store_key(&authority()),
-                Issuer::new(authority(), issuer.public(), audiences, ceiling)
-                    .unwrap()
-                    .to_record(),
-            ),
-            (
-                Registration::store_key(&runner_id()),
-                Registration::new(runner_id(), runner.public()).unwrap().to_record(),
-            ),
-        ] {
-            setup.read(Dependency::Absent(key.clone())).unwrap();
-            let change = Change::Write {
-                key,
-                version: version(1),
-                end: None,
-                data,
-            };
-            setup.change(change).unwrap();
-        }
+        let policy = store::policy_key(&authority());
+        setup.read(Dependency::Absent(policy.clone())).unwrap();
+        let change = Change::Write {
+            key: policy,
+            version: version(1),
+            end: None,
+            data: Box::from(*b"the policy"),
+        };
+        setup.change(change).unwrap();
+        Issuer::new(authority(), issuer.public(), audiences, ceiling)
+            .unwrap()
+            .register(&mut setup, &mut node.driver)
+            .unwrap();
+        Registration::register(&mut setup, runner_id(), runner.public(), authority(), &mut node.driver).unwrap();
         let (console, purpose) = (audience("console"), Id::new("acme", "operator").unwrap());
         let claims = Claims::new(
             authority(),
@@ -278,7 +289,7 @@ impl Host {
         let draft = Draft::credential(&issuer.trusted(), &claims, Some(operator.public()), at(0)).unwrap();
         let signature = issuer.sign(&draft.to_be_signed());
         setup.prepare(draft.finish(&signature, &mut budget()).unwrap());
-        let Outcome::Accepted(receipt) = node.commit(setup) else {
+        let Outcome::Accepted(receipt) = node.commit(setup, Plan::default()) else {
             panic!("the records did not commit");
         };
         let credential = receipt.artifact().unwrap();
@@ -309,10 +320,24 @@ impl Host {
         Issuer::from_record(&record.data, Limits::default()).unwrap()
     }
 
+    /// The current registration record of the workload.
+    fn registration(&mut self) -> Option<Record> {
+        self.node.read(&Registration::store_key(&runner_id()))
+    }
+
+    /// The check of a verifier that reads the current state: `credential` verifies at `audience` under the profile of
+    /// the current issuer record, and the current registration admits it, at `now`.
+    fn admits(&mut self, credential: &Credential, audience: &str, now: Reading) -> Result<(), Error> {
+        let profile = self.issuer().profile(&self::audience(audience), Limits::default())?;
+        let verified = profile.verify(credential.as_bytes(), now, &mut budget())?;
+        let registration = self.registration();
+        workload::admits(&verified, registration.as_ref(), Limits::default())
+    }
+
     /// The pending issuance of `request` at `now`, from the current records.
     fn pending(&mut self, request: Request<'_>, now: Reading) -> Result<Pending, Error> {
         let issuer = self.node.read(&Issuer::store_key(&authority())).unwrap();
-        let registration = self.node.read(&Registration::store_key(&runner_id())).unwrap();
+        let registration = self.registration().unwrap();
         Pending::new(
             request,
             &issuer,
@@ -324,21 +349,58 @@ impl Host {
         )
     }
 
-    /// The pending issuance of `request` at `now` that custody signed: its proposal, its release, and the signature.
-    fn signed(&mut self, request: Request<'_>, now: Reading) -> (Proposal, Awaiting, Vec<u8>) {
+    /// The pending issuance of `request` at `now` that custody signed: its proposal, its plan, its release, and the
+    /// signature.
+    fn signed(&mut self, request: Request<'_>, now: Reading) -> (Proposal, Plan, Awaiting, Vec<u8>) {
         let pending = self.pending(request, now).unwrap();
         let signature = self.issuer.sign(&pending.to_be_signed());
-        let (proposal, awaiting) = pending.finish(&signature, &mut budget()).unwrap();
-        (proposal, awaiting, signature)
+        let (proposal, plan, awaiting) = pending.finish(&signature, &mut budget()).unwrap();
+        (proposal, plan, awaiting, signature)
     }
 
     /// The credential of `request` at `now`, or the refusal of the issuance or of its commit.
     fn issue(&mut self, request: Request<'_>, now: Reading) -> Result<Credential, Error> {
         let pending = self.pending(request, now)?;
         let signature = self.issuer.sign(&pending.to_be_signed());
-        let (proposal, awaiting) = pending.finish(&signature, &mut budget())?;
-        let outcome = self.node.commit(proposal);
+        let (proposal, plan, awaiting) = pending.finish(&signature, &mut budget())?;
+        let outcome = self.node.commit(proposal, plan);
         awaiting.release(outcome)
+    }
+
+    /// The commit of the revocation of the operation `name` of `target` by the operator at `now`.
+    fn revoke(&mut self, name: &str, target: Target, now: Reading) -> Outcome {
+        let operator = self.operator.clone();
+        let revocation = Revocation {
+            operation: op(name),
+            by: &operator,
+            target,
+        };
+        let registration = self.registration().unwrap();
+        let (proposal, plan) = revocation
+            .proposal(&registration, &Permits, &mut self.node.driver, now, Limits::default())
+            .unwrap();
+        self.node.commit(proposal, plan)
+    }
+
+    /// The commit of the rotation of the operation `name` of the issuer key to `key` by the operator at `now`, or its
+    /// refusal.
+    fn rotate_issuer(
+        &mut self,
+        name: &str,
+        key: PublicKey<'_>,
+        retire: Retire,
+        now: Reading,
+    ) -> Result<Outcome, Error> {
+        let operator = self.operator.clone();
+        let rotation = IssuerRotation {
+            operation: op(name),
+            by: &operator,
+            key,
+            retire,
+        };
+        let issuer = self.node.read(&Issuer::store_key(&authority())).unwrap();
+        let (proposal, plan) = rotation.proposal(&issuer, &Permits, &mut self.node.driver, now, Limits::default())?;
+        Ok(self.node.commit(proposal, plan))
     }
 
     /// The first issuance of the operation `name` by the operator, for `build-api` with the default lifetime.
@@ -368,6 +430,40 @@ impl Host {
             },
             audience: &build,
             lifetime,
+            replace: None,
+        };
+        self.issue(request, now)
+    }
+
+    /// The rotation of the operation `name` at `now` by the workload, with `credential` and a proof by `key`, to the
+    /// key of `new`, whose proof `signer` signs.
+    fn rotate(
+        &mut self,
+        name: &str,
+        credential: &Credential,
+        key: &Custody,
+        new: &Custody,
+        signer: &Custody,
+        now: Reading,
+    ) -> Result<Credential, Error> {
+        let build = audience("build-api");
+        let proof = key.prove(credential.as_bytes(), &build, name.as_bytes(), now);
+        let challenge = [name.as_bytes(), b"-new"].concat();
+        let new_proof = new.prove_new(signer, &runner_id(), &challenge, now);
+        let request = Request {
+            operation: op(name),
+            by: By::Renew {
+                credential: credential.as_bytes(),
+                proof: &proof,
+                challenge: name.as_bytes(),
+            },
+            audience: &build,
+            lifetime: None,
+            replace: Some(Replace {
+                key: new.public(),
+                proof: &new_proof,
+                challenge: &challenge,
+            }),
         };
         self.issue(request, now)
     }
@@ -380,6 +476,23 @@ fn issuance<'a>(name: &str, evidence: &'a Evidence, audience: &'a Id<Audience>) 
         by: By::Issue(evidence),
         audience,
         lifetime: None,
+        replace: None,
+    }
+}
+
+/// A recovery of the operation `name` by `evidence` for `build`, to the new key `key` with its proof `proof` over
+/// `challenge`.
+fn recovery<'a>(
+    name: &str,
+    evidence: &'a Evidence,
+    build: &'a Id<Audience>,
+    key: PublicKey<'a>,
+    proof: &'a [u8],
+    challenge: &'a [u8],
+) -> Request<'a> {
+    Request {
+        replace: Some(Replace { key, proof, challenge }),
+        ..issuance(name, evidence, build)
     }
 }
 
@@ -410,10 +523,11 @@ fn a_workload_credential_refuses_at_a_wrong_audience_under_a_wrong_key_and_with_
         ceiling(),
     )
     .unwrap();
+    // The `kid` of the credential names no key of a verifier that trusts another issuer key.
     let other = other.profile(&build, Limits::default()).unwrap();
     assert_eq!(
         other.verify(credential.as_bytes(), now, &mut budget()).err(),
-        Some(credential::Error::Cose(cose::Error::Signature))
+        Some(credential::Error::Cose(cose::Error::KeyId))
     );
     let stolen = Custody::new(4).prove(credential.as_bytes(), &build, b"challenge-1", now);
     assert_eq!(
@@ -428,10 +542,10 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     let (operator, build) = (host.operator.clone(), audience("build-api"));
 
     // The commit lands, and its response is lost: the release gives no credential.
-    let (proposal, awaiting, signature) = host.signed(issuance("i-lost", &operator, &build), at(0));
+    let (proposal, plan, awaiting, signature) = host.signed(issuance("i-lost", &operator, &build), at(0));
     let serial = awaiting.serial();
     host.node.memory.inject(Fault::LostResponse);
-    let outcome = host.node.commit(proposal);
+    let outcome = host.node.commit(proposal, plan);
     let Err(Error::Unknown(operation)) = awaiting.release(outcome) else {
         panic!("a lost response released a credential, or gave another error than an unknown outcome");
     };
@@ -452,23 +566,26 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     assert!(entries.iter().all(|entry| !holds(&entry.data, &signature)));
 
     // A new proposal of the same request under the same identity commits nothing, and it releases nothing.
-    let (again, awaiting, _) = host.signed(issuance("i-lost", &operator, &build), at(0));
+    let (again, plan, awaiting, _) = host.signed(issuance("i-lost", &operator, &build), at(0));
     let serial = awaiting.serial();
-    assert_eq!(awaiting.release(host.node.commit(again)).err(), Some(Error::Committed));
+    assert_eq!(
+        awaiting.release(host.node.commit(again, plan)).err(),
+        Some(Error::Committed)
+    );
     assert_eq!(host.node.read(&workload::credential_key(serial)), None);
 
     // A crash before the commit: the release gives no credential, and nothing committed.
-    let (proposal, awaiting, _) = host.signed(issuance("i-crash", &operator, &build), at(0));
+    let (proposal, plan, awaiting, _) = host.signed(issuance("i-crash", &operator, &build), at(0));
     let serial = awaiting.serial();
     host.node.memory.inject(Fault::CrashBeforeCommit);
-    let outcome = host.node.commit(proposal);
+    let outcome = host.node.commit(proposal, plan);
     assert!(matches!(awaiting.release(outcome), Err(Error::Unknown(_))));
     host.node.start();
     assert_eq!(host.node.read(&workload::credential_key(serial)), None);
 
     // The control: the accepted commit releases the credential that custody signed, and it verifies.
-    let (proposal, awaiting, signature) = host.signed(issuance("i-accepted", &operator, &build), at(0));
-    let credential = awaiting.release(host.node.commit(proposal)).unwrap();
+    let (proposal, plan, awaiting, signature) = host.signed(issuance("i-accepted", &operator, &build), at(0));
+    let credential = awaiting.release(host.node.commit(proposal, plan)).unwrap();
     assert!(holds(credential.as_bytes(), &signature));
     let profile = host.issuer().profile(&build, Limits::default()).unwrap();
     let verified = profile.verify(credential.as_bytes(), at(1), &mut budget()).unwrap();
@@ -529,24 +646,6 @@ fn a_renewal_refuses_without_possession_of_the_registered_key() {
         host.renew("r-2", &first, &stolen, None, at(30)).err(),
         Some(Error::Credential(credential::Error::Cose(cose::Error::Signature)))
     );
-
-    // The application registers a new key. A proof by the earlier key of a credential that is still valid refuses.
-    let key = Registration::store_key(&runner_id());
-    let mut change = proposal("rotate");
-    change.read(Dependency::Version(key.clone(), version(1))).unwrap();
-    change
-        .change(Change::Write {
-            key,
-            version: version(2),
-            end: None,
-            data: Registration::new(runner_id(), stolen.public()).unwrap().to_record(),
-        })
-        .unwrap();
-    assert!(matches!(host.node.commit(change), Outcome::Accepted(_)));
-    assert_eq!(
-        host.renew("r-3", &first, &runner, None, at(30)).err(),
-        Some(Error::Possession)
-    );
 }
 
 #[test]
@@ -582,4 +681,282 @@ fn a_restore_from_an_older_snapshot_releases_no_credential_serial_twice() {
         serials.array_windows().all(|[earlier, later]| earlier < later),
         "{serials:?}"
     );
+}
+
+#[test]
+fn after_a_rotation_the_old_proof_key_refuses() {
+    let mut host = Host::new(ceiling());
+    let first = host.first("i-1");
+    let (runner, new) = (Custody::new(2), Custody::new(6));
+    // The control: before the rotation, the current registration admits the credential.
+    host.admits(&first, "build-api", at(10)).unwrap();
+
+    // The workload proves its current key and its new key. The commit issues the first credential of the new key.
+    let rotated = host.rotate("rot-1", &first, &runner, &new, &new, at(10)).unwrap();
+    let build = audience("build-api");
+    let profile = host.issuer().profile(&build, Limits::default()).unwrap();
+    let verified = profile.verify(rotated.as_bytes(), at(11), &mut budget()).unwrap();
+    let proof = new.prove(rotated.as_bytes(), &build, b"challenge-1", at(11));
+    verified
+        .possession(&proof, b"challenge-1", at(11), &mut budget())
+        .unwrap();
+    host.admits(&rotated, "build-api", at(11)).unwrap();
+
+    // The old key refuses at the issuer, and its credential refuses at a verifier that reads the registration.
+    assert_eq!(
+        host.renew("r-1", &first, &runner, None, at(30)).err(),
+        Some(Error::Possession)
+    );
+    assert_eq!(host.admits(&first, "build-api", at(11)), Err(Error::Revoked));
+    assert_eq!(
+        host.renew("r-2", &rotated, &runner, None, at(30)).err(),
+        Some(Error::Credential(credential::Error::Cose(cose::Error::Signature)))
+    );
+    host.renew("r-3", &rotated, &new, None, at(30)).unwrap();
+}
+
+#[test]
+fn a_rotation_and_a_recovery_refuse_a_new_key_without_its_proof_of_possession() {
+    let mut host = Host::new(ceiling());
+    let first = host.first("i-1");
+    let (runner, new, other) = (Custody::new(2), Custody::new(6), Custody::new(7));
+
+    // Another key signs the proof of the new key, so the issuer binds no key that the workload does not hold.
+    assert_eq!(
+        host.rotate("rot-1", &first, &runner, &new, &other, at(10)).err(),
+        Some(Error::Credential(credential::Error::Cose(cose::Error::Signature)))
+    );
+    let (operator, build) = (host.operator.clone(), audience("build-api"));
+    let forged = new.prove_new(&other, &runner_id(), b"rec-1", at(10));
+    assert_eq!(
+        host.issue(
+            recovery("rec-1", &operator, &build, new.public(), &forged, b"rec-1"),
+            at(10)
+        )
+        .err(),
+        Some(Error::Credential(credential::Error::Cose(cose::Error::Signature)))
+    );
+    // A proof of the new key for another workload binds other bytes.
+    let elsewhere = new.prove_new(&new, &Id::new("acme", "runner-8").unwrap(), b"rec-2", at(10));
+    assert_eq!(
+        host.issue(
+            recovery("rec-2", &operator, &build, new.public(), &elsewhere, b"rec-2"),
+            at(10)
+        )
+        .err(),
+        Some(Error::Credential(credential::Error::Proof))
+    );
+
+    // Nothing committed: the registered key and the generation are the same.
+    host.admits(&first, "build-api", at(10)).unwrap();
+    host.renew("r-1", &first, &runner, None, at(30)).unwrap();
+}
+
+#[test]
+fn a_revoked_credential_refuses_at_a_verifier_that_reads_the_current_registration() {
+    let mut host = Host::new(ceiling());
+    let (operator, deploy) = (host.operator.clone(), audience("deploy-api"));
+    let build = host.first("i-1");
+    let later = host.issue(issuance("i-2", &operator, &deploy), at(0)).unwrap();
+    for (credential, audience) in [(&build, "build-api"), (&later, "deploy-api")] {
+        host.admits(credential, audience, at(1)).unwrap();
+    }
+
+    // A revocation of one credential ends it and each earlier one. A later credential stays valid.
+    assert!(matches!(
+        host.revoke("rv-1", Target::Credential(build.serial()), at(1)),
+        Outcome::Accepted(_)
+    ));
+    assert_eq!(host.admits(&build, "build-api", at(2)), Err(Error::Revoked));
+    host.admits(&later, "deploy-api", at(2)).unwrap();
+    let runner = Custody::new(2);
+    assert_eq!(
+        host.renew("r-1", &build, &runner, None, at(30)).err(),
+        Some(Error::Revoked)
+    );
+
+    // A serial that the driver did not give yet would end later credentials too, so the revocation refuses.
+    let operator = host.operator.clone();
+    let ahead = Revocation {
+        operation: op("rv-2"),
+        by: &operator,
+        target: Target::Credential(Serial(later.serial().0 + 1_000)),
+    };
+    let registration = host.registration().unwrap();
+    assert_eq!(
+        ahead
+            .proposal(&registration, &Permits, &mut host.node.driver, at(2), Limits::default())
+            .err(),
+        Some(Error::Target)
+    );
+
+    // A revocation of all credentials ends each one. The registration stays, so the operator issues again.
+    assert!(matches!(host.revoke("rv-3", Target::All, at(2)), Outcome::Accepted(_)));
+    assert_eq!(host.admits(&later, "deploy-api", at(3)), Err(Error::Revoked));
+    let again = host.first("i-3");
+    host.admits(&again, "build-api", at(3)).unwrap();
+}
+
+#[test]
+fn a_replacement_host_gets_a_credential_and_the_old_hosts_credential_refuses() {
+    let mut host = Host::new(ceiling());
+    let old = host.first("i-1");
+    let (old_host, new_host) = (Custody::new(2), Custody::new(5));
+    let (operator, build) = (host.operator.clone(), audience("build-api"));
+
+    // A recovery that the old host races refuses with nothing released: it cannot revoke the old host's credential
+    // that it did not read.
+    let proof = new_host.prove_new(&new_host, &runner_id(), b"rec-1", at(10));
+    let (proposal, plan, awaiting, _) = host.signed(
+        recovery("rec-1", &operator, &build, new_host.public(), &proof, b"rec-1"),
+        at(10),
+    );
+    let renewed = host.renew("r-1", &old, &old_host, None, at(10)).unwrap();
+    assert_eq!(
+        awaiting.release(host.node.commit(proposal, plan)).err(),
+        Some(Error::Conflict)
+    );
+    host.admits(&renewed, "build-api", at(11)).unwrap();
+
+    // The recovery under the authority of the operator issues to the new host and revokes the old host in one commit.
+    let proof = new_host.prove_new(&new_host, &runner_id(), b"rec-2", at(11));
+    let replacement = host
+        .issue(
+            recovery("rec-2", &operator, &build, new_host.public(), &proof, b"rec-2"),
+            at(11),
+        )
+        .unwrap();
+    host.admits(&replacement, "build-api", at(12)).unwrap();
+    let profile = host.issuer().profile(&build, Limits::default()).unwrap();
+    let verified = profile.verify(replacement.as_bytes(), at(12), &mut budget()).unwrap();
+    let possession = new_host.prove(replacement.as_bytes(), &build, b"challenge-1", at(12));
+    verified
+        .possession(&possession, b"challenge-1", at(12), &mut budget())
+        .unwrap();
+    for credential in [&old, &renewed] {
+        assert_eq!(host.admits(credential, "build-api", at(12)), Err(Error::Revoked));
+        assert_eq!(
+            host.renew("r-2", credential, &old_host, None, at(30)).err(),
+            Some(Error::Possession)
+        );
+    }
+}
+
+#[test]
+fn an_issuance_and_a_revocation_that_race_conflict_so_no_credential_survives_its_revocation() {
+    let mut host = Host::new(ceiling());
+    let first = host.first("i-1");
+    let runner = Custody::new(2);
+
+    // The revocation reads the registration first. A renewal with a later serial commits before it. The revocation
+    // conflicts, because a revocation that committed would leave the renewed credential valid.
+    let operator = host.operator.clone();
+    let revocation = Revocation {
+        operation: op("rv-1"),
+        by: &operator,
+        target: Target::All,
+    };
+    let registration = host.registration().unwrap();
+    let (proposal, plan) = revocation
+        .proposal(
+            &registration,
+            &Permits,
+            &mut host.node.driver,
+            at(30),
+            Limits::default(),
+        )
+        .unwrap();
+    let renewed = host.renew("r-1", &first, &runner, None, at(30)).unwrap();
+    assert!(matches!(host.node.commit(proposal, plan), Outcome::Conflict));
+
+    // A renewal that read the registration before a revocation commits conflicts, and it releases nothing.
+    let build = audience("build-api");
+    let proof = runner.prove(renewed.as_bytes(), &build, b"r-2", at(31));
+    let request = Request {
+        operation: op("r-2"),
+        by: By::Renew {
+            credential: renewed.as_bytes(),
+            proof: &proof,
+            challenge: b"r-2",
+        },
+        audience: &build,
+        lifetime: None,
+        replace: None,
+    };
+    let (proposal, plan, awaiting, _) = host.signed(request, at(31));
+    assert!(matches!(host.revoke("rv-2", Target::All, at(31)), Outcome::Accepted(_)));
+    assert_eq!(
+        awaiting.release(host.node.commit(proposal, plan)).err(),
+        Some(Error::Conflict)
+    );
+    assert_eq!(host.admits(&renewed, "build-api", at(32)), Err(Error::Revoked));
+}
+
+#[test]
+fn an_issuer_rotation_keeps_the_credentials_of_the_old_key_until_they_end_and_a_retired_key_refuses() {
+    let mut host = Host::new(ceiling());
+    let old = host.first("i-1");
+    let (second, third) = (Custody::new(8), Custody::new(9));
+
+    // A routine rotation: the old key verifies its credentials until they can end, and the new key signs.
+    let outcome = host
+        .rotate_issuer("ir-1", second.public(), Retire::AfterLifetime, at(10))
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Accepted(_)));
+    host.issuer = Custody::new(8);
+    let new = host.first("i-2");
+    host.admits(&old, "build-api", at(11)).unwrap();
+    host.admits(&new, "build-api", at(11)).unwrap();
+
+    // A second routine rotation waits for the end of the credentials of the previous key. A key of another algorithm
+    // would change the declared profile of the audiences.
+    assert_eq!(
+        host.rotate_issuer("ir-2", third.public(), Retire::AfterLifetime, at(20))
+            .err(),
+        Some(Error::Overlap {
+            until: START + minutes(70)
+        })
+    );
+    let classical = Ed25519SecretKey::from_bytes([9; 32]).public_key().to_bytes();
+    assert_eq!(
+        host.rotate_issuer("ir-3", PublicKey::Ed25519(&classical), Retire::Now, at(20))
+            .err(),
+        Some(Error::Algorithm)
+    );
+
+    // A rotation that retires the old key at once: each credential of an earlier key refuses by its `kid`.
+    let outcome = host.rotate_issuer("ir-4", third.public(), Retire::Now, at(20)).unwrap();
+    assert!(matches!(outcome, Outcome::Accepted(_)));
+    host.issuer = Custody::new(9);
+    let retired = Err(Error::Credential(credential::Error::Cose(cose::Error::KeyId)));
+    assert_eq!(host.admits(&old, "build-api", at(21)), retired);
+    assert_eq!(host.admits(&new, "build-api", at(21)), retired);
+    let current = host.first("i-3");
+    host.admits(&current, "build-api", at(21)).unwrap();
+}
+
+#[test]
+fn a_restore_from_a_snapshot_older_than_a_revocation_keeps_the_revoked_credential_refused() {
+    let mut host = Host::new(ceiling());
+    let first = host.first("i-1");
+    let older = host.node.memory.snapshot();
+    assert!(matches!(host.revoke("rv-1", Target::All, at(1)), Outcome::Accepted(_)));
+    host.node.restore(&older);
+
+    // The journal ends the registration that the snapshot holds, so no verifier that reads it admits the credential.
+    assert_eq!(host.registration(), None);
+    assert_eq!(host.admits(&first, "build-api", at(2)), Err(Error::Unregistered));
+
+    // A new registration of the same key starts a new generation, so the revoked credential stays refused.
+    let mut setup = proposal("register-again");
+    Registration::register(
+        &mut setup,
+        runner_id(),
+        Custody::new(2).public(),
+        authority(),
+        &mut host.node.driver,
+    )
+    .unwrap();
+    assert!(matches!(host.node.commit(setup, Plan::default()), Outcome::Accepted(_)));
+    assert_eq!(host.admits(&first, "build-api", at(2)), Err(Error::Revoked));
 }

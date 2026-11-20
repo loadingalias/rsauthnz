@@ -3,10 +3,11 @@
 use core::fmt;
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use super::{Error, alg, algorithm, label};
 use crate::cbor::{self, Value};
-use crate::crypto::{Algorithm, Verifier};
+use crate::crypto::{self, Algorithm, Verifier};
 use crate::limits::{Limits, SignatureBudget};
 
 /// A public key from a `COSE_Key`. It is an untrusted value until the application makes a [`TrustedKey`] from it.
@@ -134,7 +135,33 @@ impl<'a> PublicKey<'a> {
     /// The `COSE_Key` of the key, with its `alg` (3): an `OKP` (1) key with `crv` (-1) `Ed25519` (6) and `x` (-2), an
     /// `EC2` (2) key with `crv` `P-256` (1), `x`, and `y` (-3), or an `AKP` (7) key with `pub` (-1).
     pub(crate) fn to_cbor(&self) -> Value<'a> {
-        let (kty, mut entries) = match *self {
+        let (kty, mut entries) = self.members();
+        let alg = alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm");
+        entries.extend([(label(1), Value::Unsigned(kty)), (label(3), alg)]);
+        Value::Map(entries)
+    }
+
+    /// The COSE Key Thumbprint of the key ([RFC 9679]): the SHA-256 digest of the deterministic CBOR of its required
+    /// parameters. An `OKP` or `EC2` key has `kty`, `crv`, and its coordinates (RFC 9679 section 4). An `AKP` key has
+    /// `kty`, `alg`, and `pub` (RFC 9964 section 6).
+    ///
+    /// [RFC 9679]: https://www.rfc-editor.org/rfc/rfc9679
+    pub(crate) fn thumbprint(&self) -> [u8; 32] {
+        let (kty, mut entries) = self.members();
+        entries.push((label(1), Value::Unsigned(kty)));
+        if kty == AKP {
+            entries.push((
+                label(3),
+                alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm"),
+            ));
+        }
+        let form = cbor::encode(&Value::Map(entries)).expect("a COSE_Key has distinct labels and no simple value");
+        crypto::sha256(&form)
+    }
+
+    /// The `kty` of the key, and its parameters other than `kty` and `alg`.
+    fn members(&self) -> (u64, Vec<(Value<'a>, Value<'a>)>) {
+        match *self {
             Self::Ed25519(x) => (1, vec![(label(-1), Value::Unsigned(6)), (label(-2), Value::Bytes(x))]),
             Self::P256 { x, y } => (
                 2,
@@ -144,15 +171,15 @@ impl<'a> PublicKey<'a> {
                     (label(-3), Value::Bytes(y)),
                 ],
             ),
-            Self::MlDsa65(public) => (7, vec![(label(-1), Value::Bytes(public))]),
-            Self::MlDsa65Ed25519(public) => (7, vec![(label(-1), Value::Bytes(public))]),
-            Self::MlDsa65EcdsaP256(public) => (7, vec![(label(-1), Value::Bytes(public))]),
-        };
-        let alg = alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm");
-        entries.extend([(label(1), Value::Unsigned(kty)), (label(3), alg)]);
-        Value::Map(entries)
+            Self::MlDsa65(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
+            Self::MlDsa65Ed25519(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
+            Self::MlDsa65EcdsaP256(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
+        }
     }
 }
+
+/// The `kty` of an `AKP` key (RFC 9964): ML-DSA-65 and the composites.
+const AKP: u64 = 7;
 
 /// Refuses a curve other than `expected`.
 fn curve(crv: Option<&Value<'_>>, expected: u64) -> Result<(), Error> {
@@ -173,15 +200,22 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<&[u8; N], Error> {
     bytes.try_into().map_err(|_| Error::Malformed)
 }
 
-/// A verification key that the application trusts for one algorithm. A [`super::Profile`] holds it, so a header of an
-/// artifact never selects a key or an algorithm.
+/// A verification key that the application trusts for one algorithm. A profile holds it, so a header of an artifact
+/// never selects an algorithm. A `kid` selects only among the trusted keys of the profile, and each of them has the
+/// algorithm of the profile.
 #[derive(Clone, PartialEq, Eq)]
-pub struct TrustedKey(Verifier);
+pub struct TrustedKey {
+    verifier: Verifier,
+    /// The COSE Key Thumbprint of the key.
+    kid: [u8; 32],
+}
 
 impl TrustedKey {
-    /// Makes the trusted key of `algorithm` from `key`.
+    /// Makes the trusted key of `algorithm` from `key`. The `kid` of `key` has no effect: the key ID of a trusted key is
+    /// its thumbprint ([`Self::kid`]).
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). A P-256 key checks its point and prepares its tables.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). A P-256 key checks its point and prepares its tables, and
+    /// the thumbprint is one SHA-256 digest of the key.
     ///
     /// # Errors
     ///
@@ -191,7 +225,7 @@ impl TrustedKey {
         if key.alg.is_some_and(|alg| alg != algorithm) {
             return Err(Error::KeyAlgorithm);
         }
-        Ok(Self(match (algorithm, &key.public) {
+        let verifier = match (algorithm, &key.public) {
             (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
             (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
             (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
@@ -202,18 +236,31 @@ impl TrustedKey {
                 Verifier::ml_dsa_65_ecdsa_p256(public).ok_or(Error::Malformed)?
             }
             _ => return Err(Error::KeyAlgorithm),
-        }))
+        };
+        Ok(Self {
+            verifier,
+            kid: key.public.thumbprint(),
+        })
     }
 
     /// The algorithm of the key.
     #[must_use]
     pub const fn algorithm(&self) -> Algorithm {
-        self.0.algorithm()
+        self.verifier.algorithm()
+    }
+
+    /// The key ID of the key: its COSE Key Thumbprint ([RFC 9679]), with SHA-256. The `kid` of an artifact names its
+    /// issuer key with it.
+    ///
+    /// [RFC 9679]: https://www.rfc-editor.org/rfc/rfc9679
+    #[must_use]
+    pub const fn kid(&self) -> &[u8; 32] {
+        &self.kid
     }
 
     /// Verifies `signature` over `message` with the algorithm of the key, after it charges `budget`.
     pub(crate) fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<(), Error> {
-        self.0
+        self.verifier
             .verify(message, signature, budget)
             .map_err(Error::Limit)?
             .ok_or(Error::Signature)

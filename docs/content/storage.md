@@ -104,8 +104,8 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
 | `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number of its write, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
 | `Local` | The record of a [local authority](local-authority.md): its host grant, its issuer key, and the log of its bootstrap values | `None` |
-| `Issuer` | An issuer of workload credentials: its authority, its public key, its audiences, and its ceiling ([Issue and renew workload credentials](workload.md)) | `None` |
-| `Workload` | The registration of a workload: the workload and its registered proof key | `None` |
+| `Issuer` | An issuer of workload credentials: its authority, its current key and its previous key, its audiences, and its ceiling ([Issue and manage workload credentials](workload.md)) | `None` |
+| `Workload` | The registration of a workload: the workload, its registered proof key, and its generation | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for

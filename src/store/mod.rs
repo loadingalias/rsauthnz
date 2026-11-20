@@ -104,10 +104,10 @@ pub enum Kind {
     /// The record of a local authority ([`crate::local`]): its host grant, its issuer key, and the log of its bootstrap
     /// values. Only an issue of a bootstrap value writes it, and it has no end.
     Local = 22,
-    /// An issuer of workload credentials: its authority, its public key, its audiences, and its ceiling
-    /// ([`workload::Issuer`](crate::workload::Issuer)).
+    /// An issuer of workload credentials: its authority, its current key and its previous key, its audiences, and its
+    /// ceiling ([`workload::Issuer`](crate::workload::Issuer)).
     Issuer = 23,
-    /// The registration of a workload: its identifier and its registered proof key
+    /// The registration of a workload: its identifier, its registered proof key, and its generation
     /// ([`workload::Registration`](crate::workload::Registration)).
     Workload = 24,
 }

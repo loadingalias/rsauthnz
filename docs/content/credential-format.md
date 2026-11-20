@@ -21,7 +21,7 @@ issuer key can sign each kind, and an artifact of one purpose does not verify fo
 
 The application chooses the purpose of each kind, as an `Id<Purpose>`, except for a workload credential. The
 `rsauthnz::workload` module issues each workload credential with the purpose `rsauthnz:workload`, through its
-transition ([Issue and renew workload credentials](workload.md)). A receipt has no `cnf` key, so it cannot prove
+transition ([Issue and manage workload credentials](workload.md)). A receipt has no `cnf` key, so it cannot prove
 possession.
 
 ## Declare the profile of an audience
@@ -29,6 +29,14 @@ possession.
 The algorithm of the issuer key is the profile that an audience declares. The issuer signs each artifact for the
 audience with that key, and the `Profile` of the audience holds that key. An artifact of another algorithm refuses
 with `Error::Cose(cose::Error::AlgorithmMismatch)`. rsauthnz tries no other key and no other algorithm.
+
+Each artifact names its issuer key with the `kid` of its protected bucket. The `kid` is the COSE Key Thumbprint of
+the key ([RFC 9679](https://www.rfc-editor.org/rfc/rfc9679)), with SHA-256: `TrustedKey::kid()`. During a rotation
+of the issuer key, `profile.with_previous(previous_key, until)` adds the key that the current key replaced. `until` is
+the time from which no artifact of the previous key is valid. The `kid` selects one of the two keys, and the
+signature check uses only that key. A check whose reading can be at or after `until` refuses an artifact of the
+previous key with `cose::Error::KeyId`. Thus a retired key that leaks later signs nothing that verifies.
+`with_previous` refuses a key of another algorithm with `Error::Profile`, so a header never selects an algorithm.
 
 | Issuer key `Algorithm` | Authentication | `cnf` key `Algorithm` | Use |
 | --- | --- | --- | --- |
@@ -51,9 +59,10 @@ The SLH-DSA trust-root profile signs issuer keys, not artifacts of this format. 
 
 The artifact is a `COSE_Sign1` with the tag 18:
 
-- The protected bucket holds only `alg`, the COSE identifier of the issuer key: -59 for `MlDsa65Ed25519`, -55 for
-  `MlDsa65EcdsaP256`, -49 for `MlDsa65`, -19 for `Ed25519`, or -7 for `Es256`. The two composite identifiers are
-  drafts.
+- The protected bucket holds `alg` (1) and `kid` (4). `alg` is the COSE identifier of the issuer key: -59 for
+  `MlDsa65Ed25519`, -55 for `MlDsa65EcdsaP256`, -49 for `MlDsa65`, -19 for `Ed25519`, or -7 for `Es256`. The two
+  composite identifiers are drafts. `kid` is the 32-byte COSE Key Thumbprint of the issuer key. A proof has only
+  `alg`.
 - The unprotected bucket is empty.
 - The payload is the claims map, in the deterministic CBOR of [Parser limits](parser-limits.md).
 - The signature covers the `Sig_structure` of RFC 9052, section 4.4, with an empty external AAD. ML-DSA-65 and the
@@ -83,22 +92,22 @@ counter of the store (`store::driver::Driver::allocate`), so that a restore neve
 An encoded artifact or proof has at most `credential::MAX_BYTES`: 8,192 bytes. A draft that can be longer refuses
 with `Error::Size` before custody signs it. Verification refuses a longer input before it decodes it.
 
-The example credential below is 5,481 bytes. The default profile signs it, and its `cnf` key is a default key:
+The example credential below is 5,517 bytes. The default profile signs it, and its `cnf` key is a default key:
 
 | Part | Bytes |
 | --- | --- |
 | The tag, the array head, and the empty unprotected bucket | 3 |
-| The protected bucket, with its head | 5 |
+| The protected bucket, with its head: `alg` and the `kid` of 32 bytes | 41 |
 | The claims, with their head | 2,097 |
 | Of the claims: the `cnf` claim | 1,997 |
 | Of the `cnf` claim: the public key of the holder | 1,984 |
 | The signature, with its head | 3,376 |
-| Total | 5,481 |
+| Total | 5,517 |
 
 The composite signature and the composite key of the holder make up 5,357 bytes of the total. A credential of the
 hardware-bound profile is at most 41 bytes longer: its key has 2,017 bytes, and its signature has at most 3,381
 bytes. A credential of `MlDsa65`, `Ed25519`, or `Es256` is shorter than the example, because its key and its
-signature are shorter. Longer identifiers make the claims longer. The example is 2,711 bytes below the limit.
+signature are shorter. Longer identifiers make the claims longer. The example is 2,675 bytes below the limit.
 
 A proof of possession of the example credential, with a challenge of 32 bytes, is 3,487 bytes. The holder sends one
 proof for each check of possession.
@@ -196,8 +205,10 @@ checks](verification.md#bound-the-signature-checks) gives.
 
 1. The artifact has at most 8,192 bytes.
 2. It does each check of `cose::Profile::verify`, as [Verify a CWT](verification.md#verify-a-cwt) gives. `iss`
-   must be the text of the issuer, and `aud` must name the text of the audience. The signature check of the issuer
-   key comes last of these checks.
+   must be the text of the issuer, and `aud` must name the text of the audience. Before the signature check, the
+   protected `kid` must name a key of the profile, or the artifact refuses with `cose::Error::KeyId`. The previous
+   key counts only while `now.latest()` is before its end. The signature check of the named key comes last of these
+   checks.
 3. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
    its owner, and a human or a workload must have none. A claim of another key, or a `sub` claim, refuses.
 4. The purpose must be the purpose of the profile.
@@ -248,8 +259,8 @@ claims or the key.
 
 | Error | Cause |
 | --- | --- |
-| `Cose(cose::Error)` | The COSE layer refused: the decode, the issuer, the audience, the validity interval, a key, the signature, or the signature budget. [Verify COSE and CWT artifacts](verification.md#errors) gives each cause |
-| `Profile` | A key is the SLH-DSA trust-root key, or the `cnf` key has another authentication than the issuer key |
+| `Cose(cose::Error)` | The COSE layer refused: the decode, the issuer, the audience, the validity interval, a key, the `kid`, the signature, or the signature budget. [Verify COSE and CWT artifacts](verification.md#errors) gives each cause |
+| `Profile` | A key is the SLH-DSA trust-root key, the `cnf` key has another authentication than the issuer key, or the previous key of `with_previous` has another algorithm than the current key |
 | `Size` | The artifact or proof is longer than 8,192 bytes, or a draft can be longer |
 | `Claims` | A claim is missing, has the wrong form, or is not a claim of this format |
 | `Purpose` | The purpose of the artifact is not the purpose of the profile |
@@ -260,6 +271,6 @@ claims or the key.
 ## Limits
 
 - The composite COSE identifiers are drafts. Another implementation can use other values until IANA assigns them.
-- The protected bucket has no `kid`. A profile holds one issuer key.
+- A profile holds at most two issuer keys: the current key and the previous key.
 - Verification decodes the artifact and the proof within the `limits` of the profile. The default limits admit
   each artifact and proof of this format.

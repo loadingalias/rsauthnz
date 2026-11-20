@@ -36,8 +36,9 @@ Each entry has its sequence, the identity of the operation that wrote it, and a 
 
 A fact (`journal::Fact`) states that each version of a record at or below a version is dead. An end of a record
 gives a fact at the version that the proposal read. A write gives a fact only for a version that it replaces, such as
-a session renewal or a grant change. A fact only removes authority, so a replay of the entries in any order, or more
-than once, gives the same state.
+a session renewal or a grant change. A rotation, a recovery, and a revocation of a
+[workload](workload.md#after-a-restore) are such writes too. A fact only removes authority, so a replay of the
+entries in any order, or more than once, gives the same state.
 
 An anchor has a `journal::Role`: a sign-in method, a CLI credential, or a recovery value of an account
 (`Id<Human>`), or an administrator binding of the authority (`Id<Authority>`).

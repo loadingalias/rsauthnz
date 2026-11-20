@@ -2,8 +2,10 @@
 //!
 //! Parsing gives untrusted values: [`Sign1::decode`], [`Key::decode`], and [`Claims::decode`]. Verification takes
 //! a trusted [`Profile`], which fixes the algorithm, the key, the issuer, the audience, and the purpose. A header
-//! can only match the algorithm of the profile. It never selects an algorithm or a key. [`Profile::verify`] gives
-//! [`Verified`] evidence, which holds the exact bytes of the artifact.
+//! can only match the algorithm of the profile. It never selects an algorithm. [`Profile::verify`] gives
+//! [`Verified`] evidence, which holds the exact bytes of the artifact. The credentials of
+//! [`credential`](crate::credential) name their issuer key with a protected `kid`. It selects only among the trusted
+//! keys of the profile, and each of them has the algorithm of the profile.
 //!
 //! [`Algorithm`] gives the profiles and their COSE identifiers. The identifiers of the composite profiles are drafts.
 //! The SLH-DSA trust-root profile has no COSE identifier yet, so no COSE key or artifact uses it.
@@ -113,6 +115,8 @@ pub enum Error {
     KeyAlgorithm,
     /// The protected header has no `alg`, or its `alg` is not the algorithm of the profile.
     AlgorithmMismatch,
+    /// The protected header has no `kid`, or its `kid` names no trusted key of the profile at the time of the check.
+    KeyId,
     /// The signature does not verify with the key of the profile.
     Signature,
     /// The signature check costs more than the [`SignatureBudget`](crate::limits::SignatureBudget) of the artifact
@@ -141,6 +145,7 @@ impl fmt::Display for Error {
             Self::Unsupported => f.write_str("the COSE input has a feature that is not supported"),
             Self::KeyAlgorithm => f.write_str("the key does not fit the algorithm"),
             Self::AlgorithmMismatch => f.write_str("the COSE algorithm is not the algorithm of the profile"),
+            Self::KeyId => f.write_str("the COSE key ID names no trusted key of the profile"),
             Self::Signature => f.write_str("the signature does not verify"),
             Self::Limit(Limit::SignatureChecks) => {
                 f.write_str("the artifact needs more signature checks than its limit")

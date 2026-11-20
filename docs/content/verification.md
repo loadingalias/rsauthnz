@@ -167,6 +167,7 @@ Each refusal is a `cose::Error`. For each refusal, the recovery is to refuse the
 | `Unsupported` | A key type, curve, or algorithm that rsauthnz does not support, a detached payload, a compressed P-256 point, an encrypted `cnf` key, or a key with private material |
 | `KeyAlgorithm` | The key does not fit the algorithm |
 | `AlgorithmMismatch` | The protected bucket has no `alg`, or its `alg` is not the algorithm of the profile. An `alg` in the unprotected bucket does not count |
+| `KeyId` | A credential or a receipt of [the credential format](credential-format.md) has no protected `kid`, or its `kid` names no key of the profile at the time of the check. A `kid` in the unprotected bucket does not count |
 | `Signature` | The signature does not verify with the key of the profile |
 | `Limit(Limit::SignatureChecks)` | The signature check costs more than the signature budget of the artifact has. The check did no signature work |
 | `Issuer` | `iss` is missing, or it is not the issuer of the profile |

@@ -407,7 +407,7 @@ fn a_default_credential_is_within_the_declared_bound_and_a_longer_draft_refuses_
     let holder = Custody::new(Algorithm::MlDsa65Ed25519, 2);
     let credential = issue(&issuer, &claims("build-api"), Some(&holder));
     // The sums of the parts that the credential format page gives: 8,192 bytes or fewer.
-    assert_eq!(credential.len(), 5_481);
+    assert_eq!(credential.len(), 5_517);
     assert_eq!(prove(&holder, &credential, &[5; 32]).len(), 3_487);
 
     // Three identifiers of 2,048 bytes make the artifact longer than 8,192 bytes, so the draft refuses and custody
@@ -422,6 +422,112 @@ fn a_default_credential_is_within_the_declared_bound_and_a_longer_draft_refuses_
     assert_eq!(
         Draft::credential(&issuer.key(), &claims, None, now()).unwrap_err(),
         Error::Size
+    );
+}
+
+/// The protected bucket and the payload of the credential `credential`.
+fn parts(credential: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let Value::Tag(18, sign1) = cbor::decode(credential, Limits::default()).expect("CBOR") else {
+        panic!("a COSE_Sign1");
+    };
+    let Value::Array(parts) = *sign1 else {
+        panic!("a COSE_Sign1 array");
+    };
+    let [Value::Bytes(protected), _, Value::Bytes(payload), _] = parts.as_slice() else {
+        panic!("the parts of a COSE_Sign1");
+    };
+    (protected.to_vec(), payload.to_vec())
+}
+
+/// The protected bucket of `credential` with the `kid` `kid` in place of its own, or with no `kid` for `None`.
+fn with_kid(credential: &[u8], kid: Option<&[u8]>) -> Vec<u8> {
+    let (protected, _) = parts(credential);
+    let Value::Map(mut header) = cbor::decode(&protected, Limits::default()).expect("a protected bucket") else {
+        panic!("a header map");
+    };
+    header.retain(|(label, _)| *label != Value::Unsigned(4));
+    header.extend(kid.map(|kid| (Value::Unsigned(4), Value::Bytes(kid))));
+    cbor::encode(&Value::Map(header)).expect("a protected bucket")
+}
+
+/// The `COSE_Sign1` of the protected bucket `protected` and the payload `payload` that `issuer` signs.
+fn signed(issuer: &Custody, protected: &[u8], payload: &[u8]) -> Vec<u8> {
+    let to_be_signed = Value::Array(vec![
+        Value::Text("Signature1"),
+        Value::Bytes(protected),
+        Value::Bytes(&[]),
+        Value::Bytes(payload),
+    ]);
+    let signature = issuer.sign(&cbor::encode(&to_be_signed).expect("a Sig_structure"));
+    let parts = vec![
+        Value::Bytes(protected),
+        Value::Map(vec![]),
+        Value::Bytes(payload),
+        Value::Bytes(&signature),
+    ];
+    cbor::encode(&Value::Tag(18, Box::new(Value::Array(parts)))).expect("a COSE_Sign1")
+}
+
+#[test]
+fn a_credential_refuses_without_the_kid_of_a_trusted_key_of_its_profile() {
+    let (issuer, other) = (
+        Custody::new(Algorithm::MlDsa65Ed25519, 1),
+        Custody::new(Algorithm::MlDsa65Ed25519, 3),
+    );
+    let claims = claims("build-api");
+    let credential = issue(&issuer, &claims, Some(&Custody::new(Algorithm::MlDsa65Ed25519, 2)));
+    let profile = profile(&issuer, &claims);
+    profile.verify(&credential, now(), &mut budget()).expect("the control");
+
+    // The issuer key signs the same claims with no `kid`, and with the `kid` of another key. Both refuse before a
+    // signature check, and no key of the profile is tried in place of the named key.
+    let (_, payload) = parts(&credential);
+    let other_kid = other.key().kid().to_vec();
+    for kid in [None, Some(other_kid.as_slice())] {
+        let mut budget = budget();
+        assert_eq!(
+            profile
+                .verify(
+                    &signed(&issuer, &with_kid(&credential, kid), &payload),
+                    now(),
+                    &mut budget
+                )
+                .unwrap_err(),
+            Error::Cose(cose::Error::KeyId)
+        );
+        assert_eq!(budget.remaining(), Limits::default().signature_checks);
+    }
+
+    // With the other key as the previous key, the `kid` selects it: a credential that it signed verifies, and a
+    // credential that names it with the signature of the current key refuses.
+    let rotated = profile
+        .clone()
+        .with_previous(other.key(), claims.expires)
+        .expect("one algorithm");
+    let signed_by_other = issue(&other, &claims, Some(&Custody::new(Algorithm::MlDsa65Ed25519, 2)));
+    rotated
+        .verify(&signed_by_other, now(), &mut budget())
+        .expect("the previous key");
+    let named = signed(&issuer, &with_kid(&credential, Some(&other_kid)), &payload);
+    assert_eq!(
+        rotated.verify(&named, now(), &mut budget()).unwrap_err(),
+        Error::Cose(cose::Error::Signature)
+    );
+    // After its end, a previous key verifies nothing, so a retired key that leaks later gives no credential.
+    let ended = profile.clone().with_previous(other.key(), now().estimate());
+    assert_eq!(
+        ended
+            .unwrap()
+            .verify(&signed_by_other, now(), &mut budget())
+            .unwrap_err(),
+        Error::Cose(cose::Error::KeyId)
+    );
+    // A previous key of another algorithm would let a header select it.
+    assert_eq!(
+        profile
+            .with_previous(Custody::new(Algorithm::Ed25519, 4).key(), claims.expires)
+            .unwrap_err(),
+        Error::Profile
     );
 }
 
@@ -458,12 +564,15 @@ fn a_credential_under_each_profile_verifies_only_for_an_audience_that_declares_t
                     .possession(&proof, &challenge, now(), &mut budget())
                     .expect("possession");
             } else {
+                let pair = format!("{:?} at an audience of {:?}", issuer.algorithm(), audience.algorithm());
+                assert_eq!(verified.unwrap_err(), Error::Cose(cose::Error::KeyId), "{pair}");
+                // A `kid` that names the key of the audience selects it, and the profile still refuses the algorithm.
+                let (_, payload) = parts(&credential);
+                let named = signed(issuer, &with_kid(&credential, Some(audience.key().kid())), &payload);
                 assert_eq!(
-                    verified.unwrap_err(),
+                    profile.verify(&named, now(), &mut budget()).unwrap_err(),
                     Error::Cose(cose::Error::AlgorithmMismatch),
-                    "{:?} at an audience of {:?}",
-                    issuer.algorithm(),
-                    audience.algorithm()
+                    "{pair}"
                 );
             }
         }
@@ -510,8 +619,9 @@ fn an_audience_that_declares_composite_refuses_a_classical_credential_of_the_cla
         public: PublicKey::MlDsa65Ed25519(joined.as_slice().try_into().expect("1,984 bytes")),
     };
     let claims = claims("build-api");
+    let composite = TrustedKey::new(Algorithm::MlDsa65Ed25519, &composite).expect("a composite key");
     let audience = Profile::new(
-        TrustedKey::new(Algorithm::MlDsa65Ed25519, &composite).expect("a composite key"),
+        composite.clone(),
         claims.issuer.clone(),
         claims.audience.clone(),
         claims.purpose.clone(),
@@ -519,10 +629,18 @@ fn an_audience_that_declares_composite_refuses_a_classical_credential_of_the_cla
     )
     .expect("a profile of the format");
 
+    // The classical credential names its own key, and the credential that names the composite key has the classical
+    // `alg`: both refuse, and no check of the classical half follows.
     let classical = Custody { public: half, secret };
     let credential = issue(&classical, &claims, Some(&Custody::new(Algorithm::Ed25519, 2)));
     assert_eq!(
         audience.verify(&credential, now(), &mut budget()).unwrap_err(),
+        Error::Cose(cose::Error::KeyId)
+    );
+    let (_, payload) = parts(&credential);
+    let named = signed(&classical, &with_kid(&credential, Some(composite.kid())), &payload);
+    assert_eq!(
+        audience.verify(&named, now(), &mut budget()).unwrap_err(),
         Error::Cose(cose::Error::AlgorithmMismatch)
     );
     // An audience that declares the classical profile of the same key accepts the credential.
@@ -553,16 +671,8 @@ fn a_cnf_key_of_another_class_than_the_issuer_key_refuses_at_issuance_and_at_ver
 
     // Another issuer signs a composite credential with a classical `cnf` key: an `OKP` key (1) on `Ed25519` (6).
     let credential = issue(&composite, &claims, Some(&Custody::new(Algorithm::MlDsa65Ed25519, 2)));
-    let Value::Tag(18, sign1) = cbor::decode(&credential, Limits::default()).expect("CBOR") else {
-        panic!("a COSE_Sign1");
-    };
-    let Value::Array(parts) = *sign1 else {
-        panic!("a COSE_Sign1 array");
-    };
-    let [Value::Bytes(protected), _, Value::Bytes(payload), _] = parts.as_slice() else {
-        panic!("the parts of a COSE_Sign1");
-    };
-    let Value::Map(mut entries) = cbor::decode(payload, Limits::default()).expect("claims") else {
+    let (protected, payload) = parts(&credential);
+    let Value::Map(mut entries) = cbor::decode(&payload, Limits::default()).expect("claims") else {
         panic!("a claims map");
     };
     let x = [9; 32];
@@ -576,25 +686,11 @@ fn a_cnf_key_of_another_class_than_the_issuer_key_refuses_at_issuance_and_at_ver
         .find(|(key, _)| *key == Value::Unsigned(8))
         .expect("a cnf claim");
     cnf.1 = Value::Map(vec![(Value::Unsigned(1), okp)]);
-    let payload = cbor::encode(&Value::Map(entries)).expect("claims");
-    let to_be_signed = cbor::encode(&Value::Array(vec![
-        Value::Text("Signature1"),
-        Value::Bytes(protected),
-        Value::Bytes(&[]),
-        Value::Bytes(&payload),
-    ]))
-    .expect("Sig_structure");
-    let signature = composite.sign(&to_be_signed);
-    let classical_cnf = cbor::encode(&Value::Tag(
-        18,
-        Box::new(Value::Array(vec![
-            Value::Bytes(protected),
-            Value::Map(Vec::new()),
-            Value::Bytes(&payload),
-            Value::Bytes(&signature),
-        ])),
-    ))
-    .expect("COSE_Sign1");
+    let classical_cnf = signed(
+        &composite,
+        &protected,
+        &cbor::encode(&Value::Map(entries)).expect("claims"),
+    );
     assert_eq!(
         profile(&composite, &claims)
             .verify(&classical_cnf, now(), &mut budget())

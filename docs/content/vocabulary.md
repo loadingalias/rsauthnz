@@ -49,7 +49,7 @@ let resource: Id<Resource> = Id::new("acme.repo", "repo:x")?;
 There is no default tenant. Each tenant is an identifier that the application chooses.
 
 The namespace `rsauthnz` holds the identifiers that rsauthnz fixes, such as the purpose `rsauthnz:workload` and the
-actions `rsauthnz:workload.issue` and `rsauthnz:workload.renew` ([Issue and renew workload
+actions `rsauthnz:workload.issue` and `rsauthnz:workload.revoke` ([Issue and manage workload
 credentials](workload.md#the-policy)). Do not use it for identifiers of the application.
 
 ## Principals
@@ -69,7 +69,9 @@ by byte. A shorter coordinate that is a prefix of a longer one is earlier. Thus 
 version a greater coordinate, for example a counter in big-endian bytes of a fixed width. Versions
 of two owners do not compare: `compare` gives `VersionError::Owners`.
 The [restore journal](restore.md) uses this order: a fact states that each version of a record at or below a
-version is dead.
+version is dead. rsauthnz writes the later versions of the issuer and registration records of
+[workloads](workload.md) itself. Each one has a new value of a counter of the commit driver, so it is greater than
+each earlier version, also after a restore.
 
 ```rust
 use rsauthnz::id::{AuthorityVersion, Id, VersionError};

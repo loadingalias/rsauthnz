@@ -326,6 +326,45 @@ fn an_ml_dsa_65_profile_verifies_its_signature() {
     verify(&profile, &artifact, reading(1_000, 1)).unwrap();
 }
 
+#[test]
+fn the_kid_of_a_trusted_key_is_its_cose_key_thumbprint() {
+    let trusted = |algorithm, public| {
+        TrustedKey::new(
+            algorithm,
+            &Key {
+                kid: None,
+                alg: None,
+                public,
+            },
+        )
+        .unwrap()
+    };
+
+    // RFC 9679 section 6: the EC2 key of the example. An EC2 key has kty, crv, x, and y.
+    let x = hex("65eda5a12577c2bae829437fe338701a10aaa375e1bb5b5de108de439c08551d");
+    let y = hex("1e52ed75701163f7f9e40ddf9f341b3dc9ba860af7e0ca7ca7e9eecd0084d19c");
+    let public = PublicKey::P256 {
+        x: x.as_slice().try_into().unwrap(),
+        y: y.as_slice().try_into().unwrap(),
+    };
+    assert_eq!(
+        trusted(Algorithm::Es256, public).kid().as_slice(),
+        hex("496bd8afadf307e5b08c64b0421bf9dc01528a344a43bda88fadd1669da253ec")
+    );
+
+    // RFC 9964 appendix A.2, the ML-DSA-65 COSE key, whose seed is 32 zero bytes. An AKP key has kty, alg, and pub
+    // (RFC 9964 section 6). The first bytes of `pub` show that the key is the key of the example.
+    let (public, _) = MlDsa65Seed::from_bytes([0; 32]).keypair().expect("ML-DSA-65 key pair");
+    let public = public.to_bytes();
+    assert_eq!(&public[..8], hex("424b2f267e58d5b3"));
+    assert_eq!(
+        trusted(Algorithm::MlDsa65, PublicKey::MlDsa65(&public))
+            .kid()
+            .as_slice(),
+        hex("b788acf242f1f1d6532926d816e76e1636874267f2a48c84c4e65789ab80cc02")
+    );
+}
+
 /// Verifies a signed CWT of the composite `algorithm` with the `AKP` key `public`. `sign` signs the `Sig_structure`.
 fn verify_composite(algorithm: Algorithm, public: &[u8], sign: impl Fn(&[u8]) -> Vec<u8>) {
     // The draft identifier comes from the profile, so a change of the draft changes only its constant.
