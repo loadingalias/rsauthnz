@@ -52,7 +52,7 @@ fn reading(seconds: u64) -> Reading {
 
 /// A user-verified, phishing-resistant passkey authentication of `subject` at 1,000 seconds.
 fn passkey(subject: Principal) -> Evidence {
-    Evidence::new(subject, Method::Passkey, reading(1_000), true, true, None)
+    Evidence::new(subject, Method::Passkey, reading(1_000), true, true, None, None)
 }
 
 /// The permit of `repo.read` on `repo:x` for the human, at policy version 7, until 2,000 seconds.
@@ -126,8 +126,8 @@ fn the_evidence_must_meet_the_requirements_and_the_deadline() {
     };
     let policy = policy(7, read_x(strict));
 
-    let recovery = Evidence::new(human(), Method::Recovery, reading(1_000), true, true, None);
-    let unverified = Evidence::new(human(), Method::Passkey, reading(1_000), false, true, None);
+    let recovery = Evidence::new(human(), Method::Recovery, reading(1_000), true, true, None, None);
+    let unverified = Evidence::new(human(), Method::Passkey, reading(1_000), false, true, None, None);
     assert_eq!(
         check(&recovery, &read, &x, &policy, reading(1_100)),
         Err(Refusal::Requirements)

@@ -4,7 +4,13 @@
 //! The format serves workload, agent, and CLI enrollment credentials, and enrollment and approval receipts. A
 //! credential has a `cnf` key: the key of its holder. A receipt has no `cnf` key. A signed purpose claim names the
 //! kind of artifact. Thus one issuer key can sign each kind, and an artifact of one purpose never verifies for
-//! another. The issuer key and the `cnf` key use a composite profile of [`crate::crypto`].
+//! another.
+//!
+//! The algorithm of the issuer key is the profile that an audience declares. The default is the composite
+//! ML-DSA-65 + Ed25519 profile of [`crate::crypto`]. Pure ML-DSA-65 and the classical profiles are explicit choices for
+//! an audience that supports nothing stronger. An artifact of another profile refuses, with no fallback. The `cnf` key
+//! has the [`Authentication`] class of the issuer key. The SLH-DSA trust-root profile signs issuer keys, not artifacts
+//! of this format, so this format refuses it.
 //!
 //! Issuance has two steps, so the issuer key stays in custody. [`Draft::credential`] makes a draft, and custody signs
 //! the bytes of [`Draft::to_be_signed`]. [`Draft::finish`] verifies the signature with the issuer key, and only then
@@ -78,7 +84,7 @@ use core::time::Duration;
 
 use crate::cbor::{self, Value};
 use crate::cose::{self, Confirmation, Key, PublicKey, Sign1, TrustedKey};
-use crate::crypto::{self, Algorithm, Authentication};
+use crate::crypto::{self, Algorithm, Authentication, Report};
 use crate::evidence::{Evidence, Method};
 use crate::id::{Agent, Audience, Authority, Human, Id, Principal, Purpose, Workload};
 use crate::limits::{Limits, SignatureBudget};
@@ -88,8 +94,9 @@ use crate::time::Reading;
 /// it, and verification refuses a longer input before it decodes it.
 pub const MAX_BYTES: usize = 8_192;
 
-/// The longest signature of a composite profile. ML-DSA-65 + ECDSA P-256 has the 3,309 bytes of ML-DSA-65 and at most
-/// 72 bytes of DER ECDSA. ML-DSA-65 + Ed25519 has 3,373 bytes.
+/// The longest signature of a profile of this format. ML-DSA-65 + ECDSA P-256 has the 3,309 bytes of ML-DSA-65 and at
+/// most 72 bytes of DER ECDSA. ML-DSA-65 + Ed25519 has 3,373 bytes, ML-DSA-65 has 3,309 bytes, and Ed25519 and ES256
+/// have 64 bytes.
 const SIGNATURE_BYTES_MAX: usize = 3_381;
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
@@ -221,9 +228,9 @@ impl Draft {
     /// # Errors
     ///
     /// [`Error::Validity`] if `expires`, after rounding, is not after `iat` and `not_before`. [`Error::Profile`] if
-    /// `key` or `confirmation` is not a composite key. [`Error::Cose`] with [`cose::Error::Malformed`] if the P-256
-    /// point of `confirmation` is not on the curve. [`Error::Size`] if the artifact can be longer than
-    /// [`MAX_BYTES`].
+    /// `key` is a trust-root key, or `confirmation` has another [`Authentication`] class than `key`. [`Error::Cose`]
+    /// with [`cose::Error::Malformed`] if the P-256 point of `confirmation` is not on the curve. [`Error::Size`] if
+    /// the artifact can be longer than [`MAX_BYTES`].
     pub fn credential(
         key: &TrustedKey,
         claims: &Claims,
@@ -262,23 +269,18 @@ impl Draft {
             entries.push((Value::Negative(OWNER), owner.to_cbor()));
         }
         if let Some(public) = confirmation {
-            let (algorithm, bytes) = composite_key(&public)?;
+            let cnf = public.to_cbor();
             // A key whose P-256 point is not on the curve refuses here, before custody signs.
             TrustedKey::new(
-                algorithm,
+                confirmation_algorithm(key.algorithm(), &public)?,
                 &Key {
                     kid: None,
                     alg: None,
                     public,
                 },
             )?;
-            // The `COSE_Key` member (1) holds an `AKP` key (`kty` 7) with its `alg` (3) and `pub` (-1).
-            let key = Value::Map(vec![
-                (Value::Unsigned(1), Value::Unsigned(7)),
-                (Value::Unsigned(3), cose::alg(algorithm)),
-                (Value::Negative(0), Value::Bytes(bytes)),
-            ]);
-            entries.push((Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(1), key)])));
+            // The `COSE_Key` member (1) holds the key with its `alg`.
+            entries.push((Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(1), cnf)])));
         }
         let payload = cbor::encode(&Value::Map(entries)).expect("the claims have distinct keys and no simple value");
         Self::new(key, payload)
@@ -292,7 +294,7 @@ impl Draft {
     ///
     /// # Errors
     ///
-    /// [`Error::Profile`] if `key` is not a composite key, and [`Error::Size`] if the proof can be longer than
+    /// [`Error::Profile`] if `key` is a trust-root key, and [`Error::Size`] if the proof can be longer than
     /// [`MAX_BYTES`].
     pub fn proof(
         key: &TrustedKey,
@@ -315,8 +317,9 @@ impl Draft {
 
     /// The draft of the encoded claims `payload` that `key` signs.
     fn new(key: &TrustedKey, payload: Vec<u8>) -> Result<Self, Error> {
-        composite(key.algorithm())?;
-        let protected = cbor::encode(&Value::Map(vec![(Value::Unsigned(1), cose::alg(key.algorithm()))]))
+        class(key.algorithm())?;
+        let alg = cose::alg(key.algorithm()).ok_or(Error::Profile)?;
+        let protected = cbor::encode(&Value::Map(vec![(Value::Unsigned(1), alg)]))
             .expect("the protected bucket has one key and no simple value");
         // The tag, the array head, and the empty unprotected bucket are one byte each.
         let string = |len: usize| cbor::head_len(len as u64) + len;
@@ -331,7 +334,7 @@ impl Draft {
     }
 
     /// The bytes that custody signs: the `Sig_structure` of RFC 9052 section 4.4, with an empty external AAD. Custody
-    /// signs them with the empty context of the composite profile.
+    /// signs them with the algorithm of the key. ML-DSA-65 and the composites use the empty context.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     #[must_use]
@@ -364,7 +367,7 @@ impl Draft {
         .expect("a COSE_Sign1 has no map key and no simple value");
         assert!(
             artifact.len() <= MAX_BYTES,
-            "the draft bounded the length with the longest composite signature, and a valid signature is not longer"
+            "the draft bounded the length with the longest signature of the format, and a valid signature is not longer"
         );
         Ok(artifact)
     }
@@ -382,7 +385,8 @@ impl fmt::Debug for Draft {
 }
 
 /// A trusted verification profile of credentials and receipts: the issuer key, the issuer, the audience, and the
-/// purpose that the application fixes before it reads an artifact.
+/// purpose that the application fixes before it reads an artifact. The algorithm of the issuer key is the profile that
+/// the audience declares. An artifact of another algorithm refuses, and no other key is tried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
     /// The COSE profile, with the text forms of the issuer and the audience.
@@ -399,7 +403,7 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::Profile`] if `key` is not a composite key.
+    /// [`Error::Profile`] if `key` is a trust-root key.
     pub fn new(
         key: TrustedKey,
         issuer: Id<Authority>,
@@ -407,7 +411,7 @@ impl Profile {
         purpose: Id<Purpose>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        composite(key.algorithm())?;
+        class(key.algorithm())?;
         Ok(Self {
             cose: cose::Profile {
                 key,
@@ -427,15 +431,15 @@ impl Profile {
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
     /// The checks are those of [`cose::Profile::verify`], with `iss` and `aud` in their text forms. Then the claims must
-    /// be the claims of this format, and the purpose must be the purpose of the profile. A `cnf` key must be a
-    /// composite key.
+    /// be the claims of this format, and the purpose must be the purpose of the profile. A `cnf` key must have the
+    /// [`Authentication`] class of the issuer key.
     ///
     /// # Errors
     ///
     /// [`Error::Size`] for an artifact longer than [`MAX_BYTES`], and [`Error::Cose`] for each refusal of
-    /// [`cose::Profile::verify`]. [`Error::Claims`] if a claim is missing, has the wrong form, or is not a claim of
-    /// this format. [`Error::Purpose`] for another purpose, and [`Error::Profile`] for a `cnf` key that is not a
-    /// composite key.
+    /// [`cose::Profile::verify`], such as [`cose::Error::AlgorithmMismatch`] for an artifact of another profile.
+    /// [`Error::Claims`] if a claim is missing, has the wrong form, or is not a claim of this format.
+    /// [`Error::Purpose`] for another purpose, and [`Error::Profile`] for a `cnf` key of another class.
     pub fn verify<'a>(
         &self,
         artifact: &'a [u8],
@@ -490,7 +494,10 @@ impl Profile {
         };
         let confirmation = match cnf {
             None => None,
-            Some(Confirmation::Key(key)) => Some(TrustedKey::new(composite_key(&key.public)?.0, key)?),
+            Some(Confirmation::Key(key)) => Some(TrustedKey::new(
+                confirmation_algorithm(self.cose.key.algorithm(), &key.public)?,
+                key,
+            )?),
             Some(Confirmation::KeyId(_)) => return Err(Error::Claims),
         };
         Ok(Verified {
@@ -543,14 +550,23 @@ impl<'a> Verified<'a, '_> {
         self.issued
     }
 
+    /// The report of the profile of the issuer signature. Its `authentication` says if the artifact has post-quantum
+    /// authentication. A `cnf` key has the same class, so the evidence of [`Self::possession`] has the same
+    /// authentication.
+    #[must_use]
+    pub const fn report(&self) -> Report {
+        self.profile.cose.key.algorithm().report()
+    }
+
     /// Checks the proof `proof` of possession of the `cnf` key at the physical time `now`, and gives the evidence of
     /// the authentication. The `cnf` key must sign the proof, and the proof must bind the exact bytes of this
     /// credential, the audience of the profile, and `challenge`. The signature check charges `budget`, the budget of
     /// the proof.
     ///
     /// The challenge makes the proof fresh. Issue each challenge for one proof, and consume it in the transition that
-    /// uses the evidence. The evidence records the subject, [`Method::KeyPossession`], and `now`. It records no user
-    /// verification, no phishing resistance, and no device or hardware binding, because the proof does not show them.
+    /// uses the evidence. The evidence records the subject, [`Method::KeyPossession`], `now`, and the
+    /// [`Authentication`] of the `cnf` key. It records no user verification, no phishing resistance, and no device or
+    /// hardware binding, because the proof does not show them.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -613,6 +629,7 @@ impl<'a> Verified<'a, '_> {
             false,
             false,
             None,
+            Some(key.algorithm().report().authentication),
         ))
     }
 }
@@ -630,18 +647,24 @@ impl fmt::Debug for Verified<'_, '_> {
     }
 }
 
-/// Refuses an algorithm that is not a composite profile. This format accepts only the composite profiles.
-fn composite(algorithm: Algorithm) -> Result<(), Error> {
-    (algorithm.report().authentication == Authentication::Hybrid).ok_or(Error::Profile)
+/// The [`Authentication`] class of a profile of this format. The SLH-DSA trust-root profile signs issuer keys, so this
+/// format refuses it.
+const fn class(algorithm: Algorithm) -> Result<Authentication, Error> {
+    match algorithm {
+        Algorithm::Ed25519
+        | Algorithm::Es256
+        | Algorithm::MlDsa65
+        | Algorithm::MlDsa65Ed25519
+        | Algorithm::MlDsa65EcdsaP256 => Ok(algorithm.report().authentication),
+        Algorithm::SlhDsaSha2_128s => Err(Error::Profile),
+    }
 }
 
-/// The composite algorithm of the public key `public`, and the bytes of the key.
-fn composite_key<'k>(public: &PublicKey<'k>) -> Result<(Algorithm, &'k [u8]), Error> {
-    match *public {
-        PublicKey::MlDsa65Ed25519(bytes) => Ok((Algorithm::MlDsa65Ed25519, bytes)),
-        PublicKey::MlDsa65EcdsaP256(bytes) => Ok((Algorithm::MlDsa65EcdsaP256, bytes)),
-        _ => Err(Error::Profile),
-    }
+/// The algorithm of the `cnf` key `public`. It must have the class of the issuer key algorithm `issuer`.
+fn confirmation_algorithm(issuer: Algorithm, public: &PublicKey<'_>) -> Result<Algorithm, Error> {
+    let algorithm = public.algorithm();
+    (class(algorithm)? == class(issuer)?).ok_or(Error::Profile)?;
+    Ok(algorithm)
 }
 
 /// The cause of a refusal. For a refused artifact or proof, the recovery is to refuse it. For a refused draft, the
@@ -651,7 +674,8 @@ pub enum Error {
     /// The COSE layer refused: the decode, the issuer, the audience, the validity interval, the key, the signature, or
     /// the signature budget.
     Cose(cose::Error),
-    /// The key is not a composite profile. This format accepts only the composite profiles.
+    /// The key is a trust-root key, which this format refuses, or the `cnf` key has another [`Authentication`] class
+    /// than the issuer key.
     Profile,
     /// The encoded artifact or proof is longer than [`MAX_BYTES`], or a draft can be longer.
     Size,
@@ -672,7 +696,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cose(error) => write!(f, "the COSE layer refused the credential: {error}"),
-            Self::Profile => f.write_str("the key is not a composite profile"),
+            Self::Profile => {
+                f.write_str("the key is a trust-root key, or its class is not the class of the issuer key")
+            }
             Self::Size => write!(f, "the artifact is longer than {MAX_BYTES} bytes"),
             Self::Claims => f.write_str("the claims are not the claims of a credential"),
             Self::Purpose => f.write_str("the purpose of the credential is not the purpose of the profile"),

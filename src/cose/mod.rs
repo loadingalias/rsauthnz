@@ -6,6 +6,7 @@
 //! [`Verified`] evidence, which holds the exact bytes of the artifact.
 //!
 //! [`Algorithm`] gives the profiles and their COSE identifiers. The identifiers of the composite profiles are drafts.
+//! The SLH-DSA trust-root profile has no COSE identifier yet, so no COSE key or artifact uses it.
 //! Each signature check charges the [`SignatureBudget`](crate::limits::SignatureBudget) of the artifact, and
 //! [rscrypto] does each check.
 //!
@@ -73,14 +74,16 @@ use crate::crypto::Algorithm;
 use crate::limits::Limit;
 use crate::time::TimeError;
 
-/// The COSE algorithm identifier of `algorithm`, in its CBOR form.
-pub(crate) const fn alg(algorithm: Algorithm) -> Value<'static> {
-    label(algorithm.report().cose)
+/// The COSE algorithm identifier of `algorithm`, in its CBOR form, or `None` if the algorithm has none.
+pub(crate) fn alg(algorithm: Algorithm) -> Option<Value<'static>> {
+    algorithm.report().cose.map(label)
 }
 
 /// The algorithm with the COSE identifier `value`, if this crate has it.
 fn algorithm(value: &Value<'_>) -> Option<Algorithm> {
-    Algorithm::ALL.into_iter().find(|algorithm| alg(*algorithm) == *value)
+    Algorithm::ALL
+        .into_iter()
+        .find(|algorithm| alg(*algorithm).as_ref() == Some(value))
 }
 
 /// The CBOR form of the integer label `label`.

@@ -211,7 +211,7 @@ fn a_proposal_lists_every_read_dependency_of_its_decision() {
         policy: version("policy", 7),
         reads: RefCell::default(),
     };
-    let evidence = Evidence::new(human(), Method::Passkey, reading(1_000), true, true, None);
+    let evidence = Evidence::new(human(), Method::Passkey, reading(1_000), true, true, None, None);
     let proposal = enroll(&state, &evidence).unwrap();
 
     let mut reads: Vec<Dependency> = Vec::new();

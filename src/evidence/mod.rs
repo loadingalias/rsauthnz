@@ -1,16 +1,17 @@
 //! Authentication evidence: the facts that one authentication proved, and no others.
 //!
 //! [`Evidence`] records the principal, the method, the time, and each property that the
-//! authentication established: user verification, phishing resistance, recovery, and a device or
-//! hardware binding of the key. It has no strength score, and a recovery never records phishing
-//! resistance. Only the verifiers of this crate make evidence, so a caller cannot mark an
-//! unverified claim as proved.
+//! authentication established: user verification, phishing resistance, recovery, a device or
+//! hardware binding of the key, and the authentication of the signature: hybrid, post-quantum, or
+//! classical. It has no strength score, and a recovery never records phishing resistance. Only the
+//! verifiers of this crate make evidence, so a caller cannot mark an unverified claim as proved.
 
 use alloc::vec;
 use core::fmt;
 use core::time::Duration;
 
 use crate::cbor::Value;
+use crate::crypto::Authentication;
 use crate::id::{IdError, Principal};
 use crate::time::{Reading, ReadingSource};
 
@@ -23,6 +24,7 @@ pub struct Evidence {
     user_verified: bool,
     phishing_resistant: bool,
     binding: Option<Binding>,
+    authentication: Option<Authentication>,
 }
 
 /// How the authentication proved the principal.
@@ -55,6 +57,7 @@ pub enum Binding {
 impl Evidence {
     /// Makes the evidence of one authentication. `phishing_resistant` is true when the proof binds
     /// the origin, as a passkey assertion does; the evidence of a recovery drops it.
+    /// `authentication` is the authentication of the signature that proved the principal.
     pub(crate) fn new(
         subject: Principal,
         method: Method,
@@ -62,6 +65,7 @@ impl Evidence {
         user_verified: bool,
         phishing_resistant: bool,
         binding: Option<Binding>,
+        authentication: Option<Authentication>,
     ) -> Self {
         Self {
             subject,
@@ -70,6 +74,7 @@ impl Evidence {
             user_verified,
             phishing_resistant: phishing_resistant && method != Method::Recovery,
             binding,
+            authentication,
         }
     }
 
@@ -116,11 +121,20 @@ impl Evidence {
         self.binding
     }
 
+    /// The authentication of the signature that proved the principal, or `None` when this crate
+    /// verified no signature of the principal, as for a recovery value. A classical signature gives
+    /// no post-quantum authentication. Post-quantum key exchange is a separate guarantee of the
+    /// transport.
+    #[must_use]
+    pub const fn authentication(&self) -> Option<Authentication> {
+        self.authentication
+    }
+
     /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
-    /// resistant, binding]`. The method and the binding are numbers, with `null` for no binding. The
-    /// time is `[estimate, bound, source]`: the estimate of the Unix time as `[seconds,
-    /// nanoseconds]`, the bound in the same form or `null` when it is unknown, and the source as a
-    /// number.
+    /// resistant, binding, authentication]`. The method, the binding, and the authentication are
+    /// numbers, with `null` for no binding and for no authentication. The time is `[estimate, bound,
+    /// source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the bound in the same
+    /// form or `null` when it is unknown, and the source as a number.
     #[must_use]
     pub fn to_cbor(&self) -> Value<'_> {
         Value::Array(vec![
@@ -139,6 +153,12 @@ impl Evidence {
                 None => Value::Null,
                 Some(Binding::Device) => Value::Unsigned(1),
                 Some(Binding::Hardware) => Value::Unsigned(2),
+            },
+            match self.authentication {
+                None => Value::Null,
+                Some(Authentication::Hybrid) => Value::Unsigned(1),
+                Some(Authentication::PostQuantum) => Value::Unsigned(2),
+                Some(Authentication::Classical) => Value::Unsigned(3),
             },
         ])
     }
@@ -168,6 +188,7 @@ impl Evidence {
             Value::Bool(user_verified),
             Value::Bool(phishing_resistant),
             binding,
+            authentication,
         ] = items.as_slice()
         else {
             return Err(EvidenceError::Form);
@@ -186,6 +207,13 @@ impl Evidence {
             Value::Unsigned(2) => Some(Binding::Hardware),
             _ => return Err(EvidenceError::Form),
         };
+        let authentication = match authentication {
+            Value::Null => None,
+            Value::Unsigned(1) => Some(Authentication::Hybrid),
+            Value::Unsigned(2) => Some(Authentication::PostQuantum),
+            Value::Unsigned(3) => Some(Authentication::Classical),
+            _ => return Err(EvidenceError::Form),
+        };
         if *phishing_resistant && method == Method::Recovery {
             return Err(EvidenceError::Form);
         }
@@ -196,6 +224,7 @@ impl Evidence {
             user_verified: *user_verified,
             phishing_resistant: *phishing_resistant,
             binding,
+            authentication,
         })
     }
 }

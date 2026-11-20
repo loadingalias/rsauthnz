@@ -22,20 +22,40 @@ issuer key can sign each kind, and an artifact of one purpose does not verify fo
 The application chooses the purpose of each kind, as an `Id<Purpose>`. A receipt has no `cnf` key, so it cannot
 prove possession.
 
-The issuer key and each `cnf` key use a composite profile: `MlDsa65Ed25519` (the default) or `MlDsa65EcdsaP256`
-(the hardware-bound profile). [Signature profiles](profiles.md) gives them. A classical or a pure ML-DSA-65 key
-refuses with `Error::Profile`.
+## Declare the profile of an audience
+
+The algorithm of the issuer key is the profile that an audience declares. The issuer signs each artifact for the
+audience with that key, and the `Profile` of the audience holds that key. An artifact of another algorithm refuses
+with `Error::Cose(cose::Error::AlgorithmMismatch)`. rsauthnz tries no other key and no other algorithm.
+
+| Issuer key `Algorithm` | Authentication | `cnf` key `Algorithm` | Use |
+| --- | --- | --- | --- |
+| `MlDsa65Ed25519` (the default) or `MlDsa65EcdsaP256` (the hardware-bound profile) | `Hybrid` | `MlDsa65Ed25519` or `MlDsa65EcdsaP256` | Each audience, unless it declares another profile |
+| `MlDsa65` | `PostQuantum` | `MlDsa65` | An audience that supports ML-DSA-65 but not the composite |
+| `Ed25519` or `Es256` | `Classical` | `Ed25519` or `Es256` | An audience that supports nothing else |
+
+The `cnf` key has the authentication of the issuer key, so a proof of possession has the same guarantee as the
+credential. A `cnf` key of another authentication refuses with `Error::Profile`, at issuance and at verification.
+
+A classical profile is an explicit choice. rsauthnz never selects it for you, and it reports `Classical`, never
+post-quantum. A quantum computer that can break Ed25519 or P-256 can forge its signatures. Use it only for an
+audience that cannot verify ML-DSA-65. [Signature profiles](profiles.md) gives the guarantee and the cost of each
+profile.
+
+The SLH-DSA trust-root profile signs issuer keys, not artifacts of this format. This format refuses it with
+`Error::Profile`.
 
 ## The format
 
 The artifact is a `COSE_Sign1` with the tag 18:
 
-- The protected bucket holds only `alg`: -59 for `MlDsa65Ed25519` or -55 for `MlDsa65EcdsaP256`. These COSE
-  identifiers are drafts.
+- The protected bucket holds only `alg`, the COSE identifier of the issuer key: -59 for `MlDsa65Ed25519`, -55 for
+  `MlDsa65EcdsaP256`, -49 for `MlDsa65`, -19 for `Ed25519`, or -7 for `Es256`. The two composite identifiers are
+  drafts.
 - The unprotected bucket is empty.
 - The payload is the claims map, in the deterministic CBOR of [Parser limits](parser-limits.md).
-- The signature covers the `Sig_structure` of RFC 9052, section 4.4, with an empty external AAD. The composite
-  signs it with the empty context.
+- The signature covers the `Sig_structure` of RFC 9052, section 4.4, with an empty external AAD. ML-DSA-65 and the
+  composites sign it with the empty context.
 
 The claims map holds these claims, and no others:
 
@@ -47,7 +67,7 @@ The claims map holds these claims, and no others:
 | 5 | `nbf` | `not_before` | Whole seconds since the Unix epoch. Only when `not_before` is set |
 | 6 | `iat` | (`Verified::issued()`) | The whole seconds of the reading at issuance |
 | 7 | `cti` | `serial` | The `Serial`: 8 bytes, with the most significant byte first |
-| 8 | `cnf` | (the key of `Verified::possession`) | A `COSE_Key` member (1): an `AKP` key (`kty` 7) with `alg` and `pub`. Only in a credential |
+| 8 | `cnf` | (the key of `Verified::possession`) | A `COSE_Key` member (1) with its `alg`: an `AKP` key (`kty` 7) with `pub` for ML-DSA-65 and the composites, an `OKP` key (`kty` 1) with `crv` 6 and `x` for Ed25519, or an `EC2` key (`kty` 2) with `crv` 1, `x`, and `y` for ES256. Only in a credential |
 | -65537 | Subject | `subject` | The CBOR form of a `Principal`: `[kind, namespace, value]` |
 | -65538 | Owner | `subject` | The CBOR form of the `Id<Human>` that owns an agent. Only when the subject is an agent |
 | -65539 | Purpose | `purpose` | The CBOR form of an `Id<Purpose>` |
@@ -75,7 +95,8 @@ The example credential below is 5,481 bytes. The default profile signs it, and i
 
 The composite signature and the composite key of the holder make up 5,357 bytes of the total. A credential of the
 hardware-bound profile is at most 41 bytes longer: its key has 2,017 bytes, and its signature has at most 3,381
-bytes. Longer identifiers make the claims longer. The example is 2,711 bytes below the limit.
+bytes. A credential of `MlDsa65`, `Ed25519`, or `Es256` is shorter than the example, because its key and its
+signature are shorter. Longer identifiers make the claims longer. The example is 2,711 bytes below the limit.
 
 A proof of possession of the example credential, with a challenge of 32 bytes, is 3,487 bytes. The holder sends one
 proof for each check of possession.
@@ -170,7 +191,7 @@ checks](verification.md#bound-the-signature-checks) gives.
 3. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
    its owner, and a human or a workload must have none. A claim of another key, or a `sub` claim, refuses.
 4. The purpose must be the purpose of the profile.
-5. A `cnf` key must be a composite key.
+5. A `cnf` key must have the authentication of the issuer key.
 
 `Verified` is the evidence of the artifact:
 
@@ -179,6 +200,7 @@ checks](verification.md#bound-the-signature-checks) gives.
 | `artifact()` | The exact bytes of the artifact |
 | `claims()` | The verified `Claims` |
 | `issued()` | `iat` |
+| `report()` | The `crypto::Report` of the profile of the issuer key. Its `authentication` is `Classical` for a classical credential |
 | `possession(proof, challenge, now, &mut budget)` | The authentication evidence of a proof by the `cnf` key |
 
 Two `Verified` values are equal only for equal artifact bytes and equal profiles. A valid signature does not give
@@ -200,8 +222,9 @@ the SHA-256 digest of the exact bytes of the credential (-65540), and the challe
 refuses a proof that does not bind this credential, the audience of the profile, and the challenge. It also
 refuses a proof by another key, and a check outside the validity interval of the credential.
 
-The evidence records the subject, the method `Method::KeyPossession`, and the reading `now`. It records no user
-verification, no phishing resistance, and no device or hardware binding, because the proof does not show them.
+The evidence records the subject, the method `Method::KeyPossession`, the reading `now`, and the authentication of
+the `cnf` key: `Hybrid`, `PostQuantum`, or `Classical`. It records no user verification, no phishing resistance,
+and no device or hardware binding, because the proof does not show them.
 [Vocabulary](vocabulary.md#authentication-evidence) gives the evidence.
 
 The challenge makes the proof fresh. rsauthnz does not store challenges. The application issues each challenge
@@ -215,7 +238,7 @@ claims or the key.
 | Error | Cause |
 | --- | --- |
 | `Cose(cose::Error)` | The COSE layer refused: the decode, the issuer, the audience, the validity interval, a key, the signature, or the signature budget. [Verify COSE and CWT artifacts](verification.md#errors) gives each cause |
-| `Profile` | A key is not a composite key |
+| `Profile` | A key is the SLH-DSA trust-root key, or the `cnf` key has another authentication than the issuer key |
 | `Size` | The artifact or proof is longer than 8,192 bytes, or a draft can be longer |
 | `Claims` | A claim is missing, has the wrong form, or is not a claim of this format |
 | `Purpose` | The purpose of the artifact is not the purpose of the profile |
@@ -225,8 +248,6 @@ claims or the key.
 
 ## Limits
 
-- Only the composite profiles issue and verify in this format. The per-audience profiles of pure ML-DSA-65 and of
-  the classical algorithms come in a later release.
 - The composite COSE identifiers are drafts. Another implementation can use other values until IANA assigns them.
 - The protected bucket has no `kid`. A profile holds one issuer key.
 - Verification decodes the artifact and the proof within the `limits` of the profile. The default limits admit

@@ -180,7 +180,7 @@ impl<'a> Sign1<'a> {
     /// [`Error::AlgorithmMismatch`] if the protected bucket has no `alg` or a different `alg`, [`Error::Limit`] if
     /// the check costs more than `budget` has, and [`Error::Signature`] if the signature does not verify.
     pub fn verify(&self, key: &TrustedKey, budget: &mut SignatureBudget) -> Result<&'a [u8], Error> {
-        if self.protected.get(1) != Some(&alg(key.algorithm())) {
+        if alg(key.algorithm()).is_none_or(|alg| self.protected.get(1) != Some(&alg)) {
             return Err(Error::AlgorithmMismatch);
         }
         key.verify(

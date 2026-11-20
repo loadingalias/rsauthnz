@@ -14,8 +14,13 @@ verification with each profile.
 | `MlDsa65` | -49 | Assigned | `PostQuantum` | 1 | 1,952 bytes | 3,309 bytes | A verifier that supports ML-DSA but not the composite |
 | `Ed25519` | -19 | Assigned | `Classical` | 1 | 32 bytes | 64 bytes | A verifier that supports nothing else |
 | `Es256` | -7 | Assigned | `Classical` | 1 | Two coordinates of 32 bytes | 64 bytes | A verifier that supports nothing else |
+| `SlhDsaSha2_128s` | None yet | Draft | `PostQuantum` | 1 | 32 bytes | 7,856 bytes | The trust-root profile: a root that signs issuer keys |
 
 rsauthnz never selects a classical profile for you, and it never reports a classical profile as post-quantum.
+
+IANA marks ES256 (-7) deprecated since [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864), which assigns the
+fully specified ESP256 (-9). `Es256` keeps -7, because the classical profile serves a verifier that supports nothing
+else, and such a verifier knows -7.
 
 The two composite profiles are the [LAMPS composite
 signatures](https://datatracker.ietf.org/doc/draft-ietf-lamps-pq-composite-sigs/) (draft 19, which becomes RFC
@@ -37,15 +42,57 @@ requests -59 for `MlDsa65Ed25519` and -55 for `MlDsa65EcdsaP256`, and rsauthnz u
 assigns them, another implementation can use other values. A later draft can change them. Each value is one
 constant in rsauthnz, so a change of the draft changes only that constant.
 
+## The profile of an audience
+
+The algorithm of the issuer key is the profile that an audience declares. The audience accepts only artifacts of that
+algorithm, and rsauthnz tries no other key and no other algorithm after a refusal. The `cnf` key of a credential has
+the same authentication as the issuer key. [Declare the profile of an audience](credential-format.md#declare-the-profile-of-an-audience)
+gives the rules.
+
+| Authentication | Guarantee | Cost of one signature |
+| --- | --- | --- |
+| `Hybrid` | A forgery must break ML-DSA-65 and the classical algorithm | Two checks. 3,373 bytes, or 3,381 bytes or fewer for P-256 |
+| `PostQuantum` | A forgery must break ML-DSA-65 only | One check. 3,309 bytes |
+| `Classical` | A forgery must break Ed25519 or P-256. A quantum computer that can break them can forge | One check. 64 bytes |
+
+Select pure ML-DSA-65 or a classical profile only for an audience that cannot verify the composite. Its credentials
+then report `PostQuantum` or `Classical`, and so does the evidence of each proof of possession.
+
+## The trust-root profile
+
+`SlhDsaSha2_128s` is SLH-DSA-SHA2-128s of [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final), in its pure form,
+with the empty context. A trust root signs issuer keys rarely, and its signatures must stay trustworthy longest.
+The security of SLH-DSA rests only on its hash function, SHA-256.
+
+rsauthnz selects SLH-DSA-SHA2-128s for these reasons:
+
+- rscrypto qualifies it first as the root profile of the family.
+- It has the smallest signature of the FIPS 205 sets: 7,856 bytes. SLH-DSA-SHA2-192s has 16,224 bytes.
+- The JOSE and COSE draft for SLH-DSA registers only the two 128s sets.
+
+The cost: SLH-DSA-SHA2-128s is in NIST security category 1, and ML-DSA-65 is in category 3. Thus the root is in a
+lower category than the credentials that it endorses. A deployment whose policy requires category 3 needs
+SLH-DSA-SHA2-192s, which rsauthnz does not have.
+
+The profile has no COSE identifier yet. [draft-ietf-cose-sphincs-plus-11](https://datatracker.ietf.org/doc/draft-ietf-cose-sphincs-plus/)
+requests -51, but IANA assigned -51 to ESP384 ([RFC 9864](https://www.rfc-editor.org/rfc/rfc9864)). Thus the
+`cose` field of its report is `None`, `TrustedKey::new` refuses the algorithm, and no COSE artifact of rsauthnz uses
+it. The credential format refuses it too.
+
+rsauthnz verifies SLH-DSA signatures through the facade. The evidence is three NIST ACVP cases of
+SLH-DSA-SHA2-128s with the empty context: two valid signatures, and one invalid signature that refuses. They verify on
+macOS on Apple silicon (aarch64). There is no claim for another target, for the speed of verification, or for
+signing.
+
 ## The profile report
 
 `Algorithm::report()` gives a `Report` with these fields:
 
 | Field | Type | Value |
 | --- | --- | --- |
-| `cose` | `i64` | The COSE algorithm identifier |
+| `cose` | `Option<i64>` | The COSE algorithm identifier, or `None` if rsauthnz uses none for the profile yet |
 | `registration` | `Registration` | `Assigned` if IANA assigned the identifier. `Draft` if a draft requests it |
-| `authentication` | `Authentication` | `Hybrid`: a post-quantum and a classical signature, and both must verify. `PostQuantum`: ML-DSA-65 only. `Classical`: no post-quantum authentication |
+| `authentication` | `Authentication` | `Hybrid`: a post-quantum and a classical signature, and both must verify. `PostQuantum`: ML-DSA-65 or SLH-DSA only. `Classical`: no post-quantum authentication |
 
 The report gives the authentication of a signature only. Post-quantum key exchange is a guarantee of the transport,
 and the evidence of the transport gives it separately. A composite credential over a connection with a classical key
@@ -62,11 +109,13 @@ assert_eq!(report.authentication, Authentication::Hybrid);
 assert_eq!(report.registration, Registration::Draft);
 // A classical profile is never reported as post-quantum.
 assert_eq!(Algorithm::Ed25519.report().authentication, Authentication::Classical);
+// The trust-root profile has no COSE identifier yet.
+assert_eq!(Algorithm::SlhDsaSha2_128s.report().cose, None);
 ```
 
 ## Cost
 
 Each signature check charges the signature budget of its artifact before its work: one check for `MlDsa65`,
-`Ed25519`, and `Es256`, and two checks for a composite. [Verify COSE and CWT
+`Ed25519`, `Es256`, and `SlhDsaSha2_128s`, and two checks for a composite. [Verify COSE and CWT
 artifacts](verification.md#bound-the-signature-checks) gives the budget. A signature check is in the cost class
 `Verify` of [Admit rsauthnz work](admission.md).

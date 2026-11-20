@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use super::{Error, algorithm, label};
+use alloc::vec;
+
+use super::{Error, alg, algorithm, label};
 use crate::cbor::{self, Value};
 use crate::crypto::{Algorithm, Verifier};
 use crate::limits::{Limits, SignatureBudget};
@@ -79,11 +81,11 @@ impl<'a> Key<'a> {
             Some(Value::Bytes(bytes)) => Ok(*bytes),
             _ => Err(Error::Malformed),
         };
-        let (public, fits) = match get(1) {
+        let public = match get(1) {
             Some(Value::Unsigned(1)) => {
                 curve(get(-1), 6)?;
                 private(get(-4))?;
-                (PublicKey::Ed25519(fixed(bytes(-2)?)?), Algorithm::Ed25519)
+                PublicKey::Ed25519(fixed(bytes(-2)?)?)
             }
             Some(Value::Unsigned(2)) => {
                 curve(get(-1), 1)?;
@@ -92,27 +94,63 @@ impl<'a> Key<'a> {
                     return Err(Error::Unsupported);
                 }
                 let (x, y) = (fixed(bytes(-2)?)?, fixed(bytes(-3)?)?);
-                (PublicKey::P256 { x, y }, Algorithm::Es256)
+                PublicKey::P256 { x, y }
             }
             Some(Value::Unsigned(7)) => {
                 // RFC 9964 requires `alg` in an `AKP` key, because the form of the key depends on it.
                 let alg = alg.ok_or(Error::Malformed)?;
                 private(get(-2))?;
-                let public = match alg {
+                match alg {
                     Algorithm::MlDsa65 => PublicKey::MlDsa65(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65Ed25519 => PublicKey::MlDsa65Ed25519(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65EcdsaP256 => PublicKey::MlDsa65EcdsaP256(fixed(bytes(-1)?)?),
                     Algorithm::Ed25519 | Algorithm::Es256 => return Err(Error::KeyAlgorithm),
-                };
-                (public, alg)
+                    // SLH-DSA has no COSE identifier yet, so no `alg` names it.
+                    Algorithm::SlhDsaSha2_128s => return Err(Error::Unsupported),
+                }
             }
             Some(Value::Unsigned(_) | Value::Negative(_) | Value::Text(_)) => return Err(Error::Unsupported),
             _ => return Err(Error::Malformed),
         };
-        if alg.is_some_and(|alg| alg != fits) {
+        if alg.is_some_and(|alg| alg != public.algorithm()) {
             return Err(Error::KeyAlgorithm);
         }
         Ok(Self { kid, alg, public })
+    }
+}
+
+impl<'a> PublicKey<'a> {
+    /// The algorithm that the key type fixes.
+    pub(crate) const fn algorithm(&self) -> Algorithm {
+        match self {
+            Self::Ed25519(_) => Algorithm::Ed25519,
+            Self::P256 { .. } => Algorithm::Es256,
+            Self::MlDsa65(_) => Algorithm::MlDsa65,
+            Self::MlDsa65Ed25519(_) => Algorithm::MlDsa65Ed25519,
+            Self::MlDsa65EcdsaP256(_) => Algorithm::MlDsa65EcdsaP256,
+        }
+    }
+
+    /// The `COSE_Key` of the key, with its `alg` (3): an `OKP` (1) key with `crv` (-1) `Ed25519` (6) and `x` (-2), an
+    /// `EC2` (2) key with `crv` `P-256` (1), `x`, and `y` (-3), or an `AKP` (7) key with `pub` (-1).
+    pub(crate) fn to_cbor(&self) -> Value<'a> {
+        let (kty, mut entries) = match *self {
+            Self::Ed25519(x) => (1, vec![(label(-1), Value::Unsigned(6)), (label(-2), Value::Bytes(x))]),
+            Self::P256 { x, y } => (
+                2,
+                vec![
+                    (label(-1), Value::Unsigned(1)),
+                    (label(-2), Value::Bytes(x)),
+                    (label(-3), Value::Bytes(y)),
+                ],
+            ),
+            Self::MlDsa65(public) => (7, vec![(label(-1), Value::Bytes(public))]),
+            Self::MlDsa65Ed25519(public) => (7, vec![(label(-1), Value::Bytes(public))]),
+            Self::MlDsa65EcdsaP256(public) => (7, vec![(label(-1), Value::Bytes(public))]),
+        };
+        let alg = alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm");
+        entries.extend([(label(1), Value::Unsigned(kty)), (label(3), alg)]);
+        Value::Map(entries)
     }
 }
 

@@ -329,7 +329,8 @@ fn an_ml_dsa_65_profile_verifies_its_signature() {
 /// Verifies a signed CWT of the composite `algorithm` with the `AKP` key `public`. `sign` signs the `Sig_structure`.
 fn verify_composite(algorithm: Algorithm, public: &[u8], sign: impl Fn(&[u8]) -> Vec<u8>) {
     // The draft identifier comes from the profile, so a change of the draft changes only its constant.
-    let n = u64::try_from(-1 - algorithm.report().cose).expect("a negative identifier");
+    let cose = algorithm.report().cose.expect("a composite has a COSE identifier");
+    let n = u64::try_from(-1 - cose).expect("a negative identifier");
     let akp = encode(&Value::Map(vec![
         (Value::Unsigned(1), Value::Unsigned(7)),
         (Value::Unsigned(3), Value::Negative(n)),

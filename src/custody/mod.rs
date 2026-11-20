@@ -147,7 +147,9 @@ impl Handle {
         let key = match algorithm {
             Algorithm::MlDsa65Ed25519 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ed25519),
             Algorithm::MlDsa65EcdsaP256 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ecdsa_p256),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 => return Err(Error::Algorithm),
+            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 | Algorithm::SlhDsaSha2_128s => {
+                return Err(Error::Algorithm);
+            }
         };
         Ok(Self {
             id,

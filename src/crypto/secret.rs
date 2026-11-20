@@ -41,7 +41,9 @@ impl SecretKey {
                     Verifier::MlDsa65EcdsaP256(Box::new(public)),
                 )
             }),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 => return Err(Error::Algorithm),
+            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 | Algorithm::SlhDsaSha2_128s => {
+                return Err(Error::Algorithm);
+            }
         };
         pair.map_err(|_| Error::Crypto)
     }
@@ -51,7 +53,7 @@ impl SecretKey {
         match algorithm {
             Algorithm::MlDsa65Ed25519 => Some(MlDsa65Ed25519SecretKey::PKCS8_DER_LENGTH),
             Algorithm::MlDsa65EcdsaP256 => Some(MlDsa65EcdsaP256SecretKey::PKCS8_DER_LENGTH),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 => None,
+            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 | Algorithm::SlhDsaSha2_128s => None,
         }
     }
 
@@ -76,7 +78,9 @@ impl SecretKey {
             Algorithm::MlDsa65EcdsaP256 => {
                 MlDsa65EcdsaP256SecretKey::from_pkcs8_der_in(&der, Global).map(Self::MlDsa65EcdsaP256)
             }
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 => return Err(Error::Algorithm),
+            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 | Algorithm::SlhDsaSha2_128s => {
+                return Err(Error::Algorithm);
+            }
         }
         .map_err(|_| Error::Mismatch)
     }

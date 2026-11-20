@@ -18,7 +18,8 @@ framework, runtime, or database lock-in.
   lock a user out.
 - **One grant model, every presentation.** TLS-bound native sessions, HTTP message signatures, and
   OAuth 2.1 tokens for MCP servers.
-- **Post-quantum credentials.** Composite ML-DSA-65 + Ed25519 on each credential that it issues. All
+- **Post-quantum credentials.** Composite ML-DSA-65 + Ed25519 on each credential that it issues,
+  unless an audience declares another profile. A classical profile is never selected for you. All
   cryptography comes from rscrypto. The HTTP layer uses the standard `http` types.
 
 **The bar.** Each release measures against webauthn-rs, jsonwebtoken, and the best OpenID relying

@@ -2,8 +2,9 @@
 //! digests, and secret keys. Other modules use only its random generator.
 //!
 //! [`Algorithm`] is the registry of the trusted signature profiles, and [`Algorithm::report`] gives the guarantee of
-//! each profile. The default profile is composite ML-DSA-65 + Ed25519. Each signature check of the crate goes through
-//! one function, which charges a [`SignatureBudget`] before its work. Each digest goes through one SHA-256 function.
+//! each profile. The default profile is composite ML-DSA-65 + Ed25519. SLH-DSA-SHA2-128s is the trust-root profile.
+//! Each signature check of the crate goes through one function, which charges a [`SignatureBudget`] before its work.
+//! Each digest goes through one SHA-256 function.
 //!
 //! The composite profiles are those of the [LAMPS composite signatures] (draft 19, which becomes RFC 10073). Both
 //! components sign the same message, and a composite signature verifies only if both components verify. rscrypto
@@ -19,6 +20,8 @@
 //! assert_eq!(report.registration, Registration::Draft);
 //! // A classical profile is never reported as post-quantum.
 //! assert_eq!(Algorithm::Ed25519.report().authentication, Authentication::Classical);
+//! // The trust-root profile has no COSE identifier yet.
+//! assert_eq!(Algorithm::SlhDsaSha2_128s.report().cose, None);
 //! ```
 //!
 //! [rscrypto]: https://crates.io/crates/rscrypto
@@ -34,6 +37,7 @@ use alloc::vec::Vec;
 use rscrypto::auth::{
     EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
     MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
+    SlhDsaSha2_128sPublicKey,
 };
 
 use crate::limits::{Limit, SignatureBudget};
@@ -52,7 +56,9 @@ const ML_DSA_65_ECDSA_P256_DRAFT: i64 = -55;
 pub enum Algorithm {
     /// Ed25519 (COSE algorithm -19, [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864)). A classical profile.
     Ed25519,
-    /// ECDSA with P-256 and SHA-256 (COSE algorithm -7). A classical profile.
+    /// ECDSA with P-256 and SHA-256 (COSE algorithm -7). A classical profile. IANA marks -7 deprecated since
+    /// [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864), which assigns ESP256 (-9). This profile keeps -7, because it
+    /// serves a verifier that supports nothing else.
     Es256,
     /// ML-DSA-65 (COSE algorithm -49, [RFC 9964](https://www.rfc-editor.org/rfc/rfc9964)), for a verifier that
     /// supports ML-DSA but not the composite.
@@ -64,27 +70,43 @@ pub enum Algorithm {
     /// Composite ML-DSA-65 + ECDSA P-256 (`id-MLDSA65-ECDSA-P256-SHA512`, X.509 OID 1.3.6.1.5.5.7.6.45): the
     /// hardware-bound profile, for a key whose P-256 half is in a Secure Enclave, a TPM, or StrongBox.
     MlDsa65EcdsaP256,
+    /// SLH-DSA-SHA2-128s ([FIPS 205](https://csrc.nist.gov/pubs/fips/205/final)), pure, with the empty context: the
+    /// trust-root profile. A root signs issuer keys, not credentials. Its security rests only on SHA-256. It is in NIST
+    /// security category 1, below the category 3 of ML-DSA-65. The profile has no COSE identifier yet.
+    SlhDsaSha2_128s,
 }
 
 impl Algorithm {
     /// Each algorithm of the registry.
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Ed25519,
         Self::Es256,
         Self::MlDsa65,
         Self::MlDsa65Ed25519,
         Self::MlDsa65EcdsaP256,
+        Self::SlhDsaSha2_128s,
     ];
 
     /// The report of the profile.
     #[must_use]
     pub const fn report(&self) -> Report {
         let (cose, registration, authentication) = match self {
-            Self::Ed25519 => (-19, Registration::Assigned, Authentication::Classical),
-            Self::Es256 => (-7, Registration::Assigned, Authentication::Classical),
-            Self::MlDsa65 => (-49, Registration::Assigned, Authentication::PostQuantum),
-            Self::MlDsa65Ed25519 => (ML_DSA_65_ED25519_DRAFT, Registration::Draft, Authentication::Hybrid),
-            Self::MlDsa65EcdsaP256 => (ML_DSA_65_ECDSA_P256_DRAFT, Registration::Draft, Authentication::Hybrid),
+            Self::Ed25519 => (Some(-19), Registration::Assigned, Authentication::Classical),
+            Self::Es256 => (Some(-7), Registration::Assigned, Authentication::Classical),
+            Self::MlDsa65 => (Some(-49), Registration::Assigned, Authentication::PostQuantum),
+            Self::MlDsa65Ed25519 => (
+                Some(ML_DSA_65_ED25519_DRAFT),
+                Registration::Draft,
+                Authentication::Hybrid,
+            ),
+            Self::MlDsa65EcdsaP256 => (
+                Some(ML_DSA_65_ECDSA_P256_DRAFT),
+                Registration::Draft,
+                Authentication::Hybrid,
+            ),
+            // draft-ietf-cose-sphincs-plus-11 requests -51, but IANA assigned -51 to ESP384 (RFC 9864). Thus this crate
+            // uses no value until IANA assigns one.
+            Self::SlhDsaSha2_128s => (None, Registration::Draft, Authentication::PostQuantum),
         };
         Report {
             cose,
@@ -96,7 +118,7 @@ impl Algorithm {
     /// The signature checks of one signature: one for each component.
     const fn checks(self) -> usize {
         match self {
-            Self::Ed25519 | Self::Es256 | Self::MlDsa65 => 1,
+            Self::Ed25519 | Self::Es256 | Self::MlDsa65 | Self::SlhDsaSha2_128s => 1,
             Self::MlDsa65Ed25519 | Self::MlDsa65EcdsaP256 => 2,
         }
     }
@@ -110,9 +132,9 @@ impl Algorithm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Report {
-    /// The COSE algorithm identifier.
-    pub cose: i64,
-    /// The registration of the COSE identifier.
+    /// The COSE algorithm identifier, or `None` if this crate uses no COSE identifier for the profile yet.
+    pub cose: Option<i64>,
+    /// The registration of a COSE identifier for the profile.
     pub registration: Registration,
     /// The authentication that a valid signature gives.
     pub authentication: Authentication,
@@ -134,7 +156,7 @@ pub enum Authentication {
     /// A post-quantum signature and a classical signature over the same message. The signature verifies only if both
     /// components verify, so a forgery must break both algorithms.
     Hybrid,
-    /// A post-quantum signature only: ML-DSA-65.
+    /// A post-quantum signature only: ML-DSA-65 or SLH-DSA.
     PostQuantum,
     /// A classical signature only. It gives no post-quantum authentication.
     Classical,
@@ -148,6 +170,7 @@ pub(crate) enum Verifier {
     MlDsa65(Box<MlDsa65PublicKey>),
     MlDsa65Ed25519(Box<MlDsa65Ed25519PublicKey>),
     MlDsa65EcdsaP256(Box<MlDsa65EcdsaP256PublicKey>),
+    SlhDsaSha2_128s(SlhDsaSha2_128sPublicKey),
 }
 
 impl Verifier {
@@ -182,8 +205,18 @@ impl Verifier {
         Some(Self::MlDsa65EcdsaP256(Box::new(key)))
     }
 
-    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, and the
-    /// encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite key.
+    /// The SLH-DSA-SHA2-128s key with the encoding `public`: PK.seed, then PK.root.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the trust roots of A302 and A305 verify with it")
+    )]
+    pub(crate) fn slh_dsa_sha2_128s(public: &[u8; 32]) -> Self {
+        Self::SlhDsaSha2_128s(SlhDsaSha2_128sPublicKey::from_bytes(*public))
+    }
+
+    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, the
+    /// encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite key, and PK.seed then PK.root for an
+    /// SLH-DSA key.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(key) => key.as_bytes().to_vec(),
@@ -191,6 +224,7 @@ impl Verifier {
             Self::MlDsa65(key) => key.as_bytes().to_vec(),
             Self::MlDsa65Ed25519(key) => key.to_bytes().to_vec(),
             Self::MlDsa65EcdsaP256(key) => key.to_bytes().to_vec(),
+            Self::SlhDsaSha2_128s(key) => key.as_bytes().to_vec(),
         }
     }
 
@@ -202,10 +236,12 @@ impl Verifier {
             Self::MlDsa65(_) => Algorithm::MlDsa65,
             Self::MlDsa65Ed25519(_) => Algorithm::MlDsa65Ed25519,
             Self::MlDsa65EcdsaP256(_) => Algorithm::MlDsa65EcdsaP256,
+            Self::SlhDsaSha2_128s(_) => Algorithm::SlhDsaSha2_128s,
         }
     }
 
-    /// Whether `signature` is a valid signature over `message`. ML-DSA-65 and the composites use the empty context.
+    /// Whether `signature` is a valid signature over `message`. ML-DSA-65, the composites, and SLH-DSA use the empty
+    /// context.
     ///
     /// The check first charges `budget` with its cost: one check for each component. If the budget has less, the
     /// check refuses with [`Limit::SignatureChecks`] and does no signature work.
@@ -224,6 +260,7 @@ impl Verifier {
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
             Self::MlDsa65EcdsaP256(key) => MlDsa65EcdsaP256Signature::try_from_slice(signature)
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
+            Self::SlhDsaSha2_128s(key) => key.verify(message, signature).is_ok(),
         })
     }
 }
@@ -242,6 +279,7 @@ impl PartialEq for Verifier {
             (Self::MlDsa65(a), Self::MlDsa65(b)) => a == b,
             (Self::MlDsa65Ed25519(a), Self::MlDsa65Ed25519(b)) => a == b,
             (Self::MlDsa65EcdsaP256(a), Self::MlDsa65EcdsaP256(b)) => a == b,
+            (Self::SlhDsaSha2_128s(a), Self::SlhDsaSha2_128s(b)) => a == b,
             _ => false,
         }
     }

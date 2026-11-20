@@ -87,8 +87,10 @@ let version = AuthorityVersion::new(owner, &7_u64.to_be_bytes())?;
 | Phishing resistance: the proof binds the origin | `phishing_resistant()` |
 | Recovery | `recovery()` |
 | A device or hardware binding of the key | `binding()` |
+| The authentication of the signature: `Hybrid`, `PostQuantum`, or `Classical` (`crypto::Authentication`), or `None` when rsauthnz verified no signature | `authentication()` |
 
-Evidence has no strength score. A recovery never records phishing resistance. Only the verifiers of
+A `Classical` authentication gives no post-quantum guarantee. Post-quantum key exchange is a separate
+guarantee of the transport, and the evidence does not record it. Evidence has no strength score. A recovery never records phishing resistance. Only the verifiers of
 rsauthnz make evidence, so a caller cannot mark an unverified claim as proved. A storage binding
 keeps the encoded evidence as opaque bytes and gives them back; it never rebuilds evidence itself.
 `credential::Verified::possession` makes the evidence of a key possession, as [Prove
@@ -107,7 +109,7 @@ type except `Evidence`, which only rsauthnz reads:
 | `Id<K>` | `[kind, namespace, value]`. The kinds are numbers: human 1, workload 2, agent 3, authority 4, tenant 5, action 6, resource 7, audience 8, purpose 9 |
 | `Principal` | The form of its identifier |
 | `AuthorityVersion` | `[owner, coordinate]`, with the coordinate as a byte string |
-| `Evidence` | `[subject, method, time, user verified, phishing resistant, binding]` |
+| `Evidence` | `[subject, method, time, user verified, phishing resistant, binding, authentication]`. The authentication is hybrid 1, post-quantum 2, classical 3, or `null` |
 
 A form of another kind refuses: for example, the form of an `Id<Agent>` does not read as an
 `Id<Human>`.

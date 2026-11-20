@@ -38,7 +38,8 @@ in a composite key, is not on the curve.
 
 [Signature profiles](profiles.md) gives the guarantee of each profile, and the state of the draft identifiers.
 `MlDsa65Ed25519` is the default profile. Ed25519 and ES256 are classical profiles. Select one only for a verifier
-that supports nothing else.
+that supports nothing else. The SLH-DSA trust-root profile has no COSE identifier yet, so `TrustedKey::new` refuses
+it with `Error::KeyAlgorithm`.
 
 ## Verify a CWT
 
