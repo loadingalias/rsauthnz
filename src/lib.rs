@@ -3,7 +3,6 @@
 extern crate alloc;
 
 pub mod authz;
-pub mod b64;
 pub mod cbor;
 pub mod cose;
 mod crypto;

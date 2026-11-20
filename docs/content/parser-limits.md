@@ -4,8 +4,8 @@ Each rsauthnz parser bounds its untrusted input before it does work on it. The c
 each bound has a stated default. A refusal names the bound that refused the input. [Admit rsauthnz
 work](admission.md) gives the cost class of each operation.
 
-rsauthnz has one codec for each format: `rsauthnz::cbor` for CBOR, `rsauthnz::json` for JSON, and `rsauthnz::b64`
-for base64url. Use them for each input of these formats, so one set of rules and bounds applies to all of them.
+rsauthnz has one codec for each format: `rsauthnz::cbor` for CBOR and `rsauthnz::json` for JSON. Use them for each
+input of these formats, so one set of rules and bounds applies to all of them.
 
 ## The limit set
 
@@ -152,45 +152,3 @@ place, with no allocation. The sort adds a factor of at most log2 of `map_keys`:
 | `Error::DuplicateMember` | An object has two members with equal names |
 
 The debug output of a `Value` shows the numbers, and only the length of each string and member name.
-
-## Base64url
-
-`rsauthnz::b64` decodes and encodes base64url with no padding
-([RFC 4648, section 5](https://www.rfc-editor.org/rfc/rfc4648#section-5)), as WebAuthn, JOSE, and OAuth use it.
-The functions write into a slice that the caller supplies, so they allocate no memory. The length of that slice
-is the bound of the output.
-
-- `decoded_len(text)` gives the number of bytes that `text` decodes to.
-- `decode(text, out)` decodes `text` into the start of `out`, and gives the bytes.
-- `encoded_len(bytes)` gives the number of characters of the text of `bytes`.
-- `encode(bytes, out)` writes the text of `bytes` into the start of `out`, and gives it. The text is ASCII.
-
-The decoder accepts only the canonical text, so each byte string has one text. A canonical text has no padding,
-only the 64 characters of the base64url alphabet, a length that an encoding can have, and zero bits after the last
-decoded byte.
-
-The time of each function depends only on the lengths of its input and output, not on the bytes. The functions use
-arithmetic, with no branch and no table on the data. Thus a key, a challenge, or a session identifier can go
-through them.
-
-This example is also the example of the `rsauthnz::b64` module documentation, and `cargo xtask test` runs it:
-
-```rust
-use rsauthnz::b64;
-
-let text = b"-_-_";
-let mut bytes = [0; 3];
-assert_eq!(b64::decode(text, &mut bytes)?, [0xfb, 0xff, 0xbf]);
-let mut encoded = [0; 4];
-assert_eq!(b64::encode(&bytes, &mut encoded)?, text);
-```
-
-| Error | Cause |
-| --- | --- |
-| `Error::Length` | The text has 4n + 1 characters, and no encoding has that length |
-| `Error::Malformed` | A byte of the text is not in the base64url alphabet. The padding character `=` is not in it |
-| `Error::TrailingBits` | The last character has nonzero bits after the last decoded byte |
-| `Error::ShortOutput` | The output slice is shorter than `decoded_len` or `encoded_len` gives |
-
-`decode` returns `Error::Malformed` and `Error::TrailingBits` after it reads all of the text, so their time does
-not show which byte refused.
