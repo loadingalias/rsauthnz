@@ -9,6 +9,12 @@ success-output = "never"
 failure-output = "immediate-final"
 fail-fast = true
 
+# A Keychain test waits while macOS shows a dialog that needs a person, for example to unlock the keychain. The timeout
+# makes that wait fail.
+[[profile.default.overrides]]
+filter = 'test(/keychain/)'
+slow-timeout = { period = "30s", terminate-after = 2 }
+
 # The CI gate: the same test semantics, reporting every failure.
 [profile.ci]
 inherits = "default"

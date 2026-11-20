@@ -23,6 +23,22 @@ profiles](profiles.md) gives the profiles. Each random value comes from the seed
 caller: the key ID, each key, and the randomness of each signature. The signing is hedged: rscrypto takes fresh
 randomness from the generator for each signature.
 
+## Select a custody
+
+The feature `native-custody` gives two custodies:
+
+- `FileCustody`, the software custody, keeps each key in a key file under OS file permissions. It is available on
+  Linux, macOS, and Windows.
+- `KeychainCustody`, the OS-vault custody, keeps each key in the login keychain of macOS. It is available on macOS.
+
+Both custodies give the same operations and the same isolation. The keychain encrypts the keys at rest, and it adds
+no directory for you to protect. No custody gives hardware non-exportability: each one reads the key into process
+memory to sign.
+
+On macOS, use `KeychainCustody`. Use `FileCustody` if the program runs with no user session, or if its code
+signature changes with each build. In those cases, the keychain needs a person, or it refuses (see
+[Keychain dialogs](#keychain-dialogs)).
+
 ## Use the file custody
 
 `FileCustody` is the software custody. It keeps each key in a key file under OS file permissions. It needs the
@@ -34,7 +50,7 @@ rsauthnz = { git = "https://github.com/loadingalias/rsauthnz", branch = "main", 
 ```
 
 The feature has an effect on Linux, macOS, and Windows only. A build for another target, such as WebAssembly, iOS,
-or Android, has no `FileCustody`.
+or Android, has no `FileCustody` and no `KeychainCustody`.
 
 1. Select a directory for the key files. Give it to `FileCustody::open` with the isolation that you require. The
    library reads no environment variable and has no default directory.
@@ -73,6 +89,79 @@ std::fs::remove_dir(&dir)?;
 
 `Handle::public_key` gives the public key in the encoding of the LAMPS draft: the `pub` of a composite `COSE_Key`.
 
+## Use the Keychain custody
+
+`KeychainCustody` keeps each key in the login keychain of the OS user account that runs the process. It needs the
+feature `native-custody`, and it is available on macOS only. The library adds no entitlement and no code-signing step.
+
+1. Select a service name for the keys of your application, such as its bundle ID. Give it to `KeychainCustody::open`
+   with the isolation that you require. The library has no default service name.
+2. Draw a key ID with `KeyId::random`, and record it before you enroll the key.
+3. Enroll the key. Store the ID, the algorithm, and the public key of the handle.
+4. Sign with the handle. Give the algorithm that the signed artifact names. A different algorithm refuses.
+5. Delete the key when you no longer use it. Then each handle of the key refuses.
+
+This example is also the example of the `KeychainCustody` documentation, and `cargo xtask test` runs it on macOS:
+
+```rust
+use rsauthnz::crypto::Algorithm;
+use rsauthnz::custody::{Custody, Handle, Isolation, KeyId, KeychainCustody};
+use rsauthnz::limits::{Limits, SignatureBudget};
+use rscrypto::ChaCha20Rng;
+
+// Name the keys of the application with a service, such as its bundle ID. Only for this example: the process ID
+// keeps the items of each run apart.
+let service = format!("com.example.rsauthnz-example.{}", std::process::id());
+// Only for this example: take the seed from the entropy source of the host.
+let mut random = ChaCha20Rng::from_seed([7; 32]);
+
+let custody = KeychainCustody::open(service, Isolation::User)?;
+// Draw the key ID, and record it before the enroll. After a lost response, delete the ID and enroll again.
+let id = KeyId::random(&mut random);
+let enrolled = custody.enroll(id, Algorithm::MlDsa65Ed25519, &mut random)?;
+// Store the ID, the algorithm, and the public key. They make the handle again after a restart.
+let handle = Handle::new(enrolled.id(), enrolled.algorithm(), &enrolled.public_key())?;
+
+let signature = custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)?;
+let mut budget = SignatureBudget::new(&Limits::default());
+assert_eq!(handle.verify(b"message", &signature, &mut budget), Ok(true));
+
+custody.delete(id)?;
+```
+
+### Keychain items
+
+| Property | Value |
+| --- | --- |
+| Keychain | The login keychain of the user, the default keychain of macOS. Not the data protection keychain |
+| Class | Generic password |
+| Service | The service name that you give to `KeychainCustody::open` |
+| Account | The key ID as 32 lowercase hexadecimal digits |
+| Data | The PKCS #8 (version 1) DER encoding of the composite key, as rscrypto writes it |
+| Synchronization | None. The item does not synchronize through iCloud |
+| Access | The default access of macOS: the program that made the item reads it without a dialog |
+| Durability | macOS writes the item before enroll returns |
+
+macOS encrypts the login keychain with a key from the login password of the user. Each operation checks that the
+length, the algorithm, and the public key of the item match the handle. An item with another key refuses with
+`Error::Mismatch`.
+
+### Keychain dialogs
+
+macOS shows a dialog that needs a person in these cases:
+
+- Another program reads the item. The program that made the item does not get a dialog.
+- A build of your program with another code signature reads the item. An ad-hoc signature changes with each build,
+  for example after each `cargo install`.
+- The login keychain is locked.
+
+The operation waits until the person answers. If the person denies access, the operation refuses with
+`Error::Vault`. macOS documents `errSecInteractionNotAllowed` (`-25308`) for a dialog that the session cannot show,
+for example in an SSH session. No test of the library runs that path.
+
+To keep access across updates, sign your program with a stable identity, such as a Developer ID certificate. If a
+program lost its access, allow it in the dialog, or enroll a new key and register it with the authority.
+
 ## Lost responses and rotation
 
 A lost response is an unknown outcome, and a custody never retries an operation. Thus the caller draws each key ID
@@ -100,24 +189,32 @@ the key file match the handle. A key file with another key refuses with `Error::
 An administrator or root can still read a key file, through file privileges. The software custody does not keep
 the key from them.
 
+A backup of the directory, such as a Time Machine backup, copies each key file, and the key in it is plaintext.
+Exclude the directory of the key files from backups.
+
 ## The custody report
 
-`Custody::report` gives a `Report`. `FileCustody::REPORT` has these values:
+`Custody::report` gives a `Report`. `FileCustody::REPORT` and `KeychainCustody::REPORT` have these values:
 
-| Field | Type | Value of `FileCustody` |
-| --- | --- | --- |
-| `owner` | `&'static str` | A key file of the OS user account that runs the process. Only that account can read it |
-| `plaintext` | `&'static str` | In process memory during one operation only. Swap space and a core dump can hold it |
-| `zeroization` | `&'static str` | rscrypto clears the key in memory after each operation. Delete removes the key file, but the storage device can keep its blocks |
-| `recovery` | `&'static str` | None. Enroll a new key, and register it with the authority |
-| `isolation` | `Isolation` | `User` |
+| Field | Type | Value of `FileCustody` | Value of `KeychainCustody` |
+| --- | --- | --- | --- |
+| `owner` | `&'static str` | A key file of the OS user account that runs the process. Only that account can read it | An item of the login keychain of the OS user account that runs the process. macOS gives it to another program, or to a build of the program with another code signature, only after the user allows it in a dialog |
+| `plaintext` | `&'static str` | In process memory during one operation only. Swap space and a core dump can hold it | macOS decrypts the item and gives it to the process for one operation. In process memory during that operation only. Swap space and a core dump can hold it |
+| `zeroization` | `&'static str` | rscrypto clears the key in memory after each operation. Delete removes the key file, but the storage device can keep its blocks | rscrypto clears its copy of the key after each operation. macOS frees its copy of the item, which the custody cannot clear. Delete removes the item. A backup of the login keychain keeps the item, encrypted |
+| `recovery` | `&'static str` | None. Enroll a new key, and register it with the authority | None. Enroll a new key, and register it with the authority |
+| `isolation` | `Isolation` | `User` | `User` |
 
 `Report::require` refuses with `Error::Isolation` if a caller requires more isolation than the report gives.
-`FileCustody::open` calls it before it reads the storage, so `Isolation::Process` refuses there.
+`FileCustody::open` and `KeychainCustody::open` call it before they read the storage, so `Isolation::Process`
+refuses there.
 
-The custody keeps one copy of a key in memory, and only during one operation. rscrypto builds the key in place in
+A custody keeps one copy of a key in memory, and only during one operation. rscrypto builds the key in place in
 its allocation, and signing reads it there. The memory that holds the encoded key file is cleared too. A test of
-the library reads each heap block that the custody frees, through the OS, and it finds no key bytes.
+the library reads each heap block that the file custody frees, through the OS, and it finds no key bytes.
+
+The Keychain custody also gets a copy of the item in memory of macOS. It releases that copy before it signs, but it
+cannot clear it. A test of the library reads each region of the process that the process can write, after the
+Keychain custody and its handles drop, and it finds no key bytes. That test passes on macOS 27.2.1 on aarch64.
 
 Use full-disk encryption on the volume of the key files, because a deleted key file can stay on the storage device.
 
@@ -126,10 +223,11 @@ Use full-disk encryption on the volume of the key files, because a deleted key f
 | Operation | Cost class | Result | Refusals |
 | --- | --- | --- | --- |
 | `FileCustody::open(dir, required)` | `External` | The custody of the key files in `dir` | `Isolation`, `Storage` |
-| `Custody::enroll(id, algorithm, random)` | `External` | The handle of a new key. The key is durable first | `Algorithm`, `Exists`, `Storage`, `Crypto` |
+| `KeychainCustody::open(service, required)` | `Parse` | The custody of the keychain items of `service`. It does no keychain work | `Isolation` |
+| `Custody::enroll(id, algorithm, random)` | `External` | The handle of a new key. The key is durable first | `Algorithm`, `Exists`, `Storage`, `Vault`, `Crypto` |
 | `Custody::rotate(from, id, random)` | `External` | The handle of the successor of `from` | The refusals of `sign` for `from`, then those of `enroll` |
-| `Custody::sign(handle, algorithm, message, random)` | `External` | The composite signature of `message` | `Algorithm`, `Unknown`, `Mismatch`, `Permissions`, `Storage`, `Crypto` |
-| `Custody::delete(id)` | `External` | The key file is gone | `Unknown`, `Storage` |
+| `Custody::sign(handle, algorithm, message, random)` | `External` | The composite signature of `message` | `Algorithm`, `Unknown`, `Mismatch`, `Permissions`, `Storage`, `Vault`, `Crypto` |
+| `Custody::delete(id)` | `External` | The key file or the keychain item is gone | `Unknown`, `Storage`, `Vault` |
 | `Handle::new(id, algorithm, public)` | `Verify` | The handle of a stored key | `Algorithm`, `Mismatch` |
 | `Handle::verify(message, signature, budget)` | `Verify` | Whether the signature is valid | `Limit::SignatureChecks` if the budget has less than two checks |
 
@@ -145,10 +243,20 @@ Use full-disk encryption on the volume of the key files, because a deleted key f
 | `Algorithm` | The custody holds no keys of the algorithm, or the algorithm is not that of the handle | Sign with the algorithm of the handle. Enroll a composite key |
 | `Unknown` | No key has the ID: the key was deleted, or another custody holds it | Use the custody of the key. Enroll a new key |
 | `Exists` | A key with the ID exists | Delete the ID, or draw another ID |
-| `Mismatch` | The stored key does not match the handle: another public key, or a damaged file | Delete the key, and enroll a new key |
+| `Mismatch` | The stored key does not match the handle: another public key, or a damaged key file or item | Delete the key, and enroll a new key |
 | `Permissions` | Another account can read or change the key file, or the custody cannot read its permissions | Delete the key, and enroll a new key |
 | `Storage(kind)` | The storage refused the operation. `kind` is the kind of the OS error | Correct the cause, such as the directory or the free space |
+| `Vault(code)` | The keychain refused the operation. `code` is the `OSStatus` of macOS | See the codes in the next table |
 | `Crypto` | rscrypto refused to make the key or the signature | Enroll a new key |
+
+These are the frequent `Vault` codes. macOS names each code in its `SecBase.h` header.
+
+| Code | Name | Cause | Recovery |
+| --- | --- | --- | --- |
+| `-25308` | `errSecInteractionNotAllowed` | macOS needs a dialog, but the session cannot show one | Unlock the login keychain, or run the program in the session of the user |
+| `-128` | `errSecUserCanceled` | The person canceled the dialog | Do the operation again, and allow it in the dialog |
+| `-25293` | `errSecAuthFailed` | The authorization or the authentication failed, for example with a wrong keychain password | Do the operation again with the keychain password |
+| `-25291` | `errSecNotAvailable` | No keychain is available | Restore or make the login keychain of the user |
 
 ## Supply a custody
 
@@ -158,12 +266,14 @@ consumer takes `&dyn Custody`.
 
 ## Support
 
-| Target | State |
-| --- | --- |
-| macOS aarch64 | The tests pass |
-| Linux x86_64 and aarch64, glibc and musl | The lints pass for the musl targets. The test runs are pending |
-| Windows x86_64 | The lints pass. The test run is pending |
-| iOS, Android, WebAssembly | No file custody. The contract and the handle are available |
+| Target | `FileCustody` | `KeychainCustody` |
+| --- | --- | --- |
+| macOS aarch64 | The tests pass | The tests pass, in the session of a user with an unlocked login keychain |
+| macOS x86_64 | No claim | No claim |
+| Linux x86_64 and aarch64, glibc and musl | The lints pass for the musl targets. The test runs are pending | Not available |
+| Windows x86_64 | The lints pass. The test run is pending | Not available |
+| iOS, Android, WebAssembly | Not available. The contract and the handle are available | Not available |
 
-The software custody does not keep a key from a hostile process of the same OS account. No custody of the library
-gives `Isolation::Process` now.
+No custody of the library keeps a key from a hostile process of the same OS account, and none gives
+`Isolation::Process`. Such a process can read a key file. It can also start your program and make it sign, or load
+its own code into your program, and then use the keychain item without a dialog.

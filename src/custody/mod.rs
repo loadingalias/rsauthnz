@@ -7,8 +7,8 @@
 //!
 //! The contract is portable, so a host, such as a browser application, can supply its own custody. With the feature
 //! `native-custody`, on Linux, macOS, and Windows, `FileCustody` keeps each key in a key file under OS file
-//! permissions. A custody holds the composite keys: [`Algorithm::MlDsa65Ed25519`] and
-//! [`Algorithm::MlDsa65EcdsaP256`].
+//! permissions. On macOS, `KeychainCustody` keeps each key in the login keychain. A custody holds the composite keys:
+//! [`Algorithm::MlDsa65Ed25519`] and [`Algorithm::MlDsa65EcdsaP256`].
 //!
 //! Each random value comes from the seeded [`ChaCha20Rng`] of the caller: the key ID, each key, and the randomness
 //! of each signature. The signing is hedged: rscrypto takes fresh randomness from the generator for each signature.
@@ -17,6 +17,8 @@
 
 #[cfg(all(feature = "native-custody", any(target_os = "linux", target_os = "macos", windows)))]
 mod file;
+#[cfg(all(feature = "native-custody", target_os = "macos"))]
+mod keychain;
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -26,6 +28,8 @@ use rscrypto::ChaCha20Rng;
 
 #[cfg(all(feature = "native-custody", any(target_os = "linux", target_os = "macos", windows)))]
 pub use file::FileCustody;
+#[cfg(all(feature = "native-custody", target_os = "macos"))]
+pub use keychain::KeychainCustody;
 
 use crate::crypto::{Algorithm, Verifier};
 use crate::limits::{Limit, SignatureBudget};
@@ -46,7 +50,8 @@ pub trait Custody {
     /// # Errors
     ///
     /// [`Error::Algorithm`] if the custody holds no keys of `algorithm`. [`Error::Exists`] if a key has the ID
-    /// already. [`Error::Storage`] and [`Error::Crypto`] if the storage or rscrypto refuses.
+    /// already. [`Error::Storage`], [`Error::Vault`], and [`Error::Crypto`] if the storage, the OS vault, or rscrypto
+    /// refuses.
     fn enroll(&self, id: KeyId, algorithm: Algorithm, random: &mut ChaCha20Rng) -> Result<Handle, Error>;
 
     /// Makes the successor of the key of `from`: a key of the same algorithm with the ID `id`. The key of `from`
@@ -56,8 +61,8 @@ pub trait Custody {
     ///
     /// # Errors
     ///
-    /// [`Error::Unknown`], [`Error::Mismatch`], [`Error::Permissions`], and [`Error::Storage`] for the key of `from`,
-    /// as [`Self::sign`] gives them. Then the errors of [`Self::enroll`].
+    /// [`Error::Unknown`], [`Error::Mismatch`], [`Error::Permissions`], [`Error::Storage`], and [`Error::Vault`] for
+    /// the key of `from`, as [`Self::sign`] gives them. Then the errors of [`Self::enroll`].
     fn rotate(&self, from: &Handle, id: KeyId, random: &mut ChaCha20Rng) -> Result<Handle, Error>;
 
     /// The signature of `message` by the key of `handle`, with the algorithm `algorithm`.
@@ -68,8 +73,8 @@ pub trait Custody {
     ///
     /// [`Error::Algorithm`] if `algorithm` is not the algorithm of `handle`. [`Error::Unknown`] if the custody has
     /// no key with the ID of `handle`. [`Error::Mismatch`] if the key with that ID does not match `handle`.
-    /// [`Error::Permissions`] if another account can read the key. [`Error::Storage`] and [`Error::Crypto`] if the
-    /// storage or rscrypto refuses.
+    /// [`Error::Permissions`] if another account can read the key. [`Error::Storage`], [`Error::Vault`], and
+    /// [`Error::Crypto`] if the storage, the OS vault, or rscrypto refuses.
     fn sign(
         &self,
         handle: &Handle,
@@ -84,7 +89,8 @@ pub trait Custody {
     ///
     /// # Errors
     ///
-    /// [`Error::Unknown`] if the custody has no key with the ID. [`Error::Storage`] if the storage refuses.
+    /// [`Error::Unknown`] if the custody has no key with the ID. [`Error::Storage`] or [`Error::Vault`] if the storage
+    /// or the OS vault refuses.
     fn delete(&self, id: KeyId) -> Result<(), Error>;
 }
 
@@ -255,6 +261,8 @@ pub enum Error {
     Permissions,
     /// The storage refused the operation, with the kind of the OS error.
     Storage(io::ErrorKind),
+    /// The OS vault refused the operation, with its status code: an `OSStatus` of the macOS keychain.
+    Vault(i32),
     /// rscrypto refused to make the key or the signature.
     Crypto,
 }
@@ -269,6 +277,7 @@ impl fmt::Display for Error {
             Self::Mismatch => f.write_str("the stored key does not match the handle"),
             Self::Permissions => f.write_str("another account can read or change the stored key"),
             Self::Storage(kind) => write!(f, "the storage refused the operation: {kind}"),
+            Self::Vault(code) => write!(f, "the OS vault refused the operation: status {code}"),
             Self::Crypto => f.write_str("rscrypto refused the operation"),
         }
     }

@@ -15,8 +15,8 @@ rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", de
 rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2", "slh-dsa"] }
 
 [features]
-# The native custody binding: key files under OS file permissions, on Linux, macOS, and Windows only. rscrypto
-# `alloc` builds each secret key in place in its allocation.
+# The native custody bindings: key files under OS file permissions on Linux, macOS, and Windows, and the login
+# keychain on macOS. rscrypto `alloc` builds each secret key in place in its allocation.
 native-custody = ["rscrypto/alloc"]
 
 [dev-dependencies]
