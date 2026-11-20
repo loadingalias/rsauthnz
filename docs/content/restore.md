@@ -128,8 +128,8 @@ applies an entry. The activation states what the restored store applies before i
 1. End each record whose version is at or below the version of its fact (`facts`).
 2. Write each anchor that a creation entry made after the snapshot, and that no fact ends (`anchors`).
 3. Raise the counter of each floor past its value (`floors`).
-4. End each pending record of a kind whose consumption pays for no anchor: a sign-in challenge or an operation
-   approval (`ends`). Then set the replay floor as a start does.
+4. End each pending record of a kind whose consumption pays for no anchor: a sign-in challenge, the challenge of a
+   CLI call, or an operation approval (`ends`). Then set the replay floor as a start does.
 5. Commit each in-doubt consumption again under its operation identity, in journal order (`completions`). Keep
    the list until each one commits, so that a crash before that does not end the restore. The driver keeps it in
    the mark record.

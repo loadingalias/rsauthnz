@@ -31,6 +31,7 @@ pub use file::FileCustody;
 #[cfg(all(feature = "native-custody", target_os = "macos"))]
 pub use keychain::KeychainCustody;
 
+use crate::cose::{Key, PublicKey, TrustedKey};
 use crate::crypto::{Algorithm, Verifier};
 use crate::limits::{Limit, SignatureBudget};
 
@@ -191,6 +192,24 @@ impl Handle {
     /// [`Limit::SignatureChecks`] if `budget` has less than two checks. Then the check does no signature work.
     pub fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<bool, Limit> {
         self.key.verify(message, signature, budget)
+    }
+
+    /// The trusted key of the public key, which checks the artifacts that the key signs.
+    pub(crate) fn trusted(&self) -> TrustedKey {
+        let bytes = self.key.to_bytes();
+        let public = match self.algorithm() {
+            Algorithm::MlDsa65Ed25519 => bytes.as_slice().try_into().map(PublicKey::MlDsa65Ed25519).ok(),
+            Algorithm::MlDsa65EcdsaP256 => bytes.as_slice().try_into().map(PublicKey::MlDsa65EcdsaP256).ok(),
+            _ => None,
+        };
+        let key = public.map(|public| Key {
+            kid: None,
+            alg: None,
+            public,
+        });
+        // `Handle::new` made the same verifier from the same bytes, so the trusted key exists.
+        key.and_then(|key| TrustedKey::new(self.algorithm(), &key).ok())
+            .expect("a handle holds a valid composite key")
     }
 }
 

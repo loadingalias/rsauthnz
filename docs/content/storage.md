@@ -85,7 +85,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Credential` | A passkey, a CLI credential, or the credential of a workload or an agent | `None` |
 | `ProviderLink` | The link of an account to the subject of an external identity provider | `None` |
 | `Registration` | A pending passkey registration ceremony | `Pays::Anchor` |
-| `SignIn` | A pending sign-in challenge | `Pays::Nothing` |
+| `SignIn` | A pending sign-in challenge, or the challenge of the next call of a [CLI](cli.md) | `Pays::Nothing` |
 | `Login` | A pending login transaction of an external identity provider | `Pays::Anchor` |
 | `CliEnrollment` | A pending enrollment request of a CLI | `Pays::Anchor` |
 | `Invitation` | An invitation value | `Pays::Anchor` |

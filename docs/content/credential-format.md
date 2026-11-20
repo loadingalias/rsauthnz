@@ -249,8 +249,10 @@ the `cnf` key: `Hybrid`, `PostQuantum`, or `Classical`. It records no user verif
 and no device or hardware binding, because the proof does not show them.
 [Vocabulary](vocabulary.md#authentication-evidence) gives the evidence.
 
-The challenge makes the proof fresh. rsauthnz does not store challenges. The application issues each challenge
-for one proof, and it refuses a challenge that it consumed.
+The challenge makes the proof fresh. For a CLI credential of a local authority, rsauthnz keeps a one-use challenge
+for each binding, and the proof binds the request of the call in place of the challenge
+([CLI credential](cli.md)). For each other credential, the application issues each challenge for one proof, and
+it refuses a challenge that it consumed.
 
 ## Errors
 

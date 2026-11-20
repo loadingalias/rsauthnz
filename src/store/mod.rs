@@ -65,7 +65,8 @@ pub enum Kind {
     ProviderLink = 2,
     /// A pending passkey registration ceremony. Its consumption pays for an anchor.
     Registration = 3,
-    /// A pending sign-in challenge. Its consumption pays for no anchor.
+    /// A pending sign-in challenge, or the challenge of the next call of a CLI ([`crate::cli`]). Its consumption pays
+    /// for no anchor.
     SignIn = 4,
     /// A pending login transaction of an external identity provider. Its consumption pays for an anchor.
     Login = 5,

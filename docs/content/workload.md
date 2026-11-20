@@ -107,7 +107,7 @@ credential again.
 
 A renewal gives a new serial with the same `cnf` key. The earlier credential stays valid until it ends.
 
-rsauthnz does not store challenges. To consume the challenge in the same commit, add the read of its record and its
+rsauthnz does not store the challenges of a workload. To consume the challenge in the same commit, add the read of its record and its
 end to the proposal before you submit it: `proposal.read(...)` and `proposal.change(Change::End(key))`. A proof
 that an attacker replays gives a credential for the registered key only, which the attacker cannot use.
 

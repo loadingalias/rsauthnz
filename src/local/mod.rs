@@ -10,7 +10,9 @@
 //! makes the CLI credential of the administrator in two steps: custody signs the bytes of [`Pending::to_be_signed`],
 //! and [`Pending::finish`] gives the proposal. Its commit consumes the value and binds the administrator. A remote
 //! call is admitted only for the credential of a live administrator binding ([`Authority::admit`]). Thus remote access
-//! refuses before a separate identity enrolls.
+//! refuses before a separate identity enrolls. Each call proves the possession of the key of the credential over a
+//! one-use challenge of the binding ([`Authority::challenge`]). The module [`crate::cli`] gives the call of the client
+//! and its journey.
 //!
 //! The store keeps no secret. A value record holds the administrator, the time of the issue, and the end of the value,
 //! under a key that the SHA-256 digest of the authority, the issuer public key, and the secret names. Thus a value of
@@ -33,12 +35,11 @@
 //! use core::task::{Context, Poll, Waker};
 //! use core::time::Duration;
 //!
-//! use rsauthnz::cose::{Key, PublicKey, TrustedKey};
-//! use rsauthnz::credential::{ProofDraft, Serial};
+//! use rsauthnz::credential::Serial;
 //! use rsauthnz::crypto::Algorithm;
 //! use rsauthnz::custody::{Handle, KeyId};
 //! use rsauthnz::id::Id;
-//! use rsauthnz::limits::{Limits, SignatureBudget};
+//! use rsauthnz::limits::Limits;
 //! use rsauthnz::local::{self, Authority, Bootstrap, HostGrant};
 //! use rsauthnz::store::driver::{Answer, Driver, Plan};
 //! use rsauthnz::store::{self, Kind, Store};
@@ -82,7 +83,7 @@
 //! // Only for this example: take the seed from the entropy source of the host, and keep each key in custody.
 //! let mut random = ChaCha20Rng::from_seed([7; 32]);
 //! let (issuer_public, issuer_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(1)))?;
-//! let (holder_public, holder_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(2)))?;
+//! let (holder_public, _) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(2)))?;
 //! let (issuer_public, holder_public) = (issuer_public.to_bytes(), holder_public.to_bytes());
 //! let issuer = Handle::new(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &issuer_public)?;
 //!
@@ -105,21 +106,9 @@
 //! let signature = issuer_secret.sign_deterministic(&pending.to_be_signed(), &[])?;
 //! let bootstrap = pending.finish(signature.as_bytes(), OperationId::new(b"b-1")?)?;
 //! let credential = commit(&mut memory, &mut driver, bootstrap)?;
+//! assert_eq!(ready(authority.credential(&mut memory, &alice, &holder_public, now))?, credential);
 //!
-//! // 3. On a remote call, the administrator proves the possession of its key over the challenge of the call.
-//! let holder = TrustedKey::new(Algorithm::MlDsa65Ed25519, &Key {
-//!     kid: None,
-//!     alg: None,
-//!     public: PublicKey::MlDsa65Ed25519(&holder_public),
-//! })?;
-//! let challenge = [9; 32];
-//! let draft = ProofDraft::new(&holder, &credential, &grant.origin, &challenge, now)?;
-//! let signature = holder_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
-//! let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
-//! let admitted = ready(authority.admit(&mut memory, &credential, &proof, &challenge, now))?;
-//! assert_eq!(admitted.administrator(), &alice);
-//!
-//! // The value is one-use.
+//! // The value is one-use. Each remote call of the administrator proves the possession of its key: see `rsauthnz::cli`.
 //! let again = ready(authority.bootstrap(&mut memory, &value, &holder_public, serial, now));
 //! assert!(matches!(again, Err(local::Failure::Refused(local::Error::Unknown))));
 //! # Ok::<(), Failure>(())
@@ -161,6 +150,7 @@ use core::time::Duration;
 use rscrypto::ChaCha20Rng;
 
 use crate::cbor::{self, Value};
+use crate::cli::{self, Call, Challenge};
 use crate::cose::{Key as CoseKey, PublicKey, TrustedKey};
 use crate::credential::{self, Claims, Draft, Serial, Subject};
 use crate::crypto::{self, Algorithm};
@@ -172,7 +162,7 @@ use crate::store::driver::Plan;
 use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Prepared, Proposal};
+use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal};
 
 /// The declared lifetime of a bootstrap value: the first value and each value of a re-bootstrap. A consumption at or
 /// after the end refuses, and the local owner issues a new value.
@@ -200,6 +190,8 @@ const BINDING_FORM: &str = "rsauthnz.local.administrator.2";
 const ISSUE: &str = "bootstrap.issue";
 const CONSUME: &str = "bootstrap.consume";
 const UNLINK: &str = "administrator.unlink";
+const CHALLENGE: &str = "cli.challenge";
+const CALL: &str = "cli.call";
 
 /// The grant of the host that opens a local authority: the local owner and the origin of the application. The origin
 /// is the audience of each CLI credential of the authority.
@@ -298,22 +290,7 @@ impl Authority {
         issuer: Handle,
         limits: Limits,
     ) -> Result<Self, Failure<S::Error>> {
-        let public = issuer.public_key();
-        let public = match issuer.algorithm() {
-            Algorithm::MlDsa65Ed25519 => public.as_slice().try_into().map(PublicKey::MlDsa65Ed25519),
-            Algorithm::MlDsa65EcdsaP256 => public.as_slice().try_into().map(PublicKey::MlDsa65EcdsaP256),
-            _ => return Err(Error::Issuer.into()),
-        }
-        .map_err(|_| Error::Issuer)?;
-        let key = TrustedKey::new(
-            issuer.algorithm(),
-            &CoseKey {
-                kid: None,
-                alg: None,
-                public,
-            },
-        )
-        .map_err(|_| Error::Issuer)?;
+        let key = issuer.trusted();
         let profile = credential::Profile::new(key.clone(), id.clone(), grant.origin.clone(), cli(), limits)
             .map_err(Error::Credential)?;
         let authority = Self {
@@ -509,49 +486,113 @@ impl Authority {
         })
     }
 
-    /// The CLI credential that the consumption of `value` issued, from the binding of `administrator`, the
-    /// administrator that the value names: the recovery of a client whose response was lost, or whose bootstrap a
-    /// restore completed. It is no secret: a call needs the possession of its `cnf` key too.
+    /// The CLI credential of the binding of `administrator` whose `cnf` key is `holder`: the recovery of a client
+    /// whose response was lost, or whose bootstrap a restore completed. The client keeps no secret for it: it gives
+    /// the administrator that the local owner named, and the public key of its key in custody. The credential is no
+    /// secret: a call needs the possession of its `cnf` key too.
     ///
-    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One keyed read.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read, and the check of the credential.
     ///
     /// # Errors
     ///
-    /// [`Error::Unknown`] if no live binding of `administrator` holds the consumption of `value`: the consumption did
-    /// not commit, an unlink ended the binding, or the value names another administrator. [`Error::Record`] if the
-    /// binding has no valid form, and [`Failure::Store`] if the read fails.
+    /// [`Error::Unknown`] if no live binding of `administrator` holds a credential with the `cnf` key `holder`: the
+    /// bootstrap did not commit, an unlink ended the binding, or the binding holds another key. [`Error::Credential`]
+    /// if the credential refuses at `now`, for example after its end. [`Error::Record`] if the binding has no valid
+    /// form, and [`Failure::Store`] if the read fails.
     pub async fn credential<S: Store>(
         &self,
         store: &mut S,
-        value: &Bootstrap,
         administrator: &Id<Human>,
+        holder: &[u8; 1984],
+        now: Reading,
     ) -> Result<Vec<u8>, Failure<S::Error>> {
         let record = read(store, &self.binding(administrator)).await?.ok_or(Error::Unknown)?;
-        let (issue, credential) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
-        (issue.identity == self.identity(value)).ok_or(Error::Unknown)?;
+        let (_, credential) = decode_binding(&record, self.limits).ok_or(Error::Record)?;
+        let holder = TrustedKey::new(
+            Algorithm::MlDsa65Ed25519,
+            &CoseKey {
+                kid: None,
+                alg: None,
+                public: PublicKey::MlDsa65Ed25519(holder),
+            },
+        )
+        .map_err(|_| Error::Unknown)?;
+        let verified = self
+            .profile
+            .verify(&credential, now, &mut SignatureBudget::new(&self.limits))
+            .map_err(Error::Credential)?;
+        (verified.confirmation() == Some(&holder)).ok_or(Error::Unknown)?;
         Ok(credential)
     }
 
-    /// Admits a remote call with the CLI credential `credential` and the proof `proof` of the possession of its `cnf`
-    /// key over `challenge`, which the host chose for this call. The credential must be the credential of a live
-    /// administrator binding. Thus a remote call refuses before an administrator enrolls, and after an unlink of the
-    /// binding.
+    /// The issue of a challenge for the next call of the CLI of `administrator`: its first call, or a call after a
+    /// refusal, a conflict, or a restore. The commit writes the challenge record of the binding, which ends after
+    /// [`cli::CHALLENGE_LIFETIME`]. It replaces the challenge that the record holds, so a binding has at most one.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). Two signature checks of each composite artifact, and one
-    /// keyed read.
+    /// The issue authenticates no caller, and its audit names `administrator`, not the caller. The challenge is no
+    /// secret: only the proof of a call shows the key. Only the receipt of the accepted commit gives the challenge, as
+    /// its artifact: the 32 bytes of a [`Challenge`]. After a lost response, issue again.
+    ///
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). Two keyed reads.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotEnrolled`] if `administrator` has no live binding. [`Error::Time`] if the end of the challenge
+    /// overflows. [`Error::Record`] if the challenge record has no valid version, [`Failure::Store`] if a read fails,
+    /// and [`Error::Transition`] for the proposal.
+    pub async fn challenge<S: Store>(
+        &self,
+        store: &mut S,
+        administrator: &Id<Human>,
+        now: Reading,
+        random: &mut ChaCha20Rng,
+        operation: OperationId,
+    ) -> Result<(Proposal, Plan), Failure<S::Error>> {
+        let binding = self.binding(administrator);
+        let record = read(store, &binding).await?.ok_or(Error::NotEnrolled)?;
+        let mut proposal = self.proposal(operation, administrator, CHALLENGE, &Value::Null, now)?;
+        proposal
+            .read(Dependency::Version(binding, record.version))
+            .map_err(Error::Transition)?;
+        let key = cli::key(&self.id, administrator);
+        let pending = read(store, &key).await?;
+        let challenge = self.renew(&mut proposal, key, pending.as_ref(), now, random)?;
+        proposal.prepare(Prepared::new(Box::new(challenge.to_bytes())));
+        Ok((proposal, Plan::default()))
+    }
+
+    /// Admits the remote call `call` with the CLI credential `credential` and the proof `proof` of the possession of
+    /// its `cnf` key over the request binding of `call` ([`cli::prove`]). The credential must be the credential of a
+    /// live administrator binding, and the challenge of `call` the pending challenge of that binding, before its end.
+    /// Thus a remote call refuses before an administrator enrolls, after an unlink of the binding, and with a
+    /// challenge that a call consumed or a restore ended.
+    ///
+    /// The proposal reads the binding and the challenge record at their versions, and writes the next challenge into
+    /// the record, so its commit consumes the challenge of `call`. Add the reads and the changes of the call to the
+    /// proposal, then submit it with an empty [`Plan`]. Give the outcome of the commit to [`Admission::release`]: only
+    /// the accepted commit of this proposal gives the [`Admitted`] call and its next challenge. The proposal carries
+    /// the next challenge as its prepared artifact, so it carries no other artifact. Its operation is the operation of
+    /// `call`, and its request is the request binding of `call`.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). Two signature checks of each composite artifact, and two
+    /// keyed reads.
     ///
     /// # Errors
     ///
     /// [`Error::Credential`] if the credential or the proof refuses. [`Error::NotEnrolled`] if no live administrator
-    /// binding holds the credential. [`Failure::Store`] if the read fails.
+    /// binding holds the credential. [`Error::Challenge`] if the binding holds no pending challenge, another one, or
+    /// one whose end passed. [`Error::Time`] if `now` has no bound or the end of the next challenge overflows.
+    /// [`Error::Record`] if the challenge record has no valid form, [`Failure::Store`] if a read fails, and
+    /// [`Error::Transition`] for the proposal.
     pub async fn admit<S: Store>(
         &self,
         store: &mut S,
         credential: &[u8],
         proof: &[u8],
-        challenge: &[u8],
+        call: &Call,
         now: Reading,
-    ) -> Result<Admitted, Failure<S::Error>> {
+        random: &mut ChaCha20Rng,
+    ) -> Result<(Proposal, Admission), Failure<S::Error>> {
         let verified = self
             .profile
             .verify(credential, now, &mut SignatureBudget::new(&self.limits))
@@ -560,19 +601,38 @@ impl Authority {
         let Subject::Human(administrator) = &claims.subject else {
             return Err(Error::NotEnrolled.into());
         };
-        let record = read(store, &self.binding(administrator))
-            .await?
-            .ok_or(Error::NotEnrolled)?;
+        let binding = self.binding(administrator);
+        let record = read(store, &binding).await?.ok_or(Error::NotEnrolled)?;
         (record.version == self.version(&claims.serial.0.to_be_bytes())).ok_or(Error::NotEnrolled)?;
+        let key = cli::key(&self.id, administrator);
+        let pending = read(store, &key).await?.ok_or(Error::Challenge)?;
+        let challenge = cli::challenge(&pending, self.limits).ok_or(Error::Record)?;
+        let end = pending.end.ok_or(Error::Record)?;
+        (challenge == call.challenge() && now.latest().map_err(Error::Time)? < end).ok_or(Error::Challenge)?;
         let evidence = verified
-            .possession(proof, challenge, now, &mut SignatureBudget::new(&self.limits))
+            .possession(proof, call.binding(), now, &mut SignatureBudget::new(&self.limits))
             .map_err(Error::Credential)?;
-        Ok(Admitted {
+        let request = Value::Bytes(call.binding());
+        let mut proposal = self.proposal(call.operation().clone(), administrator, CALL, &request, now)?;
+        proposal
+            .read(Dependency::Version(binding, record.version.clone()))
+            .map_err(Error::Transition)?;
+        let next = self.renew(&mut proposal, key, Some(&pending), now, random)?;
+        proposal.prepare(Prepared::new(Box::new(next.to_bytes())));
+        let admitted = Admitted {
             authority: self.id.clone(),
             administrator: administrator.clone(),
             version: record.version,
             evidence,
-        })
+            next,
+        };
+        Ok((
+            proposal,
+            Admission {
+                operation: call.operation().clone(),
+                admitted,
+            },
+        ))
     }
 
     /// The unlink of the binding of `administrator` by the admitted administrator `actor`: an anchor change with the
@@ -754,6 +814,35 @@ impl Authority {
         Ok(self.version(&[count.to_be_bytes().as_slice(), identity].concat()))
     }
 
+    /// Adds to `proposal` the read of the challenge record `key`, which is `pending` in the store, and the write of a
+    /// new challenge into it, which ends after [`cli::CHALLENGE_LIFETIME`]. The version is a counter and the challenge,
+    /// as for the record of the authority.
+    fn renew(
+        &self,
+        proposal: &mut Proposal,
+        key: Key,
+        pending: Option<&Record>,
+        now: Reading,
+        random: &mut ChaCha20Rng,
+    ) -> Result<Challenge, Error> {
+        let end = now
+            .estimate()
+            .checked_add(cli::CHALLENGE_LIFETIME)
+            .ok_or(Error::Time(TimeError::Overflow))?;
+        let challenge = Challenge::random(random);
+        let version = self.next(pending.map(|record| record.version.clone()), &challenge.to_bytes())?;
+        proposal.read(dependency(&key, pending)).map_err(Error::Transition)?;
+        proposal
+            .change(Change::Write {
+                key,
+                version,
+                end: Some(end),
+                data: cli::record(challenge),
+            })
+            .map_err(Error::Transition)?;
+        Ok(challenge)
+    }
+
     /// A proposal of `actor` for `action` on `request`.
     fn proposal(
         &self,
@@ -921,14 +1010,39 @@ impl Pending<'_> {
     }
 }
 
-/// A remote call that [`Authority::admit`] admitted: the evidence of the possession of the key of a live
-/// administrator binding.
+/// An admission of a remote call whose proposal waits for its commit ([`Authority::admit`]). It gives no admitted call
+/// before that commit.
+#[derive(Debug)]
+pub struct Admission {
+    operation: OperationId,
+    admitted: Admitted,
+}
+
+impl Admission {
+    /// The admitted call that the accepted commit of the proposal of this admission gives. Each other outcome gives
+    /// `None`: refuse the call, and follow the recovery of the outcome ([`Outcome::recovery`]). An earlier commit of the
+    /// same operation gives `None` too, because only the commit of this proposal consumes the challenge.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn release(self, outcome: &Outcome) -> Option<Admitted> {
+        let Outcome::Accepted(receipt) = outcome else {
+            return None;
+        };
+        let next = self.admitted.next.to_bytes();
+        (*receipt.operation() == self.operation && receipt.artifact() == Some(next.as_slice())).then_some(self.admitted)
+    }
+}
+
+/// A remote call that the commit of its admission accepted: the evidence of the possession of the key of a live
+/// administrator binding, and the challenge of the next call.
 #[derive(Debug)]
 pub struct Admitted {
     authority: Id<AuthorityKind>,
     administrator: Id<Human>,
     version: AuthorityVersion,
     evidence: Evidence,
+    next: Challenge,
 }
 
 impl Admitted {
@@ -942,6 +1056,13 @@ impl Admitted {
     #[must_use]
     pub const fn evidence(&self) -> &Evidence {
         &self.evidence
+    }
+
+    /// The challenge of the next call of the CLI, which the commit wrote. Give it to the CLI in the response of the
+    /// call.
+    #[must_use]
+    pub const fn next(&self) -> Challenge {
+        self.next
     }
 }
 
@@ -990,8 +1111,7 @@ pub enum Error {
     Form,
     /// The host grant is not the grant of the authority: another owner or origin. Open the authority with its grant.
     Grant,
-    /// The custody key is not the issuer key of the authority, or not a composite key. Open the authority with its
-    /// issuer key.
+    /// The custody key is not the issuer key of the authority. Open the authority with its issuer key.
     Issuer,
     /// The authority holds no valid record of the bootstrap value: it is consumed or ended, or it is a value of
     /// another authority or issuer key. Ask the local owner to issue a new value.
@@ -1005,6 +1125,9 @@ pub enum Error {
     Full,
     /// No live administrator binding holds the credential or the administrator. Refuse the call.
     NotEnrolled,
+    /// The binding holds no pending challenge, or another one, or one whose end passed: a call consumed it, a later
+    /// issue replaced it, or a restore ended it. Refuse the call. The CLI asks for a new challenge, and makes a new call.
+    Challenge,
     /// A record of the authority has no valid form. Restore the store from a snapshot.
     Record,
     /// The reading of the time has no bound, or a time overflows. Use a reading with a bound.
@@ -1028,6 +1151,7 @@ impl fmt::Display for Error {
                 f.write_str("the authority has the most live administrators, or each issue of its log bound one")
             }
             Self::NotEnrolled => f.write_str("no live administrator binding holds the credential"),
+            Self::Challenge => f.write_str("the binding holds no pending challenge of the call"),
             Self::Record => f.write_str("a record of the authority has no valid form"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Credential(error) => write!(f, "the credential refused: {error}"),

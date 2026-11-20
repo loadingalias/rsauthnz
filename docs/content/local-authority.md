@@ -3,7 +3,8 @@
 `rsauthnz::local` gives an application owner an authority on one host, with no hosted account and no daemon. The
 owner issues a one-use bootstrap value. A client, such as a headless CLI, submits the value with its own public key,
 and becomes the first administrator, with a CLI credential. A remote call is admitted only for the credential of a
-live administrator. If the owner loses the administrator, the owner issues a new value: an owner re-bootstrap.
+live administrator, with a proof of possession of its key over a one-use challenge ([CLI credential](cli.md)). If the
+owner loses the administrator, the owner issues a new value: an owner re-bootstrap.
 
 ## The model
 
@@ -46,9 +47,9 @@ the credential.
 6. Sign the bytes of `pending.to_be_signed()` with the issuer key in custody. `pending.finish(signature, operation)`
    verifies the signature and gives the proposal. Its commit consumes the value and binds the administrator. The
    artifact of the receipt is the CLI credential.
-7. On each remote call, the client signs a proof of possession with `credential::ProofDraft`, over a challenge that
-   the host chose for that call. `authority.admit(store, credential, proof, challenge, now)` gives `Admitted`, with
-   the evidence of the possession.
+7. On each remote call, the client proves the possession of its key over a one-use challenge of its binding and over
+   the request of the call. [CLI credential](cli.md) gives the calls: `authority.challenge`, `authority.admit`, and
+   `admission.release`.
 
 This example is the rustdoc example of `rsauthnz::local`, and `cargo xtask test` runs it. It runs the journey on the
 [memory binding](memory-binding.md), and rscrypto signs in place of custody, so that the example holds its keys. A
@@ -60,12 +61,11 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
-use rsauthnz::cose::{Key, PublicKey, TrustedKey};
-use rsauthnz::credential::{ProofDraft, Serial};
+use rsauthnz::credential::Serial;
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::Id;
-use rsauthnz::limits::{Limits, SignatureBudget};
+use rsauthnz::limits::Limits;
 use rsauthnz::local::{self, Authority, Bootstrap, HostGrant};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{self, Kind, Store};
@@ -109,7 +109,7 @@ let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_s
 // Only for this example: take the seed from the entropy source of the host, and keep each key in custody.
 let mut random = ChaCha20Rng::from_seed([7; 32]);
 let (issuer_public, issuer_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(1)))?;
-let (holder_public, holder_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(2)))?;
+let (holder_public, _) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(2)))?;
 let (issuer_public, holder_public) = (issuer_public.to_bytes(), holder_public.to_bytes());
 let issuer = Handle::new(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &issuer_public)?;
 
@@ -132,21 +132,9 @@ let pending = ready(authority.bootstrap(&mut memory, &value, &holder_public, ser
 let signature = issuer_secret.sign_deterministic(&pending.to_be_signed(), &[])?;
 let bootstrap = pending.finish(signature.as_bytes(), OperationId::new(b"b-1")?)?;
 let credential = commit(&mut memory, &mut driver, bootstrap)?;
+assert_eq!(ready(authority.credential(&mut memory, &alice, &holder_public, now))?, credential);
 
-// 3. On a remote call, the administrator proves the possession of its key over the challenge of the call.
-let holder = TrustedKey::new(Algorithm::MlDsa65Ed25519, &Key {
-    kid: None,
-    alg: None,
-    public: PublicKey::MlDsa65Ed25519(&holder_public),
-})?;
-let challenge = [9; 32];
-let draft = ProofDraft::new(&holder, &credential, &grant.origin, &challenge, now)?;
-let signature = holder_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
-let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
-let admitted = ready(authority.admit(&mut memory, &credential, &proof, &challenge, now))?;
-assert_eq!(admitted.administrator(), &alice);
-
-// The value is one-use.
+// The value is one-use. Each remote call of the administrator proves the possession of its key: see `rsauthnz::cli`.
 let again = ready(authority.bootstrap(&mut memory, &value, &holder_public, serial, now));
 assert!(matches!(again, Err(local::Failure::Refused(local::Error::Unknown))));
 ```
@@ -169,9 +157,11 @@ unlink.
 
 - **A lost response of an issue.** Look up the operation identity. The lookup shows the commit and gives no value.
   Issue again: that issue ends the value of the lost commit.
-- **A lost response of a bootstrap.** Look up the operation identity of the bootstrap. When it committed, read the
-  credential from the binding with `authority.credential(store, &value, &administrator)`. The credential is no secret:
-  a call needs the possession of its key too.
+- **A lost response of a bootstrap.** The client keeps no secret for the recovery. It gives the administrator that the
+  owner named and the public key of its key in custody. `authority.credential(store, &administrator, &holder, now)`
+  gives the credential of the binding whose `cnf` key is that key. `Error::Unknown` shows that the bootstrap did not
+  commit, or that the binding holds another key. The credential is no secret: a call needs the possession of its key
+  too.
 - **A restore from an old snapshot.** A value that a later issue ended stays ended. A value issued after the snapshot
   is lost, and the owner issues again. A bootstrap that a crash left in doubt completes at the restore when the
   snapshot holds its value and no issue ended it. Then the client reads its credential from the binding and proves
@@ -216,8 +206,9 @@ issue refuses with `Error::Full`: unlink an administrator first.
 | `authority.bootstrap(store, &value, holder, serial, now)` | The value record | `Pending` |
 | `pending.to_be_signed()` | — | The bytes that custody signs |
 | `pending.finish(signature, operation)` | — | `(Proposal, Plan)`. The receipt gives the CLI credential |
-| `authority.credential(store, &value, &administrator)` | The binding of `administrator` | The CLI credential |
-| `authority.admit(store, credential, proof, challenge, now)` | The binding of the subject of the credential | `Admitted` |
+| `authority.credential(store, &administrator, &holder, now)` | The binding of `administrator` | The CLI credential whose `cnf` key is `holder` |
+| `authority.challenge(store, &administrator, now, random, operation)` | The binding of `administrator`, and its challenge record | `(Proposal, Plan)`. The receipt gives the 32 bytes of the challenge ([CLI credential](cli.md)) |
+| `authority.admit(store, credential, proof, &call, now, random)` | The binding of the subject of the credential, and its challenge record | `(Proposal, Admission)`. `admission.release(&outcome)` gives `Admitted` ([CLI credential](cli.md)) |
 | `authority.unlink(store, &actor, &administrator, now, operation)` | The bindings of the authority | `(Proposal, Plan)` |
 | `authority.report(store, now)` | The record of the authority, the bindings of the authority, and the newest value | `Report` |
 | `authority.profile()` | — | The credential profile that verifies a CLI credential of the authority |
@@ -233,12 +224,13 @@ prefix of the authority, and it gives at most `ADMINISTRATORS_MAX` bindings. An 
 | --- | --- | --- |
 | `Form` | The text is not `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits | Refuse it |
 | `Grant` | The host grant has another owner or origin than the authority | Open the authority with its grant |
-| `Issuer` | The custody key is not the issuer key of the authority, or not a composite key | Open the authority with its issuer key |
+| `Issuer` | The custody key is not the issuer key of the authority | Open the authority with its issuer key |
 | `Unknown` | No valid record of the value: it is consumed or ended, or it is a value of another authority or issuer key | Ask the owner to issue a new value |
 | `Expired` | The end of the value passed | Ask the owner to issue a new value |
 | `Bound` | The administrator has a live binding | Name another administrator, or unlink the binding |
 | `Full` | The authority has `ADMINISTRATORS_MAX` live administrator bindings, or each issue of the full log bound a live administrator | Unlink an administrator, then issue again |
 | `NotEnrolled` | No live administrator binding holds the credential or the administrator | Refuse the call |
+| `Challenge` | The binding holds no pending challenge, another one, or one whose end passed: a call consumed it, a later issue replaced it, or a restore ended it | Refuse the call. The client asks for a new challenge, and makes a new call |
 | `Record` | A record of the authority has no valid form | Restore the store from a snapshot |
 | `Time` | The reading has no bound, or a time overflows | Use a reading with a bound |
 | `Credential` | The credential, its signature, or the proof refuses | Refuse the call. A refused signature shows a fault of custody or another key |
@@ -251,11 +243,11 @@ prefix of the authority, and it gives at most `ADMINISTRATORS_MAX` bindings. An 
 | `Local` | SHA-256 of the authority | The owner, the origin, the issuer key ID and public key, and the issue log. Only an issue writes it |
 | `Bootstrap` | SHA-256 of the authority, the issuer public key, and the secret | The administrator, the time of the issue, and the end of the value. It has no store end: an issue or a bootstrap ends it, each with a journal entry |
 | `Administrator` | SHA-256 of the authority, then SHA-256 of the authority and the administrator. The kind and the first digest are the prefix of the authority | The issue of the consumed value (its identity, the administrator, the time of the issue, and the end) and the CLI credential. Its version is the serial of the credential |
+| `SignIn` | SHA-256 of `rsauthnz.cli.challenge.1`, the authority, and the administrator | The pending challenge of the next call of the binding ([CLI credential](cli.md)). Its store end is the end of the challenge |
 
 ## Limits
 
 - The core cannot see where a call comes from. The host builds a grant only for a call of the local owner, and calls
   `admit` for each remote call.
-- The challenge of `admit` must be fresh for each call. The host chooses it and refuses its reuse.
 - The text of a value is a bearer secret in memory until the owner hands it over. The core does not clear it from
   memory.

@@ -3,6 +3,8 @@
 
 use core::time::Duration;
 
+use rsauthnz::cbor::Value;
+use rsauthnz::cli::{Call, Challenge};
 use rsauthnz::cose::{Key as CoseKey, PublicKey, TrustedKey};
 use rsauthnz::credential::{ProofDraft, Serial};
 use rsauthnz::crypto::Algorithm;
@@ -11,6 +13,7 @@ use rsauthnz::id::Id;
 use rsauthnz::limits::{Limits, SignatureBudget};
 use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Issue, Status};
 use rsauthnz::time::{Reading, ReadingSource};
+use rsauthnz::transition::OperationId;
 use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
@@ -52,8 +55,8 @@ impl Keys {
             .expect("the public key of a composite key pair makes a handle")
     }
 
-    /// The proof of possession of the key, the `cnf` key of `credential`, over `challenge`.
-    fn proof(&self, credential: &[u8], challenge: &[u8]) -> Vec<u8> {
+    /// The proof of possession of the key, the `cnf` key of `credential`, over the request binding `binding` of a call.
+    fn proof(&self, credential: &[u8], binding: &[u8]) -> Vec<u8> {
         let key = TrustedKey::new(
             Algorithm::MlDsa65Ed25519,
             &CoseKey {
@@ -63,8 +66,7 @@ impl Keys {
             },
         )
         .expect("a composite public key is a trusted key");
-        let draft =
-            ProofDraft::new(&key, credential, &grant().origin, challenge, now()).expect("a proof fits its bound");
+        let draft = ProofDraft::new(&key, credential, &grant().origin, binding, now()).expect("a proof fits its bound");
         let signature = self.sign(&draft.to_be_signed());
         draft
             .finish(&signature, &mut SignatureBudget::new(&Limits::default()))
@@ -196,28 +198,57 @@ async fn refusal<S: Subject>(
     }
 }
 
-/// The admission of a remote call with `credential` and a proof by `client`.
+/// An operation identity of 16 bytes from `random`.
+fn drawn(random: &mut ChaCha20Rng) -> OperationId {
+    let mut id = [0; 16];
+    random.fill_bytes(&mut id);
+    OperationId::new(&id).expect("an identity of 16 bytes is valid")
+}
+
+/// The admission of one remote call of the administrator `administrator` with `credential` and a proof by `client`:
+/// the issue of a challenge, the proof over the call, and the commit of the admission.
 async fn admit<S: Subject>(
     run: &mut Run<S>,
     auth: &Authority,
     credential: &[u8],
     client: &Keys,
+    administrator: &str,
+    random: &mut ChaCha20Rng,
 ) -> Result<Result<Admitted, local::Error>, String> {
-    let challenge = b"the challenge of one call";
-    match auth
-        .admit(
-            &mut run.binding,
-            credential,
-            &client.proof(credential, challenge),
-            challenge,
-            now(),
-        )
+    let refusal = |failure| match failure {
+        Failure::Refused(error) => Ok(Err(error)),
+        Failure::Store(error) => Err(format!("a read failed with no fault: {error}")),
+    };
+    let operation = drawn(random);
+    let issued = match auth
+        .challenge(&mut run.binding, &account(administrator), now(), random, operation)
         .await
     {
-        Ok(admitted) => Ok(Ok(admitted)),
-        Err(Failure::Refused(error)) => Ok(Err(error)),
-        Err(Failure::Store(error)) => Err(format!("a read failed with no fault: {error}")),
-    }
+        Ok((proposal, plan)) => artifact(submitted(run, proposal, plan).await?, "the issue of a challenge")?,
+        Err(failure) => return refusal(failure),
+    };
+    let challenge = <[u8; 32]>::try_from(issued.as_slice())
+        .map_err(|_| "the artifact of an issue is not a challenge".to_owned())?;
+    let call = Call::new(
+        Challenge::from_bytes(challenge),
+        drawn(random),
+        &Value::Text("status"),
+        Limits::default(),
+    )
+    .map_err(refused("a call"))?;
+    let proof = client.proof(credential, call.binding());
+    let (proposal, admission) = match auth
+        .admit(&mut run.binding, credential, &proof, &call, now(), random)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(failure) => return refusal(failure),
+    };
+    let outcome = submitted(run, proposal, Plan::default()).await?;
+    admission
+        .release(&outcome)
+        .map(Ok)
+        .ok_or_else(|| format!("the commit of an admission did not land: {outcome:?}"))
 }
 
 /// The administrator and the state of each issue of the report at `at`.
@@ -294,7 +325,7 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
     let credential = enroll(&mut twin, &twin_authority, &issuer, &value, &alice, "t-2").await?;
     ensure(
         matches!(
-            admit(&mut run, &auth, &credential, &alice).await?,
+            admit(&mut run, &auth, &credential, &alice, "alice", &mut random).await?,
             Err(local::Error::NotEnrolled)
         ),
         "a remote call was admitted before an administrator enrolled",
@@ -328,13 +359,17 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
         refusal(&mut run, &auth, &first, &alice, now()).await? == Some(local::Error::Unknown),
         "a consumed value did not refuse",
     )?;
-    let recovered = auth.credential(&mut run.binding, &first, &account("alice")).await;
+    let recovered = auth
+        .credential(&mut run.binding, &account("alice"), &alice.public, now())
+        .await;
     ensure(
         recovered.as_ref().is_ok_and(|recovered| *recovered == credential),
         "the binding does not give the credential of the consumption",
     )?;
     ensure(
-        admit(&mut run, &auth, &credential, &alice).await?.is_ok(),
+        admit(&mut run, &auth, &credential, &alice, "alice", &mut random)
+            .await?
+            .is_ok(),
         "the remote call of the administrator was not admitted",
     )?;
 
@@ -353,7 +388,7 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
     )?;
 
     // The new administrator ends the earlier binding with an unlink, and the last binding stays.
-    let actor = admit(&mut run, &auth, &credential_b, &bob)
+    let actor = admit(&mut run, &auth, &credential_b, &bob, "bob", &mut random)
         .await?
         .map_err(refused("an admission"))?;
     let (proposal, plan) = auth
@@ -366,7 +401,7 @@ pub(super) async fn bootstrap<S: Subject>(mut make: impl FnMut() -> S) -> Checke
     )?;
     ensure(
         matches!(
-            admit(&mut run, &auth, &credential, &alice).await?,
+            admit(&mut run, &auth, &credential, &alice, "alice", &mut random).await?,
             Err(local::Error::NotEnrolled)
         ),
         "an unlinked administrator was admitted",
@@ -461,7 +496,7 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
         rows == [row("yves"), row("zoe")],
         "after a restore, the report does not give an issue after the snapshot whose value a client consumed",
     )?;
-    let actor = admit(&mut run, &fresh, &credential, &zoe)
+    let actor = admit(&mut run, &fresh, &credential, &zoe, "zoe", &mut random)
         .await?
         .map_err(refused("an admission"))?;
     let (proposal, plan) = fresh
@@ -561,11 +596,13 @@ pub(super) async fn rebootstrap<S: Subject>(binding: S) -> Checked {
     run.drive(at_commit("r-13", Fault::LostResponse)).await?;
     run.restore(&snapshot).await?;
     let credential = auth
-        .credential(&mut run.binding, &eighth, &account("gina"))
+        .credential(&mut run.binding, &account("gina"), &gina.public, now())
         .await
         .map_err(refused("the recovery of a completed bootstrap"))?;
     ensure(
-        admit(&mut run, &auth, &credential, &gina).await?.is_ok(),
+        admit(&mut run, &auth, &credential, &gina, "gina", &mut random)
+            .await?
+            .is_ok(),
         "the client of a completed bootstrap did not prove the possession of its key",
     )?;
     ensure(
