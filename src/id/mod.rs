@@ -174,6 +174,14 @@ impl<K: Kind> Id<K> {
     }
 }
 
+/// The text form `namespace:value`. A namespace has no `:`, so the first `:` ends it, and each identifier of a kind
+/// has one text form. The text form does not name the kind.
+impl<K: Kind> fmt::Display for Id<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.namespace(), self.value())
+    }
+}
+
 impl<K: Kind> fmt::Debug for Id<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}({}:{})", K::NAME, self.namespace(), self.value())

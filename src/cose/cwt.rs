@@ -188,16 +188,7 @@ impl Profile {
             return Err(Error::Audience);
         }
         let expires = claims.exp.ok_or(Error::NoExpiry)?;
-        if now.latest()? >= expires {
-            return Err(Error::Expired);
-        }
-        // `now.latest()` proved a known bound. An earliest time before the Unix epoch is before each `nbf`.
-        if claims
-            .nbf
-            .is_some_and(|nbf| nbf > now.earliest().unwrap_or(Duration::ZERO))
-        {
-            return Err(Error::NotYetValid);
-        }
+        validity(claims.nbf, expires, now)?;
         sign1.verify(&self.key, budget)?;
         Ok(Verified {
             artifact,
@@ -206,6 +197,19 @@ impl Profile {
             expires,
         })
     }
+}
+
+/// Refuses the reading `now` unless each time `t` that it permits is in the validity interval `not_before <= t <
+/// expires`.
+pub(crate) fn validity(not_before: Option<Duration>, expires: Duration, now: Reading) -> Result<(), Error> {
+    if now.latest()? >= expires {
+        return Err(Error::Expired);
+    }
+    // `now.latest()` proved a known bound. An earliest time before the Unix epoch is before each `nbf`.
+    if not_before.is_some_and(|nbf| nbf > now.earliest().unwrap_or(Duration::ZERO)) {
+        return Err(Error::NotYetValid);
+    }
+    Ok(())
 }
 
 /// The evidence of one verified CWT. It holds the exact bytes of the artifact and the profile that verified it: the

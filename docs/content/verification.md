@@ -20,7 +20,8 @@ A `Profile` holds the facts that the application fixes before it reads an artifa
 | `limits` | `limits::Limits` | The bounds of the decode of the artifact and of its claims. See [Parser limits](parser-limits.md) |
 
 One profile serves one purpose. Give each purpose its own key, so an artifact of one purpose never verifies for
-another purpose.
+another purpose. The credentials and receipts of rsauthnz sign their purpose, so one issuer key can sign each
+purpose. [Issue and verify credentials](credential-format.md) gives that format.
 
 `TrustedKey::new(algorithm, &key)` makes the key from a `Key` and a `crypto::Algorithm`. Decode a `COSE_Key` with
 `Key::decode`, or make a `Key` from the bytes of a public key that you trust. `TrustedKey::new` returns

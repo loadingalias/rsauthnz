@@ -183,35 +183,35 @@ impl<'a> Sign1<'a> {
         if self.protected.get(1) != Some(&alg(key.algorithm())) {
             return Err(Error::AlgorithmMismatch);
         }
-        key.verify(&self.to_be_signed(), self.signature, budget)?;
+        key.verify(
+            &to_be_signed(self.protected_bytes, self.payload),
+            self.signature,
+            budget,
+        )?;
         Ok(self.payload)
     }
+}
 
-    /// The `Sig_structure` `["Signature1", protected, h'', payload]`, in one allocation of its exact size. The
-    /// external AAD is the empty byte string.
-    fn to_be_signed(&self) -> Vec<u8> {
-        let parts: [(u8, &[u8]); 4] = [
-            (3, b"Signature1"),
-            (2, self.protected_bytes),
-            (2, &[]),
-            (2, self.payload),
-        ];
-        // The parts are in the decoded input, which the limits bounded. Thus the sum cannot overflow.
-        let len = cbor::head_len(4)
-            + parts
-                .iter()
-                .map(|(_, bytes)| cbor::head_len(bytes.len() as u64) + bytes.len())
-                .sum::<usize>();
-        let mut out = Vec::with_capacity(len);
-        cbor::head(&mut out, 4, 4);
-        // The rscrypto verify functions take one contiguous message, so this copies the payload one time.
-        for (major, bytes) in parts {
-            cbor::head(&mut out, major, bytes.len() as u64);
-            out.extend_from_slice(bytes);
-        }
-        debug_assert_eq!(out.len(), len, "the Sig_structure fills its allocation");
-        out
+/// The `Sig_structure` `["Signature1", protected, h'', payload]` of the protected bucket `protected` and the payload
+/// `payload`, in one allocation of its exact size. The external AAD is the empty byte string.
+pub(crate) fn to_be_signed(protected: &[u8], payload: &[u8]) -> Vec<u8> {
+    let parts: [(u8, &[u8]); 4] = [(3, b"Signature1"), (2, protected), (2, &[]), (2, payload)];
+    // The parts are in a decoded input that the limits bounded, or in a draft that `credential::MAX_BYTES` bounded.
+    // Thus the sum cannot overflow.
+    let len = cbor::head_len(4)
+        + parts
+            .iter()
+            .map(|(_, bytes)| cbor::head_len(bytes.len() as u64) + bytes.len())
+            .sum::<usize>();
+    let mut out = Vec::with_capacity(len);
+    cbor::head(&mut out, 4, 4);
+    // The rscrypto functions take one contiguous message, so this copies the payload one time.
+    for (major, bytes) in parts {
+        cbor::head(&mut out, major, bytes.len() as u64);
+        out.extend_from_slice(bytes);
     }
+    debug_assert_eq!(out.len(), len, "the Sig_structure fills its allocation");
+    out
 }
 
 // The payload can hold a credential. Thus the output shows the headers and only the length of each byte string.

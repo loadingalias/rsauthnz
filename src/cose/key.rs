@@ -174,7 +174,7 @@ impl TrustedKey {
     }
 
     /// Verifies `signature` over `message` with the algorithm of the key, after it charges `budget`.
-    pub(super) fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<(), Error> {
+    pub(crate) fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<(), Error> {
         self.0
             .verify(message, signature, budget)
             .map_err(Error::Limit)?

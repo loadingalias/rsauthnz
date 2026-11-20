@@ -35,6 +35,10 @@ Thus each identifier has one form, and two identifiers are equal only when their
 and values are equal, byte for byte. Text with other characters needs an encoding first, for example
 percent-encoding. An identifier allocates the bytes of its namespace and its value, and no more.
 
+The text form of an identifier is `namespace:value`, which `Display` gives. A namespace has no `:`, so the first
+`:` ends it. The text form does not name the kind. The `iss` and `aud` claims of a credential hold it, as
+[Issue and verify credentials](credential-format.md) gives.
+
 ```rust
 use rsauthnz::id::{Action, Id, Resource};
 
@@ -86,8 +90,9 @@ let version = AuthorityVersion::new(owner, &7_u64.to_be_bytes())?;
 
 Evidence has no strength score. A recovery never records phishing resistance. Only the verifiers of
 rsauthnz make evidence, so a caller cannot mark an unverified claim as proved. A storage binding
-keeps the encoded evidence as opaque bytes and gives them back; it never rebuilds evidence itself. The verifiers come in
-later releases, so this release makes no evidence yet.
+keeps the encoded evidence as opaque bytes and gives them back; it never rebuilds evidence itself.
+`credential::Verified::possession` makes the evidence of a key possession, as [Prove
+possession](credential-format.md#prove-possession) gives. The other verifiers come in later releases.
 
 The time is a `rsauthnz::time::Reading`: an estimate of the Unix time, an uncertainty bound or
 "unknown", and its source.

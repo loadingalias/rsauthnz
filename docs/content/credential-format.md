@@ -1,0 +1,233 @@
+# Issue and verify credentials
+
+`rsauthnz::credential` issues and verifies the credentials and receipts of rsauthnz. They have one format: a
+`COSE_Sign1` ([RFC 9052](https://www.rfc-editor.org/rfc/rfc9052)) over CWT claims
+([RFC 8392](https://www.rfc-editor.org/rfc/rfc8392)). A credential also has the proof-of-possession key of its
+holder in a `cnf` claim ([RFC 8747](https://www.rfc-editor.org/rfc/rfc8747)). The issuer key stays in custody.
+rsauthnz gives the bytes to sign, and it checks the signature before it gives the artifact.
+
+## The artifacts
+
+One format serves five kinds of artifact. The purpose claim names the kind, and the signature covers it. Thus one
+issuer key can sign each kind, and an artifact of one purpose does not verify for another purpose.
+
+| Artifact | `cnf` key | Subject |
+| --- | --- | --- |
+| Workload credential | The key of the workload | `Subject::Workload` |
+| Agent credential | The key of the agent | `Subject::Agent`, with its human owner |
+| CLI enrollment credential | The key of the CLI | `Subject::Human` |
+| Enrollment receipt | None | The principal that enrolled |
+| Approval receipt | None | The principal that approved |
+
+The application chooses the purpose of each kind, as an `Id<Purpose>`. A receipt has no `cnf` key, so it cannot
+prove possession.
+
+The issuer key and each `cnf` key use a composite profile: `MlDsa65Ed25519` (the default) or `MlDsa65EcdsaP256`
+(the hardware-bound profile). [Signature profiles](profiles.md) gives them. A classical or a pure ML-DSA-65 key
+refuses with `Error::Profile`.
+
+## The format
+
+The artifact is a `COSE_Sign1` with the tag 18:
+
+- The protected bucket holds only `alg`: -59 for `MlDsa65Ed25519` or -55 for `MlDsa65EcdsaP256`. These COSE
+  identifiers are drafts.
+- The unprotected bucket is empty.
+- The payload is the claims map, in the deterministic CBOR of [Parser limits](parser-limits.md).
+- The signature covers the `Sig_structure` of RFC 9052, section 4.4, with an empty external AAD. The composite
+  signs it with the empty context.
+
+The claims map holds these claims, and no others:
+
+| Key | Claim | `Claims` field | Value |
+| --- | --- | --- | --- |
+| 1 | `iss` | `issuer` | The text `namespace:value` of an `Id<Authority>` |
+| 3 | `aud` | `audience` | The text `namespace:value` of an `Id<Audience>` |
+| 4 | `exp` | `expires` | Whole seconds since the Unix epoch. The artifact is not valid at this time and after it |
+| 5 | `nbf` | `not_before` | Whole seconds since the Unix epoch. Only when `not_before` is set |
+| 6 | `iat` | (`Verified::issued()`) | The whole seconds of the reading at issuance |
+| 7 | `cti` | `serial` | The `Serial`: 8 bytes, with the most significant byte first |
+| 8 | `cnf` | (the key of `Verified::possession`) | A `COSE_Key` member (1): an `AKP` key (`kty` 7) with `alg` and `pub`. Only in a credential |
+| -65537 | Subject | `subject` | The CBOR form of a `Principal`: `[kind, namespace, value]` |
+| -65538 | Owner | `subject` | The CBOR form of the `Id<Human>` that owns an agent. Only when the subject is an agent |
+| -65539 | Purpose | `purpose` | The CBOR form of an `Id<Purpose>` |
+
+The subject, owner, and purpose keys are in the private-use range of RFC 8392: less than -65536.
+[Vocabulary](vocabulary.md) gives the CBOR forms and the text form of an identifier. Take each serial from a
+counter of the store (`store::driver::Driver::allocate`), so that a restore never gives one serial twice.
+
+## Sizes
+
+An encoded artifact or proof has at most `credential::MAX_BYTES`: 8,192 bytes. A draft that can be longer refuses
+with `Error::Size` before custody signs it. Verification refuses a longer input before it decodes it.
+
+The example credential below is 5,481 bytes. The default profile signs it, and its `cnf` key is a default key:
+
+| Part | Bytes |
+| --- | --- |
+| The tag, the array head, and the empty unprotected bucket | 3 |
+| The protected bucket, with its head | 5 |
+| The claims, with their head | 2,097 |
+| Of the claims: the `cnf` claim | 1,997 |
+| Of the `cnf` claim: the public key of the holder | 1,984 |
+| The signature, with its head | 3,376 |
+| Total | 5,481 |
+
+The composite signature and the composite key of the holder make up 5,357 bytes of the total. A credential of the
+hardware-bound profile is at most 41 bytes longer: its key has 2,017 bytes, and its signature has at most 3,381
+bytes. Longer identifiers make the claims longer. The example is 2,711 bytes below the limit.
+
+A proof of possession of the example credential, with a challenge of 32 bytes, is 3,487 bytes. The holder sends one
+proof for each check of possession.
+
+## Issue a credential
+
+1. Make the claims with `Claims::new(issuer, audience, subject, purpose, serial, expires)`. Set `not_before`
+   after this call, if the credential has a start.
+2. Call `Draft::credential(&issuer_key, &claims, Some(holder_public_key), now)`. Give `None` in place of the
+   holder key for a receipt. `issuer_key` is the `cose::TrustedKey` of the issuer key in custody.
+3. Give the bytes of `draft.to_be_signed()` to custody. Custody signs them with the issuer key.
+4. Call `draft.finish(&signature, &mut budget)`. It verifies the signature with the issuer key, and then gives the
+   encoded artifact.
+
+`finish` refuses a signature that does not verify, for example a signature by another custody key. A refusal
+gives no bytes. It consumes the draft, so one draft gives at most one artifact. The issue time `iat` is the whole
+seconds of `now.estimate()`. Issuance rounds `expires` down and `not_before` up to whole seconds, so the artifact
+is never valid outside the interval that you gave.
+
+Run the signature of custody in the `External` cost class of [Admit rsauthnz work](admission.md), apart from the
+`Verify` work of `finish`.
+
+This example issues a workload credential, verifies it, and checks a proof of possession. rscrypto signs in place
+of custody. It is also the example of the `rsauthnz::credential` module documentation, and `cargo xtask test` runs
+it:
+
+```rust
+use core::time::Duration;
+use rsauthnz::cose::{Key, PublicKey, TrustedKey};
+use rsauthnz::credential::{Claims, Draft, Profile, Serial, Subject};
+use rsauthnz::crypto::Algorithm;
+use rsauthnz::evidence::Method;
+use rsauthnz::id::Id;
+use rsauthnz::limits::{Limits, SignatureBudget};
+use rsauthnz::time::{Reading, ReadingSource};
+use rscrypto::auth::MlDsa65Ed25519;
+
+fn trusted(public: PublicKey<'_>) -> Result<TrustedKey, rsauthnz::cose::Error> {
+    TrustedKey::new(Algorithm::MlDsa65Ed25519, &Key { kid: None, alg: None, public })
+}
+
+// Custody holds the secret keys. Here rscrypto signs in place of custody. A fixed filler makes the keys
+// reproducible. Use fresh randomness for real keys.
+let (issuer_public, issuer_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(1)))?;
+let (holder_public, holder_secret) = MlDsa65Ed25519::generate_keypair(|out| Ok(out.fill(2)))?;
+let (issuer_public, holder_public) = (issuer_public.to_bytes(), holder_public.to_bytes());
+let issuer_key = trusted(PublicKey::MlDsa65Ed25519(&issuer_public))?;
+let holder_key = trusted(PublicKey::MlDsa65Ed25519(&holder_public))?;
+let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
+
+// 1. The issuer makes a draft. Custody signs it, and `finish` verifies the signature before it gives the bytes.
+let claims = Claims::new(
+    Id::new("acme", "authority")?,
+    Id::new("acme", "build-api")?,
+    Subject::Workload(Id::new("acme", "runner-7")?),
+    Id::new("acme", "workload")?,
+    Serial(1),
+    Duration::from_secs(1_800_003_600),
+);
+let draft = Draft::credential(&issuer_key, &claims, Some(PublicKey::MlDsa65Ed25519(&holder_public)), now)?;
+let signature = issuer_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
+let credential = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+
+// 2. The verifier fixes the issuer, the audience, and the purpose, and verifies the credential.
+let (issuer, audience, purpose) = (claims.issuer.clone(), claims.audience.clone(), claims.purpose.clone());
+let profile = Profile::new(issuer_key, issuer, audience, purpose, Limits::default())?;
+let verified = profile.verify(&credential, now, &mut SignatureBudget::new(&Limits::default()))?;
+assert_eq!(verified.claims(), &claims);
+
+// 3. The holder signs a proof over the challenge of the verifier, and the verifier checks it.
+let challenge = [7; 32];
+let draft = Draft::proof(&holder_key, &credential, &claims.audience, &challenge, now)?;
+let signature = holder_secret.sign_deterministic(&draft.to_be_signed(), &[])?;
+let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))?;
+let evidence = verified.possession(&proof, &challenge, now, &mut SignatureBudget::new(&Limits::default()))?;
+assert_eq!(evidence.method(), Method::KeyPossession);
+```
+
+## Verify a credential
+
+`Profile::new(issuer_key, issuer, audience, purpose, limits)` makes the trusted profile. The application fixes
+these facts before it reads an artifact. Then call `profile.verify(artifact, now, &mut budget)`. `now` is a
+`time::Reading`, and `budget` is the signature budget of the artifact, as [Bound the signature
+checks](verification.md#bound-the-signature-checks) gives.
+
+`Profile::verify` does these checks, in this order. It refuses at the first check that fails:
+
+1. The artifact has at most 8,192 bytes.
+2. It does each check of `cose::Profile::verify`, as [Verify a CWT](verification.md#verify-a-cwt) gives. `iss`
+   must be the text of the issuer, and `aud` must name the text of the audience. The signature check of the issuer
+   key comes last of these checks.
+3. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
+   its owner, and a human or a workload must have none. A claim of another key, or a `sub` claim, refuses.
+4. The purpose must be the purpose of the profile.
+5. A `cnf` key must be a composite key.
+
+`Verified` is the evidence of the artifact:
+
+| Method | Result |
+| --- | --- |
+| `artifact()` | The exact bytes of the artifact |
+| `claims()` | The verified `Claims` |
+| `issued()` | `iat` |
+| `possession(proof, challenge, now, &mut budget)` | The authentication evidence of a proof by the `cnf` key |
+
+Two `Verified` values are equal only for equal artifact bytes and equal profiles. A valid signature does not give
+current permission. Keep the evidence with the claims that a later authorization check reads.
+
+## Prove possession
+
+A credential is not a bearer token. Its holder proves possession of the `cnf` key for each check:
+
+1. The verifier issues a challenge for one proof.
+2. The holder calls `Draft::proof(&holder_key, &credential, &audience, &challenge, now)`. Custody signs
+   `draft.to_be_signed()` with the `cnf` key, and `draft.finish(&signature, &mut budget)` gives the proof.
+3. The verifier calls `verified.possession(&proof, &challenge, now, &mut budget)`. Give a new budget for the
+   proof, because it is a separate artifact.
+4. The verifier consumes the challenge in the transition that uses the evidence.
+
+The proof is a `COSE_Sign1` with the tag 18, signed by the `cnf` key. Its claims map holds `aud` (3), `iat` (6),
+the SHA-256 digest of the exact bytes of the credential (-65540), and the challenge (-65541). `possession`
+refuses a proof that does not bind this credential, the audience of the profile, and the challenge. It also
+refuses a proof by another key, and a check outside the validity interval of the credential.
+
+The evidence records the subject, the method `Method::KeyPossession`, and the reading `now`. It records no user
+verification, no phishing resistance, and no device or hardware binding, because the proof does not show them.
+[Vocabulary](vocabulary.md#authentication-evidence) gives the evidence.
+
+The challenge makes the proof fresh. rsauthnz does not store challenges. The application issues each challenge
+for one proof, and it refuses a challenge that it consumed.
+
+## Errors
+
+Each refusal is a `credential::Error`. For a refused artifact or proof, refuse it. For a refused draft, correct the
+claims or the key.
+
+| Error | Cause |
+| --- | --- |
+| `Cose(cose::Error)` | The COSE layer refused: the decode, the issuer, the audience, the validity interval, a key, the signature, or the signature budget. [Verify COSE and CWT artifacts](verification.md#errors) gives each cause |
+| `Profile` | A key is not a composite key |
+| `Size` | The artifact or proof is longer than 8,192 bytes, or a draft can be longer |
+| `Claims` | A claim is missing, has the wrong form, or is not a claim of this format |
+| `Purpose` | The purpose of the artifact is not the purpose of the profile |
+| `Validity` | The validity interval of a draft is empty: `expires` is not after `iat` and `not_before` |
+| `NoConfirmation` | The artifact has no `cnf` key, so it cannot prove possession |
+| `Proof` | The proof does not bind the credential, the audience, and the challenge, or it has another claim |
+
+## Limits
+
+- Only the composite profiles issue and verify in this format. The per-audience profiles of pure ML-DSA-65 and of
+  the classical algorithms come in a later release.
+- The composite COSE identifiers are drafts. Another implementation can use other values until IANA assigns them.
+- The protected bucket has no `kid`. A profile holds one issuer key.
+- Verification decodes the artifact and the proof within the `limits` of the profile. The default limits admit
+  each artifact and proof of this format.

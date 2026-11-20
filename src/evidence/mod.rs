@@ -55,10 +55,6 @@ pub enum Binding {
 impl Evidence {
     /// Makes the evidence of one authentication. `phishing_resistant` is true when the proof binds
     /// the origin, as a passkey assertion does; the evidence of a recovery drops it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the verifiers of A102 and A2 construct evidence")
-    )]
     pub(crate) fn new(
         subject: Principal,
         method: Method,

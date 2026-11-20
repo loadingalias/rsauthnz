@@ -62,8 +62,10 @@ mod sign1;
 
 use core::fmt;
 
+pub(crate) use cwt::validity;
 pub use cwt::{Claims, Confirmation, Profile, Verified};
 pub use key::{Key, PublicKey, TrustedKey};
+pub(crate) use sign1::to_be_signed;
 pub use sign1::{Header, Sign1};
 
 use crate::cbor::{self, Value};
@@ -72,7 +74,7 @@ use crate::limits::Limit;
 use crate::time::TimeError;
 
 /// The COSE algorithm identifier of `algorithm`, in its CBOR form.
-const fn alg(algorithm: Algorithm) -> Value<'static> {
+pub(crate) const fn alg(algorithm: Algorithm) -> Value<'static> {
     label(algorithm.report().cose)
 }
 
