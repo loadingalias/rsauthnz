@@ -1,0 +1,27 @@
+[package]
+name = "native-cli"
+version = "0.0.0"
+description = "A headless CLI on a local authority of rsauthnz: the first-administrator bootstrap and the possession of its key on later calls."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "native-cli"
+required-features = ["native-custody"]
+
+[features]
+# The key files of `FileCustody`, on Linux, macOS, and Windows. The feature is off by default, so a build of the
+# workspace with its default features still builds rsauthnz with no native custody.
+native-custody = ["rsauthnz/native-custody"]
+
+[dependencies]
+# The local authority, the CLI credential, custody, and the commit driver.
+rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
+# The memory binding of the storage contract, and the executor of the effects of the driver on it.
+rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
+# The seeded random generator that custody and the authority take.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"] }
+
+[lints]
+workspace = true

@@ -55,7 +55,8 @@ when the CLI lost the response, or when a restore completed the bootstrap.
 This example is the rustdoc example of `rsauthnz::cli`, and `cargo xtask test` runs it. It needs the feature
 `native-custody`, on Linux, macOS, or Windows. It runs the journey on the [memory binding](memory-binding.md), with the
 key files of `FileCustody`. To stay short, it keeps the issuer key of the authority in the same custody. A host uses
-its own storage binding, and its CLI and its authority are two processes.
+its own storage binding, and its CLI and its authority are two processes. [Run the native CLI
+example](native-cli-example.md) runs the same journey as a program, with two failures and the cleanup.
 
 ```rust
 use core::pin::pin;

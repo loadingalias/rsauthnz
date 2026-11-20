@@ -54,7 +54,9 @@ the credential.
 This example is the rustdoc example of `rsauthnz::local`, and `cargo xtask test` runs it. It runs the journey on the
 [memory binding](memory-binding.md), and rscrypto signs in place of custody, so that the example holds its keys. A
 host uses its own storage binding and its custody. The `Bootstrap` and `Rebootstrap` cases of the
-[conformance suite](conformance.md) run the same steps with faults and restores.
+[conformance suite](conformance.md) run the same steps with faults and restores. [Run the native CLI
+example](native-cli-example.md) runs the journey as a program, with the key files of `FileCustody` and the calls of
+the CLI.
 
 ```rust
 use core::pin::pin;
