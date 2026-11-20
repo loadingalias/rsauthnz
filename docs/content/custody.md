@@ -183,11 +183,13 @@ delete it. Delete it only after the authority commits the successor, so a lost c
 
 Each operation checks the permissions of the key file before it reads the key. A key file that another account can
 read or change refuses with `Error::Permissions`. On Linux, a POSIX ACL is covered too, because the group bits of
-the mode are the mask of the ACL. On Linux and macOS, the open follows no link and does not block, and the checks
-read the open file: a link, a FIFO, or a device at the path, and a file of another owner, refuse with
-`Error::Permissions`. Thus a key file that a restore keeps with the owner of another account refuses, also for a
-service that runs as root. On Windows, a DACL that is not protected refuses, also with one entry for the user,
-because a later change of a parent directory passes its entries on to it. Each operation also checks that the length, the algorithm, and the public key of
+the mode are the mask of the ACL. The open follows no link, and the checks read the open file. A link at the path and
+a file of another owner refuse with `Error::Permissions`. Thus a key file that a restore keeps with the owner of
+another account refuses, also for a service that runs as root. On Linux and macOS, the open does not block, so a FIFO
+or a device at the path refuses at once. On Windows, each reparse point refuses: a link, a junction, or the
+placeholder of a sync service such as OneDrive, which can copy the key off the host. A DACL that is not protected
+refuses too, also with one entry for the user, because a later change of a parent directory passes its entries on
+to it. Each operation also checks that the length, the algorithm, and the public key of
 the key file match the handle. A key file with another key refuses with `Error::Mismatch`.
 
 An administrator or root can still read a key file, through file privileges. The software custody does not keep

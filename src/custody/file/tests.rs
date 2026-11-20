@@ -199,7 +199,8 @@ fn handles_reports_and_errors_show_no_key_bytes() {
     }
 }
 
-#[cfg(unix)]
+/// A link at the path of a key file refuses on each OS, and a FIFO refuses on Linux and macOS without blocking. On
+/// Windows, the host makes the link only for an elevated administrator or in Developer Mode.
 #[test]
 fn a_key_file_that_is_a_link_or_a_fifo_refuses_at_once() {
     let dir = scratch("special");
@@ -213,25 +214,32 @@ fn a_key_file_that_is_a_link_or_a_fifo_refuses_at_once() {
     // A link to the key file of the user, with its mode and its key: the open follows no link.
     let (path, kept) = (key_file(&dir, id), dir.join("kept.key"));
     fs::rename(&path, &kept).unwrap();
-    std::os::unix::fs::symlink(&kept, &path).unwrap();
+    cfg_select! {
+        unix => std::os::unix::fs::symlink(&kept, &path).unwrap(),
+        windows => std::os::windows::fs::symlink_file(&kept, &path)
+            .expect("the host makes a link: an elevated administrator, or Developer Mode"),
+    }
     assert_eq!(
         custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random),
         Err(Error::Permissions)
     );
     // A FIFO at the path refuses, and the open does not wait for a writer.
-    fs::remove_file(&path).unwrap();
-    let mkfifo = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
-    assert!(mkfifo.success());
-    let (sent, received) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let signed = custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random);
-        sent.send(signed).unwrap_or_default();
-    });
-    assert_eq!(
-        received.recv_timeout(core::time::Duration::from_secs(10)),
-        Ok(Err(Error::Permissions)),
-        "the open of a FIFO blocked, or it did not refuse"
-    );
+    #[cfg(unix)]
+    {
+        fs::remove_file(&path).unwrap();
+        let mkfifo = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+        assert!(mkfifo.success());
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let signed = custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random);
+            sent.send(signed).unwrap_or_default();
+        });
+        assert_eq!(
+            received.recv_timeout(core::time::Duration::from_secs(10)),
+            Ok(Err(Error::Permissions)),
+            "the open of a FIFO blocked, or it did not refuse"
+        );
+    }
 }
 
 /// A DACL with one entry that allows only the user, but not protected: a later change of a parent passes its entries

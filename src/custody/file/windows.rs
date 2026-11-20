@@ -5,9 +5,10 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::mem::DropGuard;
 use core::ptr;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 
@@ -24,6 +25,8 @@ const INVALID_HANDLE_VALUE: RawHandle = ptr::without_provenance_mut(usize::MAX);
 const TOKEN_USER: i32 = 1;
 const SDDL_REVISION_1: u32 = 1;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+/// `FILE_READ_ATTRIBUTES`: the check of a new key file reads its attributes through the handle of the create.
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const CREATE_NEW: u32 = 1;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 /// `SE_FILE_OBJECT` of `SE_OBJECT_TYPE`.
@@ -33,6 +36,10 @@ const DACL_SECURITY_INFORMATION: u32 = 4;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// `SE_DACL_PROTECTED` of `SECURITY_DESCRIPTOR_CONTROL`: the DACL takes no entry that a parent passes on.
 const SE_DACL_PROTECTED: u16 = 0x1000;
+/// `FILE_FLAG_OPEN_REPARSE_POINT`: the open gives a reparse point itself, such as a link, and not its target.
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_ATTRIBUTE_REPARSE_POINT`: the file is a reparse point, such as a link, a junction, or a cloud placeholder.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 /// The offset of the SID in an `ACCESS_ALLOWED_ACE`: after its header and its access mask.
 const ACE_SID_OFFSET: usize = 8;
 /// The most UTF-16 units in the text form of a SID: "S-1-", an authority of up to 15 digits, and 15 sub-authorities
@@ -164,7 +171,7 @@ pub(super) fn create(path: &Path) -> io::Result<File> {
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_WRITE,
+                GENERIC_WRITE | FILE_READ_ATTRIBUTES,
                 0,
                 &raw const attributes,
                 CREATE_NEW,
@@ -180,18 +187,27 @@ pub(super) fn create(path: &Path) -> io::Result<File> {
     })
 }
 
-/// Opens the key file `path` to read it.
+/// Opens the key file `path` to read it. The open follows no reparse point at `path`, so it gives a link itself, and
+/// [`check`] then refuses it.
 pub(super) fn open(path: &Path) -> io::Result<File> {
-    File::open(path)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
-/// Refuses a key file whose owner is not the user of the process, or whose DACL allows another account or is not
-/// protected. A DACL that is not protected takes the entries that a later change of a parent passes on.
+/// Refuses a key file that is a reparse point, whose owner is not the user of the process, or whose DACL allows
+/// another account or is not protected. The custody creates a plain file, so a reparse point shows that another
+/// program replaced it: a link, a junction, or the placeholder of a sync service, which can copy the key off the
+/// host. A DACL that is not protected takes the entries that a later change of a parent passes on. The checks read
+/// the open handle, so a change of the path after the open does not change them.
 #[expect(
     unsafe_code,
     reason = "GetSecurityInfo reads the owner and the DACL, which std cannot read"
 )]
 pub(super) fn check(file: &File) -> Result<(), Error> {
+    let metadata = file.metadata()?;
+    (metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0).ok_or(Error::Permissions)?;
     with_user(|user| {
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();

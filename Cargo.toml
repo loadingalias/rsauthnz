@@ -13,7 +13,7 @@ publish.workspace = true
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # The only source of signatures, digests, and the seeded random generator. Its `alloc` gives the owners that clear a
 # secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2", "slh-dsa"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2"] }
 
 [features]
 # The native custody bindings: key files under OS file permissions on Linux, macOS, and Windows, and the login

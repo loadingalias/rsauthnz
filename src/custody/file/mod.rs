@@ -21,8 +21,9 @@ use crate::crypto::secret::SecretKey;
 /// Each key is one file in the directory: the PKCS #8 encoding of the composite key, named by the key ID and
 /// `.key`. Only the OS user account that runs the process can read it. On Linux and macOS, the file has the mode
 /// `0600` and no extended ACL entry. On Windows, the user is its owner, and its DACL is protected and allows only
-/// the user. Each operation checks these permissions, and it refuses a key file that another account can read. On
-/// Linux and macOS it also refuses a link, a FIFO, or a device at the path, and a file of another owner.
+/// the user. Each operation checks these permissions, and it refuses a key file that another account can read. It
+/// also refuses a link at the path, and a file of another owner. On Linux and macOS it refuses a FIFO or a device at
+/// the path with no wait, and on Windows each other reparse point, such as the placeholder of a sync service.
 ///
 /// The custody holds no key between operations. Each operation reads the key file into memory, checks that it holds
 /// the key of the handle, signs, and then clears the key. Thus a key that one custody deletes refuses in each

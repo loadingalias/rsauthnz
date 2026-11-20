@@ -141,6 +141,8 @@ fn scan(needle: &Needle, chunk: &mut [u8]) -> Vec<(u64, u64, u32)> {
 mod os {
     /// `VM_PROT_READ | VM_PROT_WRITE`.
     const READ_WRITE: u32 = 3;
+    /// `KERN_INVALID_ADDRESS`: no region is at or after the address. It is the one normal end of the walk.
+    const INVALID_ADDRESS: i32 = 1;
     /// The words of a `vm_region_submap_info_64`: `VM_REGION_SUBMAP_INFO_V3_COUNT_64`.
     const INFO_WORDS: u32 = 21;
     /// The word of each field of a `vm_region_submap_info_64` that the walk reads. The structure has a packing of 4.
@@ -165,7 +167,9 @@ mod os {
     }
 
     /// Calls `scan` with the address, the size, and the tag of each region that this process can read and write and
-    /// that holds a page. The walk enters each submap, such as the shared region of the system libraries.
+    /// that holds a page. The walk enters each submap, such as the shared region of the system libraries. It ends only
+    /// at the end of the address space, and each other refusal of Mach fails the test: a walk that stops early leaves
+    /// regions unread.
     #[expect(
         unsafe_code,
         reason = "mach_vm_region_recurse writes the information of a region into `info`"
@@ -188,8 +192,10 @@ mod os {
                     &raw mut count,
                 )
             };
-            if status != 0 {
-                return;
+            match status {
+                0 => {}
+                INVALID_ADDRESS => return,
+                status => panic!("mach_vm_region_recurse refused with {status} before the end of the address space"),
             }
             if info[IS_SUBMAP] != 0 {
                 depth += 1;

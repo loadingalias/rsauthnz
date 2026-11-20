@@ -19,7 +19,7 @@ use core::pin::pin;
 use core::random::Rng as _;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::random::SystemRng;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
@@ -103,19 +103,32 @@ fn artifact(outcome: Outcome) -> Result<Vec<u8>, Failure> {
 }
 
 /// The journey, with its key files in the new directory `dir`, and the random values of `random`. It removes the
-/// directory at its end, also after a failure.
+/// directory at its end, also after a failure. A failed removal is part of the result: the error tells the operator
+/// that key files can remain in `dir`.
+fn journey(dir: PathBuf, random: ChaCha20Rng) -> Result<(), Failure> {
+    fs::create_dir(&dir)?;
+    // A panic unwinds through the guard, and a second panic there would abort the process. Thus the guard removes the
+    // directory and drops a failure. Each normal return dismisses it and reports a failed removal.
+    let guard = DropGuard::new(dir, |dir| drop(fs::remove_dir_all(dir)));
+    let result = steps(&guard, random);
+    let dir = DropGuard::dismiss(guard);
+    // The last step removed the empty directory. After a failure, the directory and its key files go.
+    let Err(error) = result else { return Ok(()) };
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(format!("{error}; the removal of {} also failed: {cleanup}", dir.display()).into()),
+    }
+}
+
+/// The steps of the journey, with the key files in the directory `dir`.
 #[expect(clippy::print_stdout, reason = "the example prints each step of its journey")]
-fn journey(dir: PathBuf, mut random: ChaCha20Rng) -> Result<(), Failure> {
+fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
     // A host reads its clock for each request, with the bound of its time source. This journey takes one reading for
     // its requests, and a fresh one for each commit.
     let now = clock()?;
     let limits = Limits::default();
 
-    fs::create_dir(&dir)?;
-    let dir = DropGuard::new(dir, |dir| {
-        fs::remove_dir_all(dir).expect("the example can remove its key directory")
-    });
-    let custody = FileCustody::open(&*dir, Isolation::User)?;
+    let custody = FileCustody::open(dir, Isolation::User)?;
     let mut memory = Memory::new(Schedule::None);
     let mut driver = Driver::new(Profile::new(memory.declaration())?, limits)?;
     driver.start(now);
@@ -210,7 +223,7 @@ fn journey(dir: PathBuf, mut random: ChaCha20Rng) -> Result<(), Failure> {
     // 9. Cleanup: delete each key from custody, then remove the empty directory.
     custody.delete(key.id())?;
     custody.delete(issuer.id())?;
-    fs::remove_dir(DropGuard::dismiss(dir))?;
+    fs::remove_dir(dir)?;
     println!("9. The CLI and the authority deleted their keys, and the example removed its key directory.");
     Ok(())
 }

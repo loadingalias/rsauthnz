@@ -68,6 +68,9 @@ The example matches each refusal by its error. If an operation does not refuse w
 The example makes a new directory `rsauthnz-native-cli-<process ID>` under the temporary directory of the system. Its
 two key files are there. At the end, the CLI and the authority delete their keys with `custody.delete`, and the
 example removes the empty directory. After a failure, the example removes the directory and each key file in it.
+If that removal also fails, for example on a file system that became read-only, the error names the directory and
+both causes. Then remove the directory by hand, because key files can remain in it. After a panic, the example
+removes the directory with no further error.
 
 ## Test the example
 
