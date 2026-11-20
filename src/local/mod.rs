@@ -633,6 +633,11 @@ impl Authority {
 
     /// The report of the authority: each issue in its log, oldest first, with the state of its value at `now`.
     ///
+    /// Limit: a restore from an older snapshot loses the issues after the snapshot, because an issue gives no journal
+    /// fact. The binding of a value from such an issue that a client consumed stays live, because a consumption gives
+    /// a journal fact, but the report does not show it. Keep the list of the administrators that you issued values
+    /// for, and unlink each one that you do not want after a restore.
+    ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One keyed read of the record of the authority, and at most
     /// one more for each issue.
     ///

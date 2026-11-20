@@ -246,3 +246,7 @@ Each read is a keyed read. An operation that reads gives `Failure::Refused(error
 - The challenge of `admit` must be fresh for each call. The host chooses it and refuses its reuse.
 - The text of a value is a bearer secret in memory until the owner hands it over. The core does not clear it from
   memory.
+- After a restore from an older snapshot, the report can omit a live administrator. A restore loses the issues after
+  the snapshot, because an issue gives no journal fact. A consumption gives one, so the binding of a value that a
+  client consumed after the snapshot stays live. Keep the list of the administrators that you issued values for, and
+  unlink each one that you do not want after a restore. A later release closes this limit.
