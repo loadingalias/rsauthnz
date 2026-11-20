@@ -22,7 +22,8 @@ with `rsauthnz::limits::Limit`, in `Error::Limit` of the codec.
 | `string_bytes` | 16,384 | Bytes in one byte string or text string | UTF-8 bytes in one string or member name, after the escapes | `Limit::StringBytes` |
 
 The fields `dependencies` and `intents` bound a transition proposal, not a codec. [Propose a
-transition](transitions.md#limits) gives them.
+transition](transitions.md#limits) gives them. The field `signature_checks` bounds the signature checks of one
+artifact. [Bound the signature checks](verification.md#bound-the-signature-checks) gives it.
 
 Each limit refuses before the decoder allocates memory. Each error value is a small `Copy` value that holds no
 input text and no allocation.

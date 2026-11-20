@@ -5,7 +5,7 @@ extern crate alloc;
 pub mod authz;
 pub mod cbor;
 pub mod cose;
-mod crypto;
+pub mod crypto;
 pub mod evidence;
 pub mod id;
 pub mod json;

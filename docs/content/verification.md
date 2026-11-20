@@ -22,29 +22,35 @@ A `Profile` holds the facts that the application fixes before it reads an artifa
 One profile serves one purpose. Give each purpose its own key, so an artifact of one purpose never verifies for
 another purpose.
 
-`TrustedKey::new(algorithm, &key)` makes the key from a `Key`. Decode a `COSE_Key` with `Key::decode`, or make a
-`Key` from the bytes of a public key that you trust. `TrustedKey::new` returns `Error::KeyAlgorithm` if the key
-does not fit the algorithm.
+`TrustedKey::new(algorithm, &key)` makes the key from a `Key` and a `crypto::Algorithm`. Decode a `COSE_Key` with
+`Key::decode`, or make a `Key` from the bytes of a public key that you trust. `TrustedKey::new` returns
+`Error::KeyAlgorithm` if the key does not fit the algorithm. It returns `Error::Malformed` if a P-256 point, alone or
+in a composite key, is not on the curve.
 
 | `Algorithm` | COSE `alg` | `PublicKey` | `COSE_Key` |
 | --- | --- | --- | --- |
+| `MlDsa65Ed25519` | -59 (draft) | `MlDsa65Ed25519(&[u8; 1984])` | `kty` 7 (`AKP`), `alg` -59, `pub` |
+| `MlDsa65EcdsaP256` | -55 (draft) | `MlDsa65EcdsaP256(&[u8; 2017])` | `kty` 7 (`AKP`), `alg` -55, `pub` |
+| `MlDsa65` | -49 | `MlDsa65(&[u8; 1952])` | `kty` 7 (`AKP`), `alg` -49, `pub` |
 | `Ed25519` | -19 | `Ed25519(&[u8; 32])` | `kty` 1 (`OKP`), `crv` 6, `x` |
 | `Es256` | -7 | `P256 { x, y }`, 32 bytes each | `kty` 2 (`EC2`), `crv` 1, `x`, `y` |
-| `MlDsa65` | -49 | `MlDsa65(&[u8; 1952])` | `kty` 7 (`AKP`), `alg` -49, `pub` |
 
-Ed25519 and ES256 are classical profiles. Select one only for a verifier that supports nothing else. rsauthnz never
-selects a profile for you.
+[Signature profiles](profiles.md) gives the guarantee of each profile, and the state of the draft identifiers.
+`MlDsa65Ed25519` is the default profile. Ed25519 and ES256 are classical profiles. Select one only for a verifier
+that supports nothing else.
 
 ## Verify a CWT
 
-Call `Profile::verify(artifact, now)`. `now` is a `time::Reading`: the physical time, with its uncertainty bound.
-This example verifies the signed CWT of RFC 8392, Appendix A.3. It is also the example of the `rsauthnz::cose`
-module documentation, and `cargo xtask test` runs it:
+Call `Profile::verify(artifact, now, &mut budget)`. `now` is a `time::Reading`: the physical time, with its
+uncertainty bound. `budget` is the signature budget of the artifact, as [Bound the signature
+checks](#bound-the-signature-checks) gives. This example verifies the signed CWT of RFC 8392, Appendix A.3. It is
+also the example of the `rsauthnz::cose` module documentation, and `cargo xtask test` runs it:
 
 ```rust
 use core::time::Duration;
-use rsauthnz::limits::Limits;
-use rsauthnz::cose::{Algorithm, Key, Profile, PublicKey, TrustedKey};
+use rsauthnz::crypto::Algorithm;
+use rsauthnz::limits::{Limits, SignatureBudget};
+use rsauthnz::cose::{Key, Profile, PublicKey, TrustedKey};
 use rsauthnz::id::Id;
 use rsauthnz::time::{Reading, ReadingSource};
 
@@ -70,7 +76,10 @@ let profile = Profile {
 // The physical time of the check, with its uncertainty bound. The CWT is valid in October 2015.
 let now = Reading::new(Duration::from_secs(1_444_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 
-let verified = profile.verify(&cwt, now)?;
+// One budget bounds the signature checks of the artifact. An ES256 signature is one check.
+let mut budget = SignatureBudget::new(&profile.limits);
+let verified = profile.verify(&cwt, now, &mut budget)?;
+assert_eq!(budget.remaining(), 1);
 assert_eq!(verified.claims().sub, Some("erikw"));
 assert_eq!(verified.expires(), Duration::from_secs(1_444_064_944));
 ```
@@ -88,11 +97,23 @@ The example uses a `hex` function that converts hexadecimal digits to bytes. rsa
 4. It checks the validity interval. The claims must have `exp`. The artifact is valid while `nbf <= t < exp` for
    each time `t` from `now.earliest()` to `now.latest()`. Thus a reading with an unknown bound refuses.
 5. It checks that the protected `alg` is the algorithm of the profile.
-6. It verifies the signature with the key of the profile. This is the only expensive check.
+6. It charges the signature budget, then verifies the signature with the key of the profile. This is the only
+   expensive check.
 
 The checks of the claims come before the signature check because they are cheap. Thus `Error::Issuer`,
 `Error::Audience`, `Error::NoExpiry`, `Error::Expired`, and `Error::NotYetValid` can come before the signature
 check. Such a refusal, and each other refusal of steps 1 to 5, does not show that the artifact is authentic.
+
+## Bound the signature checks
+
+`limits::SignatureBudget` holds the signature checks that one artifact can still make. Make one budget for each
+artifact with `SignatureBudget::new(&limits)`. It starts at `Limits::signature_checks`, and the default is 2: one
+composite signature. Give the same budget to each signature check of the artifact, for example `Profile::verify`
+for a credential and `Sign1::verify` for a structure in it.
+
+Each check charges its cost before its signature work: two checks for a composite profile, and one check for each
+other profile. If the budget has less, the check refuses with `Error::Limit(Limit::SignatureChecks)`. It charges
+nothing, and it does no signature work. `remaining()` gives the checks that are left.
 
 ## Use the evidence
 
@@ -122,8 +143,8 @@ These functions give untrusted values:
 - `Sign1::decode(input, limits)` decodes a `COSE_Sign1`. `protected()` and `unprotected()` give the header buckets.
   A header that rsauthnz does not process stays in its bucket. `Header::get(label)` and `Header::entries()` read
   it. `payload()` gives the untrusted payload.
-- `Sign1::verify(&key)` checks the `alg` and the signature of a `COSE_Sign1` that is not a CWT, and gives its payload.
-  The externally supplied data is empty.
+- `Sign1::verify(&key, &mut budget)` checks the `alg` and the signature of a `COSE_Sign1` that is not a CWT, and
+  gives its payload. The externally supplied data is empty.
 - `Key::decode(input, limits)` decodes a `COSE_Key`. It ignores the parameters that it does not read.
 - `Claims::decode(input, limits)` decodes a CWT claims map. Each claim of RFC 8392 has its own field. Each other
   claim is in `other`.
@@ -145,6 +166,7 @@ Each refusal is a `cose::Error`. For each refusal, the recovery is to refuse the
 | `KeyAlgorithm` | The key does not fit the algorithm |
 | `AlgorithmMismatch` | The protected bucket has no `alg`, or its `alg` is not the algorithm of the profile. An `alg` in the unprotected bucket does not count |
 | `Signature` | The signature does not verify with the key of the profile |
+| `Limit(Limit::SignatureChecks)` | The signature check costs more than the signature budget of the artifact has. The check did no signature work |
 | `Issuer` | `iss` is missing, or it is not the issuer of the profile |
 | `Audience` | `aud` is missing, or it does not name the audience of the profile |
 | `NoExpiry` | The claims have no `exp` |

@@ -8,7 +8,7 @@ use core::time::Duration;
 use super::{Error, Key, Sign1, TrustedKey};
 use crate::cbor::{self, Value};
 use crate::id::{Id, Purpose};
-use crate::limits::Limits;
+use crate::limits::{Limits, SignatureBudget};
 use crate::time::Reading;
 
 /// The CWT tag (RFC 8392 section 6). It can enclose the tagged `COSE_Sign1`.
@@ -155,7 +155,7 @@ pub struct Profile {
 
 impl Profile {
     /// Verifies the signed CWT `artifact` at the physical time `now`. `artifact` is a `COSE_Sign1` with the tag 18 or
-    /// no tag, and the CWT tag (61) can enclose it.
+    /// no tag, and the CWT tag (61) can enclose it. The signature check charges `budget`, the budget of the artifact.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -169,7 +169,12 @@ impl Profile {
     /// The errors of [`Sign1::decode`], [`Claims::decode`], and [`Sign1::verify`]. [`Error::Issuer`],
     /// [`Error::Audience`], [`Error::NoExpiry`], [`Error::Expired`], and [`Error::NotYetValid`] for the claims, and
     /// [`Error::Time`] if `now` has no known bound.
-    pub fn verify<'a>(&self, artifact: &'a [u8], now: Reading) -> Result<Verified<'a, '_>, Error> {
+    pub fn verify<'a>(
+        &self,
+        artifact: &'a [u8],
+        now: Reading,
+        budget: &mut SignatureBudget,
+    ) -> Result<Verified<'a, '_>, Error> {
         let value = match cbor::decode(artifact, self.limits)? {
             Value::Tag(CWT_TAG, item) => *item,
             value => value,
@@ -193,7 +198,7 @@ impl Profile {
         {
             return Err(Error::NotYetValid);
         }
-        sign1.verify(&self.key)?;
+        sign1.verify(&self.key, budget)?;
         Ok(Verified {
             artifact,
             profile: self,

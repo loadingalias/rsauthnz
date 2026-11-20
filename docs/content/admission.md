@@ -25,7 +25,7 @@ does signature, KDF, or storage work.
    full.
 2. Run `Parse` work on the request path. It is linear in bounded input.
 3. Run `Verify` work in a pool that the host sizes for its CPU. A verifying operation such as
-   `cose::Profile::verify` does its cheap checks first. An input over a bound refuses before a signature call.
+   `cose::Profile::verify` does its cheap checks first. An input over a bound refuses before a signature check.
 4. Run `Mutate` and `External` work in their own pools, so that slow work in one cannot hold the other.
 
 ## The limit set
@@ -34,10 +34,12 @@ does signature, KDF, or storage work.
 proposal checks its input against it before expensive work. A refusal names the bound with
 `rsauthnz::limits::Limit`. The fields of the codecs, their defaults, and their refusals are in [Parser
 limits](parser-limits.md). A `cose::Profile` holds the limits of its artifacts. The fields `dependencies` and
-`intents` bound a proposal, as [Propose a transition](transitions.md#limits) gives.
+`intents` bound a proposal, as [Propose a transition](transitions.md#limits) gives. The field `signature_checks`
+bounds the signature checks of one artifact, as [Bound the signature
+checks](verification.md#bound-the-signature-checks) gives.
 
 A new bound joins `Limits` in the change that adds its first consumer. The bounds that come next are grants,
-resource scopes, the keys of a key set, and the signatures of one artifact.
+resource scopes, and the keys of a key set.
 
 ## Keyed reads
 

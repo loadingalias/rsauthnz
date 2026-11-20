@@ -2,10 +2,10 @@
 
 use core::fmt;
 
-use super::{Algorithm, Error, label};
+use super::{Error, algorithm, label};
 use crate::cbor::{self, Value};
-use crate::crypto::Verifier;
-use crate::limits::Limits;
+use crate::crypto::{Algorithm, Verifier};
+use crate::limits::{Limits, SignatureBudget};
 
 /// A public key from a `COSE_Key`. It is an untrusted value until the application makes a [`TrustedKey`] from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +32,12 @@ pub enum PublicKey<'a> {
     },
     /// An `AKP` (7) key with the algorithm ML-DSA-65: the 1,952 bytes of `pub` (-1).
     MlDsa65(&'a [u8; 1952]),
+    /// An `AKP` (7) key with the algorithm ML-DSA-65 + Ed25519: the 1,984 bytes of `pub` (-1). They are the ML-DSA-65
+    /// key, then the Ed25519 key.
+    MlDsa65Ed25519(&'a [u8; 1984]),
+    /// An `AKP` (7) key with the algorithm ML-DSA-65 + ECDSA P-256: the 2,017 bytes of `pub` (-1). They are the
+    /// ML-DSA-65 key, then the uncompressed P-256 point.
+    MlDsa65EcdsaP256(&'a [u8; 2017]),
 }
 
 impl<'a> Key<'a> {
@@ -68,9 +74,7 @@ impl<'a> Key<'a> {
             Some(Value::Bytes(kid)) => Some(*kid),
             Some(_) => return Err(Error::Malformed),
         };
-        let alg = get(3)
-            .map(|alg| Algorithm::from_value(alg).ok_or(Error::Unsupported))
-            .transpose()?;
+        let alg = get(3).map(|alg| algorithm(alg).ok_or(Error::Unsupported)).transpose()?;
         let bytes = |key: i64| match get(key) {
             Some(Value::Bytes(bytes)) => Ok(*bytes),
             _ => Err(Error::Malformed),
@@ -92,11 +96,15 @@ impl<'a> Key<'a> {
             }
             Some(Value::Unsigned(7)) => {
                 // RFC 9964 requires `alg` in an `AKP` key, because the form of the key depends on it.
-                if alg.is_none() {
-                    return Err(Error::Malformed);
-                }
+                let alg = alg.ok_or(Error::Malformed)?;
                 private(get(-2))?;
-                (PublicKey::MlDsa65(fixed(bytes(-1)?)?), Algorithm::MlDsa65)
+                let public = match alg {
+                    Algorithm::MlDsa65 => PublicKey::MlDsa65(fixed(bytes(-1)?)?),
+                    Algorithm::MlDsa65Ed25519 => PublicKey::MlDsa65Ed25519(fixed(bytes(-1)?)?),
+                    Algorithm::MlDsa65EcdsaP256 => PublicKey::MlDsa65EcdsaP256(fixed(bytes(-1)?)?),
+                    Algorithm::Ed25519 | Algorithm::Es256 => return Err(Error::KeyAlgorithm),
+                };
+                (public, alg)
             }
             Some(Value::Unsigned(_) | Value::Negative(_) | Value::Text(_)) => return Err(Error::Unsupported),
             _ => return Err(Error::Malformed),
@@ -140,7 +148,7 @@ impl TrustedKey {
     /// # Errors
     ///
     /// [`Error::KeyAlgorithm`] if `key` does not fit `algorithm`, or its `alg` is a different algorithm.
-    /// [`Error::Malformed`] if the P-256 point is not on the curve.
+    /// [`Error::Malformed`] if a P-256 point, alone or in a composite key, is not on the curve.
     pub fn new(algorithm: Algorithm, key: &Key<'_>) -> Result<Self, Error> {
         if key.alg.is_some_and(|alg| alg != algorithm) {
             return Err(Error::KeyAlgorithm);
@@ -149,6 +157,12 @@ impl TrustedKey {
             (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
             (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
             (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
+            (Algorithm::MlDsa65Ed25519, PublicKey::MlDsa65Ed25519(public)) => {
+                Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Malformed)?
+            }
+            (Algorithm::MlDsa65EcdsaP256, PublicKey::MlDsa65EcdsaP256(public)) => {
+                Verifier::ml_dsa_65_ecdsa_p256(public).ok_or(Error::Malformed)?
+            }
             _ => return Err(Error::KeyAlgorithm),
         }))
     }
@@ -156,20 +170,15 @@ impl TrustedKey {
     /// The algorithm of the key.
     #[must_use]
     pub const fn algorithm(&self) -> Algorithm {
-        match self.0 {
-            Verifier::Ed25519(_) => Algorithm::Ed25519,
-            Verifier::Es256(_) => Algorithm::Es256,
-            Verifier::MlDsa65(_) => Algorithm::MlDsa65,
-        }
+        self.0.algorithm()
     }
 
-    /// Verifies `signature` over `message` with the algorithm of the key.
-    pub(super) fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), Error> {
-        if self.0.verify(message, signature) {
-            Ok(())
-        } else {
-            Err(Error::Signature)
-        }
+    /// Verifies `signature` over `message` with the algorithm of the key, after it charges `budget`.
+    pub(super) fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<(), Error> {
+        self.0
+            .verify(message, signature, budget)
+            .map_err(Error::Limit)?
+            .ok_or(Error::Signature)
     }
 }
 

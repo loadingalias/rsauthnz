@@ -3,9 +3,9 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::{Error, TrustedKey, label};
+use super::{Error, TrustedKey, alg, label};
 use crate::cbor::{self, Value};
-use crate::limits::Limits;
+use crate::limits::{Limits, SignatureBudget};
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
 const SIGN1_TAG: u64 = 18;
@@ -165,8 +165,8 @@ impl<'a> Sign1<'a> {
         self.payload
     }
 
-    /// Verifies the signature with `key`, and gives the payload. The externally supplied data of RFC 9052 section
-    /// 4.3 is empty.
+    /// Verifies the signature with `key`, and gives the payload. The check charges `budget`, the budget of the
+    /// artifact, before its signature work. The externally supplied data of RFC 9052 section 4.3 is empty.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -177,13 +177,13 @@ impl<'a> Sign1<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::AlgorithmMismatch`] if the protected bucket has no `alg` or a different `alg`, and
-    /// [`Error::Signature`] if the signature does not verify.
-    pub fn verify(&self, key: &TrustedKey) -> Result<&'a [u8], Error> {
-        if self.protected.get(1) != Some(&key.algorithm().value()) {
+    /// [`Error::AlgorithmMismatch`] if the protected bucket has no `alg` or a different `alg`, [`Error::Limit`] if
+    /// the check costs more than `budget` has, and [`Error::Signature`] if the signature does not verify.
+    pub fn verify(&self, key: &TrustedKey, budget: &mut SignatureBudget) -> Result<&'a [u8], Error> {
+        if self.protected.get(1) != Some(&alg(key.algorithm())) {
             return Err(Error::AlgorithmMismatch);
         }
-        key.verify(&self.to_be_signed(), self.signature)?;
+        key.verify(&self.to_be_signed(), self.signature, budget)?;
         Ok(self.payload)
     }
 

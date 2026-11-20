@@ -5,10 +5,10 @@ use core::time::Duration;
 
 use rscrypto::auth::Ed25519SecretKey;
 
-use super::{Limit, Limits};
+use super::{Limit, Limits, SignatureBudget};
 use crate::cbor::{self, Value};
-use crate::cose::{Algorithm, Error, Key, Profile, PublicKey, TrustedKey};
-use crate::crypto;
+use crate::cose::{Error, Key, Profile, PublicKey, TrustedKey};
+use crate::crypto::Algorithm;
 use crate::id::Id;
 use crate::time::{Reading, ReadingSource};
 
@@ -51,7 +51,7 @@ fn nested(levels: usize) -> Value<'static> {
 }
 
 #[test]
-fn an_input_over_each_bound_refuses_before_a_signature_call() {
+fn an_input_over_each_bound_refuses_before_a_signature_check() {
     let public = Ed25519SecretKey::from_bytes([7; 32]).public_key().to_bytes();
     let key = Key {
         kid: None,
@@ -69,6 +69,7 @@ fn an_input_over_each_bound_refuses_before_a_signature_call() {
             items: 32,
             map_keys: 8,
             string_bytes: 128,
+            signature_checks: 1,
             ..Limits::default()
         },
     };
@@ -80,14 +81,11 @@ fn an_input_over_each_bound_refuses_before_a_signature_call() {
     let empty = || Value::Map(vec![]);
     let claim = |value| Some((Value::Unsigned(9), value));
 
-    // The control: a valid artifact makes one signature call. Thus a count that does not work fails.
-    let before = crypto::calls();
-    profile.verify(&artifact(None, empty(), None), now).unwrap();
-    assert_eq!(
-        crypto::calls(),
-        before + 1,
-        "the valid artifact made no counted signature call"
-    );
+    // The control: a valid artifact charges its budget one check. Thus a budget that is not charged fails.
+    let valid = artifact(None, empty(), None);
+    let mut spent = SignatureBudget::new(&profile.limits);
+    profile.verify(&valid, now, &mut spent).unwrap();
+    assert_eq!(spent.remaining(), 0, "the valid artifact charged no check");
 
     let long = "x".repeat(129);
     let keys: Vec<_> = (10..19).map(|key| (Value::Unsigned(key), Value::Null)).collect();
@@ -114,16 +112,18 @@ fn an_input_over_each_bound_refuses_before_a_signature_call() {
         (artifact(None, empty(), claim(Value::Text(&long))), Limit::StringBytes),
     ];
     for (input, limit) in over {
-        let before = crypto::calls();
+        let mut budget = SignatureBudget::new(&profile.limits);
         assert_eq!(
-            profile.verify(&input, now).err(),
+            profile.verify(&input, now, &mut budget).err(),
             Some(Error::Cbor(cbor::Error::Limit(limit))),
             "{limit:?}"
         );
-        assert_eq!(
-            crypto::calls(),
-            before,
-            "the refusal of {limit:?} made a signature call"
-        );
+        assert_eq!(budget.remaining(), 1, "the refusal of {limit:?} charged a check");
     }
+
+    // The spent budget refuses a second signature check of the artifact.
+    assert_eq!(
+        profile.verify(&valid, now, &mut spent).err(),
+        Some(Error::Limit(Limit::SignatureChecks))
+    );
 }

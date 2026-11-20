@@ -12,7 +12,7 @@ publish.workspace = true
 # rstypes and rscrypto come from their Git `main`.
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # The only source of signatures and digests.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa", "sha2"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2"] }
 
 [lints]
 workspace = true

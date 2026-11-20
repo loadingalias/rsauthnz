@@ -5,12 +5,15 @@
 //! can only match the algorithm of the profile. It never selects an algorithm or a key. [`Profile::verify`] gives
 //! [`Verified`] evidence, which holds the exact bytes of the artifact.
 //!
-//! The profiles are Ed25519 (COSE -19), ES256 (-7), and ML-DSA-65 (-49). [rscrypto] does each signature check.
+//! [`Algorithm`] gives the profiles and their COSE identifiers. The identifiers of the composite profiles are drafts.
+//! Each signature check charges the [`SignatureBudget`](crate::limits::SignatureBudget) of the artifact, and
+//! [rscrypto] does each check.
 //!
 //! ```
 //! use core::time::Duration;
-//! use rsauthnz::limits::Limits;
-//! use rsauthnz::cose::{Algorithm, Key, Profile, PublicKey, TrustedKey};
+//! use rsauthnz::crypto::Algorithm;
+//! use rsauthnz::limits::{Limits, SignatureBudget};
+//! use rsauthnz::cose::{Key, Profile, PublicKey, TrustedKey};
 //! use rsauthnz::id::Id;
 //! use rsauthnz::time::{Reading, ReadingSource};
 //!
@@ -39,7 +42,10 @@
 //! // The physical time of the check, with its uncertainty bound. The CWT is valid in October 2015.
 //! let now = Reading::new(Duration::from_secs(1_444_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //!
-//! let verified = profile.verify(&cwt, now)?;
+//! // One budget bounds the signature checks of the artifact. An ES256 signature is one check.
+//! let mut budget = SignatureBudget::new(&profile.limits);
+//! let verified = profile.verify(&cwt, now, &mut budget)?;
+//! assert_eq!(budget.remaining(), 1);
 //! assert_eq!(verified.claims().sub, Some("erikw"));
 //! assert_eq!(verified.expires(), Duration::from_secs(1_444_064_944));
 //! # Ok::<(), Box<dyn core::error::Error>>(())
@@ -61,35 +67,18 @@ pub use key::{Key, PublicKey, TrustedKey};
 pub use sign1::{Header, Sign1};
 
 use crate::cbor::{self, Value};
+use crate::crypto::Algorithm;
+use crate::limits::Limit;
 use crate::time::TimeError;
 
-/// A signature algorithm of a trusted profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Algorithm {
-    /// Ed25519 (COSE algorithm -19, [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864)). A classical profile.
-    Ed25519,
-    /// ECDSA with P-256 and SHA-256 (COSE algorithm -7). A classical profile.
-    Es256,
-    /// ML-DSA-65 (COSE algorithm -49, [RFC 9964](https://www.rfc-editor.org/rfc/rfc9964)).
-    MlDsa65,
+/// The COSE algorithm identifier of `algorithm`, in its CBOR form.
+const fn alg(algorithm: Algorithm) -> Value<'static> {
+    label(algorithm.report().cose)
 }
 
-impl Algorithm {
-    /// The COSE algorithm identifier, in its CBOR form.
-    const fn value(self) -> Value<'static> {
-        match self {
-            Self::Ed25519 => Value::Negative(18),
-            Self::Es256 => Value::Negative(6),
-            Self::MlDsa65 => Value::Negative(48),
-        }
-    }
-
-    /// The algorithm with the COSE identifier `value`, if this crate has it.
-    fn from_value(value: &Value<'_>) -> Option<Self> {
-        [Self::Ed25519, Self::Es256, Self::MlDsa65]
-            .into_iter()
-            .find(|algorithm| algorithm.value() == *value)
-    }
+/// The algorithm with the COSE identifier `value`, if this crate has it.
+fn algorithm(value: &Value<'_>) -> Option<Algorithm> {
+    Algorithm::ALL.into_iter().find(|algorithm| alg(*algorithm) == *value)
 }
 
 /// The CBOR form of the integer label `label`.
@@ -121,6 +110,9 @@ pub enum Error {
     AlgorithmMismatch,
     /// The signature does not verify with the key of the profile.
     Signature,
+    /// The signature check costs more than the [`SignatureBudget`](crate::limits::SignatureBudget) of the artifact
+    /// has. The check did no signature work.
+    Limit(Limit),
     /// The `iss` claim is missing, or it is not the issuer of the profile.
     Issuer,
     /// The `aud` claim is missing, or it does not name the audience of the profile.
@@ -145,6 +137,10 @@ impl fmt::Display for Error {
             Self::KeyAlgorithm => f.write_str("the key does not fit the algorithm"),
             Self::AlgorithmMismatch => f.write_str("the COSE algorithm is not the algorithm of the profile"),
             Self::Signature => f.write_str("the signature does not verify"),
+            Self::Limit(Limit::SignatureChecks) => {
+                f.write_str("the artifact needs more signature checks than its limit")
+            }
+            Self::Limit(_) => f.write_str("the artifact is larger than a bound of the limits"),
             Self::Issuer => f.write_str("the issuer is not the issuer of the profile"),
             Self::Audience => f.write_str("the audience does not include the audience of the profile"),
             Self::NoExpiry => f.write_str("the claims have no expiry"),

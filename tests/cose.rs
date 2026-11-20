@@ -4,11 +4,12 @@
 use core::time::Duration;
 
 use rsauthnz::cbor::{Value, encode};
-use rsauthnz::cose::{Algorithm, Claims, Confirmation, Error, Key, Profile, PublicKey, Sign1, TrustedKey};
+use rsauthnz::cose::{Claims, Confirmation, Error, Key, Profile, PublicKey, Sign1, TrustedKey, Verified};
+use rsauthnz::crypto::Algorithm;
 use rsauthnz::id::Id;
-use rsauthnz::limits::Limits;
+use rsauthnz::limits::{Limits, SignatureBudget};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
-use rscrypto::auth::{Ed25519SecretKey, MlDsa65Seed};
+use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65EcdsaP256, MlDsa65Ed25519, MlDsa65Seed};
 
 /// The bytes of a string of hexadecimal digits.
 fn hex(digits: &str) -> Vec<u8> {
@@ -41,6 +42,11 @@ fn profile(algorithm: Algorithm, public: PublicKey<'_>, issuer: &str, audience: 
         purpose: Id::new("test", "credential").expect("identifier"),
         limits: Limits::default(),
     }
+}
+
+/// Verifies `artifact` with `profile`, with the signature budget of the limits of the profile.
+fn verify<'a, 'p>(profile: &'p Profile, artifact: &'a [u8], now: Reading) -> Result<Verified<'a, 'p>, Error> {
+    profile.verify(artifact, now, &mut SignatureBudget::new(&profile.limits))
 }
 
 /// A tagged `COSE_Sign1` with an empty external AAD. `sign` signs the `Sig_structure` of RFC 9052 section 4.4.
@@ -119,12 +125,18 @@ fn rfc_9052_c_2_1_sign1_verifies_and_a_changed_payload_refuses() {
         "d58fef5c083106c4d25a91aef0b0117e2af9a291aa32e14ab834dc56ed2a223444547e01f11d3b0916e5a4c345cacb36",
     ));
     let sign1 = Sign1::decode(&message, Limits::default()).expect("C.2.1");
-    assert_eq!(sign1.verify(&key), Ok(&b"This is the content."[..]));
+    assert_eq!(
+        sign1.verify(&key, &mut SignatureBudget::new(&Limits::default())),
+        Ok(&b"This is the content."[..])
+    );
 
     // The last byte of the payload, '.', becomes '!'.
     message[31] = b'!';
     let sign1 = Sign1::decode(&message, Limits::default()).expect("a changed C.2.1");
-    assert_eq!(sign1.verify(&key), Err(Error::Signature));
+    assert_eq!(
+        sign1.verify(&key, &mut SignatureBudget::new(&Limits::default())),
+        Err(Error::Signature)
+    );
 }
 
 #[test]
@@ -149,7 +161,7 @@ fn rfc_8392_a_3_cwt_verifies_with_the_claims_of_a_1() {
     );
 
     // Between nbf (1443944944) and exp (1444064944).
-    let verified = profile.verify(&cwt, reading(1_444_000_000, 60)).expect("A.3");
+    let verified = verify(&profile, &cwt, reading(1_444_000_000, 60)).expect("A.3");
     assert_eq!(verified.artifact(), &cwt[..]);
     assert_eq!(verified.not_before(), Some(Duration::from_secs(1_443_944_944)));
     assert_eq!(verified.expires(), Duration::from_secs(1_444_064_944));
@@ -179,17 +191,17 @@ fn a_header_alg_that_differs_from_the_profile_refuses() {
 
     // The control: the algorithm of the profile verifies.
     let valid = sign1(&alg(ED25519), empty.clone(), &payload, ed25519_sign);
-    profile.verify(&valid, now).unwrap();
+    verify(&profile, &valid, now).unwrap();
 
     // The Ed25519 key signs, but the protected header says ES256. A verifier that dispatches on the header fails here.
     let es256 = sign1(&alg(ES256), empty.clone(), &payload, ed25519_sign);
-    assert_eq!(profile.verify(&es256, now), Err(Error::AlgorithmMismatch));
+    assert_eq!(verify(&profile, &es256, now), Err(Error::AlgorithmMismatch));
 
     // No `alg`, and an `alg` in the unprotected bucket, which the signature does not cover.
     let none = sign1(&Value::Map(vec![]), empty, &payload, ed25519_sign);
-    assert_eq!(profile.verify(&none, now), Err(Error::AlgorithmMismatch));
+    assert_eq!(verify(&profile, &none, now), Err(Error::AlgorithmMismatch));
     let unprotected = sign1(&Value::Map(vec![]), alg(ED25519), &payload, ed25519_sign);
-    assert_eq!(profile.verify(&unprotected, now), Err(Error::AlgorithmMismatch));
+    assert_eq!(verify(&profile, &unprotected, now), Err(Error::AlgorithmMismatch));
 }
 
 #[test]
@@ -210,16 +222,16 @@ fn an_unknown_critical_header_refuses_and_an_unknown_optional_header_stays() {
     // Label -70000 is not a header that this crate processes.
     let critical = Value::Array(vec![Value::Negative(69_999)]);
     let refused = sign1(&protected(Some(critical)), Value::Map(vec![]), &payload, ed25519_sign);
-    assert_eq!(profile.verify(&refused, now), Err(Error::UnknownCritical));
+    assert_eq!(verify(&profile, &refused, now), Err(Error::UnknownCritical));
 
     // A critical `kid` is a header that this crate processes.
     let critical = Value::Array(vec![Value::Unsigned(4)]);
     let kid = sign1(&protected(Some(critical)), Value::Map(vec![]), &payload, ed25519_sign);
-    profile.verify(&kid, now).unwrap();
+    verify(&profile, &kid, now).unwrap();
 
     // Without `crit`, the unknown header is optional: it stays in its bucket, and it has no effect.
     let optional = sign1(&protected(None), Value::Map(vec![]), &payload, ed25519_sign);
-    profile.verify(&optional, now).unwrap();
+    verify(&profile, &optional, now).unwrap();
     let sign1 = Sign1::decode(&optional, Limits::default()).expect("COSE_Sign1");
     assert_eq!(sign1.protected().get(-70_000), Some(&Value::Unsigned(1)));
 }
@@ -232,12 +244,12 @@ fn a_signature_valid_under_another_audience_or_issuer_refuses() {
 
     let other_audience = claims("https://issuer.example", "https://rp-b.example", 2_000, 0);
     let artifact = sign1(&alg(ED25519), empty.clone(), &other_audience, ed25519_sign);
-    ed25519_profile("https://rp-b.example").verify(&artifact, now).unwrap();
-    assert_eq!(profile.verify(&artifact, now), Err(Error::Audience));
+    verify(&ed25519_profile("https://rp-b.example"), &artifact, now).unwrap();
+    assert_eq!(verify(&profile, &artifact, now), Err(Error::Audience));
 
     let other_issuer = claims("https://other.example", "https://rp-a.example", 2_000, 0);
     let artifact = sign1(&alg(ED25519), empty, &other_issuer, ed25519_sign);
-    assert_eq!(profile.verify(&artifact, now), Err(Error::Issuer));
+    assert_eq!(verify(&profile, &artifact, now), Err(Error::Issuer));
 }
 
 #[test]
@@ -247,14 +259,14 @@ fn evidence_compares_equal_only_for_the_exact_artifact_bytes() {
     let now = reading(1_000, 1);
     let artifact = sign1(&alg(ED25519), Value::Map(vec![]), &payload, ed25519_sign);
 
-    let first = profile.verify(&artifact, now).expect("artifact");
+    let first = verify(&profile, &artifact, now).expect("artifact");
     let again = artifact.clone();
-    assert_eq!(first, profile.verify(&again, now).expect("the same bytes"));
+    assert_eq!(first, verify(&profile, &again, now).expect("the same bytes"));
 
     // The signature does not cover the unprotected bucket. A `kid` there gives other bytes with the same claims.
     let kid = Value::Map(vec![(Value::Unsigned(4), Value::Bytes(b"k1"))]);
     let other = sign1(&alg(ED25519), kid, &payload, ed25519_sign);
-    let second = profile.verify(&other, now).expect("other bytes");
+    let second = verify(&profile, &other, now).expect("other bytes");
     assert_eq!(first.claims(), second.claims());
     assert_ne!(first, second);
 }
@@ -279,17 +291,17 @@ fn validity_needs_exp_and_a_known_bound_over_the_whole_reading() {
     let artifact = signed(Some(1_000));
 
     // Each time of the reading must be in [nbf, exp).
-    profile.verify(&artifact, reading(989, 10)).unwrap();
-    assert_eq!(profile.verify(&artifact, reading(990, 10)), Err(Error::Expired));
-    profile.verify(&artifact, reading(510, 10)).unwrap();
-    assert_eq!(profile.verify(&artifact, reading(509, 10)), Err(Error::NotYetValid));
+    verify(&profile, &artifact, reading(989, 10)).unwrap();
+    assert_eq!(verify(&profile, &artifact, reading(990, 10)), Err(Error::Expired));
+    verify(&profile, &artifact, reading(510, 10)).unwrap();
+    assert_eq!(verify(&profile, &artifact, reading(509, 10)), Err(Error::NotYetValid));
 
     let unknown = Reading::new(Duration::from_secs(700), None, ReadingSource::SystemClock);
     assert_eq!(
-        profile.verify(&artifact, unknown),
+        verify(&profile, &artifact, unknown),
         Err(Error::Time(TimeError::UnknownBound))
     );
-    assert_eq!(profile.verify(&signed(None), reading(700, 1)), Err(Error::NoExpiry));
+    assert_eq!(verify(&profile, &signed(None), reading(700, 1)), Err(Error::NoExpiry));
 }
 
 #[test]
@@ -311,7 +323,61 @@ fn an_ml_dsa_65_profile_verifies_its_signature() {
             .to_bytes()
             .to_vec()
     });
-    profile.verify(&artifact, reading(1_000, 1)).unwrap();
+    verify(&profile, &artifact, reading(1_000, 1)).unwrap();
+}
+
+/// Verifies a signed CWT of the composite `algorithm` with the `AKP` key `public`. `sign` signs the `Sig_structure`.
+fn verify_composite(algorithm: Algorithm, public: &[u8], sign: impl Fn(&[u8]) -> Vec<u8>) {
+    // The draft identifier comes from the profile, so a change of the draft changes only its constant.
+    let n = u64::try_from(-1 - algorithm.report().cose).expect("a negative identifier");
+    let akp = encode(&Value::Map(vec![
+        (Value::Unsigned(1), Value::Unsigned(7)),
+        (Value::Unsigned(3), Value::Negative(n)),
+        (Value::Negative(0), Value::Bytes(public)),
+    ]))
+    .expect("AKP");
+    let key = Key::decode(&akp, Limits::default()).expect("a composite AKP key");
+    let profile = Profile {
+        key: TrustedKey::new(algorithm, &key).expect("the key fits the algorithm"),
+        issuer: "https://issuer.example".into(),
+        audience: "https://rp.example".into(),
+        purpose: Id::new("test", "credential").expect("identifier"),
+        limits: Limits::default(),
+    };
+    let payload = claims("https://issuer.example", "https://rp.example", 2_000, 0);
+    let artifact = sign1(&alg(n), Value::Map(vec![]), &payload, sign);
+
+    // The composite is two checks: the default budget of one artifact.
+    let mut budget = SignatureBudget::new(&profile.limits);
+    profile
+        .verify(&artifact, reading(1_000, 1), &mut budget)
+        .expect("the composite artifact");
+    assert_eq!(budget.remaining(), 0, "{algorithm:?}");
+}
+
+#[test]
+fn a_composite_profile_verifies_its_akp_key_and_its_signature() {
+    // A fixed filler makes the keys reproducible. The signatures are the deterministic form of rscrypto.
+    let fill = |out: &mut [u8]| -> Result<(), CompositeMlDsaError> {
+        out.fill(7);
+        Ok(())
+    };
+    let (public, secret) = MlDsa65Ed25519::generate_keypair(fill).expect("an ML-DSA-65 + Ed25519 key");
+    verify_composite(Algorithm::MlDsa65Ed25519, &public.to_bytes(), |message| {
+        secret
+            .sign_deterministic(message, &[])
+            .expect("signature")
+            .as_bytes()
+            .to_vec()
+    });
+    let (public, secret) = MlDsa65EcdsaP256::generate_keypair(fill).expect("an ML-DSA-65 + ECDSA P-256 key");
+    verify_composite(Algorithm::MlDsa65EcdsaP256, &public.to_bytes(), |message| {
+        secret
+            .sign_deterministic(message, &[])
+            .expect("signature")
+            .as_bytes()
+            .to_vec()
+    });
 }
 
 #[test]

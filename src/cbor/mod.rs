@@ -129,7 +129,9 @@ impl fmt::Display for Error {
             Self::Limit(Limit::Items) => "the CBOR item has too many data items",
             Self::Limit(Limit::MapKeys) => "a CBOR map has too many keys",
             Self::Limit(Limit::StringBytes) => "a CBOR string has too many bytes",
-            Self::Limit(Limit::Dependencies | Limit::Intents) => "the CBOR item is larger than a bound of the limits",
+            Self::Limit(Limit::Dependencies | Limit::Intents | Limit::SignatureChecks) => {
+                "the CBOR item is larger than a bound of the limits"
+            }
             Self::Truncated => "the CBOR input ends in the item",
             Self::TrailingBytes => "bytes follow the CBOR item",
             Self::Malformed => "the CBOR item is not well-formed, or its text is not UTF-8",

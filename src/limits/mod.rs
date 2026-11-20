@@ -2,8 +2,8 @@
 //!
 //! [`Limits`] is the one limit set of the crate. Each parser, each verifier, and each transition proposal checks its
 //! input against it before expensive work, and a refusal names the [`Limit`] that refused the input. A future bound
-//! joins [`Limits`] in the change that adds its first consumer: grants, resource scopes, the keys of a key set, and
-//! the signatures of one artifact.
+//! joins [`Limits`] in the change that adds its first consumer: grants, resource scopes, and the keys of a key set.
+//! [`SignatureBudget`] bounds the signature checks of one artifact.
 //!
 //! [`Class`] is the cost class of an operation. Each public function names its class in its documentation, in the
 //! form "Cost class: [`Parse`](Class::Parse)." A method that takes only `&self` and returns no `Result` reads a
@@ -44,6 +44,9 @@ pub struct Limits {
     pub dependencies: usize,
     /// The most effect intents of one transition proposal. The default is 8.
     pub intents: usize,
+    /// The most signature checks of one artifact. A composite signature is two checks, one for each component. The
+    /// default is 2: one composite signature. [`SignatureBudget`] counts them.
+    pub signature_checks: usize,
 }
 
 impl Default for Limits {
@@ -56,6 +59,7 @@ impl Default for Limits {
             string_bytes: 16_384,
             dependencies: 64,
             intents: 8,
+            signature_checks: 2,
         }
     }
 }
@@ -78,6 +82,39 @@ pub enum Limit {
     Dependencies,
     /// [`Limits::intents`].
     Intents,
+    /// [`Limits::signature_checks`].
+    SignatureChecks,
+}
+
+/// The signature checks that one artifact can still make. Make one budget for each artifact, and give it to each
+/// signature check of the artifact.
+///
+/// Each signature check of the crate charges the budget with its cost before its work: one check for each component
+/// of the signature. A check that costs more than the budget has refuses with [`Limit::SignatureChecks`]. It charges
+/// nothing, and it does no signature work.
+#[derive(Debug)]
+pub struct SignatureBudget(usize);
+
+impl SignatureBudget {
+    /// The budget of one artifact: [`Limits::signature_checks`] checks.
+    ///
+    /// Cost class: [`Parse`](Class::Parse).
+    #[must_use]
+    pub const fn new(limits: &Limits) -> Self {
+        Self(limits.signature_checks)
+    }
+
+    /// The checks that the artifact can still make.
+    #[must_use]
+    pub const fn remaining(&self) -> usize {
+        self.0
+    }
+
+    /// Charges `checks`, or refuses and charges nothing.
+    pub(crate) fn charge(&mut self, checks: usize) -> Result<(), Limit> {
+        self.0 = self.0.checked_sub(checks).ok_or(Limit::SignatureChecks)?;
+        Ok(())
+    }
 }
 
 /// The cost class of an operation. A host admits each class with its own bound on concurrent work and pending

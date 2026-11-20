@@ -115,7 +115,9 @@ impl fmt::Display for Error {
             Self::Limit(Limit::Items) => "the JSON text has too many values and member names",
             Self::Limit(Limit::MapKeys) => "a JSON object has too many members",
             Self::Limit(Limit::StringBytes) => "a JSON string has too many bytes",
-            Self::Limit(Limit::Dependencies | Limit::Intents) => "the JSON text is larger than a bound of the limits",
+            Self::Limit(Limit::Dependencies | Limit::Intents | Limit::SignatureChecks) => {
+                "the JSON text is larger than a bound of the limits"
+            }
             Self::Truncated => "the JSON input ends in the value",
             Self::TrailingBytes => "bytes follow the JSON value",
             Self::Malformed => "the input is not RFC 8259 JSON in UTF-8",
