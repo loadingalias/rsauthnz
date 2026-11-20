@@ -5,7 +5,7 @@
 mod os;
 
 use alloc::vec::Vec;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 
@@ -21,7 +21,8 @@ use crate::crypto::secret::SecretKey;
 /// Each key is one file in the directory: the PKCS #8 encoding of the composite key, named by the key ID and
 /// `.key`. Only the OS user account that runs the process can read it. On Linux and macOS, the file has the mode
 /// `0600` and no extended ACL entry. On Windows, the user is its owner, and its DACL is protected and allows only
-/// the user. Each operation checks these permissions, and it refuses a key file that another account can read.
+/// the user. Each operation checks these permissions, and it refuses a key file that another account can read. On
+/// Linux and macOS it also refuses a link, a FIFO, or a device at the path, and a file of another owner.
 ///
 /// The custody holds no key between operations. Each operation reads the key file into memory, checks that it holds
 /// the key of the handle, signs, and then clears the key. Thus a key that one custody deletes refuses in each
@@ -94,7 +95,12 @@ impl FileCustody {
     /// The key of `handle`, after the checks of its file: the permissions, the length, the algorithm, and the
     /// public key.
     fn load(&self, handle: &Handle) -> Result<SecretKey, Error> {
-        let mut file = File::open(self.path(handle.id())).map_err(unknown)?;
+        let path = self.path(handle.id());
+        let mut file = os::open(&path).map_err(|error| match fs::symlink_metadata(&path) {
+            // The open follows no link, and a link at the path is no key file of the user.
+            Ok(metadata) if metadata.file_type().is_symlink() => Error::Permissions,
+            _ => unknown(error),
+        })?;
         os::check(&file)?;
         let len = SecretKey::pkcs8_len(handle.algorithm()).ok_or(Error::Algorithm)?;
         (usize::try_from(file.metadata()?.len()) == Ok(len)).ok_or(Error::Mismatch)?;

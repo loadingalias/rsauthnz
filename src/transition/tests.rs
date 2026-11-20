@@ -344,7 +344,7 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
         .unwrap();
     proposal.intend(Intent::new(Effect::Provider, SECRET.into())).unwrap();
     proposal
-        .prepare(Prepared::new(SECRET.into(), key("session"), version("auth", 1)))
+        .prepare(Prepared::new(SECRET.to_vec(), key("session"), version("auth", 1)))
         .unwrap();
 
     let operation = proposal.operation().clone();
@@ -369,7 +369,7 @@ fn debug_of_a_proposal_with_a_secret_field_shows_no_secret_bytes() {
 /// the artifact, so a credential never commits with an unrelated transition. A second artifact refuses too.
 #[test]
 fn a_prepared_artifact_refuses_a_proposal_that_does_not_write_its_issuance_record() {
-    let issued = || Prepared::new(Box::new(*b"credential 9"), key("credential/9"), version("auth", 9));
+    let issued = || Prepared::new(b"credential 9".to_vec(), key("credential/9"), version("auth", 9));
     let mut unrelated = proposal(b"op-1", human(), "credential.issue", "repo:x");
     unrelated.read(Dependency::Absent(key("credential/1"))).unwrap();
     unrelated

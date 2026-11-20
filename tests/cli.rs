@@ -19,7 +19,7 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Handle, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Error, Failure, HostGrant, Unlink};
+use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Error, Failure, HostGrant, Offer, Unlink};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{self, Kind, Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
@@ -93,6 +93,8 @@ struct World<'c> {
     issuer: Handle,
     random: ChaCha20Rng,
     keys: Vec<KeyId>,
+    /// The `Debug` output of each effect and each output.
+    log: String,
 }
 
 impl<'c> World<'c> {
@@ -123,15 +125,18 @@ impl<'c> World<'c> {
             issuer,
             random,
             keys: Vec::new(),
+            log: String::new(),
         };
         world.start();
         world
     }
 
-    /// Executes each effect of the driver until it has none.
+    /// Executes each effect of the driver until it has none, and logs the `Debug` output of each effect and output.
     fn run(&mut self) {
         while let Some(effect) = self.driver.effect() {
+            self.log.push_str(&format!("{effect:?}\n"));
             let output = ready(suite::execute(&mut self.memory, effect));
+            self.log.push_str(&format!("{output:?}\n"));
             self.driver.give(output).unwrap();
         }
     }
@@ -286,12 +291,17 @@ impl<'c> World<'c> {
         })
     }
 
-    /// The challenge that the commit of an issue for `administrator` at `at` gives.
+    /// The challenge of the binding of `administrator` at `at`: the open challenge, or the one that the commit of a
+    /// new challenge gives.
     fn challenge(&mut self, auth: &Authority, administrator: &str, at: Reading) -> Challenge {
         let administrator = Id::new("acme", administrator).unwrap();
         let operation = self.operation();
-        let issue = ready(auth.challenge(&mut self.memory, &administrator, at, &mut self.random, operation)).unwrap();
-        Challenge::from_bytes(self.artifact(issue).as_slice().try_into().unwrap())
+        match ready(auth.challenge(&mut self.memory, &administrator, at, &mut self.random, operation)).unwrap() {
+            Offer::Open(challenge) => challenge,
+            Offer::New(proposal, plan) => {
+                Challenge::from_bytes(self.artifact((proposal, plan)).as_slice().try_into().unwrap())
+            }
+        }
     }
 
     /// The proof of `call` by the CLI key `key` in custody.
@@ -692,4 +702,122 @@ fn a_credential_with_the_serial_of_a_binding_but_other_bytes_refuses() {
         world.admit(&auth, &forged, &proof, &first, now()),
         Err(Failure::Refused(Error::NotEnrolled))
     );
+}
+
+/// Whether `text` shows the first 16 bytes of `bytes` as `Debug` shows a byte slice: in decimal, or in hexadecimal as
+/// for a version.
+fn shows(text: &str, bytes: &[u8]) -> bool {
+    let window = &bytes[..16];
+    [format!("{window:?}"), format!("{window:02x?}")]
+        .iter()
+        .any(|form| text.contains(form.trim_start_matches('[').trim_end_matches(']')))
+}
+
+#[test]
+fn the_debug_output_of_a_journey_shows_no_challenge_and_no_credential() {
+    let files = Files::new("debug");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let (key, credential) = world.enroll(&auth, "alice");
+    let challenge = world.challenge(&auth, "alice", now());
+    let first = call(challenge, "call-1", "status");
+    let proof = world.prove(&key, &credential, &first);
+    let admitted = world.call(&auth, &credential, &proof, &first);
+
+    // The search finds each value where `Debug` of the bytes shows it.
+    let (challenge, next, public) = (challenge.to_bytes(), admitted.next().to_bytes(), holder(&key));
+    assert!(shows(&format!("{public:?}"), &public) && shows(&format!("{challenge:02x?}"), &challenge));
+    // The bootstrap journals the binding with the claims of the credential, and the commits of the challenge and of
+    // the call write challenge records. No effect, no output, and no value of the call shows them.
+    let log = format!("{}{first:?}{admitted:?}", world.log);
+    assert!(log.contains("Append"), "the journey journals its bootstrap");
+    assert!(!shows(&log, &challenge), "the challenge");
+    assert!(!shows(&log, &next), "the next challenge");
+    assert!(!shows(&log, &public), "the cnf key of the credential");
+}
+
+#[test]
+fn a_call_request_past_the_limits_refuses() {
+    let limits = Limits::default();
+    let mut request = Value::Null;
+    for _ in 0..limits.depth {
+        request = Value::Array(vec![request]);
+    }
+    // At the depth limit the call is made. One level more refuses, as it does for the proposal of an operation.
+    let challenge = Challenge::from_bytes([1; 32]);
+    Call::new(challenge, op("call-1"), &request, limits).unwrap();
+    let deeper = Value::Array(vec![request]);
+    assert_eq!(
+        Call::new(challenge, op("call-1"), &deeper, limits),
+        Err(cli::Error::Request)
+    );
+    let audit = transition::Audit {
+        actor: rsauthnz::id::Principal::Human(Id::new("acme", "alice").unwrap()),
+        action: Id::new("acme", "deploy").unwrap(),
+        time: now(),
+    };
+    assert_matches!(
+        Proposal::new(op("op-1"), audit, &deeper, limits),
+        Err(transition::Error::Request(rsauthnz::cbor::Error::Limit(
+            rsauthnz::limits::Limit::Depth
+        )))
+    );
+}
+
+#[test]
+fn a_challenge_request_gives_the_open_challenge_and_commits_nothing() {
+    let files = Files::new("open");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let (key, credential) = world.enroll(&auth, "alice");
+    let alice = Id::new("acme", "alice").unwrap();
+    let request = |world: &mut World<'_>, at: Reading| {
+        let operation = world.operation();
+        ready(auth.challenge(&mut world.memory, &alice, at, &mut world.random, operation)).unwrap()
+    };
+    let Offer::New(proposal, plan) = request(&mut world, now()) else {
+        panic!("a binding with no challenge gets the proposal of one");
+    };
+    let open = Challenge::from_bytes(world.artifact((proposal, plan)).as_slice().try_into().unwrap());
+
+    // The CLI signs a call over the open challenge. Another caller asks for a challenge before the call arrives: it
+    // gets the same challenge, nothing commits, and the call is admitted.
+    let first = call(open, "call-1", "status");
+    let proof = world.prove(&key, &credential, &first);
+    assert_matches!(request(&mut world, at(Duration::from_secs(30))), Offer::Open(challenge) if challenge == open);
+    let admitted = world.call(&auth, &credential, &proof, &first);
+    // The commit of the call wrote the next challenge, which a request gives until its end. At its end, a request
+    // gets the proposal of a new one.
+    assert_matches!(
+        request(&mut world, at(Duration::from_secs(58))),
+        Offer::Open(challenge) if challenge == admitted.next()
+    );
+    assert_matches!(request(&mut world, at(Duration::from_secs(59))), Offer::New(..));
+}
+
+#[test]
+fn one_operation_under_two_authorities_binds_two_requests() {
+    let files = Files::new("two");
+    let mut world = World::new(&files.custody);
+    let (first, second) = (world.open("auth-a"), world.open("auth-b"));
+    world.enroll(&first, "alice");
+    world.enroll(&second, "alice");
+    let alice = Id::new("acme", "alice").unwrap();
+    let offer = |world: &mut World<'_>, auth: &Authority| match ready(auth.challenge(
+        &mut world.memory,
+        &alice,
+        now(),
+        &mut world.random,
+        op("challenge-1"),
+    ))
+    .unwrap()
+    {
+        Offer::New(proposal, plan) => (proposal, plan),
+        Offer::Open(_) => panic!("a binding with no challenge gets the proposal of one"),
+    };
+    let proposal = offer(&mut world, &first);
+    world.artifact(proposal);
+    // The same operation identity and the same administrator under the other authority is another request.
+    let proposal = offer(&mut world, &second);
+    assert_matches!(world.commit(proposal), Outcome::Refused(transition::Error::Reuse));
 }

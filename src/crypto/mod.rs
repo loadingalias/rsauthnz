@@ -270,6 +270,16 @@ pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
     rscrypto::Sha256::digest(message)
 }
 
+/// The SHA-256 digest of the concatenation of `parts`, with no buffer that holds it. Thus a part can be a secret: the
+/// hasher clears its state when it drops.
+pub(crate) fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = rscrypto::Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize()
+}
+
 /// Two keys are equal when their algorithms and their public keys are equal.
 impl PartialEq for Verifier {
     fn eq(&self, other: &Self) -> bool {

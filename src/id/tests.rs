@@ -5,6 +5,7 @@ use super::{
     VersionError, Workload,
 };
 use crate::cbor;
+use crate::limits::Limits;
 
 /// A human and an agent with the same raw identifier are different principals: they are not
 /// equal, the CBOR form of the agent does not read as a human, and a principal keeps its kind
@@ -19,7 +20,7 @@ fn a_human_and_an_agent_with_the_same_raw_id_stay_distinct() {
         Principal::Agent(agent.clone())
     );
 
-    let encoded = cbor::encode(&agent.to_cbor()).unwrap();
+    let encoded = cbor::encode(&agent.to_cbor(), Limits::default()).unwrap();
     let value = cbor::decode(&encoded, crate::limits::Limits::default()).unwrap();
     assert_eq!(Id::<Human>::from_cbor(&value), Err(IdError::Kind));
     assert_eq!(Principal::from_cbor(&value), Ok(Principal::Agent(agent)));
@@ -65,7 +66,7 @@ fn an_identifier_has_one_canonical_cbor_form() {
     expected.extend_from_slice(b"acme.repo");
     expected.push(0x69);
     expected.extend_from_slice(b"repo.read");
-    assert_eq!(cbor::encode(&id.to_cbor()), Ok(expected.clone()));
+    assert_eq!(cbor::encode(&id.to_cbor(), Limits::default()), Ok(expected.clone()));
     let value = cbor::decode(&expected, crate::limits::Limits::default()).unwrap();
     assert_eq!(Id::<Action>::from_cbor(&value), Ok(id));
 }

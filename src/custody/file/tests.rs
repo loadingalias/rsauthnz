@@ -198,3 +198,79 @@ fn handles_reports_and_errors_show_no_key_bytes() {
         assert!(!shown.contains(&decimal) && !shown.contains(&hex), "{shown}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_key_file_that_is_a_link_or_a_fifo_refuses_at_once() {
+    let dir = scratch("special");
+    let custody = FileCustody::open(&*dir, Isolation::User).unwrap();
+    let mut random = ChaCha20Rng::from_seed([5; 32]);
+    let id = KeyId::random(&mut random);
+    let handle = custody.enroll(id, Algorithm::MlDsa65Ed25519, &mut random).unwrap();
+    custody
+        .sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)
+        .unwrap();
+    // A link to the key file of the user, with its mode and its key: the open follows no link.
+    let (path, kept) = (key_file(&dir, id), dir.join("kept.key"));
+    fs::rename(&path, &kept).unwrap();
+    std::os::unix::fs::symlink(&kept, &path).unwrap();
+    assert_eq!(
+        custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random),
+        Err(Error::Permissions)
+    );
+    // A FIFO at the path refuses, and the open does not wait for a writer.
+    fs::remove_file(&path).unwrap();
+    let mkfifo = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+    assert!(mkfifo.success());
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let signed = custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random);
+        sent.send(signed).unwrap_or_default();
+    });
+    assert_eq!(
+        received.recv_timeout(core::time::Duration::from_secs(10)),
+        Ok(Err(Error::Permissions)),
+        "the open of a FIFO blocked, or it did not refuse"
+    );
+}
+
+/// A DACL with one entry that allows only the user, but not protected: a later change of a parent passes its entries
+/// on to the key file.
+#[cfg(windows)]
+#[test]
+fn a_key_file_whose_dacl_is_not_protected_refuses() {
+    use std::process::Command;
+
+    let dir = scratch("unprotected");
+    let whoami = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    let user = String::from_utf8(whoami.stdout).unwrap();
+    let sid = user.trim().rsplit(',').next().unwrap().trim_matches('"').to_owned();
+    // The directory passes no entry on, so the key file keeps its one entry when it takes the entries of its parent.
+    let grant = format!("*{sid}:(F)");
+    let icacls = Command::new("icacls")
+        .arg(&*dir)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .status()
+        .unwrap();
+    assert!(icacls.success());
+    let custody = FileCustody::open(&*dir, Isolation::User).unwrap();
+    let mut random = ChaCha20Rng::from_seed([6; 32]);
+    let id = KeyId::random(&mut random);
+    let handle = custody.enroll(id, Algorithm::MlDsa65Ed25519, &mut random).unwrap();
+    custody
+        .sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)
+        .unwrap();
+    let icacls = Command::new("icacls")
+        .arg(key_file(&dir, id))
+        .arg("/inheritance:e")
+        .status()
+        .unwrap();
+    assert!(icacls.success());
+    assert_eq!(
+        custody.sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random),
+        Err(Error::Permissions)
+    );
+}

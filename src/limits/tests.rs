@@ -20,20 +20,23 @@ fn artifact(
 ) -> Vec<u8> {
     let mut header = vec![(Value::Unsigned(1), Value::Negative(18))];
     header.extend(protected);
-    let protected = cbor::encode(&Value::Map(header)).unwrap();
+    let protected = cbor::encode(&Value::Map(header), Limits::default()).unwrap();
     let mut claims = vec![
         (Value::Unsigned(1), Value::Text("https://issuer.example")),
         (Value::Unsigned(3), Value::Text("https://rp.example")),
         (Value::Unsigned(4), Value::Unsigned(2_000)),
     ];
     claims.extend(claim);
-    let payload = cbor::encode(&Value::Map(claims)).unwrap();
-    let to_be_signed = cbor::encode(&Value::Array(vec![
-        Value::Text("Signature1"),
-        Value::Bytes(&protected),
-        Value::Bytes(&[]),
-        Value::Bytes(&payload),
-    ]))
+    let payload = cbor::encode(&Value::Map(claims), Limits::default()).unwrap();
+    let to_be_signed = cbor::encode(
+        &Value::Array(vec![
+            Value::Text("Signature1"),
+            Value::Bytes(&protected),
+            Value::Bytes(&[]),
+            Value::Bytes(&payload),
+        ]),
+        Limits::default(),
+    )
     .unwrap();
     let signature = Ed25519SecretKey::from_bytes([7; 32]).sign(&to_be_signed).to_bytes();
     let sign1 = Value::Array(vec![
@@ -42,7 +45,7 @@ fn artifact(
         Value::Bytes(&payload),
         Value::Bytes(&signature),
     ]);
-    cbor::encode(&Value::Tag(18, Box::new(sign1))).unwrap()
+    cbor::encode(&Value::Tag(18, Box::new(sign1)), Limits::default()).unwrap()
 }
 
 /// Nested arrays, `levels` deep, around the integer 0.

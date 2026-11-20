@@ -133,7 +133,7 @@ custody.delete(id)?;
 
 | Property | Value |
 | --- | --- |
-| Keychain | The login keychain of the user, the default keychain of macOS. Not the data protection keychain |
+| Keychain | The login keychain of the user: `~/Library/Keychains/login.keychain-db`. Each add, read, and delete names it, so another default keychain or another keychain of the search list takes no part. Not the data protection keychain |
 | Class | Generic password |
 | Service | The service name that you give to `KeychainCustody::open` |
 | Account | The key ID as 32 lowercase hexadecimal digits |
@@ -177,13 +177,17 @@ delete it. Delete it only after the authority commits the successor, so a lost c
 | --- | --- |
 | Name | The key ID as 32 lowercase hexadecimal digits, then `.key`, in the directory of the custody |
 | Content | The PKCS #8 (version 1) DER encoding of the composite key, as rscrypto writes it |
-| Linux and macOS | Mode `0600`, set when the file is created. On macOS, also no extended ACL entry |
+| Linux and macOS | A regular file of the effective user of the process, with the mode `0600`, set when the file is created. On macOS, also no extended ACL entry |
 | Windows | The user of the process is the owner. The DACL is protected and has one entry, which allows that user. The security descriptor applies when the file is created |
 | Durability | Enroll flushes the key file before the handle returns. On Linux and macOS, enroll and delete also flush the directory |
 
 Each operation checks the permissions of the key file before it reads the key. A key file that another account can
 read or change refuses with `Error::Permissions`. On Linux, a POSIX ACL is covered too, because the group bits of
-the mode are the mask of the ACL. Each operation also checks that the length, the algorithm, and the public key of
+the mode are the mask of the ACL. On Linux and macOS, the open follows no link and does not block, and the checks
+read the open file: a link, a FIFO, or a device at the path, and a file of another owner, refuse with
+`Error::Permissions`. Thus a key file that a restore keeps with the owner of another account refuses, also for a
+service that runs as root. On Windows, a DACL that is not protected refuses, also with one entry for the user,
+because a later change of a parent directory passes its entries on to it. Each operation also checks that the length, the algorithm, and the public key of
 the key file match the handle. A key file with another key refuses with `Error::Mismatch`.
 
 An administrator or root can still read a key file, through file privileges. The software custody does not keep
@@ -208,12 +212,15 @@ Exclude the directory of the key files from backups.
 `FileCustody::open` and `KeychainCustody::open` call it before they read the storage, so `Isolation::Process`
 refuses there.
 
-A custody keeps one copy of a key in memory, and only during one operation. rscrypto builds the key in place in
-its allocation, and signing reads it there. The memory that holds the encoded key file is cleared too. A test of
-the library reads each heap block that the file custody frees, through the OS, and it finds no key bytes.
+A custody keeps a key in memory only during one operation, and each copy that it makes is in memory that is cleared
+when it drops. rscrypto builds the key in place in its allocation, and signing reads it there. An import reads the
+PKCS #8 encoding in place, and an export writes it into a buffer that is cleared. Thus an import or an export holds
+the encoding and the key together for that one call. The file custody reads the key file into such a buffer. A test
+of the library reads each heap block that the file custody frees, through the OS, and it finds no key bytes.
 
-The Keychain custody also gets a copy of the item in memory of macOS. It releases that copy before it signs, but it
-cannot clear it. A test of the library reads each region of the process that the process can write, after the
+The Keychain custody also gets a copy of the item in memory of macOS, and rscrypto reads the key from it in place.
+The custody releases that copy before it signs, but it cannot clear it. Enroll writes the encoding into memory that
+CoreFoundation owns, and CoreFoundation gives it back to rsauthnz to clear when the item data ends. A test of the library reads each region of the process that the process can write, after the
 Keychain custody and its handles drop, and it finds no key bytes. That test passes on macOS 27.2.1 on aarch64.
 
 Use full-disk encryption on the volume of the key files, because a deleted key file can stay on the storage device.

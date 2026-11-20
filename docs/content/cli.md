@@ -12,11 +12,14 @@ and a proof for one request refuses for another.
 - The **CLI credential** is the credential of the administrator binding that a bootstrap value paid for. Its `cnf` key
   is the CLI key. It is valid for `local::CLI_LIFETIME` (365 days).
 - A **challenge** (`Challenge`) is 32 random bytes of the authority, valid for `CHALLENGE_LIFETIME` (60 seconds). Each
-  administrator binding has at most one pending challenge. A new issue replaces it.
+  administrator binding has at most one pending challenge. A request for a challenge authenticates no caller, so it
+  never replaces a challenge that is still valid: it gives that challenge. `Debug` of a challenge and of a call does
+  not show the challenge.
 - A **call** (`Call`) is a challenge, an operation identity, and a request: the CBOR value of the call that the
   application defines, such as its action, its target, and the digest of its content. Its request binding is the
   SHA-256 digest of `["rsauthnz.cli.call.1", challenge, operation, request]`. The proof binds it in place of a
-  challenge of the verifier.
+  challenge of the verifier. `Call::new` encodes the request within the `limits` that you give it, and a request past
+  them refuses with `cli::Error::Request`.
 - An **admission** (`Admission`) is the proposal of a call before its commit. The commit consumes the challenge and
   writes the next one. Only the accepted commit gives the admitted call (`Admitted`), with the challenge of the next
   call.
@@ -37,8 +40,10 @@ when the CLI lost the response, or when a restore completed the bootstrap.
 ## Make a call
 
 1. For its first call, the CLI asks for a challenge. The authority calls
-   `authority.challenge(store, &administrator, now, random, operation)`. The artifact of the accepted commit is the
-   32 bytes of the challenge: `Challenge::from_bytes`.
+   `authority.challenge(store, &administrator, now, random, operation)`, which gives a `local::Offer`:
+   - `Offer::Open(challenge)`: the binding holds a challenge that is valid now. Nothing commits. Give it to the CLI.
+   - `Offer::New(proposal, plan)`: the binding holds no valid challenge. Submit the proposal. The artifact of the
+     accepted commit is the 32 bytes of the new challenge: `Challenge::from_bytes`.
 2. The CLI makes the call with `Call::new(challenge, operation, &request, limits)`. Draw a new operation identity for
    each call, and keep it until the call has an outcome.
 3. The CLI signs the proof in custody with `cli::prove(custody, &handle, &credential, &audience, &call, now, random)`.
@@ -76,7 +81,7 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::{Authority, Bootstrap, HostGrant};
+use rsauthnz::local::{Authority, Bootstrap, HostGrant, Offer};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{self, Kind, Store};
 use rsauthnz::time::{Reading, ReadingSource};
@@ -149,8 +154,12 @@ let bootstrap = pending.finish(&signature, OperationId::new(b"b-1")?)?;
 let credential = artifact(commit(&mut memory, &mut driver, bootstrap)?)?;
 
 // 3. The first call: the authority issues a challenge, and the CLI proves the possession of its key in custody.
-let issued = ready(authority.challenge(&mut memory, &alice, now, &mut random, OperationId::new(b"c-1")?))?;
-let mut challenge = Challenge::from_bytes(artifact(commit(&mut memory, &mut driver, issued)?)?.as_slice().try_into()?);
+let mut challenge = match ready(authority.challenge(&mut memory, &alice, now, &mut random, OperationId::new(b"c-1")?))? {
+    Offer::Open(challenge) => challenge,
+    Offer::New(proposal, plan) => {
+        Challenge::from_bytes(artifact(commit(&mut memory, &mut driver, (proposal, plan))?)?.as_slice().try_into()?)
+    }
+};
 for (operation, target) in [(&b"call-1"[..], "status"), (b"call-2", "deploy")] {
     let call = Call::new(challenge, OperationId::new(operation)?, &Value::Text(target), Limits::default())?;
     let proof = cli::prove(&custody, &key, &credential, &grant.origin, &call, now, &mut random)?;
@@ -191,11 +200,12 @@ zeroization, its recovery, and the isolation that the OS enforces.
   the credential of the binding whose `cnf` key is that key. The binding keeps no signed credential, so each recovery
   costs one issuer signature. `local::Error::Unknown` shows that the bootstrap did not commit. A bootstrap that a
   restore completed gives its credential in the same way.
-- **A lost response of an issue of a challenge.** Ask for a challenge again. The new issue replaces the challenge of
-  the lost one.
+- **A lost response of an issue of a challenge.** Ask for a challenge again. While the challenge of the lost commit is
+  valid, the request gives it with `Offer::Open`. If that commit did not land, the request gives a new proposal.
 - **A lost response of a call.** The outcome is unknown, and the call can have committed. The authority looks up the
   operation that `Outcome::Unknown` gives, with `driver.lookup(operation)`. Never send the call again as a new
-  operation. After the lookup, the CLI asks for a new challenge, because it did not get the next one.
+  operation. After the lookup, the CLI asks for a challenge: the request gives the next challenge that the commit
+  wrote, or the challenge of the call if it did not commit.
 - **A restore.** A restore ends each pending challenge, also a challenge that the snapshot holds. A call over it
   refuses with `local::Error::Challenge`, and the CLI asks for a new challenge.
 
@@ -203,7 +213,7 @@ zeroization, its recovery, and the isolation that the OS enforces.
 
 | Operation | Side | Result |
 | --- | --- | --- |
-| `authority.challenge(store, &administrator, now, random, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the 32 bytes of the challenge |
+| `authority.challenge(store, &administrator, now, random, operation)` | Authority | `Offer::Open(challenge)` while the binding holds a valid challenge, with no commit. Else `Offer::New(proposal, plan)`: the receipt gives the 32 bytes of the new challenge |
 | `Challenge::from_bytes(bytes)`, `challenge.to_bytes()` | Both | The challenge, and its bytes |
 | `Call::new(challenge, operation, &request, limits)` | Both | `Call` |
 | `cli::prove(custody, &handle, &credential, &audience, &call, now, random)` | CLI | The bytes of the proof |

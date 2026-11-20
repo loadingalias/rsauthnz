@@ -31,7 +31,7 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::{self, Authority, Bootstrap, HostGrant};
+use rsauthnz::local::{self, Authority, Bootstrap, HostGrant, Offer};
 use rsauthnz::store::driver::{Answer, Driver, Effect, Output, Plan};
 use rsauthnz::store::{Kind, Profile, Store as _};
 use rsauthnz::time::{Reading, ReadingSource};
@@ -171,9 +171,15 @@ fn journey(dir: PathBuf, mut random: ChaCha20Rng) -> Result<(), Failure> {
     // 6. The first call. The authority issues a challenge. The CLI proves the possession of its key over the
     // challenge, the operation, and the request. It sends the credential, the proof, and the call.
     let operation = OperationId::new(b"challenge-1")?;
-    let issued = ready(authority.challenge(&mut memory, &alice, now, &mut random, operation))?;
-    let challenge = artifact(commit(&mut memory, &mut driver, issued)?)?;
-    let challenge = Challenge::from_bytes(challenge.as_slice().try_into()?);
+    // A binding with an open challenge offers it, and nothing commits. This binding has none, so the authority
+    // offers the proposal of a new one.
+    let challenge = match ready(authority.challenge(&mut memory, &alice, now, &mut random, operation))? {
+        Offer::Open(challenge) => challenge,
+        Offer::New(proposal, plan) => {
+            let challenge = artifact(commit(&mut memory, &mut driver, (proposal, plan))?)?;
+            Challenge::from_bytes(challenge.as_slice().try_into()?)
+        }
+    };
     let first = Call::new(challenge, OperationId::new(b"call-1")?, &Value::Text("status"), limits)?;
     let proof = cli::prove(&custody, &key, &credential, origin, &first, now, &mut random)?;
     // The authority makes the call again from what it received. One commit admits it and consumes the challenge.

@@ -1,23 +1,60 @@
-//! The key-file permissions of Linux and macOS: the mode `0600`, and on macOS no extended ACL entry.
+//! The key-file permissions of Linux and macOS: a regular file of the effective user, the mode `0600`, and on macOS no
+//! extended ACL entry. The flags of the open are the system ABI of each target.
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use crate::custody::Error;
+
+// `O_NOFOLLOW` and `O_NONBLOCK` of `<fcntl.h>`. Linux gives other values on other architectures, so each target names
+// its values, and another target does not build.
+cfg_select! {
+    target_os = "macos" => {
+        const NO_FOLLOW: i32 = 0x0100;
+        const NON_BLOCK: i32 = 0x0004;
+    }
+    all(target_os = "linux", target_arch = "x86_64") => {
+        const NO_FOLLOW: i32 = 0o400_000;
+        const NON_BLOCK: i32 = 0o4_000;
+    }
+    all(target_os = "linux", target_arch = "aarch64") => {
+        const NO_FOLLOW: i32 = 0o100_000;
+        const NON_BLOCK: i32 = 0o4_000;
+    }
+    _ => {
+        compile_error!("the native custody declares the open flags of macOS, and of Linux on x86_64 and aarch64 only");
+    }
+}
+
+#[expect(unsafe_code, reason = "the system ABI of the user ID of the process")]
+unsafe extern "C" {
+    safe fn geteuid() -> u32;
+}
 
 /// Creates the key file `path` with the mode `0600`. It refuses a file that exists.
 pub(super) fn create(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
 }
 
-/// Refuses a key file that another account can read or change: a mode bit of the group or of others, or an extended
-/// ACL entry on macOS. With a POSIX ACL on Linux, the group bits are the mask of the ACL, so they also cover each
-/// named entry.
+/// Opens the key file `path` to read it. The open follows no link at `path`, so a link refuses. A FIFO or a device at
+/// `path` does not block the open, and [`check`] then refuses it.
+pub(super) fn open(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(NO_FOLLOW | NON_BLOCK)
+        .open(path)
+}
+
+/// Refuses a key file that is not a regular file of the effective user of the process, or that another account can
+/// read or change: a mode bit of the group or of others, or an extended ACL entry on macOS. With a POSIX ACL on Linux,
+/// the group bits are the mask of the ACL, so they also cover each named entry. The checks read the open descriptor,
+/// so a change of the path after the open does not change them.
 pub(super) fn check(file: &File) -> Result<(), Error> {
-    let mode = file.metadata()?.permissions().mode();
-    (mode & 0o077 == 0 && !extended_acl(file)?).ok_or(Error::Permissions)
+    let metadata = file.metadata()?;
+    let own = metadata.file_type().is_file() && metadata.uid() == geteuid();
+    (own && metadata.permissions().mode() & 0o077 == 0 && !extended_acl(file)?).ok_or(Error::Permissions)
 }
 
 /// Makes the entries of `dir` durable.

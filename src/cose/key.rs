@@ -155,7 +155,8 @@ impl<'a> PublicKey<'a> {
                 alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm"),
             ));
         }
-        let form = cbor::encode(&Value::Map(entries)).expect("a COSE_Key has distinct labels and no simple value");
+        let form = cbor::encode(&Value::Map(entries), Limits::FORM)
+            .expect("a COSE_Key has distinct labels and no simple value");
         crypto::sha256(&form)
     }
 

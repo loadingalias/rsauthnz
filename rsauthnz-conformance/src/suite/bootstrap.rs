@@ -11,7 +11,7 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::{Limits, SignatureBudget};
-use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Issue, Status, Unlink};
+use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Issue, Offer, Status, Unlink};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{self, OperationId};
 use rscrypto::ChaCha20Rng;
@@ -205,7 +205,8 @@ fn drawn(random: &mut ChaCha20Rng) -> OperationId {
     OperationId::new(&id).expect("an identity of 16 bytes is valid")
 }
 
-/// The challenge that the commit of an issue for the administrator `administrator` gives.
+/// The challenge of the binding of the administrator `administrator`: the open challenge, or the one that the commit
+/// of a new challenge gives.
 async fn challenge<S: Subject>(
     run: &mut Run<S>,
     auth: &Authority,
@@ -217,7 +218,8 @@ async fn challenge<S: Subject>(
         .challenge(&mut run.binding, &account(administrator), now(), random, operation)
         .await
     {
-        Ok((proposal, plan)) => artifact(submitted(run, proposal, plan).await?, "the issue of a challenge")?,
+        Ok(Offer::Open(challenge)) => return Ok(Ok(challenge)),
+        Ok(Offer::New(proposal, plan)) => artifact(submitted(run, proposal, plan).await?, "the issue of a challenge")?,
         Err(failure) => return refusal_of(failure),
     };
     let challenge = <[u8; 32]>::try_from(issued.as_slice())

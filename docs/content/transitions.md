@@ -109,6 +109,13 @@ one outcome record for each identity.
 digest of the canonical CBOR form `["rsauthnz.transition.binding.1", actor, action, request]`. The same actor,
 action, and request give the same binding in each process and each release that keeps this form. The binding
 holds no request bytes, so the outcome record holds no secret of the request. `Debug` does not show the binding.
+`Proposal::new` encodes `request` within the `limits` that you give it, and it refuses a request past them with
+`Error::Request` before more work ([Parser limits](parser-limits.md#cbor)).
+
+Put each fact that selects the effect of the request into `request`, such as the authority or the issuer. Then the
+same identity under another authority or issuer is another request, and it refuses with `Error::Reuse`. The
+operations of rsauthnz do this: each local operation binds its authority, and each workload operation binds its
+issuer.
 
 The outcome record is the `Operation` of the commit. When the store has an outcome record for the identity of a
 submission, `record.answer(&submitted)` gives the answer:
@@ -132,7 +139,8 @@ new operation can, for example, issue a second grant. A lookup of the same ident
 
 `receipt.artifact()` gives the prepared artifact. Only the acceptance of the exact proposal releases it: a
 proposal has no accessor for it, and only a proposal that writes its issuance record takes it. The store never keeps
-the artifact, so the receipt of a lookup has none.
+the artifact, so the receipt of a lookup has none. An artifact can be a bearer value, such as a bootstrap value, so
+the memory of the artifact is cleared when the receipt drops. Read it in place, and clear each copy that you make.
 
 ## Deadlines
 
@@ -188,4 +196,5 @@ Each operation of `rsauthnz::transition` is in the cost class `Parse`. `Proposal
 the bounded request. [Admit rsauthnz work](admission.md) gives the classes.
 
 `Debug` of a proposal, a receipt, and an outcome shows the length of record data, intent payloads, and the
-prepared artifact, and never their bytes.
+prepared artifact, and never their bytes. A version shows its coordinate, so no coordinate holds a secret or a
+challenge: the version of a challenge record holds the SHA-256 digest of the challenge.

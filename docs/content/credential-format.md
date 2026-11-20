@@ -35,7 +35,9 @@ the key ([RFC 9679](https://www.rfc-editor.org/rfc/rfc9679)), with SHA-256: `Tru
 of the issuer key, `profile.with_previous(previous_key, until)` adds the key that the current key replaced. `until` is
 the time from which no artifact of the previous key is valid. The `kid` selects one of the two keys, and the
 signature check uses only that key. A check whose reading can be at or after `until` refuses an artifact of the
-previous key with `cose::Error::KeyId`. Thus a retired key that leaks later signs nothing that verifies.
+previous key with `cose::Error::KeyId`. This also holds for `possession` through a `Verified` value that you kept
+from an earlier reading, and the evidence of a credential of the previous key ends at `until`. Thus a retired key
+that leaks later signs nothing that verifies.
 `with_previous` refuses a key of another algorithm with `Error::Profile`, so a header never selects an algorithm.
 
 | Issuer key `Algorithm` | Authentication | `cnf` key `Algorithm` | Use |
@@ -67,6 +69,11 @@ The artifact is a `COSE_Sign1` with the tag 18:
 - The payload is the claims map, in the deterministic CBOR of [Parser limits](parser-limits.md).
 - The signature covers the `Sig_structure` of RFC 9052, section 4.4, with an empty external AAD. ML-DSA-65 and the
   composites sign it with the empty context.
+
+Verification accepts only this exact form, also when the issuer key signed another one. Another tag, no tag, the CWT
+tag around the tag 18, an unprotected header, another protected header, and another encoding of a claim refuse with
+`Error::Form`. Thus an `aud` array, a float time, or another member of the `cnf` key refuses: an artifact for one
+audience never verifies at another audience. A proof has the same rule.
 
 The claims map holds these claims, and no others:
 
@@ -217,10 +224,14 @@ checks](verification.md#bound-the-signature-checks) gives.
    protected `kid` must name a key of the profile, or the artifact refuses with `cose::Error::KeyId`. The previous
    key counts only while `now.latest()` is before its end. The signature check of the named key comes last of these
    checks.
-3. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
+3. The artifact must have the exact form of [The format](#the-format): the tag 18, the protected bucket of the
+   named key, and an empty unprotected bucket. Else it refuses with `Error::Form`.
+4. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
    its owner, and a human or a workload must have none. A claim of another key, or a `sub` claim, refuses.
-4. The purpose must be the purpose of the profile.
-5. A `cnf` key must have the authentication of the issuer key.
+5. The purpose must be the purpose of the profile.
+6. A `cnf` key must have the authentication of the issuer key.
+7. The claims map must be the encoding that issuance writes for these claims, or the artifact refuses with
+   `Error::Form`.
 
 `Verified` is the evidence of the artifact:
 
@@ -240,7 +251,8 @@ current permission. Keep the evidence with the claims that a later authorization
 A credential is not a bearer token. Its holder proves possession of the `cnf` key for each check:
 
 1. The verifier issues a challenge for one proof.
-2. The holder calls `ProofDraft::new(&holder_key, &credential, &audience, &challenge, now)`. Custody signs
+2. The holder calls `ProofDraft::new(&holder_key, &credential, &audience, &challenge, now)`. It refuses a
+   credential or a challenge longer than 8,192 bytes with `Error::Size`, before it reads them. Custody signs
    `draft.to_be_signed()` with the `cnf` key, and `draft.finish(&signature, &mut budget)` gives the proof. A proof
    gives no authority, so `finish` gives its bytes at once.
 3. The verifier calls `verified.possession(&proof, &challenge, now, &mut budget)`. Give a new budget for the
@@ -249,14 +261,17 @@ A credential is not a bearer token. Its holder proves possession of the `cnf` ke
 
 The proof is a `COSE_Sign1` with the tag 18, signed by the `cnf` key. Its claims map holds `aud` (3), `iat` (6),
 the SHA-256 digest of the exact bytes of the credential (-65540), and the challenge (-65541). `possession`
-refuses a proof that does not bind this credential, the audience of the profile, and the challenge. It also
-refuses a proof by another key, and a check outside the validity interval of the credential.
+refuses a proof that does not bind this credential, the audience of the profile, and the challenge, in the encoding
+that `ProofDraft::new` writes, with `Error::Proof`. A proof in another envelope refuses with `Error::Form`. It also
+refuses a proof by another key, and a check outside the validity interval of the credential or after the end of
+the previous issuer key that verified it.
 
 The evidence records the subject, the method `Method::KeyPossession`, the reading `now`, and the authentication of
 the `cnf` key: `Hybrid`, `PostQuantum`, or `Classical`. It also keeps the credential: `evidence.artifact()` gives its
 verified claims, with the issuer, the audience, the purpose, the serial, the end, and the owner of an agent, and the
-SHA-256 digest of its bytes. `evidence.expires()` gives the end of the credential, and `authz::check` ends the checked
-scope there ([Authorize an operation](authorization.md)). It records no user verification, no phishing resistance,
+SHA-256 digest of its bytes. `evidence.expires()` gives the end of the credential, or the end of the previous issuer
+key that verified it when that is earlier (`Artifact::end`). `authz::check` ends the checked scope there
+([Authorize an operation](authorization.md)). It records no user verification, no phishing resistance,
 and no device or hardware binding, because the proof does not show them.
 [Vocabulary](vocabulary.md#authentication-evidence) gives the evidence.
 
@@ -274,12 +289,13 @@ claims or the key.
 | --- | --- |
 | `Cose(cose::Error)` | The COSE layer refused: the decode, the issuer, the audience, the validity interval, a key, the `kid`, the signature, or the signature budget. [Verify COSE and CWT artifacts](verification.md#errors) gives each cause |
 | `Profile` | A key is the SLH-DSA trust-root key, the `cnf` key has another authentication than the issuer key, or the previous key of `with_previous` has another algorithm than the current key |
-| `Size` | The artifact or proof is longer than 8,192 bytes, or a draft can be longer |
+| `Size` | The artifact or proof is longer than 8,192 bytes, a draft can be longer, or a proof draft has a credential or a challenge longer than 8,192 bytes |
 | `Claims` | A claim is missing, has the wrong form, or is not a claim of this format |
 | `Purpose` | The purpose of the artifact is not the purpose of the profile |
 | `Validity` | The validity interval of a draft is empty: `expires` is not after `iat` and `not_before` |
 | `NoConfirmation` | The artifact has no `cnf` key, so it cannot prove possession |
-| `Proof` | The proof does not bind the credential, the audience, and the challenge, or it has another claim |
+| `Proof` | The proof does not bind the credential, the audience, and the challenge in the encoding of `ProofDraft::new`, or it has another claim |
+| `Form` | The artifact or the proof is not in the exact form of this format: another tag, another protected or unprotected bucket, or another encoding of its claims, such as an `aud` array or a float time |
 
 ## Limits
 

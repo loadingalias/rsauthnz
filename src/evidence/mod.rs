@@ -32,12 +32,15 @@ pub struct Evidence {
     pub(crate) artifact: Option<Artifact>,
 }
 
-/// The credential that an authentication used: its verified claims and the SHA-256 digest of its exact bytes. The
-/// claims hold the issuer, the audience, the purpose, the serial, the validity interval, and the owner of an agent.
+/// The credential that an authentication used: its verified claims, the SHA-256 digest of its exact bytes, and the end
+/// of its authority. The claims hold the issuer, the audience, the purpose, the serial, the validity interval, and the
+/// owner of an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Artifact {
     pub(crate) claims: Claims,
     pub(crate) digest: [u8; 32],
+    /// The end of the credential, or the end of the previous issuer key that verified it when that is earlier.
+    pub(crate) end: Duration,
 }
 
 impl Artifact {
@@ -51,6 +54,14 @@ impl Artifact {
     #[must_use]
     pub const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    /// The end of the authority of the credential, as the time since the Unix epoch: the end of the credential, or the
+    /// end of the previous issuer key that verified it ([`Profile::with_previous`](crate::credential::Profile::with_previous))
+    /// when that is earlier.
+    #[must_use]
+    pub const fn end(&self) -> Duration {
+        self.end
     }
 }
 
@@ -164,11 +175,12 @@ impl Evidence {
         self.artifact.as_ref()
     }
 
-    /// The end of the authority of the evidence, as the time since the Unix epoch: the end of its credential, or
-    /// `None` for evidence with no credential. A check of the evidence is not valid at this time and after it.
+    /// The end of the authority of the evidence, as the time since the Unix epoch: the end of its credential
+    /// ([`Artifact::end`]), or `None` for evidence with no credential. A check of the evidence is not valid at this
+    /// time and after it.
     #[must_use]
     pub fn expires(&self) -> Option<Duration> {
-        self.artifact.as_ref().map(|artifact| artifact.claims.expires)
+        self.artifact.as_ref().map(|artifact| artifact.end)
     }
 
     /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
@@ -177,7 +189,7 @@ impl Evidence {
     /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
     /// bound in the same form or `null` when it is unknown, and the source as a number. The artifact
     /// is `null`, or `[issuer, audience, subject, owner, purpose, serial, not before, expires,
-    /// digest]`, with `null` for no owner and for no start, and each time as `[seconds,
+    /// digest, end]`, with `null` for no owner and for no start, and each time as `[seconds,
     /// nanoseconds]`.
     #[must_use]
     pub fn to_cbor(&self) -> Value<'_> {
@@ -206,7 +218,7 @@ impl Evidence {
             },
             self.artifact
                 .as_ref()
-                .map_or(Value::Null, |Artifact { claims, digest }| {
+                .map_or(Value::Null, |Artifact { claims, digest, end }| {
                     let owner = match &claims.subject {
                         Subject::Agent { owner, .. } => owner.to_cbor(),
                         Subject::Human(_) | Subject::Workload(_) => Value::Null,
@@ -221,6 +233,7 @@ impl Evidence {
                         claims.not_before.map_or(Value::Null, duration_to_cbor),
                         duration_to_cbor(claims.expires),
                         Value::Bytes(digest),
+                        duration_to_cbor(*end),
                     ])
                 }),
         ])
@@ -312,6 +325,7 @@ fn artifact_from_cbor(value: &Value<'_>) -> Option<Artifact> {
         not_before,
         expires,
         Value::Bytes(digest),
+        end,
     ] = items.as_slice()
     else {
         return None;
@@ -337,9 +351,12 @@ fn artifact_from_cbor(value: &Value<'_>) -> Option<Artifact> {
         Value::Null => None,
         not_before => Some(duration_from_cbor(not_before)?),
     };
+    let end = duration_from_cbor(end)?;
+    (end <= claims.expires).then_some(())?;
     Some(Artifact {
         claims,
         digest: (*digest).try_into().ok()?,
+        end,
     })
 }
 

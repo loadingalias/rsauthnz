@@ -14,9 +14,10 @@ use crate::crypto::secret::SecretKey;
 
 /// The custody of keys in the login keychain of macOS. Available with the feature `native-custody`, on macOS.
 ///
-/// Each key is one generic-password item of the login keychain of the OS user account that runs the process. Its
-/// service is the service of the custody, its account is the key ID, and its data is the PKCS #8 encoding of the
-/// composite key. The item does not synchronize through iCloud. macOS encrypts the keychain with a key from the login
+/// Each key is one generic-password item of the login keychain of the OS user account that runs the process:
+/// `~/Library/Keychains/login.keychain-db`. Each operation names that keychain, so another default keychain or another
+/// keychain of the search list takes no part. Its service is the service of the custody, its account is the key ID,
+/// and its data is the PKCS #8 encoding of the composite key. The item does not synchronize through iCloud. macOS encrypts the keychain with a key from the login
 /// password of the user. No hardware keeps the key: the custody reads the key into process memory to sign.
 ///
 /// macOS gives an item without a dialog only to the program that made it. Another program, or a build of the program
@@ -25,8 +26,9 @@ use crate::crypto::secret::SecretKey;
 /// cannot show a dialog, such as an SSH session, the operation refuses with [`Error::Vault`].
 ///
 /// The custody holds no key between operations. Each operation reads the item, checks that it holds the key of the
-/// handle, signs, and then clears the key. macOS gives the item in memory of its own. The custody releases that memory
-/// before it signs, but it cannot clear it.
+/// handle, signs, and then clears the key. macOS gives the item in memory of its own, and rscrypto reads the key from
+/// it in place. The custody releases that memory before it signs, but it cannot clear it. Enroll writes the encoding
+/// into memory that CoreFoundation owns and clears when it frees it.
 ///
 /// ```
 /// use rsauthnz::crypto::Algorithm;
@@ -88,7 +90,8 @@ impl KeychainCustody {
         })
     }
 
-    /// The key of `handle`, after the checks of its item: the length, the algorithm, and the public key.
+    /// The key of `handle`, after the checks of its item: the length, the algorithm, and the public key. rscrypto
+    /// reads the key from the memory of macOS in place, so the custody makes no other copy of the encoding.
     fn load(&self, handle: &Handle) -> Result<SecretKey, Error> {
         let len = SecretKey::pkcs8_len(handle.algorithm()).ok_or(Error::Algorithm)?;
         // The item releases its data at the end of the block, before the signature work.
@@ -96,10 +99,7 @@ impl KeychainCustody {
             let item = sys::copy(&self.service, &account(handle.id()))?;
             let der = item.bytes();
             (der.len() == len).ok_or(Error::Mismatch)?;
-            SecretKey::read(handle.algorithm(), |out| {
-                out.copy_from_slice(der);
-                Ok(())
-            })?
+            SecretKey::from_pkcs8(handle.algorithm(), der)?
         };
         key.matches(&handle.key).ok_or(Error::Mismatch)?;
         Ok(key)
@@ -113,9 +113,10 @@ impl Custody for KeychainCustody {
 
     fn enroll(&self, id: KeyId, algorithm: Algorithm, random: &mut ChaCha20Rng) -> Result<Handle, Error> {
         let (key, public) = SecretKey::generate(algorithm, random)?;
-        let der = key.to_pkcs8()?;
+        // The encoding goes straight into the data of the item, which CoreFoundation owns and clears.
+        let data = sys::Secret::new(key.len(), |out| key.write_pkcs8(out))?;
         drop(key);
-        sys::add(&self.service, &account(id), &der)?;
+        sys::add(&self.service, &account(id), data)?;
         Ok(Handle { id, key: public })
     }
 

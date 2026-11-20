@@ -102,7 +102,7 @@ impl Mark {
     /// The stored form of the entry `body` of `operation` after this mark, and the mark of the new entry. Append the
     /// form, and keep the new mark as the head only when the append gives its sequence.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse). It reads the form back once and digests it once.
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). It encodes the form within `limits` and digests it once.
     ///
     /// # Errors
     ///
@@ -110,16 +110,16 @@ impl Mark {
     /// after the last sequence.
     pub fn next(&self, operation: &OperationId, body: &Body, limits: Limits) -> Result<(Box<[u8]>, Self), Error> {
         let sequence = Sequence(self.sequence.0.checked_add(1).ok_or(Error::Overflow)?);
-        let bytes = form::encode(sequence, &self.link, operation, body);
-        cbor::decode(&bytes, limits).map_err(Error::Cbor)?;
+        let bytes = form::encode(sequence, &self.link, operation, body, limits).map_err(Error::Cbor)?;
         let link = Link(crypto::sha256(&bytes));
         Ok((bytes.into_boxed_slice(), Self { sequence, link }))
     }
 }
 
-/// The CBOR form of `anchors`, the payload of an intent of [`Effect::Journal`](crate::transition::Effect::Journal).
-pub(crate) fn encode_anchors(anchors: &[Anchor]) -> Vec<u8> {
-    form::encode_anchors(anchors)
+/// The CBOR form of `anchors` within `limits`, the payload of an intent of
+/// [`Effect::Journal`](crate::transition::Effect::Journal).
+pub(crate) fn encode_anchors(anchors: &[Anchor], limits: Limits) -> Result<Vec<u8>, cbor::Error> {
+    form::encode_anchors(anchors, limits)
 }
 
 /// The anchors of the payload of an intent of [`Effect::Journal`](crate::transition::Effect::Journal), or `None` for

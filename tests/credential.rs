@@ -439,7 +439,7 @@ fn with_kid(credential: &[u8], kid: Option<&[u8]>) -> Vec<u8> {
     };
     header.retain(|(label, _)| *label != Value::Unsigned(4));
     header.extend(kid.map(|kid| (Value::Unsigned(4), Value::Bytes(kid))));
-    cbor::encode(&Value::Map(header)).expect("a protected bucket")
+    cbor::encode(&Value::Map(header), Limits::default()).expect("a protected bucket")
 }
 
 /// The `COSE_Sign1` of the protected bucket `protected` and the payload `payload` that `issuer` signs.
@@ -450,14 +450,14 @@ fn signed(issuer: &Custody, protected: &[u8], payload: &[u8]) -> Vec<u8> {
         Value::Bytes(&[]),
         Value::Bytes(payload),
     ]);
-    let signature = issuer.sign(&cbor::encode(&to_be_signed).expect("a Sig_structure"));
+    let signature = issuer.sign(&cbor::encode(&to_be_signed, Limits::default()).expect("a Sig_structure"));
     let parts = vec![
         Value::Bytes(protected),
         Value::Map(vec![]),
         Value::Bytes(payload),
         Value::Bytes(&signature),
     ];
-    cbor::encode(&Value::Tag(18, Box::new(Value::Array(parts)))).expect("a COSE_Sign1")
+    cbor::encode(&Value::Tag(18, Box::new(Value::Array(parts))), Limits::default()).expect("a COSE_Sign1")
 }
 
 #[test]
@@ -681,7 +681,7 @@ fn a_cnf_key_of_another_class_than_the_issuer_key_refuses_at_issuance_and_at_ver
     let classical_cnf = signed(
         &composite,
         &protected,
-        &cbor::encode(&Value::Map(entries)).expect("claims"),
+        &cbor::encode(&Value::Map(entries), Limits::default()).expect("claims"),
     );
     assert_eq!(
         profile(&composite, &claims)
@@ -689,4 +689,163 @@ fn a_cnf_key_of_another_class_than_the_issuer_key_refuses_at_issuance_and_at_ver
             .unwrap_err(),
         Error::Profile
     );
+}
+
+#[test]
+fn possession_through_a_kept_verification_refuses_after_the_end_of_the_previous_issuer_key() {
+    let (current, previous) = (
+        Custody::new(Algorithm::MlDsa65Ed25519, 1),
+        Custody::new(Algorithm::MlDsa65Ed25519, 3),
+    );
+    let holder = Custody::new(Algorithm::MlDsa65Ed25519, 2);
+    let claims = claims("build-api");
+    // The previous key signed a credential that is valid for one hour, and the rotation ends that key after 100 s.
+    let credential = issue(&previous, &claims, Some(&holder));
+    let until = now().estimate() + Duration::from_secs(100);
+    let profile = profile(&current, &claims)
+        .with_previous(previous.key(), until)
+        .expect("one algorithm");
+    let verified = profile
+        .verify(&credential, now(), &mut budget())
+        .expect("the previous key");
+    let challenge = [5; 32];
+    let proof = prove(&holder, &credential, &challenge);
+
+    // Before the end of the key, the kept verification gives evidence, and the evidence ends with the key.
+    let evidence = verified
+        .possession(&proof, &challenge, reading(1_800_000_050), &mut budget())
+        .expect("possession before the end of the key");
+    assert_eq!(evidence.expires(), Some(until));
+    // At the end of the key the credential is still valid, but the kept verification gives no evidence.
+    assert_eq!(
+        verified
+            .possession(&proof, &challenge, reading(1_800_000_100), &mut budget())
+            .unwrap_err(),
+        Error::Cose(cose::Error::KeyId)
+    );
+}
+
+/// The decoded claims map of the payload `payload`.
+fn entries(payload: &[u8]) -> Vec<(Value<'_>, Value<'_>)> {
+    let Value::Map(entries) = cbor::decode(payload, Limits::default()).expect("a claims map") else {
+        panic!("a claims map");
+    };
+    entries
+}
+
+/// The encoding of the claims map `entries`.
+fn encoded(entries: Vec<(Value<'_>, Value<'_>)>) -> Vec<u8> {
+    cbor::encode(&Value::Map(entries), Limits::default()).expect("a claims map")
+}
+
+/// The `COSE_Sign1` of `protected`, the unprotected bucket `unprotected`, and `payload` that `signer` signs, in the
+/// outer form that `wrap` gives the array of its parts.
+fn sign1(
+    signer: &Custody,
+    (protected, unprotected, payload): (&[u8], Vec<(Value<'_>, Value<'_>)>, &[u8]),
+    wrap: fn(Value<'_>) -> Value<'_>,
+) -> Vec<u8> {
+    let to_be_signed = Value::Array(vec![
+        Value::Text("Signature1"),
+        Value::Bytes(protected),
+        Value::Bytes(&[]),
+        Value::Bytes(payload),
+    ]);
+    let signature = signer.sign(&cbor::encode(&to_be_signed, Limits::default()).expect("a Sig_structure"));
+    let parts = Value::Array(vec![
+        Value::Bytes(protected),
+        Value::Map(unprotected),
+        Value::Bytes(payload),
+        Value::Bytes(&signature),
+    ]);
+    cbor::encode(&wrap(parts), Limits::default()).expect("a COSE_Sign1")
+}
+
+fn tagged(parts: Value<'_>) -> Value<'_> {
+    Value::Tag(18, Box::new(parts))
+}
+
+#[test]
+fn an_artifact_or_a_proof_in_another_wire_form_refuses() {
+    let issuer = Custody::new(Algorithm::MlDsa65Ed25519, 1);
+    let holder = Custody::new(Algorithm::MlDsa65Ed25519, 2);
+    let claims = claims("build-api");
+    let credential = issue(&issuer, &claims, Some(&holder));
+    let (protected, payload) = parts(&credential);
+    let build = profile(&issuer, &claims);
+    let mut deploy_claims = claims;
+    deploy_claims.audience = id("deploy-api");
+    let deploy = profile(&issuer, &deploy_claims);
+    let control = sign1(&issuer, (&protected, vec![], &payload), tagged);
+    assert_eq!(control, credential, "the control is the issued form");
+    build.verify(&control, now(), &mut budget()).expect("the control");
+
+    // The issuer key signs each other form. An `aud` array names two audiences, and it refuses at each of them.
+    let mut audiences = entries(&payload);
+    audiences.retain(|(key, _)| *key != Value::Unsigned(3));
+    audiences.push((
+        Value::Unsigned(3),
+        Value::Array(vec![Value::Text("acme:build-api"), Value::Text("acme:deploy-api")]),
+    ));
+    let audiences = encoded(audiences);
+    let two = sign1(&issuer, (&protected, vec![], &audiences), tagged);
+    for profile in [&build, &deploy] {
+        assert_eq!(profile.verify(&two, now(), &mut budget()).unwrap_err(), Error::Form);
+    }
+    // A float `exp`, and a `cnf` key with another member.
+    let mut float = entries(&payload);
+    for (key, value) in &mut float {
+        if *key == Value::Unsigned(4) {
+            *value = Value::Float(1_800_003_600.0);
+        }
+    }
+    let float = encoded(float);
+    let mut member = entries(&payload);
+    for (key, value) in &mut member {
+        if *key == Value::Unsigned(8)
+            && let Value::Map(cnf) = value
+            && let Some((_, Value::Map(cose_key))) = cnf.first_mut()
+        {
+            cose_key.push((Value::Unsigned(2), Value::Bytes(b"key-1")));
+        }
+    }
+    let member = encoded(member);
+    // No tag, the CWT tag around the tag 18, and a header in the unprotected bucket.
+    let untagged: fn(Value<'_>) -> Value<'_> = |parts| parts;
+    let cwt: fn(Value<'_>) -> Value<'_> = |parts| Value::Tag(61, Box::new(Value::Tag(18, Box::new(parts))));
+    let header = vec![(Value::Unsigned(3), Value::Text("application/cwt"))];
+    for other in [
+        sign1(&issuer, (&protected, vec![], &float), tagged),
+        sign1(&issuer, (&protected, vec![], &member), tagged),
+        sign1(&issuer, (&protected, vec![], &payload), untagged),
+        sign1(&issuer, (&protected, vec![], &payload), cwt),
+        sign1(&issuer, (&protected, header.clone(), &payload), tagged),
+    ] {
+        assert_eq!(build.verify(&other, now(), &mut budget()).unwrap_err(), Error::Form);
+    }
+
+    // A proof in another form refuses too: the holder key signs each one.
+    let verified = build.verify(&credential, now(), &mut budget()).expect("credential");
+    let challenge = [5; 32];
+    let proof = prove(&holder, &credential, &challenge);
+    let (proof_protected, proof_payload) = parts(&proof);
+    let mut aud = entries(&proof_payload);
+    for (key, value) in &mut aud {
+        if *key == Value::Unsigned(3) {
+            *value = Value::Array(vec![Value::Text("acme:build-api")]);
+        }
+    }
+    let aud = encoded(aud);
+    let check = |proof: &[u8]| verified.possession(proof, &challenge, now(), &mut budget());
+    check(&sign1(&holder, (&proof_protected, vec![], &proof_payload), tagged)).expect("the control");
+    assert_eq!(
+        check(&sign1(&holder, (&proof_protected, vec![], &aud), tagged)).unwrap_err(),
+        Error::Proof
+    );
+    for other in [
+        sign1(&holder, (&proof_protected, vec![], &proof_payload), untagged),
+        sign1(&holder, (&proof_protected, header, &proof_payload), tagged),
+    ] {
+        assert_eq!(check(&other).unwrap_err(), Error::Form);
+    }
 }

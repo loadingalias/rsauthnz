@@ -159,6 +159,9 @@ const SIGNATURE_BYTES_MAX: usize = 3_381;
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
 const SIGN1_TAG: u64 = 18;
+/// The first byte of an artifact or a proof: the head of the tag 18. The decoder accepts only the shortest head, so a
+/// decoded input that starts with this byte has the tag 18 as its outer item.
+const SIGN1_HEAD: u8 = 0xd2;
 
 /// The first item of the CBOR form of an issuance record ([`Draft::record`]). Its number changes with the form.
 const RECORD_FORM: &str = "rsauthnz.credential.record.1";
@@ -379,47 +382,30 @@ impl Draft {
         if expires <= issued || not_before.is_some_and(|nbf| nbf >= expires) {
             return Err(Error::Validity);
         }
-        let issuer = claims.issuer.to_string();
-        let audience = claims.audience.to_string();
-        let serial = claims.serial.0.to_be_bytes();
-        let mut entries = vec![
-            (Value::Unsigned(1), Value::Text(&issuer)),
-            (Value::Unsigned(3), Value::Text(&audience)),
-            (Value::Unsigned(4), Value::Unsigned(expires)),
-            (Value::Unsigned(6), Value::Unsigned(issued)),
-            (Value::Unsigned(7), Value::Bytes(&serial)),
-            (Value::Negative(SUBJECT), claims.subject.to_cbor()),
-            (Value::Negative(PURPOSE), claims.purpose.to_cbor()),
-        ];
-        if let Some(nbf) = not_before {
-            entries.push((Value::Unsigned(5), Value::Unsigned(nbf)));
-        }
-        if let Subject::Agent { owner, .. } = &claims.subject {
-            entries.push((Value::Negative(OWNER), owner.to_cbor()));
-        }
-        if let Some(public) = confirmation {
-            let cnf = public.to_cbor();
+        if let Some(public) = &confirmation {
             // A key whose P-256 point is not on the curve refuses here, before custody signs.
             TrustedKey::new(
-                confirmation_algorithm(key.algorithm(), &public)?,
+                confirmation_algorithm(key.algorithm(), public)?,
                 &CoseKey {
                     kid: None,
                     alg: None,
-                    public,
+                    public: public.clone(),
                 },
             )?;
-            // The `COSE_Key` member (1) holds the key with its `alg`.
-            entries.push((Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(1), cnf)])));
         }
-        let payload = cbor::encode(&Value::Map(entries)).expect("the claims have distinct keys and no simple value");
-        let data = cbor::encode(&Value::Array(vec![
-            Value::Text(RECORD_FORM),
-            claims.issuer.to_cbor(),
-            claims.subject.to_cbor(),
-            claims.audience.to_cbor(),
-            claims.purpose.to_cbor(),
-            Value::Unsigned(expires),
-        ]))
+        let payload = payload(claims, issued, expires, not_before, confirmation.as_ref());
+        let serial = claims.serial.0.to_be_bytes();
+        let data = cbor::encode(
+            &Value::Array(vec![
+                Value::Text(RECORD_FORM),
+                claims.issuer.to_cbor(),
+                claims.subject.to_cbor(),
+                claims.audience.to_cbor(),
+                claims.purpose.to_cbor(),
+                Value::Unsigned(expires),
+            ]),
+            Limits::FORM,
+        )
         .expect("the form has no map and no simple value");
         let issuance = Issuance {
             key: record_key(claims.serial),
@@ -485,11 +471,7 @@ impl Draft {
     /// costs more than `budget` has.
     pub fn finish(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Prepared, Error> {
         let artifact = self.unsigned.sign(signature, budget)?;
-        Ok(Prepared::new(
-            artifact.into_boxed_slice(),
-            self.issuance.key,
-            self.issuance.version,
-        ))
+        Ok(Prepared::new(artifact, self.issuance.key, self.issuance.version))
     }
 
     /// The bytes that custody signs, before the signature, for a record that keeps the artifact without its signature.
@@ -502,12 +484,7 @@ impl Unsigned {
     /// The unsigned bytes of the encoded claims `payload` that `key` signs. The protected bucket holds `alg`, and `kid`
     /// when `kid` is not `None`.
     fn new(key: &TrustedKey, payload: Vec<u8>, kid: Option<&[u8; 32]>) -> Result<Self, Error> {
-        class(key.algorithm())?;
-        let alg = cose::alg(key.algorithm()).ok_or(Error::Profile)?;
-        let mut header = vec![(Value::Unsigned(1), alg)];
-        header.extend(kid.map(|kid| (Value::Unsigned(4), Value::Bytes(kid))));
-        let protected =
-            cbor::encode(&Value::Map(header)).expect("the protected bucket has distinct keys and no simple value");
+        let protected = protected(key, kid)?;
         // The tag, the array head, and the empty unprotected bucket are one byte each.
         let string = |len: usize| cbor::head_len(len as u64) + len;
         if 3 + string(protected.len()) + string(payload.len()) + string(SIGNATURE_BYTES_MAX) > MAX_BYTES {
@@ -549,15 +526,18 @@ impl Unsigned {
     /// charges `budget`.
     pub(crate) fn sign(self, signature: &[u8], budget: &mut SignatureBudget) -> Result<Vec<u8>, Error> {
         self.key.verify(&self.to_be_signed(), signature, budget)?;
-        let artifact = cbor::encode(&Value::Tag(
-            SIGN1_TAG,
-            Box::new(Value::Array(vec![
-                Value::Bytes(&self.protected),
-                Value::Map(Vec::new()),
-                Value::Bytes(&self.payload),
-                Value::Bytes(signature),
-            ])),
-        ))
+        let artifact = cbor::encode(
+            &Value::Tag(
+                SIGN1_TAG,
+                Box::new(Value::Array(vec![
+                    Value::Bytes(&self.protected),
+                    Value::Map(Vec::new()),
+                    Value::Bytes(&self.payload),
+                    Value::Bytes(signature),
+                ])),
+            ),
+            Limits::FORM,
+        )
         .expect("a COSE_Sign1 has no map key and no simple value");
         assert!(
             artifact.len() <= MAX_BYTES,
@@ -597,12 +577,13 @@ impl ProofDraft {
     /// binds the SHA-256 digest of the exact bytes of `credential`, the audience `audience` of the verifier, the
     /// challenge `challenge` of the verifier, and the time `iat`: the whole seconds of `now.estimate()`.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). The draft checks the lengths of `credential` and
+    /// `challenge` before it reads them.
     ///
     /// # Errors
     ///
-    /// [`Error::Profile`] if `key` is a trust-root key, and [`Error::Size`] if the proof can be longer than
-    /// [`MAX_BYTES`].
+    /// [`Error::Profile`] if `key` is a trust-root key. [`Error::Size`] if `credential` or `challenge` is longer than
+    /// [`MAX_BYTES`], or the proof can be longer than [`MAX_BYTES`].
     pub fn new(
         key: &TrustedKey,
         credential: &[u8],
@@ -610,15 +591,13 @@ impl ProofDraft {
         challenge: &[u8],
         now: Reading,
     ) -> Result<Self, Error> {
-        let digest = crypto::sha256(credential);
-        let audience = audience.to_string();
-        let payload = cbor::encode(&Value::Map(vec![
-            (Value::Unsigned(3), Value::Text(&audience)),
-            (Value::Unsigned(6), Value::Unsigned(now.estimate().as_secs())),
-            (Value::Negative(PROOF_CREDENTIAL), Value::Bytes(&digest)),
-            (Value::Negative(PROOF_CHALLENGE), Value::Bytes(challenge)),
-        ]))
-        .expect("the claims have distinct keys and no simple value");
+        (credential.len() <= MAX_BYTES && challenge.len() <= MAX_BYTES).ok_or(Error::Size)?;
+        let payload = proof_payload(
+            &audience.to_string(),
+            now.estimate().as_secs(),
+            &crypto::sha256(credential),
+            challenge,
+        );
         Unsigned::new(key, payload, None).map(Self)
     }
 
@@ -714,8 +693,11 @@ impl Profile {
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
     /// The checks are those of [`cose::Profile::verify`], with `iss` and `aud` in their text forms, and with the key
-    /// that the protected `kid` names. Then the claims must be the claims of this format, and the purpose must be the
-    /// purpose of the profile. A `cnf` key must have the [`Authentication`] class of the issuer key.
+    /// that the protected `kid` names. The artifact must be in the exact form of this format: the tag 18, the
+    /// protected bucket of the issuer key, an empty unprotected bucket, and the claims in the encoding that
+    /// [`Draft::credential`] writes. Thus an `aud` array, a float time, or another member of the `cnf` key refuses.
+    /// Then the claims must be the claims of this format, and the purpose must be the purpose of the profile. A `cnf`
+    /// key must have the [`Authentication`] class of the issuer key.
     ///
     /// # Errors
     ///
@@ -723,6 +705,7 @@ impl Profile {
     /// [`cose::Profile::verify`], such as [`cose::Error::AlgorithmMismatch`] for an artifact of another profile.
     /// [`Error::Cose`] with [`cose::Error::KeyId`] if the protected bucket has no `kid`, or its `kid` names no key of
     /// the profile. It is also the error for the previous key when `now` can be at or after the end of that key.
+    /// [`Error::Form`] for another tag, another protected or unprotected bucket, or another encoding of the claims.
     /// [`Error::Claims`] if a claim is missing, has the wrong form, or is not a claim of this format.
     /// [`Error::Purpose`] for another purpose, and [`Error::Profile`] for a `cnf` key of another class.
     pub fn verify<'a>(
@@ -734,20 +717,26 @@ impl Profile {
         if artifact.len() > MAX_BYTES {
             return Err(Error::Size);
         }
-        let verified = self.cose.verify_by(artifact, now, budget, |protected| {
-            let Some(Value::Bytes(kid)) = protected.get(4) else {
-                return Err(cose::Error::KeyId);
+        let (mut until, mut payload) = (None, &[][..]);
+        let verified = self.cose.verify_by::<Error>(artifact, now, budget, |sign1| {
+            let Some(Value::Bytes(kid)) = sign1.protected().get(4) else {
+                return Err(cose::Error::KeyId.into());
             };
-            if self.cose.key.kid() == *kid {
-                return Ok(&self.cose.key);
-            }
-            // The validity check came first, so the reading has a known bound.
-            match &self.previous {
-                Some((previous, until)) if previous.kid() == *kid && now.latest().is_ok_and(|now| now < *until) => {
-                    Ok(previous)
+            let key = if self.cose.key.kid() == *kid {
+                &self.cose.key
+            } else {
+                // The validity check came first, so the reading has a known bound.
+                match &self.previous {
+                    Some((previous, end)) if previous.kid() == *kid && now.latest().is_ok_and(|now| now < *end) => {
+                        until = Some(*end);
+                        previous
+                    }
+                    _ => return Err(cose::Error::KeyId.into()),
                 }
-                _ => Err(cose::Error::KeyId),
-            }
+            };
+            envelope(artifact, sign1, key, Some(key.kid()))?;
+            payload = sign1.payload();
+            Ok(key)
         })?;
         let cose::Claims {
             sub: None,
@@ -791,28 +780,37 @@ impl Profile {
             (Principal::Agent(agent), Some(owner)) => Subject::Agent { agent, owner },
             _ => return Err(Error::Claims),
         };
-        let confirmation = match cnf {
-            None => None,
-            Some(Confirmation::Key(key)) => Some(TrustedKey::new(
-                confirmation_algorithm(self.cose.key.algorithm(), &key.public)?,
-                key,
-            )?),
+        let (public, confirmation) = match cnf {
+            None => (None, None),
+            Some(Confirmation::Key(key)) => (
+                Some(&key.public),
+                Some(TrustedKey::new(
+                    confirmation_algorithm(self.cose.key.algorithm(), &key.public)?,
+                    key,
+                )?),
+            ),
             Some(Confirmation::KeyId(_)) => return Err(Error::Claims),
         };
+        let claims = Claims {
+            issuer: self.issuer.clone(),
+            audience: self.audience.clone(),
+            subject,
+            purpose,
+            serial,
+            not_before: *nbf,
+            expires: verified.expires(),
+        };
+        // A time with a fraction encodes as a whole second here, so it refuses too.
+        let exact = claims.not_before.map(|nbf| nbf.as_secs());
+        (payload == self::payload(&claims, issued.as_secs(), claims.expires.as_secs(), exact, public))
+            .ok_or(Error::Form)?;
         Ok(Verified {
             artifact,
             profile: self,
-            claims: Claims {
-                issuer: self.issuer.clone(),
-                audience: self.audience.clone(),
-                subject,
-                purpose,
-                serial,
-                not_before: *nbf,
-                expires: verified.expires(),
-            },
+            claims,
             issued: *issued,
             confirmation,
+            until,
         })
     }
 }
@@ -828,6 +826,9 @@ pub struct Verified<'a, 'p> {
     issued: Duration,
     /// The `cnf` key of a credential, or `None` for a receipt.
     confirmation: Option<TrustedKey>,
+    /// The end of the previous issuer key of the profile when that key verified the artifact, or `None` for the
+    /// current key.
+    until: Option<Duration>,
 }
 
 impl<'a> Verified<'a, '_> {
@@ -872,6 +873,8 @@ impl<'a> Verified<'a, '_> {
     /// [`Authentication`] of the `cnf` key. It also keeps the credential ([`Evidence::artifact`]): its verified claims,
     /// with the issuer, the audience, the purpose, the serial, the end, and the owner of an agent, and the SHA-256
     /// digest of its bytes. Thus a check of the evidence ends with the credential ([`authz::check`](crate::authz::check)).
+    /// For a credential of the previous issuer key ([`Profile::with_previous`]), the check refuses at or after the end
+    /// of that key, also for a [`Verified`] that an earlier reading gave, and the evidence ends there too.
     /// It records no user verification, no phishing resistance, and no device or hardware binding, because the proof
     /// does not show them.
     ///
@@ -881,10 +884,12 @@ impl<'a> Verified<'a, '_> {
     ///
     /// [`Error::NoConfirmation`] if the artifact has no `cnf` key. [`Error::Cose`] with [`cose::Error::Expired`],
     /// [`cose::Error::NotYetValid`], or [`cose::Error::Time`] if the credential is not valid at each time that `now`
-    /// permits. [`Error::Size`] for a proof longer than [`MAX_BYTES`], and [`Error::Cose`] for a proof that does not
-    /// decode. [`Error::Proof`] if the proof does not bind the credential, the audience, and the challenge, or has
-    /// another claim. [`Error::Cose`] for a refusal of [`Sign1::verify`], such as [`cose::Error::Signature`] for a
-    /// proof that another key signed.
+    /// permits, and with [`cose::Error::KeyId`] if `now` can be at or after the end of the previous issuer key that
+    /// verified it. [`Error::Size`] for a proof longer than [`MAX_BYTES`], and [`Error::Cose`] for a proof that does
+    /// not decode. [`Error::Form`] for a proof with another tag or bucket. [`Error::Proof`] if the proof does not bind
+    /// the credential, the audience, and the challenge in the encoding of [`ProofDraft::new`], or has another claim.
+    /// [`Error::Cose`] for a refusal of [`Sign1::verify`], such as [`cose::Error::Signature`] for a proof that another
+    /// key signed.
     pub fn possession(
         &self,
         proof: &[u8],
@@ -894,6 +899,13 @@ impl<'a> Verified<'a, '_> {
     ) -> Result<Evidence, Error> {
         let key = self.confirmation.as_ref().ok_or(Error::NoConfirmation)?;
         cose::validity(self.claims.not_before, self.claims.expires, now)?;
+        // The validity check proved a known bound. An artifact of the previous issuer key ends with that key.
+        if self
+            .until
+            .is_some_and(|until| now.latest().is_ok_and(|now| now >= until))
+        {
+            return Err(cose::Error::KeyId.into());
+        }
         let cose = &self.profile.cose;
         check_proof(
             key,
@@ -916,6 +928,9 @@ impl<'a> Verified<'a, '_> {
         evidence.artifact = Some(Artifact {
             claims: self.claims.clone(),
             digest: crypto::sha256(self.artifact),
+            end: self
+                .until
+                .map_or(self.claims.expires, |until| until.min(self.claims.expires)),
         });
         Ok(evidence)
     }
@@ -928,7 +943,8 @@ impl<'a> Verified<'a, '_> {
 ///
 /// # Errors
 ///
-/// The errors of [`Verified::possession`] for the proof: [`Error::Size`], [`Error::Proof`], and [`Error::Cose`].
+/// The errors of [`Verified::possession`] for the proof: [`Error::Size`], [`Error::Form`], [`Error::Proof`], and
+/// [`Error::Cose`].
 pub(crate) fn check_proof(
     key: &TrustedKey,
     artifact: &[u8],
@@ -942,34 +958,87 @@ pub(crate) fn check_proof(
         return Err(Error::Size);
     }
     let sign1 = Sign1::decode(proof, limits)?;
-    let cose::Claims {
-        iss: None,
-        sub: None,
-        aud,
-        exp: None,
-        nbf: None,
-        iat: Some(_),
-        cti: None,
-        cnf: None,
-        other,
-    } = cose::Claims::decode(sign1.payload(), limits)?
-    else {
-        return Err(Error::Proof);
-    };
-    let digest = crypto::sha256(artifact);
-    let (mut credential, mut nonce) = (None, None);
-    for (key, value) in &other {
-        match (key, value) {
-            (Value::Negative(PROOF_CREDENTIAL), Value::Bytes(bytes)) => credential = Some(*bytes),
-            (Value::Negative(PROOF_CHALLENGE), Value::Bytes(bytes)) => nonce = Some(*bytes),
-            _ => return Err(Error::Proof),
-        }
-    }
-    if aud != [audience] || credential != Some(digest.as_slice()) || nonce != Some(challenge) {
-        return Err(Error::Proof);
-    }
+    envelope(proof, &sign1, key, None)?;
+    // A proof of at most `MAX_BYTES` bytes cannot hold a longer challenge.
+    (challenge.len() <= MAX_BYTES).ok_or(Error::Proof)?;
+    let issued = cose::Claims::decode(sign1.payload(), limits)?.iat.ok_or(Error::Proof)?;
+    // The proof binds exactly these claims, in the encoding of the draft. A time with a fraction refuses too.
+    let expected = proof_payload(audience, issued.as_secs(), &crypto::sha256(artifact), challenge);
+    (sign1.payload() == expected).ok_or(Error::Proof)?;
     sign1.verify(key, budget)?;
     Ok(())
+}
+
+/// Refuses an artifact or a proof `input`, decoded as `sign1`, that is not in the envelope of this format: the tag
+/// 18, the protected bucket of `key` with the `kid` `kid`, and an empty unprotected bucket.
+fn envelope(input: &[u8], sign1: &Sign1<'_>, key: &TrustedKey, kid: Option<&[u8; 32]>) -> Result<(), Error> {
+    // An artifact of another profile keeps the refusal of its algorithm.
+    if sign1.protected().get(1) != cose::alg(key.algorithm()).as_ref() {
+        return Err(cose::Error::AlgorithmMismatch.into());
+    }
+    let exact = input.first() == Some(&SIGN1_HEAD)
+        && sign1.unprotected().entries().is_empty()
+        && sign1.protected_bytes() == protected(key, kid)?.as_slice();
+    exact.ok_or(Error::Form)
+}
+
+/// The encoded protected bucket of an artifact or a proof that `key` signs: `alg`, and `kid` when it is not `None`.
+fn protected(key: &TrustedKey, kid: Option<&[u8; 32]>) -> Result<Vec<u8>, Error> {
+    class(key.algorithm())?;
+    let alg = cose::alg(key.algorithm()).ok_or(Error::Profile)?;
+    let mut header = vec![(Value::Unsigned(1), alg)];
+    header.extend(kid.map(|kid| (Value::Unsigned(4), Value::Bytes(kid))));
+    Ok(cbor::encode(&Value::Map(header), Limits::FORM)
+        .expect("the protected bucket has distinct keys and no simple value"))
+}
+
+/// The encoded claims of a credential or a receipt with `claims`, the issue time `issued`, and the `cnf` key
+/// `confirmation`. `issued`, `expires`, and `not_before` are whole seconds. Issuance and verification encode them with
+/// this one function, so a verified artifact has exactly the encoding of its draft.
+fn payload(
+    claims: &Claims,
+    issued: u64,
+    expires: u64,
+    not_before: Option<u64>,
+    confirmation: Option<&PublicKey<'_>>,
+) -> Vec<u8> {
+    let issuer = claims.issuer.to_string();
+    let audience = claims.audience.to_string();
+    let serial = claims.serial.0.to_be_bytes();
+    let mut entries = vec![
+        (Value::Unsigned(1), Value::Text(&issuer)),
+        (Value::Unsigned(3), Value::Text(&audience)),
+        (Value::Unsigned(4), Value::Unsigned(expires)),
+        (Value::Unsigned(6), Value::Unsigned(issued)),
+        (Value::Unsigned(7), Value::Bytes(&serial)),
+        (Value::Negative(SUBJECT), claims.subject.to_cbor()),
+        (Value::Negative(PURPOSE), claims.purpose.to_cbor()),
+    ];
+    entries.extend(not_before.map(|nbf| (Value::Unsigned(5), Value::Unsigned(nbf))));
+    if let Subject::Agent { owner, .. } = &claims.subject {
+        entries.push((Value::Negative(OWNER), owner.to_cbor()));
+    }
+    // The `COSE_Key` member (1) holds the key with its `alg`.
+    entries.extend(confirmation.map(|public| {
+        (
+            Value::Unsigned(8),
+            Value::Map(vec![(Value::Unsigned(1), public.to_cbor())]),
+        )
+    }));
+    cbor::encode(&Value::Map(entries), Limits::FORM).expect("the claims have distinct keys and no simple value")
+}
+
+/// The encoded claims of a proof: `aud` (3), `iat` (6) in whole seconds, the SHA-256 `digest` of the credential, and
+/// the `challenge` of the verifier. A draft and a check encode them with this one function, after each checks that
+/// `challenge` has at most [`MAX_BYTES`] bytes.
+fn proof_payload(audience: &str, issued: u64, digest: &[u8; 32], challenge: &[u8]) -> Vec<u8> {
+    let claims = Value::Map(vec![
+        (Value::Unsigned(3), Value::Text(audience)),
+        (Value::Unsigned(6), Value::Unsigned(issued)),
+        (Value::Negative(PROOF_CREDENTIAL), Value::Bytes(digest)),
+        (Value::Negative(PROOF_CHALLENGE), Value::Bytes(challenge)),
+    ]);
+    cbor::encode(&claims, Limits::FORM).expect("the claims have distinct keys and no simple value")
 }
 
 // The artifact can be a bearer receipt. Thus the output shows only its length.
@@ -1028,6 +1097,9 @@ pub enum Error {
     /// The proof does not bind the credential, the audience of the profile, and the challenge, or it has another
     /// claim.
     Proof,
+    /// The artifact or the proof is not in the exact form of this format: another tag, another protected or
+    /// unprotected bucket, or another encoding of its claims, such as an `aud` array or a float time.
+    Form,
 }
 
 impl fmt::Display for Error {
@@ -1043,6 +1115,7 @@ impl fmt::Display for Error {
             Self::Validity => f.write_str("the validity interval of the credential is empty"),
             Self::NoConfirmation => f.write_str("the credential has no proof-of-possession key"),
             Self::Proof => f.write_str("the proof does not bind the credential, the audience, and the challenge"),
+            Self::Form => f.write_str("the artifact is not in the exact form of the credential format"),
         }
     }
 }

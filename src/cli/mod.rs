@@ -10,7 +10,8 @@
 //!    CLI lost the response. After a lost response, custody signs its credential again
 //!    ([`local::Authority::credential`]).
 //! 2. For its first call, the CLI asks the authority for a [`Challenge`] ([`local::Authority::challenge`]). A
-//!    challenge is valid for [`CHALLENGE_LIFETIME`]. A binding has at most one: a new issue replaces it.
+//!    challenge is valid for [`CHALLENGE_LIFETIME`]. A binding has at most one. While it is valid, a request gives
+//!    that challenge and commits nothing, so a request of another caller does not change it.
 //! 3. The CLI makes the [`Call`]: the challenge, an operation identity, and its request as a CBOR value. [`prove`]
 //!    signs the proof in custody. The CLI sends its credential, the proof, the challenge, the operation, and the
 //!    request.
@@ -36,7 +37,7 @@
 //! use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 //! use rsauthnz::id::Id;
 //! use rsauthnz::limits::Limits;
-//! use rsauthnz::local::{Authority, Bootstrap, HostGrant};
+//! use rsauthnz::local::{Authority, Bootstrap, HostGrant, Offer};
 //! use rsauthnz::store::driver::{Answer, Driver, Plan};
 //! use rsauthnz::store::{self, Kind, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
@@ -109,8 +110,12 @@
 //! let credential = artifact(commit(&mut memory, &mut driver, bootstrap)?)?;
 //!
 //! // 3. The first call: the authority issues a challenge, and the CLI proves the possession of its key in custody.
-//! let issued = ready(authority.challenge(&mut memory, &alice, now, &mut random, OperationId::new(b"c-1")?))?;
-//! let mut challenge = Challenge::from_bytes(artifact(commit(&mut memory, &mut driver, issued)?)?.as_slice().try_into()?);
+//! let mut challenge = match ready(authority.challenge(&mut memory, &alice, now, &mut random, OperationId::new(b"c-1")?))? {
+//!     Offer::Open(challenge) => challenge,
+//!     Offer::New(proposal, plan) => {
+//!         Challenge::from_bytes(artifact(commit(&mut memory, &mut driver, (proposal, plan))?)?.as_slice().try_into()?)
+//!     }
+//! };
 //! for (operation, target) in [(&b"call-1"[..], "status"), (b"call-2", "deploy")] {
 //!     let call = Call::new(challenge, OperationId::new(operation)?, &Value::Text(target), Limits::default())?;
 //!     let proof = cli::prove(&custody, &key, &credential, &grant.origin, &call, now, &mut random)?;
@@ -164,8 +169,9 @@ pub const CHALLENGE_LIFETIME: Duration = Duration::from_secs(60);
 const CHALLENGE_FORM: &str = "rsauthnz.cli.challenge.1";
 const CALL_FORM: &str = "rsauthnz.cli.call.1";
 
-/// A one-use challenge of a call: 32 random bytes of the authority. It is no secret.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A one-use challenge of a call: 32 random bytes of the authority. A proof also needs the key of the CLI, so it is
+/// no secret. Still, `Debug` does not show it, as for each value that admits a call.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Challenge([u8; 32]);
 
 impl Challenge {
@@ -193,6 +199,12 @@ impl Challenge {
     }
 }
 
+impl fmt::Debug for Challenge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Challenge(..)")
+    }
+}
+
 /// A call of a CLI: its challenge, its operation identity, and the request binding.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Call {
@@ -207,28 +219,29 @@ impl Call {
     /// SHA-256 digest of the canonical CBOR form `["rsauthnz.cli.call.1", challenge, operation, request]`. The CLI
     /// makes the call, and the authority makes it again from the values that it received.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse). One SHA-256 digest of the bounded form.
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). One SHA-256 digest of the bounded form. The encoder refuses
+    /// `request` at the first bound of `limits`, before more work.
     ///
     /// # Errors
     ///
-    /// [`Error::Request`] if `request` has no CBOR encoding, or the form is longer than [`Limits::bytes`] of `limits`.
+    /// [`Error::Request`] if `request` has no CBOR encoding within `limits`, or the form is longer than
+    /// [`Limits::bytes`] of `limits`.
     pub fn new(
         challenge: Challenge,
         operation: OperationId,
         request: &Value<'_>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let form = Value::Array(vec![
+        let request = cbor::encode(request, limits).map_err(|_| Error::Request)?;
+        let prefix = cbor::prefix(&[
             Value::Text(CALL_FORM),
             Value::Bytes(&challenge.0),
             Value::Bytes(operation.as_bytes()),
-            request.clone(),
         ]);
-        let form = cbor::encode(&form).map_err(|_| Error::Request)?;
-        (form.len() <= limits.bytes).ok_or(Error::Request)?;
+        (prefix.len() + request.len() <= limits.bytes).ok_or(Error::Request)?;
         Ok(Self {
             challenge,
-            binding: crypto::sha256(&form),
+            binding: crypto::sha256_parts(&[&prefix, &request]),
             operation,
         })
     }
@@ -252,11 +265,10 @@ impl Call {
     }
 }
 
-// A request can hold a secret, so the output does not show the request binding.
+// A request can hold a secret, so the output does not show the request binding. It shows no challenge either.
 impl fmt::Debug for Call {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Call")
-            .field("challenge", &self.challenge)
             .field("operation", &self.operation)
             .finish_non_exhaustive()
     }
@@ -298,7 +310,7 @@ pub fn prove(
 /// kind, so a challenge from before a restore refuses after it.
 pub(crate) fn key(issuer: &Id<Authority>, subject: &Id<Human>) -> Key {
     let form = Value::Array(vec![Value::Text(CHALLENGE_FORM), issuer.to_cbor(), subject.to_cbor()]);
-    let form = cbor::encode(&form).expect("the form has no map and no simple value");
+    let form = cbor::encode(&form, Limits::FORM).expect("the form has no map and no simple value");
     Kind::SignIn
         .key(&crypto::sha256(&form))
         .expect("a key of 33 bytes is valid")
@@ -308,7 +320,7 @@ pub(crate) fn key(issuer: &Id<Authority>, subject: &Id<Human>) -> Key {
 /// challenge.
 pub(crate) fn record(challenge: Challenge) -> Box<[u8]> {
     let form = Value::Array(vec![Value::Text(CHALLENGE_FORM), Value::Bytes(&challenge.0)]);
-    cbor::encode(&form)
+    cbor::encode(&form, Limits::FORM)
         .expect("the form has no map and no simple value")
         .into_boxed_slice()
 }

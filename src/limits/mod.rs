@@ -49,6 +49,22 @@ pub struct Limits {
     pub signature_checks: usize,
 }
 
+impl Limits {
+    /// The bounds of the encode of a fixed form of this crate, such as a record form or an audit form. The form is a
+    /// shape of typed values, which bounds it, so the encoder applies no other bound. A value of a caller never
+    /// encodes with these bounds: it encodes within the limits of its caller.
+    pub(crate) const FORM: Self = Self {
+        bytes: usize::MAX,
+        depth: u8::MAX,
+        items: usize::MAX,
+        map_keys: usize::MAX,
+        string_bytes: usize::MAX,
+        dependencies: usize::MAX,
+        intents: usize::MAX,
+        signature_checks: usize::MAX,
+    };
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {

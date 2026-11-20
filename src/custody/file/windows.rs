@@ -31,6 +31,8 @@ const SE_FILE_OBJECT: i32 = 1;
 const OWNER_SECURITY_INFORMATION: u32 = 1;
 const DACL_SECURITY_INFORMATION: u32 = 4;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// `SE_DACL_PROTECTED` of `SECURITY_DESCRIPTOR_CONTROL`: the DACL takes no entry that a parent passes on.
+const SE_DACL_PROTECTED: u16 = 0x1000;
 /// The offset of the SID in an `ACCESS_ALLOWED_ACE`: after its header and its access mask.
 const ACE_SID_OFFSET: usize = 8;
 /// The most UTF-16 units in the text form of a SID: "S-1-", an authority of up to 15 digits, and 15 sub-authorities
@@ -105,6 +107,7 @@ unsafe extern "system" {
         descriptor: *mut *mut c_void,
     ) -> u32;
     fn EqualSid(a: Sid, b: Sid) -> i32;
+    fn GetSecurityDescriptorControl(descriptor: *mut c_void, control: *mut u16, revision: *mut u32) -> i32;
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]
@@ -177,7 +180,13 @@ pub(super) fn create(path: &Path) -> io::Result<File> {
     })
 }
 
-/// Refuses a key file whose owner is not the user of the process, or whose DACL allows another account.
+/// Opens the key file `path` to read it.
+pub(super) fn open(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Refuses a key file whose owner is not the user of the process, or whose DACL allows another account or is not
+/// protected. A DACL that is not protected takes the entries that a later change of a parent passes on.
 #[expect(
     unsafe_code,
     reason = "GetSecurityInfo reads the owner and the DACL, which std cannot read"
@@ -205,14 +214,20 @@ pub(super) fn check(file: &File) -> Result<(), Error> {
                 i32::try_from(status).map_or(Error::Permissions, |code| io::Error::from_raw_os_error(code).into())
             );
         }
-        let _descriptor = DropGuard::new(descriptor, |descriptor| {
+        let descriptor = DropGuard::new(descriptor, |descriptor| {
             // SAFETY: GetSecurityInfo allocated the descriptor with LocalAlloc, and this is its last use.
             unsafe { LocalFree(descriptor) };
         });
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: the descriptor is the valid descriptor that GetSecurityInfo gave, and each out pointer is a valid
+        // place for its result.
+        if unsafe { GetSecurityDescriptorControl(*descriptor, &raw mut control, &raw mut revision) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
         // SAFETY: `owner` and `dacl` point into the descriptor, which lives until this closure returns, and `user` is
         // a valid SID.
         let only_user = !owner.is_null() && unsafe { EqualSid(owner, user) != 0 && allows_only(dacl, user) };
-        only_user.ok_or(Error::Permissions)
+        (only_user && control & SE_DACL_PROTECTED != 0).ok_or(Error::Permissions)
     })
 }
 

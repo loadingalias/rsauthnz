@@ -24,7 +24,7 @@
 //!         (Value::Unsigned(3), Value::Negative(6)),
 //!     ])
 //! );
-//! assert_eq!(cbor::encode(&value)?, bytes);
+//! assert_eq!(cbor::encode(&value, limits)?, bytes);
 //! # Ok::<(), cbor::Error>(())
 //! ```
 //!
@@ -42,7 +42,7 @@ use crate::limits::Limit;
 
 pub use decode::{decode, decode_prefix};
 pub use encode::encode;
-pub(crate) use encode::{head, head_len};
+pub(crate) use encode::{head, head_len, prefix};
 
 /// A CBOR data item. Byte and text strings borrow the decoded input.
 ///

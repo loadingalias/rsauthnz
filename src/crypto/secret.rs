@@ -1,8 +1,10 @@
 //! The secret keys of the native custody binding: the only secret keys of the core.
 //!
-//! rscrypto builds each key in place in its allocation, and it clears the key when the key drops. Thus a key has one
-//! copy in memory, and signing reads it in place. This module has no by-value key form, because a by-value key
-//! leaves moved copies that nothing clears.
+//! rscrypto builds each key in place in its allocation, and it clears the key when the key drops. Signing reads the
+//! key in place. An import reads the PKCS #8 encoding in place, and an export writes it into memory that clears itself
+//! when it drops. Thus each copy of a key is in an owner that clears it, and an import or an export holds the encoding
+//! and the key together for that one call. This module has no by-value key form, because a by-value key leaves moved
+//! copies that nothing clears.
 
 use alloc::alloc::Global;
 use alloc::boxed::Box;
@@ -58,25 +60,34 @@ impl SecretKey {
     }
 
     /// The key of `algorithm` whose PKCS #8 encoding `read` writes into a buffer of [`Self::pkcs8_len`] bytes. The
-    /// buffer is memory that rscrypto clears when it drops. The encoding must name `algorithm`, so a stored key never
-    /// selects an algorithm.
+    /// buffer is memory that rscrypto clears when it drops.
     ///
     /// # Errors
     ///
-    /// [`Error::Algorithm`] if `algorithm` is not a composite. [`Error::Storage`] if the allocator or `read` refuses.
-    /// [`Error::Mismatch`] if the encoding is not a key of `algorithm`.
+    /// [`Error::Storage`] if the allocator or `read` refuses, and the errors of [`Self::from_pkcs8`].
     pub(crate) fn read(algorithm: Algorithm, read: impl FnOnce(&mut [u8]) -> io::Result<()>) -> Result<Self, Error> {
         let len = Self::pkcs8_len(algorithm).ok_or(Error::Algorithm)?;
         let der = SecretVec::try_fill_with(len, read).map_err(|error| match error {
             SecretVecConstructionError::Allocation(_) => Error::Storage(ErrorKind::OutOfMemory),
             SecretVecConstructionError::Fill(error) => error.into(),
         })?;
+        Self::from_pkcs8(algorithm, &der)
+    }
+
+    /// The key of `algorithm` with the PKCS #8 encoding `der`, which it reads in place. The encoding must name
+    /// `algorithm`, so a stored key never selects an algorithm.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Algorithm`] if `algorithm` is not a composite. [`Error::Mismatch`] if `der` is not a key of
+    /// `algorithm`.
+    pub(crate) fn from_pkcs8(algorithm: Algorithm, der: &[u8]) -> Result<Self, Error> {
         match algorithm {
             Algorithm::MlDsa65Ed25519 => {
-                MlDsa65Ed25519SecretKey::from_pkcs8_der_in(&der, Global).map(Self::MlDsa65Ed25519)
+                MlDsa65Ed25519SecretKey::from_pkcs8_der_in(der, Global).map(Self::MlDsa65Ed25519)
             }
             Algorithm::MlDsa65EcdsaP256 => {
-                MlDsa65EcdsaP256SecretKey::from_pkcs8_der_in(&der, Global).map(Self::MlDsa65EcdsaP256)
+                MlDsa65EcdsaP256SecretKey::from_pkcs8_der_in(der, Global).map(Self::MlDsa65EcdsaP256)
             }
             Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::MlDsa65 | Algorithm::SlhDsaSha2_128s => {
                 return Err(Error::Algorithm);
@@ -85,22 +96,37 @@ impl SecretKey {
         .map_err(|_| Error::Mismatch)
     }
 
+    /// Writes the PKCS #8 encoding of the key into `out`, which has the [`Self::pkcs8_len`] of its algorithm.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mismatch`] if `out` has another length.
+    pub(crate) fn write_pkcs8(&self, out: &mut [u8]) -> Result<(), Error> {
+        match self {
+            Self::MlDsa65Ed25519(key) => key.to_pkcs8_der_into(out.try_into().map_err(|_| Error::Mismatch)?),
+            Self::MlDsa65EcdsaP256(key) => key.to_pkcs8_der_into(out.try_into().map_err(|_| Error::Mismatch)?),
+        }
+        Ok(())
+    }
+
+    /// The length of the PKCS #8 encoding of the key.
+    pub(crate) const fn len(&self) -> usize {
+        match self {
+            Self::MlDsa65Ed25519(_) => MlDsa65Ed25519SecretKey::PKCS8_DER_LENGTH,
+            Self::MlDsa65EcdsaP256(_) => MlDsa65EcdsaP256SecretKey::PKCS8_DER_LENGTH,
+        }
+    }
+
     /// The PKCS #8 encoding of the key, in memory that rscrypto clears when it drops.
     ///
     /// # Errors
     ///
     /// [`Error::Storage`] with [`ErrorKind::OutOfMemory`] if the allocator refuses the memory.
     pub(crate) fn to_pkcs8(&self) -> Result<SecretVec, Error> {
-        /// Encodes into a zeroed buffer of `N` bytes. The buffer has `N` bytes, so the only error is a refused
-        /// allocation.
-        fn encode<const N: usize>(write: impl FnOnce(&mut [u8; N])) -> Result<SecretVec, Error> {
-            SecretVec::try_fill_with(N, |out| out.try_into().map(write))
-                .map_err(|_| Error::Storage(ErrorKind::OutOfMemory))
-        }
-        match self {
-            Self::MlDsa65Ed25519(key) => encode(|out| key.to_pkcs8_der_into(out)),
-            Self::MlDsa65EcdsaP256(key) => encode(|out| key.to_pkcs8_der_into(out)),
-        }
+        SecretVec::try_fill_with(self.len(), |out| self.write_pkcs8(out)).map_err(|error| match error {
+            SecretVecConstructionError::Allocation(_) => Error::Storage(ErrorKind::OutOfMemory),
+            SecretVecConstructionError::Fill(error) => error,
+        })
     }
 
     /// Whether `public` is the public key of this key.

@@ -340,7 +340,7 @@ fn a_worker_reads_the_intents_of_a_commit_in_bounded_passes() {
             key,
             version: cancelled.version(),
             end: None,
-            data: cbor::encode(&cancelled.to_cbor()).unwrap().into(),
+            data: cbor::encode(&cancelled.to_cbor(), Limits::default()).unwrap().into(),
         })
         .unwrap();
 }

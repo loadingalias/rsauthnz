@@ -94,8 +94,9 @@ fn read_repo(evidence: &Evidence, policy: &OneAction, now: Reading) -> Result<()
 | `Time(TimeError)` | `now` or the time of the evidence has no known bound |
 
 The deadline is the earliest of `expires`, the end of `max_age`, and the end of the credential of the evidence
-(`evidence.expires()`). The age starts at the earliest time that the evidence permits. Thus evidence of a credential
-gives no authority after the credential ends, also when `max_age` permits an older authentication.
+(`evidence.expires()`). For a credential of a previous issuer key, that end is also no later than the end of that
+key. The age starts at the earliest time that the evidence permits. Thus evidence of a credential gives no authority
+after the credential ends, also when `max_age` permits an older authentication.
 
 A transition that a check permits carries the deadline: `proposal.until(checked.deadline())`. The commit driver reads a
 fresh clock just before the commit, and it refuses the commit at or after the deadline with

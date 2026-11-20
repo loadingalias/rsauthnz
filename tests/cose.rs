@@ -51,24 +51,30 @@ fn verify<'a, 'p>(profile: &'p Profile, artifact: &'a [u8], now: Reading) -> Res
 
 /// A tagged `COSE_Sign1` with an empty external AAD. `sign` signs the `Sig_structure` of RFC 9052 section 4.4.
 fn sign1(protected: &Value<'_>, unprotected: Value<'_>, payload: &[u8], sign: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
-    let protected = encode(protected).expect("protected header");
-    let to_be_signed = encode(&Value::Array(vec![
-        Value::Text("Signature1"),
-        Value::Bytes(&protected),
-        Value::Bytes(&[]),
-        Value::Bytes(payload),
-    ]))
+    let protected = encode(protected, Limits::default()).expect("protected header");
+    let to_be_signed = encode(
+        &Value::Array(vec![
+            Value::Text("Signature1"),
+            Value::Bytes(&protected),
+            Value::Bytes(&[]),
+            Value::Bytes(payload),
+        ]),
+        Limits::default(),
+    )
     .expect("Sig_structure");
     let signature = sign(&to_be_signed);
-    encode(&Value::Tag(
-        18,
-        Box::new(Value::Array(vec![
-            Value::Bytes(&protected),
-            unprotected,
-            Value::Bytes(payload),
-            Value::Bytes(&signature),
-        ])),
-    ))
+    encode(
+        &Value::Tag(
+            18,
+            Box::new(Value::Array(vec![
+                Value::Bytes(&protected),
+                unprotected,
+                Value::Bytes(payload),
+                Value::Bytes(&signature),
+            ])),
+        ),
+        Limits::default(),
+    )
     .expect("COSE_Sign1")
 }
 
@@ -79,12 +85,15 @@ fn alg(n: u64) -> Value<'static> {
 
 /// The claims `{iss, aud, exp, nbf}`.
 fn claims(issuer: &str, audience: &str, exp: u64, nbf: u64) -> Vec<u8> {
-    encode(&Value::Map(vec![
-        (Value::Unsigned(1), Value::Text(issuer)),
-        (Value::Unsigned(3), Value::Text(audience)),
-        (Value::Unsigned(4), Value::Unsigned(exp)),
-        (Value::Unsigned(5), Value::Unsigned(nbf)),
-    ]))
+    encode(
+        &Value::Map(vec![
+            (Value::Unsigned(1), Value::Text(issuer)),
+            (Value::Unsigned(3), Value::Text(audience)),
+            (Value::Unsigned(4), Value::Unsigned(exp)),
+            (Value::Unsigned(5), Value::Unsigned(nbf)),
+        ]),
+        Limits::default(),
+    )
     .expect("claims")
 }
 
@@ -284,7 +293,7 @@ fn validity_needs_exp_and_a_known_bound_over_the_whole_reading() {
         sign1(
             &alg(ED25519),
             Value::Map(vec![]),
-            &encode(&Value::Map(claims)).expect("claims"),
+            &encode(&Value::Map(claims), Limits::default()).expect("claims"),
             ed25519_sign,
         )
     };
@@ -370,11 +379,14 @@ fn verify_composite(algorithm: Algorithm, public: &[u8], sign: impl Fn(&[u8]) ->
     // The draft identifier comes from the profile, so a change of the draft changes only its constant.
     let cose = algorithm.report().cose.expect("a composite has a COSE identifier");
     let n = u64::try_from(-1 - cose).expect("a negative identifier");
-    let akp = encode(&Value::Map(vec![
-        (Value::Unsigned(1), Value::Unsigned(7)),
-        (Value::Unsigned(3), Value::Negative(n)),
-        (Value::Negative(0), Value::Bytes(public)),
-    ]))
+    let akp = encode(
+        &Value::Map(vec![
+            (Value::Unsigned(1), Value::Unsigned(7)),
+            (Value::Unsigned(3), Value::Negative(n)),
+            (Value::Negative(0), Value::Bytes(public)),
+        ]),
+        Limits::default(),
+    )
     .expect("AKP");
     let key = Key::decode(&akp, Limits::default()).expect("a composite AKP key");
     let profile = Profile {
@@ -436,10 +448,13 @@ fn cose_keys_and_cnf_decode_and_a_private_key_refuses() {
         Value::Map(key)
     };
     let cnf = |member: u64, value: Value<'_>| {
-        encode(&Value::Map(vec![
-            (Value::Unsigned(1), Value::Text("coaps://server.example.com")),
-            (Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(member), value)])),
-        ]))
+        encode(
+            &Value::Map(vec![
+                (Value::Unsigned(1), Value::Text("coaps://server.example.com")),
+                (Value::Unsigned(8), Value::Map(vec![(Value::Unsigned(member), value)])),
+            ]),
+            Limits::default(),
+        )
         .expect("claims")
     };
     let expected = Key {
@@ -467,20 +482,26 @@ fn cose_keys_and_cnf_decode_and_a_private_key_refuses() {
     assert_eq!(Claims::decode(&encrypted, Limits::default()), Err(Error::Unsupported));
 
     // An Ed25519 OKP key and an ML-DSA-65 AKP key decode. A key does not fit another algorithm.
-    let okp = encode(&Value::Map(vec![
-        (Value::Unsigned(1), Value::Unsigned(1)),
-        (Value::Negative(0), Value::Unsigned(6)),
-        (Value::Negative(1), Value::Bytes(&[3; 32])),
-    ]))
+    let okp = encode(
+        &Value::Map(vec![
+            (Value::Unsigned(1), Value::Unsigned(1)),
+            (Value::Negative(0), Value::Unsigned(6)),
+            (Value::Negative(1), Value::Bytes(&[3; 32])),
+        ]),
+        Limits::default(),
+    )
     .expect("OKP");
     let okp = Key::decode(&okp, Limits::default()).expect("OKP key");
     assert_eq!(okp.public, PublicKey::Ed25519(&[3; 32]));
     assert_eq!(TrustedKey::new(Algorithm::Es256, &okp), Err(Error::KeyAlgorithm));
-    let akp = encode(&Value::Map(vec![
-        (Value::Unsigned(1), Value::Unsigned(7)),
-        (Value::Unsigned(3), Value::Negative(48)),
-        (Value::Negative(0), Value::Bytes(&[5; 1952])),
-    ]))
+    let akp = encode(
+        &Value::Map(vec![
+            (Value::Unsigned(1), Value::Unsigned(7)),
+            (Value::Unsigned(3), Value::Negative(48)),
+            (Value::Negative(0), Value::Bytes(&[5; 1952])),
+        ]),
+        Limits::default(),
+    )
     .expect("AKP");
     let akp = Key::decode(&akp, Limits::default()).expect("AKP key");
     assert_eq!(akp.public, PublicKey::MlDsa65(&[5; 1952]));

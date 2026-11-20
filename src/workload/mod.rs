@@ -328,11 +328,10 @@ pub fn issuer_resource(authority: &Id<Authority>) -> Id<Resource> {
 #[must_use]
 pub fn key_binding(workload: &Id<Workload>, key: &PublicKey<'_>) -> Vec<u8> {
     let kid = key.thumbprint();
-    cbor::encode(&Value::Array(vec![
-        Value::Text(KEY_FORM),
-        workload.to_cbor(),
-        Value::Bytes(&kid),
-    ]))
+    cbor::encode(
+        &Value::Array(vec![Value::Text(KEY_FORM), workload.to_cbor(), Value::Bytes(&kid)]),
+        Limits::FORM,
+    )
     .expect("the form has no map and no simple value")
 }
 
@@ -354,18 +353,16 @@ pub fn binding(
     key: Option<&PublicKey<'_>>,
 ) -> [u8; 32] {
     let kid = key.map(PublicKey::thumbprint);
-    crypto::sha256(
-        &cbor::encode(&Value::Array(vec![
-            Value::Text(PROOF_FORM),
-            Value::Bytes(challenge),
-            Value::Bytes(operation.as_bytes()),
-            issuer.to_cbor(),
-            workload.to_cbor(),
-            audience.to_cbor(),
-            kid.as_ref().map_or(Value::Null, |kid| Value::Bytes(kid)),
-        ]))
-        .expect("the form has no map and no simple value"),
-    )
+    let form = Value::Array(vec![
+        Value::Text(PROOF_FORM),
+        Value::Bytes(challenge),
+        Value::Bytes(operation.as_bytes()),
+        issuer.to_cbor(),
+        workload.to_cbor(),
+        audience.to_cbor(),
+        kid.as_ref().map_or(Value::Null, |kid| Value::Bytes(kid)),
+    ]);
+    crypto::sha256(&cbor::encode(&form, Limits::FORM).expect("the form has no map and no simple value"))
 }
 
 /// The kind of an operation, and its action in the policy.
@@ -432,7 +429,8 @@ impl RecordKey {
             },
         )
         .map_err(Error::Key)?;
-        let encoded = cbor::encode(&key.to_cbor()).expect("a COSE_Key has distinct keys and no simple value");
+        let encoded =
+            cbor::encode(&key.to_cbor(), Limits::FORM).expect("a COSE_Key has distinct keys and no simple value");
         Ok(Self {
             encoded: encoded.into_boxed_slice(),
             trusted,
@@ -467,7 +465,8 @@ pub struct Issuer {
 
 impl Issuer {
     /// The issuer `authority` with the public key `key`, the audiences `audiences`, and the ceiling `ceiling`. The
-    /// issuer drops a second equal audience, and it keeps the whole seconds of the ceiling.
+    /// issuer drops a second equal audience, and it keeps the whole seconds of the ceiling. The bound counts each
+    /// audience of `audiences`, also a second equal one, before the issuer sorts them.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). The key checks as [`TrustedKey::new`] checks it.
     ///
@@ -492,9 +491,9 @@ impl Issuer {
         mut audiences: Vec<Id<Audience>>,
         ceiling: Ceiling,
     ) -> Result<Self, Error> {
+        (audiences.len() <= AUDIENCES_MAX).ok_or(Error::Audiences)?;
         audiences.sort_unstable();
         audiences.dedup();
-        (audiences.len() <= AUDIENCES_MAX).ok_or(Error::Audiences)?;
         let whole = |time: Duration| Duration::from_secs(time.as_secs());
         Ok(Self {
             authority,
@@ -577,7 +576,7 @@ impl Issuer {
             Value::Unsigned(self.ceiling.lifetime_max.as_secs()),
             Value::Unsigned(self.ceiling.not_after.as_secs()),
         ]);
-        cbor::encode(&form)
+        cbor::encode(&form, Limits::FORM)
             .expect("the form has no map and no simple value")
             .into_boxed_slice()
     }
@@ -798,7 +797,7 @@ impl Registration {
             Value::Unsigned(self.generation.0),
             Value::Array(revoked),
         ]);
-        cbor::encode(&form)
+        cbor::encode(&form, Limits::FORM)
             .expect("the form has no map and no simple value")
             .into_boxed_slice()
     }
@@ -999,7 +998,9 @@ pub struct Pending {
     draft: Draft,
     proposal: Proposal,
     plan: Plan,
-    awaiting: Awaiting,
+    serial: Serial,
+    issued: Duration,
+    expires: Duration,
 }
 
 impl Pending {
@@ -1031,7 +1032,8 @@ impl Pending {
     /// [`Error::Record`] if a record is not its form, [`Error::Issuer`] if the registration names another issuer, and
     /// [`Error::Audience`] for an audience that the issuer does not have. [`Error::Ceiling`] for a lifetime past
     /// `lifetime_max`, or an end past `not_after`. [`Error::Credential`] if the current credential or a proof refuses,
-    /// or if the key of the credential has another class than the key of the issuer. [`Error::Possession`] if the
+    /// if the key of the credential has another class than the key of the issuer, or with [`credential::Error::Size`]
+    /// for a challenge longer than [`credential::MAX_BYTES`]. [`Error::Possession`] if the
     /// current credential names another workload or another `cnf` key than the registration, and [`Error::Revoked`]
     /// if it is dead or revoked. [`Error::Key`] if the new key refuses as a trusted key, and [`Error::Unchanged`] if it
     /// is the registered key. [`Error::Refusal`] if the policy refuses, [`Error::Driver`] if the driver gives no
@@ -1053,6 +1055,13 @@ impl Pending {
             lifetime,
             replace,
         } = request;
+        // Each proof binds the digest of its challenge, so the bound comes before the digest.
+        let long = |challenge: &[u8]| challenge.len() > credential::MAX_BYTES;
+        if matches!(by, By::Renew { challenge, .. } if long(challenge))
+            || replace.as_ref().is_some_and(|replace| long(replace.challenge))
+        {
+            return Err(Error::Credential(credential::Error::Size));
+        }
         let (issuer_record, registration_record) = (issuer, registration);
         let issuer = Issuer::from_record(&issuer_record.data, limits)?;
         let mut registration = Registration::from_record(&registration_record.data, limits)?;
@@ -1067,8 +1076,10 @@ impl Pending {
         // A replacement of the registered key by itself would keep the key that the operation retires.
         (new_kid.as_ref() != Some(registration.key.trusted.kid())).ok_or(Error::Unchanged)?;
         // The request binding holds what the requester asks, so a new proposal of the same request after a lost
-        // response binds the same request. The serial and the times are not part of it.
+        // response binds the same request. The serial and the times are not part of it. It names the issuer, so the
+        // same request under another issuer is another request.
         let asked = Value::Array(vec![
+            issuer.authority.to_cbor(),
             registration.workload.to_cbor(),
             audience.to_cbor(),
             lifetime.map_or(Value::Null, |lifetime| Value::Unsigned(lifetime.as_secs())),
@@ -1162,17 +1173,13 @@ impl Pending {
         ))?;
         registration.rewrite(&mut proposal, registration_record, serial.0, now)?;
         draft.record(&mut proposal)?;
-        let awaiting = Awaiting {
-            operation: proposal.operation().id.clone(),
-            serial,
-            issued,
-            expires,
-        };
         Ok(Self {
             draft,
             proposal,
             plan,
-            awaiting,
+            serial,
+            issued,
+            expires,
         })
     }
 
@@ -1187,7 +1194,8 @@ impl Pending {
 
     /// Verifies `signature`, the signature of custody over [`Self::to_be_signed`], with the key of the issuer, and
     /// puts the credential into the proposal. Submit the proposal to the commit driver with the [`Plan`], and give the
-    /// outcome of its commit to [`Awaiting::release`]. The check charges `budget`, the budget of the credential.
+    /// outcome of its commit to [`Awaiting::release`]. The [`Awaiting`] keeps the SHA-256 digest of this credential,
+    /// so it releases only this credential. The check charges `budget`, the budget of the credential.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
@@ -1200,17 +1208,28 @@ impl Pending {
             draft,
             mut proposal,
             plan,
-            awaiting,
+            serial,
+            issued,
+            expires,
         } = self;
-        proposal.prepare(draft.finish(signature, budget)?)?;
+        let prepared = draft.finish(signature, budget)?;
+        let awaiting = Awaiting {
+            operation: proposal.operation().id.clone(),
+            digest: crypto::sha256(prepared.bytes()),
+            serial,
+            issued,
+            expires,
+        };
+        proposal.prepare(prepared)?;
         Ok((proposal, plan, awaiting))
     }
 }
 
-/// An issuance whose proposal waits for its commit. It holds no credential.
+/// An issuance whose proposal waits for its commit. It holds no credential, only the SHA-256 digest of its credential.
 #[derive(Debug)]
 pub struct Awaiting {
     operation: OperationId,
+    digest: [u8; 32],
     serial: Serial,
     issued: Duration,
     expires: Duration,
@@ -1224,8 +1243,9 @@ impl Awaiting {
         self.serial
     }
 
-    /// The credential that the accepted commit of the proposal of this issuance releases. Each other outcome gives no
-    /// credential.
+    /// The credential that the accepted commit of the proposal of this issuance releases: the credential of this
+    /// issuance, with its serial and its validity interval. Each other outcome gives no credential, also the receipt of
+    /// another issuance under the same operation.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
@@ -1233,15 +1253,20 @@ impl Awaiting {
     ///
     /// [`Error::Unknown`] if the commit can have occurred, [`Error::Conflict`] if a dependency changed first, and
     /// [`Error::Transition`] if the commit refused. [`Error::Committed`] if an earlier submission of the operation
-    /// committed, so that this one releases nothing. [`Error::Operation`] for the outcome of another operation.
+    /// committed, so that this one releases nothing. [`Error::Operation`] for the outcome of another operation, and for
+    /// the receipt of another issuance under this operation.
     pub fn release(self, outcome: Outcome) -> Result<Credential, Error> {
         match outcome {
-            Outcome::Accepted(receipt) if *receipt.operation() == self.operation => Ok(Credential {
-                bytes: receipt.artifact().ok_or(Error::Committed)?.into(),
-                serial: self.serial,
-                issued: self.issued,
-                expires: self.expires,
-            }),
+            Outcome::Accepted(receipt) if *receipt.operation() == self.operation => {
+                let bytes = receipt.artifact().ok_or(Error::Committed)?;
+                (crypto::sha256(bytes) == self.digest).ok_or(Error::Operation)?;
+                Ok(Credential {
+                    bytes: bytes.into(),
+                    serial: self.serial,
+                    issued: self.issued,
+                    expires: self.expires,
+                })
+            }
             Outcome::Accepted(_) => Err(Error::Operation),
             Outcome::Conflict => Err(Error::Conflict),
             Outcome::Refused(error) => Err(Error::Transition(error)),
@@ -1350,7 +1375,9 @@ impl Revocation<'_> {
     ) -> Result<(Proposal, Plan), Error> {
         let mut revoked = Registration::from_record(&registration.data, limits)?;
         let workload = revoked.workload.clone();
+        // The request names the issuer of the registration, so the same request under another issuer is another one.
         let asked = Value::Array(vec![
+            registration.version.owner().to_cbor(),
             workload.to_cbor(),
             match self.target {
                 Target::Credential(serial, _) => Value::Unsigned(serial.0),
@@ -1533,7 +1560,7 @@ fn later(read: &AuthorityVersion, value: u64) -> Result<AuthorityVersion, Error>
 /// The key of a record of `kind`: the SHA-256 digest of `form`. The digest keeps the key short, because an
 /// identifier can be longer than a key.
 fn digest_key(kind: Kind, form: &Value<'_>) -> transition::Key {
-    let form = cbor::encode(form).expect("the form of an identifier has no map and no simple value");
+    let form = cbor::encode(form, Limits::FORM).expect("the form of an identifier has no map and no simple value");
     kind.key(&crypto::sha256(&form)).expect("a key of 33 bytes is valid")
 }
 
@@ -1598,7 +1625,7 @@ pub enum Error {
     /// An earlier submission of the operation committed, so this one releases nothing. Ask for a credential as a new
     /// operation.
     Committed,
-    /// The outcome is of another operation.
+    /// The outcome is of another operation, or the receipt is of another issuance under the same operation.
     Operation,
 }
 
@@ -1635,7 +1662,7 @@ impl fmt::Display for Error {
             Self::Conflict => f.write_str("a dependency changed before the commit"),
             Self::Unknown(_) => f.write_str("the outcome of the commit is unknown"),
             Self::Committed => f.write_str("an earlier submission of the operation committed"),
-            Self::Operation => f.write_str("the outcome is of another operation"),
+            Self::Operation => f.write_str("the outcome is of another operation or another issuance"),
         }
     }
 }

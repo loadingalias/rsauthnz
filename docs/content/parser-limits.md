@@ -43,8 +43,14 @@ structures, and CWT claims. [Verify COSE and CWT artifacts](verification.md) giv
 - `decode(input, limits)` decodes one item that fills `input`.
 - `decode_prefix(input, limits)` decodes the item at the start of `input` and gives the bytes after it. Use it
   for WebAuthn authenticator data, where the extensions follow the credential public key.
-- `encode(value)` writes the deterministic encoding of a value. It sorts map keys, so the order of the map
+- `encode(value, limits)` writes the deterministic encoding of a value. It sorts map keys, so the order of the map
   entries in the value has no effect on the output.
+
+`encode` applies each bound of `limits` that `decode` applies, and it refuses at the same bound with the same
+`Error::Limit`. Thus a value encodes within `limits` if and only if its encoding decodes within them. The encoder
+checks each bound before it writes the item, so a deep or long value that you build costs bounded work and stack.
+The operations that take a CBOR value of yours, such as `transition::Proposal::new` and `cli::Call::new`, encode it
+within the limits that you give them.
 
 The decoder accepts only the deterministic encoding of
 [RFC 8949, section 4.2.1](https://www.rfc-editor.org/rfc/rfc8949#section-4.2.1). Thus each value has one
@@ -69,7 +75,7 @@ assert_eq!(
         (Value::Unsigned(3), Value::Negative(6)),
     ])
 );
-assert_eq!(cbor::encode(&value)?, bytes);
+assert_eq!(cbor::encode(&value, limits)?, bytes);
 ```
 
 The decoder checks the bound of an array, map, or string at its head, before it reads the contents. For each

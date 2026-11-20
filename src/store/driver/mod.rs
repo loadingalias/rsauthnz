@@ -88,7 +88,6 @@ pub fn record_bytes_min(limits: Limits) -> usize {
 pub struct Ticket(u64);
 
 /// A primitive call that the binding executes.
-#[derive(Debug)]
 pub enum Effect<'a> {
     /// [`Store::start`](super::Store::start). Give [`Output::Started`].
     Start,
@@ -109,6 +108,25 @@ pub enum Effect<'a> {
     /// A fresh reading of the clock of the host, just before the commit of a proposal with a deadline
     /// ([`Proposal::until`]). Give [`Output::Clock`]. A production executor reads the system clock with its bound.
     Clock,
+}
+
+// A journal entry holds record forms, which can hold a credential, so the output shows only the length of an entry.
+impl fmt::Debug for Effect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start => f.write_str("Start"),
+            Self::Read(key) => f.debug_tuple("Read").field(key).finish(),
+            Self::Commit(proposal, instance) => f.debug_tuple("Commit").field(proposal).field(instance).finish(),
+            Self::Expire(kind, now, limit) => f.debug_tuple("Expire").field(kind).field(now).field(limit).finish(),
+            Self::Range(prefix, after, limit) => {
+                f.debug_tuple("Range").field(prefix).field(after).field(limit).finish()
+            }
+            Self::Append(entry) => f.debug_struct("Append").field("len", &entry.len()).finish(),
+            Self::Sync => f.write_str("Sync"),
+            Self::ReadJournal(after, limit) => f.debug_tuple("ReadJournal").field(after).field(limit).finish(),
+            Self::Clock => f.write_str("Clock"),
+        }
+    }
 }
 
 /// The result of an [`Effect`].
@@ -495,7 +513,9 @@ impl Driver {
             }
             let consumes = entries.end.as_ref().is_some_and(|end| end.consumption.is_some());
             if !entries.creation.is_empty() && !consumes {
-                let payload = journal::encode_anchors(&entries.creation).into_boxed_slice();
+                let payload = journal::encode_anchors(&entries.creation, self.core.limits)
+                    .map_err(|_| Error::Transition(transition::Error::Limit(crate::limits::Limit::Bytes)))?
+                    .into_boxed_slice();
                 proposal
                     .intend(Intent::new(Call::Journal, payload))
                     .map_err(Error::Transition)?;

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::time::Duration;
 
-use super::{Error, Header, Key, Sign1, TrustedKey};
+use super::{Error, Key, Sign1, TrustedKey};
 use crate::cbor::{self, Value};
 use crate::id::{Id, Purpose};
 use crate::limits::{Limits, SignatureBudget};
@@ -178,31 +178,31 @@ impl Profile {
         self.verify_by(artifact, now, budget, |_| Ok(&self.key))
     }
 
-    /// Verifies `artifact` as [`Self::verify`] does, with the key that `key` selects from the protected bucket in place
-    /// of the key of the profile. The selected key must have the algorithm of the profile, so a header never selects an
-    /// algorithm.
-    pub(crate) fn verify_by<'a, 'k>(
+    /// Verifies `artifact` as [`Self::verify`] does, with the key that `key` selects from the decoded `COSE_Sign1` in
+    /// place of the key of the profile. The selection can also refuse the form of the `COSE_Sign1`. The selected key
+    /// must have the algorithm of the profile, so a header never selects an algorithm.
+    pub(crate) fn verify_by<'a, 'k, E: From<Error>>(
         &self,
         artifact: &'a [u8],
         now: Reading,
         budget: &mut SignatureBudget,
-        key: impl FnOnce(&Header<'a>) -> Result<&'k TrustedKey, Error>,
-    ) -> Result<Verified<'a, '_>, Error> {
-        let value = match cbor::decode(artifact, self.limits)? {
+        key: impl FnOnce(&Sign1<'a>) -> Result<&'k TrustedKey, E>,
+    ) -> Result<Verified<'a, '_>, E> {
+        let value = match cbor::decode(artifact, self.limits).map_err(Error::from)? {
             Value::Tag(CWT_TAG, item) => *item,
             value => value,
         };
         let sign1 = Sign1::from_value(value, self.limits)?;
         let claims = Claims::decode(sign1.payload(), self.limits)?;
         if claims.iss != Some(self.issuer.as_str()) {
-            return Err(Error::Issuer);
+            return Err(Error::Issuer.into());
         }
         if !claims.aud.contains(&self.audience.as_str()) {
-            return Err(Error::Audience);
+            return Err(Error::Audience.into());
         }
         let expires = claims.exp.ok_or(Error::NoExpiry)?;
         validity(claims.nbf, expires, now)?;
-        let key = key(sign1.protected())?;
+        let key = key(&sign1)?;
         assert!(
             key.algorithm() == self.key.algorithm(),
             "each key that a selection gives has the algorithm of the profile"

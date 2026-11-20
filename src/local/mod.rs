@@ -153,14 +153,13 @@
 //! ```
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt::{self, Write as _};
+use core::fmt;
 use core::num::NonZeroUsize;
 use core::time::Duration;
 
-use rscrypto::ChaCha20Rng;
+use rscrypto::{ChaCha20Rng, SecretBytes};
 
 use crate::cbor::{self, Value};
 use crate::cli::{self, Call, Challenge};
@@ -221,8 +220,8 @@ pub struct HostGrant {
 }
 
 /// A bootstrap value: 32 random bytes. Its text is `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits. It is
-/// a secret, so `Debug` does not show it.
-pub struct Bootstrap([u8; 32]);
+/// a secret, so `Debug` does not show it, and its memory is cleared when it drops.
+pub struct Bootstrap(SecretBytes<32>);
 
 impl Bootstrap {
     /// Reads the text of a bootstrap value.
@@ -237,20 +236,32 @@ impl Bootstrap {
         let (pairs, []) = hex.as_bytes().as_chunks::<2>() else {
             return Err(Error::Form);
         };
-        let mut secret = [0; 32];
-        (pairs.len() == secret.len()).ok_or(Error::Form)?;
-        for (byte, [high, low]) in secret.iter_mut().zip(pairs) {
-            *byte = (digit(*high)? << 4) | digit(*low)?;
-        }
-        Ok(Self(secret))
+        (pairs.len() == 32).ok_or(Error::Form)?;
+        SecretBytes::try_fill_with(|secret| {
+            for (byte, [high, low]) in secret.iter_mut().zip(pairs) {
+                *byte = (digit(*high)? << 4) | digit(*low)?;
+            }
+            Ok(())
+        })
+        .map(Self)
     }
 
-    /// The text of the value.
-    fn text(&self) -> String {
-        let mut text = String::with_capacity(PREFIX.len() + 64);
-        text.push_str(PREFIX);
-        for byte in self.0 {
-            write!(text, "{byte:02x}").expect("a write to a String does not fail");
+    /// A new value from `random`, drawn into its owner.
+    fn random(random: &mut ChaCha20Rng) -> Self {
+        let Ok(secret) = SecretBytes::try_fill_with(|secret| {
+            random.fill_bytes(secret);
+            Ok::<_, !>(())
+        });
+        Self(secret)
+    }
+
+    /// The text of the value, in an allocation of its exact length. [`Prepared`] keeps that allocation and clears it.
+    fn text(&self) -> Vec<u8> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = Vec::with_capacity(PREFIX.len() + 64);
+        text.extend_from_slice(PREFIX.as_bytes());
+        for byte in self.0.as_bytes() {
+            text.extend([DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0xf)]]);
         }
         text
     }
@@ -380,9 +391,7 @@ impl Authority {
         let expires = issued
             .checked_add(LIFETIME.as_secs())
             .ok_or(Error::Time(TimeError::Overflow))?;
-        let mut secret = [0; 32];
-        random.fill_bytes(&mut secret);
-        let value = Bootstrap(secret);
+        let value = Bootstrap::random(random);
         let identity = self.identity(&value);
         let value_data = encode(&[
             Value::Text(VALUE_FORM),
@@ -395,7 +404,7 @@ impl Authority {
             administrator.to_cbor(),
             Value::Unsigned(expires),
         ]);
-        let mut proposal = self.proposal(operation, &self.grant.owner, ISSUE, &request, now)?;
+        let mut proposal = self.proposal(operation, &self.grant.owner, ISSUE, request, now)?;
         let key = self.key();
         let stored = read(store, &key).await?;
         let mut log = match &stored {
@@ -457,9 +466,8 @@ impl Authority {
                 data: value_data.into_boxed_slice(),
             })
             .map_err(Error::Transition)?;
-        let text = value.text().into_bytes().into_boxed_slice();
         proposal
-            .prepare(Prepared::new(text, key, version))
+            .prepare(Prepared::new(value.text(), key, version))
             .map_err(Error::Transition)?;
         Ok((proposal, Plan::default()))
     }
@@ -567,13 +575,16 @@ impl Authority {
         })
     }
 
-    /// The issue of a challenge for the next call of the CLI of `administrator`: its first call, or a call after a
-    /// refusal, a conflict, or a restore. The commit writes the challenge record of the binding, which ends after
-    /// [`cli::CHALLENGE_LIFETIME`]. It replaces the challenge that the record holds, so a binding has at most one.
+    /// The challenge for the next call of the CLI of `administrator`: its first call, or a call after a refusal, a
+    /// conflict, a lost response, or a restore. A binding has at most one challenge, in its challenge record.
     ///
-    /// The issue authenticates no caller, and its audit names `administrator`, not the caller. The challenge is no
-    /// secret: only the proof of a call shows the key. Only the receipt of the accepted commit gives the challenge, as
-    /// its artifact: the 32 bytes of a [`Challenge`]. After a lost response, issue again.
+    /// The request authenticates no caller. Thus it changes no challenge that can still admit a call: while the record
+    /// holds a challenge that is valid at each time that `now` permits, it gives [`Offer::Open`] with that challenge,
+    /// and nothing commits. Only with no such challenge does it give [`Offer::New`]: the proposal of a new challenge
+    /// in the record, which ends after [`cli::CHALLENGE_LIFETIME`]. Its audit names `administrator`, not the caller.
+    /// Only the receipt of the accepted commit gives the new challenge, as its artifact: the 32 bytes of a
+    /// [`Challenge`]. After a lost response, ask again. The challenge is no secret: only the proof of a call shows the
+    /// key.
     ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One range read of the bindings of the administrator, and
     /// one keyed read.
@@ -590,19 +601,26 @@ impl Authority {
         now: Reading,
         random: &mut ChaCha20Rng,
         operation: OperationId,
-    ) -> Result<(Proposal, Plan), Failure<S::Error>> {
+    ) -> Result<Offer, Failure<S::Error>> {
         let (binding, record, _) = self.bound(store, administrator, now).await?.ok_or(Error::NotEnrolled)?;
-        let mut proposal = self.proposal(operation, administrator, CHALLENGE, &Value::Null, now)?;
+        let key = cli::key(&self.id, administrator);
+        let pending = read(store, &key).await?;
+        if let Some(pending) = &pending {
+            let challenge = cli::challenge(pending, self.limits).ok_or(Error::Record)?;
+            let end = pending.end.ok_or(Error::Record)?;
+            if now.latest().map_err(Error::Time)? < end {
+                return Ok(Offer::Open(challenge));
+            }
+        }
+        let mut proposal = self.proposal(operation, administrator, CHALLENGE, Value::Null, now)?;
         proposal
             .read(Dependency::Version(binding, record.version))
             .map_err(Error::Transition)?;
-        let key = cli::key(&self.id, administrator);
-        let pending = read(store, &key).await?;
         let (challenge, version) = self.renew(&mut proposal, key.clone(), pending.as_ref(), now, random)?;
         proposal
-            .prepare(Prepared::new(Box::new(challenge.to_bytes()), key, version))
+            .prepare(Prepared::new(challenge.to_bytes().to_vec(), key, version))
             .map_err(Error::Transition)?;
-        Ok((proposal, Plan::default()))
+        Ok(Offer::New(proposal, Plan::default()))
     }
 
     /// Admits the remote call `call` with the CLI credential `credential` and the proof `proof` of the possession of
@@ -617,7 +635,7 @@ impl Authority {
     /// then submit it with an empty [`Plan`]. Give the outcome of the commit to [`Admission::release`]: only the
     /// accepted commit of this proposal gives the [`Admitted`] call and its next challenge. The proposal carries the
     /// next challenge as its prepared artifact, so it carries no other artifact. Its operation is the operation of
-    /// `call`, and its request is the request binding of `call`. An unlink of an administrator binding is a call of its
+    /// `call`, and its request names the authority and the request binding of `call`. An unlink of an administrator binding is a call of its
     /// own ([`Self::unlink`]).
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). Two signature checks of each composite artifact, and two
@@ -759,14 +777,14 @@ impl Authority {
             .possession(proof, call.binding(), now, &mut SignatureBudget::new(&self.limits))
             .map_err(Error::Credential)?;
         let request = Value::Bytes(call.binding());
-        let mut proposal = self.proposal(call.operation().clone(), administrator, action, &request, now)?;
+        let mut proposal = self.proposal(call.operation().clone(), administrator, action, request, now)?;
         proposal
             .read(Dependency::Version(binding.clone(), record.version))
             .map_err(Error::Transition)?;
         proposal.until(end.min(claims.expires));
         let (next, version) = self.renew(&mut proposal, key.clone(), Some(&pending), now, random)?;
         proposal
-            .prepare(Prepared::new(Box::new(next.to_bytes()), key, version))
+            .prepare(Prepared::new(next.to_bytes().to_vec(), key, version))
             .map_err(Error::Transition)?;
         let admitted = Admitted {
             administrator: administrator.clone(),
@@ -971,15 +989,16 @@ impl Authority {
         .into_boxed_slice()
     }
 
-    /// The identity of `value`: the SHA-256 digest of the authority, the issuer public key, and the secret. Thus a value
-    /// of another authority or issuer key has another identity.
+    /// The identity of `value`: the SHA-256 digest of the canonical CBOR form `["rsauthnz.local.bootstrap.1",
+    /// authority, issuer public key, secret]`. Thus a value of another authority or issuer key has another identity.
+    /// The digest reads the form in parts, so no buffer holds the secret.
     fn identity(&self, value: &Bootstrap) -> [u8; 32] {
-        crypto::sha256(&encode(&[
-            Value::Text(IDENTITY_FORM),
-            self.id.to_cbor(),
-            Value::Bytes(&self.issuer.public_key()),
-            Value::Bytes(&value.0),
-        ]))
+        let public = self.issuer.public_key();
+        let prefix = cbor::prefix(&[Value::Text(IDENTITY_FORM), self.id.to_cbor(), Value::Bytes(&public)]);
+        let secret = value.0.as_bytes();
+        let mut head = Vec::with_capacity(2);
+        cbor::head(&mut head, 2, secret.len() as u64);
+        crypto::sha256_parts(&[&prefix, &head, secret])
     }
 
     /// The version `coordinate` of the authority.
@@ -1002,8 +1021,8 @@ impl Authority {
     }
 
     /// Adds to `proposal` the read of the challenge record `key`, which is `pending` in the store, and the write of a
-    /// new challenge into it, which ends after [`cli::CHALLENGE_LIFETIME`]. The version is a counter and the challenge,
-    /// as for the record of the authority.
+    /// new challenge into it, which ends after [`cli::CHALLENGE_LIFETIME`]. The version is a counter and the SHA-256
+    /// digest of the challenge, as for the record of the authority. Thus `Debug` of the version shows no challenge.
     fn renew(
         &self,
         proposal: &mut Proposal,
@@ -1017,7 +1036,10 @@ impl Authority {
             .checked_add(cli::CHALLENGE_LIFETIME)
             .ok_or(Error::Time(TimeError::Overflow))?;
         let challenge = Challenge::random(random);
-        let version = self.next(pending.map(|record| record.version.clone()), &challenge.to_bytes())?;
+        let version = self.next(
+            pending.map(|record| record.version.clone()),
+            &crypto::sha256(&challenge.to_bytes()),
+        )?;
         proposal.read(dependency(&key, pending)).map_err(Error::Transition)?;
         proposal
             .change(Change::Write {
@@ -1030,13 +1052,14 @@ impl Authority {
         Ok((challenge, version))
     }
 
-    /// A proposal of `actor` for `action` on `request`.
+    /// A proposal of `actor` for `action` on `request`. Its request is `[authority, request]`, so one operation
+    /// identity under two authorities of one store binds two requests.
     fn proposal(
         &self,
         operation: OperationId,
         actor: &Id<Human>,
         action: &str,
-        request: &Value<'_>,
+        request: Value<'_>,
         now: Reading,
     ) -> Result<Proposal, Error> {
         let audit = Audit {
@@ -1044,7 +1067,8 @@ impl Authority {
             action: Id::new("rsauthnz", action).expect("each action of this module is a valid identifier"),
             time: now,
         };
-        Proposal::new(operation, audit, request, self.limits).map_err(Error::Transition)
+        let request = Value::Array(vec![self.id.to_cbor(), request]);
+        Proposal::new(operation, audit, &request, self.limits).map_err(Error::Transition)
     }
 
     /// The log of the record of the authority, after a check of its grant and its issuer key.
@@ -1084,7 +1108,7 @@ impl Authority {
         let mut index = 0;
         loop {
             let entries: Vec<Value<'_>> = log.iter().map(Entry::to_cbor).collect();
-            let data = encode(&[
+            let form = Value::Array(vec![
                 Value::Text(RECORD_FORM),
                 self.grant.owner.to_cbor(),
                 self.grant.origin.to_cbor(),
@@ -1092,7 +1116,10 @@ impl Authority {
                 Value::Bytes(&public),
                 Value::Array(entries),
             ]);
-            if log.len() <= ISSUES_MAX && cbor::decode(&data, self.limits).is_ok() {
+            // A form that encodes within the limits decodes within them.
+            if log.len() <= ISSUES_MAX
+                && let Ok(data) = cbor::encode(&form, self.limits)
+            {
                 return Ok(data.into_boxed_slice());
             }
             let (_, older) = log.split_last().expect("the log holds the new issue");
@@ -1166,7 +1193,7 @@ impl Pending<'_> {
     pub fn finish(self, signature: &[u8], operation: OperationId) -> Result<(Proposal, Plan), Error> {
         let authority = self.authority;
         let request = Value::Array(vec![Value::Bytes(&self.issue.identity), Value::Bytes(&self.holder)]);
-        let mut proposal = authority.proposal(operation, &self.issue.administrator, CONSUME, &request, self.now)?;
+        let mut proposal = authority.proposal(operation, &self.issue.administrator, CONSUME, request, self.now)?;
         let (value, version) = self.value;
         proposal
             .read(Dependency::Version(value.clone(), version))
@@ -1273,6 +1300,21 @@ impl Unlink {
     pub const fn administrator(&self) -> &Id<Human> {
         &self.administrator
     }
+}
+
+/// The challenge that a challenge request offers ([`Authority::challenge`]).
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the caller matches the offer at once, as it takes `(Proposal, Plan)` from each other operation; a box adds an allocation to each request"
+)]
+pub enum Offer {
+    /// The challenge record holds this challenge, which is valid at the time of the request. Nothing commits: give it
+    /// to the CLI.
+    Open(Challenge),
+    /// The record holds no valid challenge. Submit the proposal of a new one with its plan: the receipt of the
+    /// accepted commit gives the new challenge, as its artifact.
+    New(Proposal, Plan),
 }
 
 /// An admission of a remote call whose proposal waits for its commit ([`Authority::admit`]). It gives no admitted call
@@ -1568,7 +1610,8 @@ fn expired(now: Reading, expires: u64) -> Result<bool, Error> {
 
 /// The canonical CBOR form of the array `items`.
 fn encode(items: &[Value<'_>]) -> Vec<u8> {
-    cbor::encode(&Value::Array(items.to_vec())).expect("the forms of this module have no map and no simple value")
+    cbor::encode(&Value::Array(items.to_vec()), Limits::FORM)
+        .expect("the forms of this module have no map and no simple value")
 }
 
 /// The keyed read of `key`.

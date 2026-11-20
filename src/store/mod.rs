@@ -46,6 +46,7 @@ use core::time::Duration;
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::id::{Authority, AuthorityVersion, Id};
+use crate::limits::Limits;
 use crate::time::{Reading, ReadingSource, TimeError};
 use crate::transition::{self, Change, Key, Operation, OperationId, Proposal};
 
@@ -209,7 +210,9 @@ impl Kind {
     ///
     /// [`transition::Error::Key`] if `id` is longer than [`Key::BYTES_MAX`] minus one bytes.
     pub fn key(self, id: &[u8]) -> Result<Key, transition::Error> {
-        let mut bytes = Vec::with_capacity(id.len().saturating_add(1));
+        // The kind is the first byte of the key. The check comes before the copy.
+        (id.len() < Key::BYTES_MAX).ok_or(transition::Error::Key)?;
+        let mut bytes = Vec::with_capacity(id.len() + 1);
         bytes.push(self as u8);
         bytes.extend_from_slice(id);
         Key::new(&bytes)
@@ -235,12 +238,21 @@ pub struct Instance(pub u64);
 pub struct Sequence(pub u64);
 
 /// A durable entry of the restore journal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The sequence.
     pub sequence: Sequence,
-    /// The bytes of the entry.
+    /// The bytes of the entry. They hold record forms, which can hold a credential, so `Debug` shows only their length.
     pub data: Box<[u8]>,
+}
+
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("sequence", &self.sequence)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
 }
 
 /// The current state of one record.
@@ -536,7 +548,8 @@ pub enum ExpiryError<E> {
 /// Cost class: [`Parse`](crate::limits::Class::Parse).
 #[must_use]
 pub fn policy_key(owner: &Id<Authority>) -> Key {
-    let form = cbor::encode(&owner.to_cbor()).expect("the form of an identifier has no map and no simple value");
+    let form =
+        cbor::encode(&owner.to_cbor(), Limits::FORM).expect("the form of an identifier has no map and no simple value");
     Kind::Policy
         .key(&crypto::sha256(&form))
         .expect("a key of 33 bytes is valid")
@@ -629,7 +642,7 @@ pub fn audit_record(proposal: &Proposal) -> (Key, Record) {
     let key = Kind::Audit
         .key(proposal.operation().id.as_bytes())
         .expect("an operation identity of at most 64 bytes makes a valid key");
-    let data = cbor::encode(&form).expect("the audit form has no map and no simple value");
+    let data = cbor::encode(&form, Limits::FORM).expect("the audit form has no map and no simple value");
     (
         key,
         Record {
@@ -655,7 +668,7 @@ pub fn intent_records(proposal: &Proposal) -> Result<Vec<(Key, Record)>, transit
     let mut records = Vec::with_capacity(proposal.intents().len());
     for (index, intent) in (0_u64..).zip(proposal.intents()) {
         let key = Kind::Intent.key(&[id, &index.to_be_bytes()].concat())?;
-        let data = cbor::encode(&intent.to_cbor()).map_err(|_| transition::Error::Intent)?;
+        let data = cbor::encode(&intent.to_cbor(), Limits::FORM).map_err(|_| transition::Error::Intent)?;
         records.push((
             key,
             Record {

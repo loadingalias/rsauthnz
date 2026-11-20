@@ -28,7 +28,9 @@ owner loses the administrator, the owner issues a new value: an owner re-bootstr
   its value.
 
 The store keeps no secret and no signed credential. The key of a value record is the SHA-256 digest of the authority, the issuer public key,
-and the secret. Thus a value of another authority, or of another issuer key, finds no record and refuses.
+and the secret. Thus a value of another authority, or of another issuer key, finds no record and refuses. The request
+binding of each operation names the authority, so one operation identity under two authorities of one store is two
+requests: the second refuses with `transition::Error::Reuse` and reports no commit of the first.
 
 ## Bootstrap the first administrator
 
@@ -42,8 +44,10 @@ the credential.
    a restore lost the record of the authority, its administrator bindings name the owner, the origin, and the issuer
    key, so another grant or issuer key refuses too.
 2. Issue a value with `authority.issue(store, &grant, administrator, now, random, operation)`. Draw the operation
-   identity from `random`, and keep it. The artifact of the receipt is the text of the value.
-3. Give the text to the client by a local path. Do not put it in a URL, a log, or an argument.
+   identity from `random`, and keep it. The artifact of the receipt is the text of the value. rsauthnz keeps the
+   secret and the text only in memory that it clears when it drops: `Bootstrap`, and the receipt.
+3. Give the text to the client by a local path. Do not put it in a URL, a log, or an argument. Read it from the
+   receipt in place, and clear each copy that you make.
 4. The client generates its key in its custody and stores it before it submits the value. A completion that the
    client never heard about then binds a key that the client has.
 5. Take the text and the public key of the client, an ML-DSA-65 + Ed25519 key of 1,984 bytes. Allocate a serial with
@@ -237,7 +241,7 @@ of the full log bound such an administrator, an issue refuses with `Error::Full`
 | `authority.credential(store, &administrator, &holder, now)` | The bindings of `administrator` | `Reissue` of the CLI credential whose `cnf` key is `holder` |
 | `reissue.to_be_signed()` | — | The bytes that custody signs |
 | `reissue.finish(signature)` | — | The CLI credential |
-| `authority.challenge(store, &administrator, now, random, operation)` | The bindings of `administrator`, and its challenge record | `(Proposal, Plan)`. The receipt gives the 32 bytes of the challenge ([CLI credential](cli.md)) |
+| `authority.challenge(store, &administrator, now, random, operation)` | The bindings of `administrator`, and its challenge record | `Offer::Open(challenge)` while the record holds a valid challenge, with no commit. Else `Offer::New(proposal, plan)`: the receipt gives the 32 bytes of the new challenge ([CLI credential](cli.md)) |
 | `authority.admit(store, credential, proof, &call, now, random)` | The binding of the subject and the serial of the credential, and its challenge record | `(Proposal, Admission)`. `admission.release(&outcome)` gives `Admitted` ([CLI credential](cli.md)) |
 | `Unlink::new(challenge, operation, administrator, limits)` | — | The unlink, whose `call()` the CLI proves |
 | `authority.unlink(store, credential, proof, &unlink, now, random)` | The reads of `admit`, and the bindings of the authority | `(Proposal, Plan, Admission)` |
@@ -261,7 +265,7 @@ administrator is one range read of its prefix, and it gives at most `ADMINISTRAT
 | `Bound` | The administrator has a binding with a valid CLI credential | Name another administrator, or unlink the binding |
 | `Full` | The store holds `ADMINISTRATORS_MAX` bindings of the authority, or each issue of the full log bound an administrator with a valid CLI credential | Run an expiry pass, or unlink an administrator, then issue again |
 | `NotEnrolled` | No administrator binding with a valid CLI credential holds the credential or the administrator, or the credential is not the credential of its binding | Refuse the call |
-| `Challenge` | The binding holds no pending challenge, another one, or one whose end passed: a call consumed it, a later issue replaced it, or a restore ended it | Refuse the call. The client asks for a new challenge, and makes a new call |
+| `Challenge` | The binding holds no pending challenge, another one, or one whose end passed: a call consumed it, its end passed, or a restore ended it | Refuse the call. The client asks for a challenge, and makes a new call |
 | `Record` | A record of the authority has no valid form | Restore the store from a snapshot |
 | `Time` | The reading has no bound, or a time overflows | Use a reading with a bound |
 | `Credential` | The credential, its signature, or the proof refuses | Refuse the call. A refused signature shows a fault of custody or another key |
@@ -281,5 +285,5 @@ administrator is one range read of its prefix, and it gives at most `ADMINISTRAT
 
 - The core cannot see where a call comes from. The host builds a grant only for a call of the local owner, and calls
   `admit` for each remote call.
-- The text of a value is a bearer secret in memory until the owner hands it over. The core does not clear it from
-  memory.
+- The text of a value is a bearer secret in memory until the owner hands it over. The core clears its own copies:
+  `Bootstrap` and the artifact of the receipt. It cannot clear a copy that the host makes.

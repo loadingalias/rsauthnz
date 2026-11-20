@@ -16,8 +16,15 @@ use crate::transition::{Key, OperationId};
 /// The first item of the stored form. Its number changes with the form.
 const FORM: &str = "rsauthnz.journal.1";
 
-/// The stored form of the entry `body` of `operation` with `sequence`, after the entry with the link `link`.
-pub(super) fn encode(sequence: Sequence, link: &Link, operation: &OperationId, body: &Body) -> Vec<u8> {
+/// The stored form of the entry `body` of `operation` with `sequence`, after the entry with the link `link`, within
+/// `limits`. A form within `limits` decodes within them, so [`decode`] reads it back.
+pub(super) fn encode(
+    sequence: Sequence,
+    link: &Link,
+    operation: &OperationId,
+    body: &Body,
+    limits: Limits,
+) -> Result<Vec<u8>, cbor::Error> {
     let body = match body {
         Body::End(end) => Value::Array(vec![
             Value::Unsigned(0),
@@ -52,7 +59,7 @@ pub(super) fn encode(sequence: Sequence, link: &Link, operation: &OperationId, b
         Value::Bytes(operation.as_bytes()),
         body,
     ]);
-    cbor::encode(&entry).expect("the form of an entry has no map and no simple value")
+    cbor::encode(&entry, limits)
 }
 
 /// Reads the stored form `bytes` of an entry: the link that it holds, and the entry. `None` for bytes that are not the
@@ -108,9 +115,9 @@ pub(super) fn decode(bytes: &[u8], limits: Limits) -> Option<(Link, Entry)> {
     Some((Link(<[u8; 32]>::try_from(*link).ok()?), entry))
 }
 
-/// The CBOR form of `anchors`: the payload of an intent of `Effect::Journal`.
-pub(super) fn encode_anchors(anchors: &[Anchor]) -> Vec<u8> {
-    cbor::encode(&list(anchors, anchor)).expect("the form of an anchor has no map and no simple value")
+/// The CBOR form of `anchors` within `limits`: the payload of an intent of `Effect::Journal`.
+pub(super) fn encode_anchors(anchors: &[Anchor], limits: Limits) -> Result<Vec<u8>, cbor::Error> {
+    cbor::encode(&list(anchors, anchor), limits)
 }
 
 /// The anchors of the CBOR form `bytes` of [`encode_anchors`], or `None` for another form within `limits`.

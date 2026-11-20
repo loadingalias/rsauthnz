@@ -4,6 +4,7 @@ use super::{Binding, Evidence, EvidenceError, Method};
 use crate::cbor;
 use crate::crypto::Authentication;
 use crate::id::{Agent, Human, Id, Principal};
+use crate::limits::Limits;
 use crate::time::{Reading, ReadingSource};
 
 fn human() -> Principal {
@@ -70,7 +71,7 @@ fn evidence_reads_back_from_its_cbor_form() {
         Evidence::new(human(), Method::Provider, time(None), false, false, None, None),
     ];
     for evidence in cases {
-        let encoded = cbor::encode(&evidence.to_cbor()).unwrap();
+        let encoded = cbor::encode(&evidence.to_cbor(), Limits::default()).unwrap();
         let value = cbor::decode(&encoded, crate::limits::Limits::default()).unwrap();
         assert_eq!(Evidence::from_cbor(&value), Ok(evidence));
     }

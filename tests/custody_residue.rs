@@ -1,4 +1,5 @@
-//! The contract of zeroization: the software custody frees no heap block that holds key bytes.
+//! The contract of zeroization: the software custody frees no heap block that holds key bytes, and a bootstrap value of
+//! a local authority leaves no heap block that holds its secret.
 //!
 //! This test binary has its own global allocator. While a thread arms it, the allocator copies each block that the
 //! thread frees through the OS, before it releases the block, and it counts each block that holds a part of the key.
@@ -17,13 +18,14 @@ use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rscrypto::ChaCha20Rng;
 use rscrypto::auth::MlDsa65Ed25519;
 
-/// The bytes of a part of the key that the scan looks for.
+/// The bytes of a part of the secret that the scan looks for.
 const PART: usize = 16;
 /// The most bytes that one copy through the OS reads.
 const CHUNK: usize = 4096;
 
-/// The raw key: the ML-DSA-65 seed, then the Ed25519 key.
-static KEY: OnceLock<[u8; 64]> = OnceLock::new();
+/// The secret that the scan looks for: the raw key (the ML-DSA-65 seed, then the Ed25519 key), or the secret of a
+/// bootstrap value and its text.
+static KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -114,7 +116,7 @@ fn custody_frees_no_heap_block_that_holds_key_bytes() {
         Ok(())
     })
     .unwrap();
-    KEY.set(*key.expose_secret().as_bytes()).unwrap();
+    KEY.set(key.expose_secret().as_bytes().to_vec()).unwrap();
     drop(key);
 
     // The positive control: a copy of the key in a `Vec` that drops with no zeroization.
@@ -225,4 +227,110 @@ mod os {
         };
         done != 0 && copied == out.len()
     }
+}
+
+#[test]
+fn a_bootstrap_value_leaves_no_secret_in_freed_memory() {
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+
+    use rsauthnz::credential::Serial;
+    use rsauthnz::custody::Handle;
+    use rsauthnz::id::Id;
+    use rsauthnz::limits::Limits;
+    use rsauthnz::local::{Authority, Bootstrap, HostGrant};
+    use rsauthnz::store::driver::{Answer, Driver, Plan};
+    use rsauthnz::store::{self, Kind, Store};
+    use rsauthnz::time::{Reading, ReadingSource};
+    use rsauthnz::transition::{OperationId, Outcome, Proposal};
+    use rsauthnz_conformance::memory::{Memory, Schedule};
+    use rsauthnz_conformance::suite::execute;
+
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let Poll::Ready(output) = pin!(future).poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("the memory binding does no I/O");
+        };
+        output
+    }
+    fn settle(memory: &mut Memory, driver: &mut Driver) {
+        while let Some(effect) = driver.effect() {
+            let output = ready(execute(memory, effect));
+            driver.give(output).unwrap();
+        }
+    }
+    fn commit(memory: &mut Memory, driver: &mut Driver, (proposal, plan): (Proposal, Plan)) -> Outcome {
+        let ticket = driver.submit(proposal, plan).unwrap();
+        settle(memory, driver);
+        let Some(Answer::Outcome(outcome)) = driver.take(ticket) else {
+            panic!("the commit gave no outcome");
+        };
+        outcome
+    }
+
+    os::open();
+    let seed = [8; 32];
+    // A twin generator draws what the issue draws first: the secret of the value. Thus the test knows the secret and
+    // its text, and it reads no memory of the authority.
+    let mut twin = ChaCha20Rng::from_seed(seed);
+    let mut secret = [0; 32];
+    twin.fill_bytes(&mut secret);
+    let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+    KEY.set([secret.as_slice(), hex.as_bytes()].concat()).unwrap();
+    // The positive control: a copy of the text in a `Vec` that drops with no zeroization.
+    assert_eq!(freed_with_key(|| drop(black_box(hex.clone().into_bytes()))), 1);
+
+    let now = Reading::new(
+        Duration::from_secs(1_800_000_000),
+        Some(Duration::from_secs(1)),
+        ReadingSource::Caller,
+    );
+    let (issuer, _) = MlDsa65Ed25519::generate_keypair(|out| {
+        let _: () = out.fill(1);
+        Ok(())
+    })
+    .unwrap();
+    let (holder, _) = MlDsa65Ed25519::generate_keypair(|out| {
+        let _: () = out.fill(2);
+        Ok(())
+    })
+    .unwrap();
+    let issuer = Handle::new(
+        KeyId::from_bytes([3; 16]),
+        Algorithm::MlDsa65Ed25519,
+        &issuer.to_bytes(),
+    )
+    .unwrap();
+    let mut memory = Memory::new(Schedule::None);
+    let mut driver = Driver::new(store::Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
+    driver.start(now);
+    settle(&mut memory, &mut driver);
+    let grant = HostGrant {
+        owner: Id::new("acme", "owner").unwrap(),
+        origin: Id::new("acme", "build-app").unwrap(),
+    };
+    let authority = ready(Authority::open(
+        &mut memory,
+        &grant,
+        Id::new("acme", "auth").unwrap(),
+        issuer,
+        Limits::default(),
+    ))
+    .unwrap();
+    let (alice, operation) = (Id::new("acme", "alice").unwrap(), OperationId::new(b"issue-1").unwrap());
+    let mut random = ChaCha20Rng::from_seed(seed);
+
+    // The issue, the delivery of the value through the receipt, and the bootstrap of the client.
+    let found = freed_with_key(|| {
+        let issue = ready(authority.issue(&mut memory, &grant, alice, now, &mut random, operation)).unwrap();
+        let Outcome::Accepted(receipt) = commit(&mut memory, &mut driver, issue) else {
+            panic!("the issue did not commit");
+        };
+        let value = Bootstrap::parse(core::str::from_utf8(receipt.artifact().unwrap()).unwrap()).unwrap();
+        drop(receipt);
+        let serial = Serial(driver.allocate(Kind::Credential).unwrap());
+        let pending = ready(authority.bootstrap(&mut memory, &value, &holder.to_bytes(), serial, now)).unwrap();
+        drop((pending, value));
+    });
+    assert_eq!(found, 0);
 }

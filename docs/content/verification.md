@@ -91,7 +91,8 @@ The example uses a `hex` function that converts hexadecimal digits to bytes. rsa
 `Profile::verify` does these checks, in this order. It refuses at the first check that fails:
 
 1. It decodes the artifact within `limits`. The artifact is a `COSE_Sign1` with the tag 18 or no tag. The CWT tag
-   61 can enclose it.
+   61 can enclose it. The credentials and receipts of rsauthnz accept only their exact form: the tag 18, no CWT tag,
+   and an empty unprotected bucket ([Issue and verify credentials](credential-format.md#the-format)).
 2. It checks the header buckets. A label must not be in both buckets. A `crit` header must be protected. It can
    name only `alg` (1), `content type` (3), and `kid` (4), and each label that it names must be in the protected
    bucket.

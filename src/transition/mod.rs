@@ -59,6 +59,8 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::time::Duration;
 
+use rscrypto::SecretVec;
+
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::id::{Action, AuthorityVersion, Id, Principal};
@@ -458,19 +460,17 @@ impl Proposal {
     /// action, and `request`. The proposal holds at most [`Limits::dependencies`] dependencies and
     /// [`Limits::intents`] intents.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse). The binding is one SHA-256 digest of the bounded request.
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). The binding is one SHA-256 digest of the canonical CBOR
+    /// form `["rsauthnz.transition.binding.1", actor, action, request]`. `request` must encode within `limits`, and the
+    /// encoder refuses it at the first bound, before more work.
     ///
     /// # Errors
     ///
-    /// [`Error::Request`] if `request` has no CBOR encoding.
+    /// [`Error::Request`] if `request` has no CBOR encoding within `limits`.
     pub fn new(id: OperationId, audit: Audit, request: &Value<'_>, limits: Limits) -> Result<Self, Error> {
-        let form = Value::Array(vec![
-            Value::Text(BINDING_FORM),
-            audit.actor.to_cbor(),
-            audit.action.to_cbor(),
-            request.clone(),
-        ]);
-        let binding = crypto::sha256(&cbor::encode(&form).map_err(Error::Request)?);
+        let request = cbor::encode(request, limits).map_err(Error::Request)?;
+        let prefix = cbor::prefix(&[Value::Text(BINDING_FORM), audit.actor.to_cbor(), audit.action.to_cbor()]);
+        let binding = crypto::sha256_parts(&[&prefix, &request]);
         Ok(Self {
             operation: Operation { id, binding },
             audit,
@@ -651,7 +651,7 @@ impl Receipt {
     /// store never keeps the artifact.
     #[must_use]
     pub fn artifact(&self) -> Option<&[u8]> {
-        self.artifact.as_ref().map(|artifact| &*artifact.bytes)
+        self.artifact.as_ref().map(Prepared::bytes)
     }
 }
 
@@ -700,7 +700,7 @@ pub enum Error {
     OperationId,
     /// The key has no bytes or more than [`Key::BYTES_MAX`] bytes.
     Key,
-    /// The request has no CBOR encoding.
+    /// The request has no CBOR encoding within the limits.
     Request(cbor::Error),
     /// The proposal is larger than a bound of [`Limits`].
     Limit(Limit),
@@ -748,7 +748,7 @@ impl fmt::Display for Error {
         match self {
             Self::OperationId => f.write_str("the operation identity is empty or too long"),
             Self::Key => f.write_str("the key is empty or too long"),
-            Self::Request(error) => write!(f, "the request has no CBOR encoding: {error}"),
+            Self::Request(error) => write!(f, "the request has no CBOR encoding within the limits: {error}"),
             Self::Limit(Limit::Dependencies) => f.write_str("the proposal has too many dependencies"),
             Self::Limit(Limit::Intents) => f.write_str("the proposal has too many effect intents"),
             Self::Limit(_) => f.write_str("the proposal is larger than a bound of the limits"),
@@ -769,24 +769,35 @@ impl core::error::Error for Error {}
 /// It names its issuance record: the key and the version of the record that its transition writes. It has no public
 /// constructor and no accessor of its bytes. [`Proposal::prepare`] takes it only for a proposal that writes its
 /// issuance record, and only [`Receipt::artifact`] of the accepted proposal gives its bytes. Thus no caller can
-/// release it before the commit, or with another transition.
+/// release it before the commit, or with another transition. An artifact can be a bearer value, such as a bootstrap
+/// value, so its memory is cleared when the receipt drops.
 pub struct Prepared {
-    bytes: Box<[u8]>,
+    bytes: SecretVec,
     record: Key,
     version: AuthorityVersion,
 }
 
 impl Prepared {
-    /// The prepared artifact with the bytes `bytes`, whose transition writes the record `record` at `version`.
-    pub(crate) const fn new(bytes: Box<[u8]>, record: Key, version: AuthorityVersion) -> Self {
-        Self { bytes, record, version }
+    /// The prepared artifact with the bytes `bytes`, whose transition writes the record `record` at `version`. It
+    /// keeps the allocation of `bytes`, with no copy, and clears it when it drops.
+    pub(crate) const fn new(bytes: Vec<u8>, record: Key, version: AuthorityVersion) -> Self {
+        Self {
+            bytes: SecretVec::from_vec(bytes),
+            record,
+            version,
+        }
+    }
+
+    /// The bytes of the artifact.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.bytes.as_bytes()
     }
 }
 
 impl fmt::Debug for Prepared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Prepared")
-            .field("bytes", &Hidden(&self.bytes))
+            .field("bytes", &Hidden(self.bytes()))
             .field("record", &self.record)
             .field("version", &self.version)
             .finish()

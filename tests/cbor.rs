@@ -157,12 +157,12 @@ fn appendix_a_deterministic_vectors_decode_and_encode_byte_for_byte() {
             assert_eq!(decoded, value, "decode {encoded}");
         }
         assert_eq!(
-            encode(&decoded).as_deref(),
+            encode(&decoded, Limits::default()).as_deref(),
             Ok(bytes.as_slice()),
             "encode the decoded {encoded}"
         );
         assert_eq!(
-            encode(&value).as_deref(),
+            encode(&value, Limits::default()).as_deref(),
             Ok(bytes.as_slice()),
             "encode the value of {encoded}"
         );
@@ -208,9 +208,9 @@ fn appendix_a_vectors_outside_deterministic_encoding_refuse() {
 }
 
 /// Each limit admits an item at the limit, and refuses an item one past it before the decoder allocates.
-#[test]
-fn each_limit_admits_its_value_and_refuses_one_past_it_without_allocating() {
-    let cases = [
+/// For each limit: the limits, a value at the limit, a value one past it, and the bound that refuses it.
+fn limit_cases() -> [(Limits, &'static str, &'static str, Limit); 8] {
+    [
         // [1, 2] has 3 bytes, and [1, 2, 3] has 4.
         (limits(|limits| limits.bytes = 3), "820102", "83010203", Limit::Bytes),
         // [[]] has 2 levels, and [[[]]] has 3.
@@ -246,11 +246,32 @@ fn each_limit_admits_its_value_and_refuses_one_past_it_without_allocating() {
             "6461626364",
             Limit::StringBytes,
         ),
-    ];
-    for (limits, at, past, limit) in cases {
+    ]
+}
+
+#[test]
+fn each_limit_admits_its_value_and_refuses_one_past_it_without_allocating() {
+    for (limits, at, past, limit) in limit_cases() {
         decode(&hex(at), limits).expect(at);
         assert_eq!(refusal(&hex(past), limits), Some(Error::Limit(limit)), "{past}");
     }
+}
+
+#[test]
+fn the_encoder_refuses_at_each_limit_where_the_decoder_refuses() {
+    for (limits, at, past, limit) in limit_cases() {
+        let (at, past) = (hex(at), hex(past));
+        let value = decode(&at, Limits::default()).expect("the value at the limit");
+        assert_eq!(encode(&value, limits).as_ref(), Ok(&at), "{value:?}");
+        let value = decode(&past, Limits::default()).expect("the value past the limit");
+        assert_eq!(encode(&value, limits), Err(Error::Limit(limit)), "{value:?}");
+    }
+    // A value of a caller can nest deeper than any decode admits. It refuses at the depth limit.
+    let mut deep = Array(vec![]);
+    for _ in 0..=Limits::default().depth {
+        deep = Array(vec![deep]);
+    }
+    assert_eq!(encode(&deep, Limits::default()), Err(Error::Limit(Limit::Depth)));
 }
 
 /// Each class of input outside deterministic CBOR has its typed refusal.
@@ -326,13 +347,17 @@ fn encode_sorts_map_keys_by_their_encodings_and_refuses_values_without_an_encodi
         (Unsigned(3), Negative(6)),
         (Unsigned(1), Unsigned(2)),
     ]);
-    assert_eq!(encode(&key), Ok(hex("a5010203262001214100224101")));
+    assert_eq!(encode(&key, Limits::default()), Ok(hex("a5010203262001214100224101")));
     assert_eq!(
-        encode(&Map(vec![(Text("a"), Null), (Text("a"), Null)])),
+        encode(&Map(vec![(Text("a"), Null), (Text("a"), Null)]), Limits::default()),
         Err(Error::DuplicateKey)
     );
     for simple in [20, 22, 24, 31] {
-        assert_eq!(encode(&Simple(simple)), Err(Error::Malformed), "simple({simple})");
+        assert_eq!(
+            encode(&Simple(simple), Limits::default()),
+            Err(Error::Malformed),
+            "simple({simple})"
+        );
     }
 }
 

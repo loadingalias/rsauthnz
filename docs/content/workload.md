@@ -39,8 +39,8 @@ verifier.
   ([Declare the profile of an audience](credential-format.md#declare-the-profile-of-an-audience)). The registered key
   must have the authentication of the issuer key. An audience of another profile needs another issuer record, with
   its own authority.
-- An issuer has at most 16 audiences (`workload::AUDIENCES_MAX`). `Issuer::new` sorts them and drops a second equal
-  audience.
+- An issuer has at most 16 audiences (`workload::AUDIENCES_MAX`). `Issuer::new` counts each audience that you give,
+  also a second equal one, before it sorts them and drops a second equal audience.
 - The `Ceiling` has two fields. `lifetime_max` is the longest lifetime of one credential. `not_after` is the latest
   end of any credential, as the time since the Unix epoch. The record keeps whole seconds.
 - The generation is a serial. Each credential of the workload with a lower serial is dead. A new registration takes
@@ -60,18 +60,22 @@ verifier.
    credential.
 6. Submit the proposal with `driver.submit(proposal, plan)`, and run the driver.
 7. Give the outcome of the commit to `awaiting.release(outcome)`. Only an accepted commit of this operation gives the
-   `Credential`. Send `credential.as_bytes()` to the workload.
+   `Credential`. Send `credential.as_bytes()` to the workload. `Awaiting` keeps the SHA-256 digest of its own
+   credential, so the receipt of another issuance under the same operation refuses with `Error::Operation`. Thus the
+   serial and the end of the `Credential` are always those of its bytes.
 
 `Pending::new` does these checks before custody signs. It refuses at the first check that fails:
 
-1. The audience must be an audience of the issuer.
-2. The lifetime must be at most `lifetime_max`, and the end must be at most `not_after`. A request past the ceiling
+1. Each challenge of the request has at most 8,192 bytes (`credential::MAX_BYTES`), or the request refuses with
+   `Error::Credential(credential::Error::Size)` before more work.
+2. The audience must be an audience of the issuer.
+3. The lifetime must be at most `lifetime_max`, and the end must be at most `not_after`. A request past the ceiling
    refuses. rsauthnz does not give a shorter credential in its place.
-3. For a renewal or a rotation, it checks the current credential and its proof ([Renew a
+4. For a renewal or a rotation, it checks the current credential and its proof ([Renew a
    credential](#renew-a-credential)).
-4. For a rotation or a recovery, it checks the proof of the new key ([Rotate the proof key](#rotate-the-proof-key)).
-5. `authz::check` checks the evidence for the action of the request on the resource of the workload.
-6. The driver gives the serial: the next value of the `Kind::Credential` counter. Thus a restore from an older
+5. For a rotation or a recovery, it checks the proof of the new key ([Rotate the proof key](#rotate-the-proof-key)).
+6. `authz::check` checks the evidence for the action of the request on the resource of the workload.
+7. The driver gives the serial: the next value of the `Kind::Credential` counter. Thus a restore from an older
    snapshot never gives one serial twice.
 
 The proposal reads these dependencies, so a concurrent change between the decision and the commit gives a conflict:
@@ -466,14 +470,14 @@ Each refusal is a `workload::Error`. Refuse the request unless the table gives a
 | `Issuer` | The registration names another issuer than the issuer record of the request | Use the issuer of the registration |
 | `Algorithm` | The new issuer key has another algorithm than the current key | Use a key of the declared profile, or a new issuer with its own authority |
 | `Overlap { until }` | A routine issuer rotation while the previous key still verifies | Rotate at `until` or later, or with `Retire::Now` |
-| `Credential(credential::Error)` | The format refused the draft, the current credential, a proof, or the signature of custody | Refuse |
+| `Credential(credential::Error)` | The format refused the draft, the current credential, a proof, or the signature of custody, or a challenge is longer than `credential::MAX_BYTES` | Refuse |
 | `Refusal(authz::Refusal)` | The policy refused | Refuse |
 | `Driver(driver::Error)` | The driver gave no value | As the driver error gives |
 | `Transition(transition::Error)` | The proposal or the commit refused | As `error.recovery()` gives |
 | `Conflict` | A dependency changed before the commit, so nothing committed | Read the records again, and ask as a new operation |
 | `Unknown(operation)` | The commit can have occurred | [After a lost response](#after-a-lost-response) |
 | `Committed` | An earlier submission of the operation committed, so this one released nothing | Ask as a new operation |
-| `Operation` | The outcome is of another operation | Give the outcome of this operation |
+| `Operation` | The outcome is of another operation, or the receipt is of another issuance under this operation | Give the outcome of the commit of this proposal |
 
 ## Record forms
 
@@ -494,9 +498,10 @@ Each identifier has its CBOR form of [Vocabulary](vocabulary.md#cbor-forms). A k
 | Registration | The issuer authority, and 8 bytes of a value of the `Kind::Credential` counter |
 | Credential | The issuer authority, and the 8 bytes of the serial |
 
-The request binding of an issuance holds `[workload, audience, lifetime, kid]`. `lifetime` is `null` for no
+The request binding of an issuance holds `[issuer, workload, audience, lifetime, kid]`. `lifetime` is `null` for no
 lifetime, and `kid` is the thumbprint of the new key, or `null` with no `replace`. A revocation binds
-`[workload, serial]`, with `null` for `Target::All`. An issuer rotation binds `[authority, kid, retire]`, with 0 for `Retire::AfterLifetime` and 1 for
+`[issuer, workload, serial]`, with `null` for `Target::All`; its issuer is the issuer of the registration. Thus the
+same request under another issuer is another request, and it refuses with `transition::Error::Reuse`. An issuer rotation binds `[authority, kid, retire]`, with 0 for `Retire::AfterLifetime` and 1 for
 `Retire::Now`. The serial and the times are not part of a binding.
 
 ## Limits

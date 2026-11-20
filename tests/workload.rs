@@ -1207,3 +1207,63 @@ fn an_issuance_after_the_end_of_the_credential_of_its_evidence_refuses() {
     host.node.memory.set_clock(at(59));
     host.issue(issuance("i-3", &operator, &build), at(59)).unwrap();
 }
+
+#[test]
+fn the_receipt_of_another_issuance_under_the_same_operation_releases_nothing() {
+    let mut host = Host::new(ceiling());
+    let (operator, build) = (host.operator.clone(), audience("build-api"));
+    // Two issuances of one request under one operation, as a host makes after a lost response: each has its own serial
+    // and its own credential. The receipt of the first one releases nothing through the second one.
+    let (proposal, plan, _, _) = host.signed(issuance("i-1", &operator, &build), at(0));
+    let (_, _, second, _) = host.signed(issuance("i-1", &operator, &build), at(1));
+    assert_eq!(
+        second.release(host.node.commit(proposal, plan)).err(),
+        Some(Error::Operation)
+    );
+    // The control: the receipt of an issuance releases its own credential, with its own serial.
+    let (proposal, plan, awaiting, _) = host.signed(issuance("i-2", &operator, &build), at(1));
+    let serial = awaiting.serial();
+    let credential = awaiting.release(host.node.commit(proposal, plan)).unwrap();
+    let profile = host.issuer().profile(&build, Limits::default()).unwrap();
+    let verified = profile.verify(credential.as_bytes(), at(1), &mut budget()).unwrap();
+    assert_eq!((verified.claims().serial, credential.serial()), (serial, serial));
+}
+
+#[test]
+fn the_same_request_under_two_issuers_binds_two_requests() {
+    let mut host = Host::new(ceiling());
+    let (operator, build) = (host.operator.clone(), audience("build-api"));
+    host.issue(issuance("i-1", &operator, &build), at(0)).unwrap();
+    // A second issuer, and the registration of the same workload under it, as a restore that registered the workload
+    // again leaves it.
+    let other = Id::new("acme", "authority-2").unwrap();
+    let mut setup = proposal("setup-2");
+    let record = Issuer::new(other.clone(), host.issuer.public(), vec![build.clone()], ceiling()).unwrap();
+    record.register(&mut setup, &mut host.node.driver).unwrap();
+    assert!(matches!(host.node.commit(setup, Plan::default()), Outcome::Accepted(_)));
+    let issuer = host.node.read(&Issuer::store_key(&other)).unwrap();
+    let registration = host.registration().unwrap();
+    let version = AuthorityVersion::new(other, registration.version.coordinate()).unwrap();
+    let registration = Record {
+        version,
+        ..registration
+    };
+    let pending = Pending::new(
+        issuance("i-1", &operator, &build),
+        &issuer,
+        &registration,
+        &Permits,
+        &mut host.node.driver,
+        at(1),
+        Limits::default(),
+    )
+    .unwrap();
+    let signature = host.issuer.sign(&pending.to_be_signed());
+    let (proposal, plan, awaiting) = pending.finish(&signature, &mut budget()).unwrap();
+    // The same operation identity and the same request under the other issuer is another request: it does not report
+    // the commit of the first issuer.
+    assert_eq!(
+        awaiting.release(host.node.commit(proposal, plan)).err(),
+        Some(Error::Transition(rsauthnz::transition::Error::Reuse))
+    );
+}

@@ -164,9 +164,8 @@ impl State {
                     .collect(),
             ),
         ]);
-        let data = cbor::encode(&form).expect("the mark form has no map and no simple value");
         // The driver reads the record back within `limits`, and `bytes_max` counts on it.
-        (data.len() <= limits.bytes).then_some(())?;
+        let data = cbor::encode(&form, limits).ok()?;
         let (proposal, version) = replace(
             id,
             MARK,
@@ -201,7 +200,7 @@ pub(super) fn replay_floor(
         duration(now.estimate()),
         now.bound().map_or(Value::Null, duration),
     ]);
-    let data = cbor::encode(&form).expect("the floor form has no map and no simple value");
+    let data = cbor::encode(&form, Limits::FORM).expect("the floor form has no map and no simple value");
     replace(
         id,
         REPLAY_FLOOR,
