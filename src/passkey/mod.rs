@@ -771,7 +771,7 @@ impl RelyingParty {
         let public = Key::decode(&stored.public_key, self.limits).map_err(|_| Error::Record)?;
         TrustedKey::new(stored.algorithm, &public)
             .map_err(|_| Error::Record)?
-            .verify_assertion(&message, &assertion.signature, &mut SignatureBudget::new(&self.limits))
+            .verify_der(&message, &assertion.signature, &mut SignatureBudget::new(&self.limits))
             .map_err(|_| Error::Signature)?;
 
         let advances = count > stored.sign_count;

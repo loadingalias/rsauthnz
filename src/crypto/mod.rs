@@ -252,6 +252,26 @@ impl Verifier {
         Self::SlhDsaSha2_128s(SlhDsaSha2_128sPublicKey::from_bytes(*public))
     }
 
+    /// The key of `algorithm` with the encoding `public` of [`Self::to_bytes`], or `None` if `public` is not a key of
+    /// `algorithm`. An RSA key has no such encoding here: `None`.
+    pub(crate) fn from_bytes(algorithm: Algorithm, public: &[u8]) -> Option<Self> {
+        match algorithm {
+            Algorithm::Ed25519 => public.try_into().ok().map(Self::ed25519),
+            Algorithm::Es256 => {
+                let (&[0x04], point) = public.split_first_chunk::<1>()? else {
+                    return None;
+                };
+                let (x, y) = point.split_first_chunk::<32>()?;
+                Self::es256(x, y.try_into().ok()?)
+            }
+            Algorithm::MlDsa65 => public.try_into().ok().map(Self::ml_dsa_65),
+            Algorithm::MlDsa65Ed25519 => public.try_into().ok().and_then(Self::ml_dsa_65_ed25519),
+            Algorithm::MlDsa65EcdsaP256 => public.try_into().ok().and_then(Self::ml_dsa_65_ecdsa_p256),
+            Algorithm::SlhDsaSha2_128s => public.try_into().ok().map(Self::slh_dsa_sha2_128s),
+            Algorithm::Rs256 | Algorithm::Ps256 => None,
+        }
+    }
+
     /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, the
     /// `RSAPublicKey` DER of an RSA key, the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite
     /// key, and PK.seed then PK.root for an SLH-DSA key.
@@ -281,9 +301,9 @@ impl Verifier {
         }
     }
 
-    /// Whether `signature` is a valid WebAuthn assertion signature over `message`: as [`Self::verify`], but an ES256
-    /// signature is the DER `Ecdsa-Sig-Value` that WebAuthn uses, and not `r || s`.
-    pub(crate) fn verify_assertion(
+    /// Whether `signature` is a valid signature over `message` in the form of WebAuthn and X.509: as [`Self::verify`],
+    /// but an ES256 signature is the DER `Ecdsa-Sig-Value`, and not `r || s`.
+    pub(crate) fn verify_der(
         &self,
         message: &[u8],
         signature: &[u8],

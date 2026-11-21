@@ -305,14 +305,14 @@ impl TrustedKey {
 
     /// Verifies the WebAuthn assertion signature `signature` over `message`, after it charges `budget`. An ES256
     /// signature is DER.
-    pub(crate) fn verify_assertion(
+    pub(crate) fn verify_der(
         &self,
         message: &[u8],
         signature: &[u8],
         budget: &mut SignatureBudget,
     ) -> Result<(), Error> {
         self.verifier
-            .verify_assertion(message, signature, budget)
+            .verify_der(message, signature, budget)
             .map_err(Error::Limit)?
             .ok_or(Error::Signature)
     }

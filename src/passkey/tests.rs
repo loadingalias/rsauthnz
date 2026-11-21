@@ -66,14 +66,14 @@ fn the_published_assertions_verify_with_their_credential_keys() {
         let signature = hex(case.signature);
         let mut budget = SignatureBudget::new(&Limits::default());
         assert_eq!(
-            trusted.verify_assertion(&message, &signature, &mut budget),
+            trusted.verify_der(&message, &signature, &mut budget),
             Ok(()),
             "{}",
             case.name
         );
         message[0] ^= 1;
         assert_eq!(
-            trusted.verify_assertion(&message, &signature, &mut budget),
+            trusted.verify_der(&message, &signature, &mut budget),
             Err(cose::Error::Signature),
             "{}",
             case.name

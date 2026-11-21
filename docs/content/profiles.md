@@ -3,7 +3,8 @@
 `rsauthnz::crypto` holds the signature profiles. A profile is the algorithm of a trusted key. The application
 selects it, and an artifact cannot select it. [rscrypto](https://github.com/loadingalias/rscrypto) does each
 signature check. rsauthnz adds no cryptography. [Verify COSE and CWT artifacts](verification.md) gives the
-verification with each profile.
+verification with each profile, and [Issue and read X.509 certificates](certificates.md) gives the X.509 identifier of
+each profile of a certificate.
 
 ## The profiles
 
@@ -84,7 +85,8 @@ and the custody handle of the trusted root names the algorithm.
 
 Custody makes, signs with, rotates, and deletes root keys ([Hold keys in custody](custody.md)), and a custody handle
 verifies their signatures. The three NIST ACVP cases of `tests/slh-dsa/` verify through the facade, with the empty
-context. The other formats of rsauthnz refuse the profile, because a root signs issuer keys and trust snapshots only.
+context. A root also signs X.509 issuer certificates ([Issue and read X.509 certificates](certificates.md)). The other
+formats of rsauthnz refuse the profile, because a root signs issuer keys and trust snapshots only.
 
 ## The profile report
 

@@ -7,6 +7,10 @@ work](admission.md) gives the cost class of each operation.
 rsauthnz has one CBOR codec: `rsauthnz::cbor`. Use it for each CBOR input, so one set of rules and bounds applies to
 all of them.
 
+The X.509 reader has fixed bounds of its own: at most `CERTIFICATE_BYTES_MAX` (16,384) bytes, refused before a read,
+and lengths that fit in the input, so it allocates nothing for the DER ([Read and verify a
+certificate](certificates.md#read-and-verify-a-certificate)).
+
 ## The limit set
 
 Set the bounds of the CBOR decoder in a `rsauthnz::limits::Limits` value: the one limit set of the crate. Build it

@@ -152,17 +152,14 @@ impl Handle {
     /// [`Error::Algorithm`] if `algorithm` is not a composite or SLH-DSA. [`Error::Mismatch`] if `public` is not a
     /// public key of `algorithm`.
     pub fn new(id: KeyId, algorithm: Algorithm, public: &[u8]) -> Result<Self, Error> {
-        let key = match algorithm {
-            Algorithm::MlDsa65Ed25519 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ed25519),
-            Algorithm::MlDsa65EcdsaP256 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ecdsa_p256),
-            Algorithm::SlhDsaSha2_128s => public.try_into().ok().map(Verifier::slh_dsa_sha2_128s),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::MlDsa65 => {
-                return Err(Error::Algorithm);
-            }
-        };
+        let held = matches!(
+            algorithm,
+            Algorithm::MlDsa65Ed25519 | Algorithm::MlDsa65EcdsaP256 | Algorithm::SlhDsaSha2_128s
+        );
+        held.ok_or(Error::Algorithm)?;
         Ok(Self {
             id,
-            key: key.ok_or(Error::Mismatch)?,
+            key: Verifier::from_bytes(algorithm, public).ok_or(Error::Mismatch)?,
         })
     }
 
