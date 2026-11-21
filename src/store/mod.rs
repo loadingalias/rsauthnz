@@ -284,7 +284,8 @@ pub enum Commit {
     /// A dependency or the instance number did not hold, so the commit wrote nothing.
     Conflict,
     /// The store has an outcome record of the operation identity ([`outcome_of`]), so the commit wrote nothing. The
-    /// record answers the proposal ([`Operation::answer`]).
+    /// commit driver answers the proposal from the record: the receipt of the first commit for the same request, and
+    /// [`Error::Reuse`](crate::transition::Error::Reuse) for another one.
     Recorded(Operation),
 }
 

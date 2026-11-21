@@ -69,7 +69,7 @@ Otherwise it writes nothing.
 | --- | --- |
 | `Accepted` | The commit wrote everything. It is durable when it returns |
 | `Conflict` | A dependency or the instance number did not hold |
-| `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). `record.answer(proposal.operation())` gives the outcome |
+| `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). The commit driver gives the outcome from it: the receipt of the first commit for the same request, or `Error::Reuse` |
 
 An error of the commit is a crash with an unknown outcome. The commit takes a proposal, so state changes cannot
 commit without their audit and their outcome record. The rustdoc of `rsauthnz::store` shows it with a compiled

@@ -1,6 +1,6 @@
 use core::time::Duration;
 
-use super::{Binding, Evidence, EvidenceError, Method};
+use super::{Backup, Binding, Evidence, EvidenceError, Method};
 use crate::cbor;
 use crate::crypto::Authentication;
 use crate::id::{Agent, Human, Id, Principal};
@@ -36,19 +36,36 @@ fn a_recovery_never_reports_phishing_resistance() {
 }
 
 /// Evidence reads back from its encoded CBOR form with each fact: the kind of its subject, the time
-/// with a known or an unknown bound, each binding, and each authentication of a signature.
+/// with a known or an unknown bound, each binding, each authentication of a signature, and each backup
+/// state of a passkey.
 #[test]
 fn evidence_reads_back_from_its_cbor_form() {
     let agent = Principal::Agent(Id::<Agent>::new("acme", "u-17").unwrap());
-    let cases = [
-        Evidence::new(
+    let passkey = |backup| {
+        let mut evidence = Evidence::new(
             human(),
             Method::Passkey,
             time(Some(Duration::from_millis(20))),
             true,
             true,
-            Some(Binding::Device),
+            None,
             Some(Authentication::PostQuantum),
+        );
+        evidence.backup = Some(backup);
+        evidence
+    };
+    let cases = [
+        passkey(Backup::SingleDevice),
+        passkey(Backup::Eligible),
+        passkey(Backup::BackedUp),
+        Evidence::new(
+            human(),
+            Method::KeyPossession,
+            time(None),
+            false,
+            false,
+            Some(Binding::Device),
+            Some(Authentication::Classical),
         ),
         Evidence::new(
             agent,

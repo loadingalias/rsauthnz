@@ -118,10 +118,13 @@ operations of rsauthnz do this: each local operation binds its authority, and ea
 issuer.
 
 The outcome record is the `Operation` of the commit. When the store has an outcome record for the identity of a
-submission, `record.answer(&submitted)` gives the answer:
+submission, the commit driver answers from that record:
 
 - The same request gets `Outcome::Accepted` with the receipt of the first commit, and nothing commits again.
 - Another actor, action, or request gets `Outcome::Refused(Error::Reuse)`.
+
+Only the commit driver makes a `Receipt`: after an accepted commit, or from a stored outcome record. Thus each receipt
+shows a durable commit, and an artifact or evidence that a receipt releases never leaves before its commit.
 
 ## Outcomes and recovery
 

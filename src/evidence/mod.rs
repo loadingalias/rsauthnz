@@ -4,9 +4,10 @@
 //! authentication established: user verification, phishing resistance, recovery, a device or
 //! hardware binding of the key, and the authentication of the signature: hybrid, post-quantum, or
 //! classical. Evidence of a credential also keeps the credential: its verified claims and the digest
-//! of its bytes ([`Artifact`]). It has no strength score, and a recovery never records phishing
-//! resistance. Only the verifiers of this crate make evidence, so a caller cannot mark an unverified
-//! claim as proved.
+//! of its bytes ([`Artifact`]). Evidence of a passkey also keeps the backup state that its
+//! authenticator reports ([`Backup`]), which proves no binding. It has no strength score, and a
+//! recovery never records phishing resistance. Only the verifiers of this crate make evidence, so a
+//! caller cannot mark an unverified claim as proved.
 
 use alloc::vec;
 use core::fmt;
@@ -30,6 +31,8 @@ pub struct Evidence {
     authentication: Option<Authentication>,
     /// The credential of the authentication, or `None` when it used no credential.
     pub(crate) artifact: Option<Artifact>,
+    /// The backup state that the authenticator of a passkey reports, or `None` for another method.
+    pub(crate) backup: Option<Backup>,
     /// Whether the signature counter of a passkey did not increase: a possible clone of the credential.
     pub(crate) possible_clone: bool,
 }
@@ -94,6 +97,21 @@ pub enum Binding {
     Hardware,
 }
 
+/// The backup state of a passkey that its authenticator reports: the BE (backup eligible) and BS
+/// (backup state) flags of WebAuthn Level 3. No attestation signs them, and the key of the
+/// passkey can be outside any authenticator, so they prove no [`Binding`]. Use them as a signal,
+/// for example to offer a second passkey to an account whose only passkey is on one device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Backup {
+    /// The authenticator reports that it cannot back up the credential (BE is 0).
+    SingleDevice,
+    /// The authenticator can back up the credential and reports no backup (BE is 1, BS is 0).
+    Eligible,
+    /// The authenticator reports a backup of the credential (BE and BS are 1), as a synchronized
+    /// passkey has.
+    BackedUp,
+}
+
 impl Evidence {
     /// Makes the evidence of one authentication. `phishing_resistant` is true when the proof binds
     /// the origin, as a passkey assertion does; the evidence of a recovery drops it.
@@ -116,6 +134,7 @@ impl Evidence {
             binding,
             authentication,
             artifact: None,
+            backup: None,
             possible_clone: false,
         }
     }
@@ -172,6 +191,13 @@ impl Evidence {
         self.authentication
     }
 
+    /// The backup state that the authenticator of a passkey reports, or `None` for another method.
+    /// It proves no binding of the key: [`Self::binding`] of a passkey is `None`.
+    #[must_use]
+    pub const fn backup(&self) -> Option<Backup> {
+        self.backup
+    }
+
     /// Whether the signature counter of the passkey did not increase, with a nonzero counter on either side: the
     /// credential can be cloned, the authenticator can be faulty, or two sign-ins can have committed out of order. The
     /// signal locks nothing out. The policy of the application decides the response.
@@ -195,8 +221,9 @@ impl Evidence {
     }
 
     /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
-    /// resistant, binding, authentication, artifact, possible clone]`. The method, the binding, and the
-    /// authentication are numbers, with `null` for no binding and for no authentication. The time is
+    /// resistant, binding, authentication, artifact, backup, possible clone]`. The method, the binding,
+    /// the authentication, and the backup state are numbers, with `null` for no binding, for no
+    /// authentication, and for no backup state. The time is
     /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
     /// bound in the same form or `null` when it is unknown, and the source as a number. The artifact
     /// is `null`, or `[issuer, audience, subject, owner, purpose, serial, not before, expires,
@@ -247,6 +274,12 @@ impl Evidence {
                         duration_to_cbor(*end),
                     ])
                 }),
+            match self.backup {
+                None => Value::Null,
+                Some(Backup::SingleDevice) => Value::Unsigned(1),
+                Some(Backup::Eligible) => Value::Unsigned(2),
+                Some(Backup::BackedUp) => Value::Unsigned(3),
+            },
             Value::Bool(self.possible_clone),
         ])
     }
@@ -278,6 +311,7 @@ impl Evidence {
             binding,
             authentication,
             artifact,
+            backup,
             Value::Bool(possible_clone),
         ] = items.as_slice()
         else {
@@ -304,6 +338,13 @@ impl Evidence {
             Value::Unsigned(3) => Some(Authentication::Classical),
             _ => return Err(EvidenceError::Form),
         };
+        let backup = match backup {
+            Value::Null => None,
+            Value::Unsigned(1) => Some(Backup::SingleDevice),
+            Value::Unsigned(2) => Some(Backup::Eligible),
+            Value::Unsigned(3) => Some(Backup::BackedUp),
+            _ => return Err(EvidenceError::Form),
+        };
         if *phishing_resistant && method == Method::Recovery {
             return Err(EvidenceError::Form);
         }
@@ -319,6 +360,7 @@ impl Evidence {
                 Value::Null => None,
                 artifact => Some(artifact_from_cbor(artifact).ok_or(EvidenceError::Form)?),
             },
+            backup,
             possible_clone: *possible_clone,
         })
     }

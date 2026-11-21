@@ -1,5 +1,6 @@
-//! The passkey registration of WebAuthn Level 3: the published registration cases, the options of the profile, each
-//! refusal of a response, one commit for each ceremony, and the completion of a registration in doubt at a restore.
+//! The passkeys of WebAuthn Level 3: the published registration cases, the options of the profile, each refusal of a
+//! response, one commit for each ceremony, the decision of the application in the credential commit, the completion of
+//! a registration in doubt at a restore, the records of each relying party, and the sign-in.
 
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
@@ -13,18 +14,14 @@ use core::time::Duration;
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::crypto::Authentication;
-use rsauthnz::evidence::Binding;
-use rsauthnz::evidence::{Evidence, Method};
-use rsauthnz::id::Principal;
-use rsauthnz::id::{Authority, Human, Id};
+use rsauthnz::evidence::{Backup, Evidence, Method};
+use rsauthnz::id::{Authority, AuthorityVersion, Human, Id, Principal};
 use rsauthnz::limits::Limits;
-use rsauthnz::passkey::{
-    self, Assertion, Credential, Error, Failure, RelyingParty, Response, SignIn, User, UserHandle,
-};
+use rsauthnz::passkey::{self, Assertion, Error, Failure, RelyingParty, Response, SignIn, User, UserHandle};
 use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
-use rsauthnz::store::{Kind, Profile, Record, Store};
-use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::{self, Key, OperationId, Outcome, Proposal};
+use rsauthnz::store::{self, Kind, Profile, Record, Store};
+use rsauthnz::time::{Reading, ReadingSource, TimeError};
+use rsauthnz::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
 use rscodec::base64::Profile::Url;
@@ -43,11 +40,18 @@ const KEY: [u8; 32] = [3; 32];
 /// The user handle of alice.
 const HANDLE: [u8; 32] = [9; 32];
 
-/// The key of the pending record of the registration challenge `challenge`.
+/// The key of the pending record of the registration challenge `challenge` of [`rp`]: the documented digest of
+/// `["rsauthnz.passkey.registration.1", authority, relying party ID, challenge]`.
 fn ceremony(challenge: &[u8]) -> Key {
-    Kind::Registration
-        .key(&rscrypto::Sha256::digest(challenge))
-        .expect("a key")
+    let authority = authority();
+    let form = Value::Array(vec![
+        Value::Text("rsauthnz.passkey.registration.1"),
+        authority.to_cbor(),
+        Value::Text(RP_ID),
+        Value::Bytes(challenge),
+    ]);
+    let form = cbor::encode(&form, Limits::default()).expect("a form");
+    Kind::Registration.key(&rscrypto::Sha256::digest(&form)).expect("a key")
 }
 
 /// The reading at `seconds` past [`START`], with an uncertainty of one second.
@@ -79,9 +83,12 @@ fn alice() -> Id<Human> {
     Id::new("acme", "alice").expect("an identifier")
 }
 
+fn authority() -> Id<Authority> {
+    Id::new("acme", "auth").expect("an identifier")
+}
+
 fn rp() -> RelyingParty {
-    let authority: Id<Authority> = Id::new("acme", "auth").expect("an identifier");
-    RelyingParty::new(authority, RP_ID, ORIGIN, "Acme", KEY, Limits::default()).expect("a relying party")
+    RelyingParty::new(authority(), RP_ID, ORIGIN, "Acme", KEY, Limits::default()).expect("a relying party")
 }
 
 /// The memory binding and the commit driver on it.
@@ -130,6 +137,35 @@ impl Node {
     fn read(&mut self, key: &Key) -> Option<Record> {
         ready(Store::read(&mut self.memory, key)).expect("a read")
     }
+
+    /// Commits the policy record of the authority at the version `to`, after the version `from` or no record, and
+    /// gives the version.
+    fn policy(&mut self, from: Option<&AuthorityVersion>, to: u64) -> AuthorityVersion {
+        let key = store::policy_key(&authority());
+        let version = AuthorityVersion::new(authority(), &to.to_be_bytes()).expect("a version");
+        let audit = Audit {
+            actor: Principal::Human(Id::new("acme", "admin").expect("an identifier")),
+            action: Id::new("acme", "policy.change").expect("an identifier"),
+            time: at(0),
+        };
+        let operation = OperationId::new(format!("policy-{to}").as_bytes()).expect("an operation identity");
+        let mut proposal =
+            Proposal::new(operation, audit, &Value::Unsigned(to), Limits::default()).expect("a proposal");
+        let read = match from {
+            Some(from) => Dependency::Version(key.clone(), from.clone()),
+            None => Dependency::Absent(key.clone()),
+        };
+        proposal.read(read).expect("a read");
+        let change = Change::Write {
+            key,
+            version: version.clone(),
+            end: None,
+            data: Box::from(*b"the policy"),
+        };
+        proposal.change(change).expect("a change");
+        assert!(matches!(self.commit(proposal, Plan::default()), Outcome::Accepted(_)));
+        version
+    }
 }
 
 /// A site: its node, its relying party, and its random generator.
@@ -160,7 +196,7 @@ impl Site {
         let operation = OperationId::new(operation.as_bytes()).expect("an operation identity");
         let (proposal, plan) = self
             .rp
-            .start(&user, operation, at(0), &mut self.random, &mut self.node.driver)
+            .start(&user, &[], operation, at(0), &mut self.random, &mut self.node.driver)
             .expect("a start");
         let Outcome::Accepted(receipt) = self.node.commit(proposal, plan) else {
             panic!("the start does not commit");
@@ -174,7 +210,7 @@ impl Site {
         let passkey = Passkey::new(algorithm, alg, seed);
         let mut registration = Registration::new(&passkey, RP_ID, ORIGIN, challenge);
         registration.sign_count = count;
-        let (proposal, plan, _) = self.finish(&registration.json(), at(1)).expect("a finish");
+        let (proposal, plan) = self.propose(&registration.json(), at(1));
         assert!(matches!(self.node.commit(proposal, plan), Outcome::Accepted(_)));
         passkey
     }
@@ -208,7 +244,7 @@ impl Site {
     fn counter(&mut self, passkey: &Passkey) -> u64 {
         let record = self
             .node
-            .read(&passkey::credential_key(&passkey.id))
+            .read(&self.rp.credential_key(&passkey.id))
             .expect("the credential record");
         let Ok(Value::Array(items)) = cbor::decode(&record.data, Limits::default()) else {
             panic!("a record form");
@@ -219,13 +255,19 @@ impl Site {
         count
     }
 
-    /// Proposes the finish of `json` with the pending record that the store holds.
-    fn finish(&mut self, json: &[u8], now: Reading) -> Result<(Proposal, Plan, Credential), Error> {
+    /// The finish of `json` with the pending record that the store holds.
+    fn finish(&mut self, json: &[u8], now: Reading) -> Result<passkey::Registration, Error> {
         let response = Response::parse(json)?;
         let finish = self
             .rp
             .finish(&mut self.node.memory, &response, now, &mut self.node.driver);
         ready(finish).map_err(refused)
+    }
+
+    /// The commit of the finish of `json`, with a decision of the application that reads nothing.
+    fn propose(&mut self, json: &[u8], now: Reading) -> (Proposal, Plan) {
+        let registration = self.finish(json, now).expect("a finish");
+        registration.propose(&[]).expect("a proposal")
     }
 }
 
@@ -279,7 +321,7 @@ fn verify(vector: &Vector, verified: bool) -> Result<(Algorithm, bool, usize), E
     let credential = rp.verify(&Response::parse(&json)?, &challenge)?;
     Ok((
         credential.algorithm(),
-        credential.backup_eligible(),
+        credential.backup() != Backup::SingleDevice,
         credential.id().len(),
     ))
 }
@@ -342,7 +384,7 @@ fn the_options_offer_the_profile_and_release_only_after_the_start_commits() {
     let operation = OperationId::new(b"start-1").expect("an operation identity");
     let (proposal, plan) = site
         .rp
-        .start(&user, operation, at(0), &mut site.random, &mut site.node.driver)
+        .start(&user, &[], operation, at(0), &mut site.random, &mut site.node.driver)
         .expect("a start");
     // A lost response releases no options: the browser gets no challenge whose record may not exist.
     site.node.memory.inject(Fault::LostResponse);
@@ -353,6 +395,7 @@ fn the_options_offer_the_profile_and_release_only_after_the_start_commits() {
         .rp
         .start(
             &user,
+            &[],
             OperationId::new(b"start-2").expect("an operation identity"),
             at(0),
             &mut site.random,
@@ -402,8 +445,9 @@ fn each_algorithm_of_the_profile_registers_through_the_ceremony() {
         let challenge = site.start(&format!("start-{seed}"));
         let passkey = Passkey::new(algorithm, alg, seed);
         let json = Registration::new(&passkey, RP_ID, ORIGIN, challenge.clone()).json();
-        let (proposal, plan, credential) = site.finish(&json, at(1)).expect("a finish");
-        assert_eq!(credential.algorithm(), algorithm, "{alg}");
+        let registration = site.finish(&json, at(1)).expect("a finish");
+        assert_eq!(registration.credential().algorithm(), algorithm, "{alg}");
+        let (proposal, plan) = registration.propose(&[]).expect("a proposal");
         let ceremony = ceremony(&challenge);
         assert!(
             matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)),
@@ -413,7 +457,7 @@ fn each_algorithm_of_the_profile_registers_through_the_ceremony() {
         assert_eq!(site.node.read(&ceremony), None, "{alg}");
         let record = site
             .node
-            .read(&passkey::credential_key(&passkey.id))
+            .read(&site.rp.credential_key(&passkey.id))
             .expect("the credential record");
         assert_eq!(record.end, None, "{alg}");
     }
@@ -531,24 +575,32 @@ fn a_response_that_differs_from_the_ceremony_or_the_profile_refuses() {
 }
 
 #[test]
-fn a_synchronized_passkey_reports_no_hardware_binding() {
+fn a_passkey_reports_its_backup_flags_and_no_binding() {
     let rp = rp();
     let passkey = Passkey::new(Algorithm::Ed25519, -8, 1);
     let mut registration = Registration::new(&passkey, RP_ID, ORIGIN, vec![7; 32]);
     let check = |registration: &Registration<'_>| {
         let credential = rp.verify(&Response::parse(&registration.json())?, &[7; 32])?;
-        Ok::<_, Error>((
-            credential.backup_eligible(),
-            credential.backup_state(),
-            credential.binding(),
-        ))
+        Ok::<_, Error>(credential.backup())
     };
-    assert_eq!(check(&registration), Ok((true, true, None)));
+    assert_eq!(check(&registration), Ok(Backup::BackedUp));
     registration.flags &= !BACKUP_STATE;
-    assert_eq!(check(&registration), Ok((true, false, None)));
-    // A credential that cannot leave its device reports the device. No registration proves hardware.
+    assert_eq!(check(&registration), Ok(Backup::Eligible));
     registration.flags &= !BACKUP_ELIGIBLE;
-    assert_eq!(check(&registration), Ok((false, false, Some(Binding::Device))));
+    assert_eq!(check(&registration), Ok(Backup::SingleDevice));
+
+    // An authenticator that reports BE=0 proves no binding: nothing attests where its key lives.
+    let mut site = Site::new();
+    registration.challenge = site.start("start-1");
+    let (proposal, plan) = site.propose(&registration.json(), at(1));
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    let mut get = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
+    get.flags &= !(BACKUP_ELIGIBLE | BACKUP_STATE);
+    let evidence = site.signed_in(&get.json(), at(11));
+    assert_eq!(
+        (evidence.backup(), evidence.binding()),
+        (Some(Backup::SingleDevice), None)
+    );
 }
 
 #[test]
@@ -563,8 +615,8 @@ fn a_ceremony_commits_once_and_its_challenge_refuses_after_it() {
     let second_json = Registration::new(&second, RP_ID, ORIGIN, challenge.clone()).json();
     // Two finishes of one ceremony read its pending record before either one commits.
     let ceremony = ceremony(&challenge);
-    let (one, one_plan, _) = site.finish(&first_json, at(1)).expect("a finish");
-    let (two, two_plan, _) = site.finish(&second_json, at(1)).expect("a finish");
+    let (one, one_plan) = site.propose(&first_json, at(1));
+    let (two, two_plan) = site.propose(&second_json, at(1));
     let tickets = [
         site.node.driver.submit(one, one_plan).expect("a submission"),
         site.node.driver.submit(two, two_plan).expect("a submission"),
@@ -580,8 +632,8 @@ fn a_ceremony_commits_once_and_its_challenge_refuses_after_it() {
         "{:?}",
         outcomes[1]
     );
-    assert!(site.node.read(&passkey::credential_key(&first.id)).is_some());
-    assert_eq!(site.node.read(&passkey::credential_key(&second.id)), None);
+    assert!(site.node.read(&site.rp.credential_key(&first.id)).is_some());
+    assert_eq!(site.node.read(&site.rp.credential_key(&second.id)), None);
     // The commit consumed the challenge, so no later finish finds its ceremony.
     assert_eq!(site.node.read(&ceremony), None);
     assert_eq!(site.finish(&second_json, at(2)).err(), Some(Error::Challenge));
@@ -606,7 +658,7 @@ fn a_registration_in_doubt_completes_once_at_restore() {
     let snapshot = site.node.memory.snapshot();
     let passkey = Passkey::new(Algorithm::MlDsa65, -49, 1);
     let json = Registration::new(&passkey, RP_ID, ORIGIN, challenge.clone()).json();
-    let (proposal, plan, _) = site.finish(&json, at(1)).expect("a finish");
+    let (proposal, plan) = site.propose(&json, at(1));
     let operation = proposal.operation().clone();
     // The commit lands, and its response is lost. Then the store comes back from the snapshot before the commit.
     site.node.memory.inject(Fault::LostResponse);
@@ -616,7 +668,7 @@ fn a_registration_in_doubt_completes_once_at_restore() {
     site.node.run();
 
     // The restored store holds the passkey of alice, and the ceremony is consumed.
-    assert!(site.node.read(&passkey::credential_key(&passkey.id)).is_some());
+    assert!(site.node.read(&site.rp.credential_key(&passkey.id)).is_some());
     let ceremony = ceremony(&challenge);
     assert_eq!(site.node.read(&ceremony), None);
     let ticket = site.node.driver.lookup(operation).expect("a lookup");
@@ -627,6 +679,81 @@ fn a_registration_in_doubt_completes_once_at_restore() {
     ));
     // The same response again commits nothing: its ceremony is consumed.
     assert_eq!(site.finish(&json, at(2)).err(), Some(Error::Challenge));
+}
+
+#[test]
+fn a_decision_read_that_changes_before_the_credential_commit_stops_it() {
+    let mut site = Site::new();
+    // The policy of the authority permits the registration at its first version.
+    let permitted = site.node.policy(None, 1);
+    let challenge = site.start("start-1");
+    let passkey = Passkey::new(Algorithm::Es256, -7, 1);
+    let json = Registration::new(&passkey, RP_ID, ORIGIN, challenge).json();
+    let registration = site.finish(&json, at(1)).expect("a finish");
+    assert_eq!(registration.account(), &alice());
+    let (proposal, plan) = registration
+        .propose(&[Dependency::Policy(permitted.clone())])
+        .expect("a proposal");
+    // A policy change after the decision ends the permission before the commit.
+    let changed = site.node.policy(Some(&permitted), 2);
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Conflict));
+    let key = site.rp.credential_key(&passkey.id);
+    assert_eq!(site.node.read(&key), None);
+    // The control: a decision at the current policy commits the same response.
+    let (proposal, plan) = site
+        .finish(&json, at(2))
+        .expect("a finish")
+        .propose(&[Dependency::Policy(changed)])
+        .expect("a proposal");
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    assert!(site.node.read(&key).is_some());
+}
+
+#[test]
+fn records_of_one_relying_party_serve_no_other_relying_party_of_the_store() {
+    let mut site = Site::new();
+    let new = |authority, id, origin| {
+        RelyingParty::new(authority, id, origin, "Other", KEY, Limits::default()).expect("a relying party")
+    };
+    let globex = Id::new("globex", "auth").expect("an identifier");
+    let others = [
+        (
+            new(authority(), "other.example", "https://other.example"),
+            "other.example",
+            "https://other.example",
+        ),
+        (new(globex, RP_ID, ORIGIN), RP_ID, ORIGIN),
+    ];
+    let challenge = site.start("start-1");
+    let passkey = Passkey::new(Algorithm::Es256, -7, 1);
+    for (other, id, origin) in &others {
+        // A response of the other relying party with the challenge of this one finds no pending record.
+        let response =
+            Response::parse(&Registration::new(&passkey, id, origin, challenge.clone()).json()).expect("a response");
+        let finish = other.finish(&mut site.node.memory, &response, at(1), &mut site.node.driver);
+        assert_eq!(ready(finish).map_err(refused).err(), Some(Error::Challenge), "{id}");
+    }
+    // The control: this relying party finishes its ceremony.
+    let (proposal, plan) = site.propose(&Registration::new(&passkey, RP_ID, ORIGIN, challenge).json(), at(1));
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+
+    for (other, id, origin) in &others {
+        // An assertion of the passkey for the other relying party finds no credential record there.
+        let options = other.sign_in_options(at(10), &mut site.random).expect("the options");
+        let get = Get::new(&passkey, id, origin, authenticator::challenge(&options), HANDLE);
+        let assertion = Assertion::parse(&get.json()).expect("an assertion");
+        let sign_in = other.sign_in(
+            &mut site.node.memory,
+            &assertion,
+            at(11),
+            &mut site.random,
+            &mut site.node.driver,
+        );
+        assert_eq!(ready(sign_in).map_err(refused).err(), Some(Error::Credential), "{id}");
+    }
+    // The control: the passkey signs in at this relying party.
+    let get = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
+    site.signed_in(&get.json(), at(11));
 }
 
 #[test]
@@ -760,10 +887,10 @@ fn each_algorithm_of_the_profile_signs_in_and_reports_its_authentication() {
             ),
             (Method::Passkey, true, true)
         );
-        // A synchronized passkey reports no binding.
+        // A synchronized passkey reports its backup, and no binding.
         assert_eq!(
-            (evidence.binding(), evidence.authentication()),
-            (None, Some(authentication))
+            (evidence.backup(), evidence.binding(), evidence.authentication()),
+            (Some(Backup::BackedUp), None, Some(authentication))
         );
     }
 }
@@ -774,10 +901,25 @@ fn a_sign_in_challenge_from_before_a_restore_refuses_after_it() {
     let passkey = site.register(Algorithm::Ed25519, -8, 1, 0);
     let snapshot = site.node.memory.snapshot();
     let before = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE).json();
+    // At the true time 15, a clock that runs 10 seconds fast within its bound of 11 seconds reads 25.
+    let fast = Reading::new(
+        START + Duration::from_secs(25),
+        Some(Duration::from_secs(11)),
+        ReadingSource::Caller,
+    );
+    let fast = Get::new(&passkey, RP_ID, ORIGIN, site.options(fast), HANDLE).json();
     site.node.memory.restore(&snapshot);
     site.node.driver.restore(at(20)).expect("a restore");
     site.node.run();
     assert_eq!(site.sign_in(&before, at(21)).err(), Some(Error::Challenge));
+    // The estimate 25 is later than the floor of the restore (20 and twice its bound), but the challenge is older.
+    assert_eq!(site.sign_in(&fast, at(30)).err(), Some(Error::Challenge));
+    // A reading with no bound cannot show that a challenge is later than a restore, so it gives none.
+    let unbounded = Reading::new(START + Duration::from_secs(30), None, ReadingSource::Caller);
+    assert_eq!(
+        site.rp.sign_in_options(unbounded, &mut site.random).err(),
+        Some(Error::Time(TimeError::UnknownBound))
+    );
     // The control: a challenge after the restore signs in.
     let after = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(30)), HANDLE).json();
     site.signed_in(&after, at(31));

@@ -14,7 +14,7 @@
 //! An operation has a stable identity, which the client chooses or which an existing ceremony or grant identity
 //! supplies. Its request binding is a digest of the actor, the action, and the request. A second submission of the
 //! same request under the same identity gets the outcome of the first, and a different request refuses
-//! ([`Operation::answer`]). A lost response is an [`Outcome::Unknown`]. Its recovery is a lookup of the same
+//! with [`Error::Reuse`]. A lost response is an [`Outcome::Unknown`]. Its recovery is a lookup of the same
 //! identity, never a new operation.
 //!
 //! ```
@@ -122,9 +122,10 @@ impl Operation {
     /// The answer of a store that keeps `self` as the outcome record of an identity, to the submission `submitted` of
     /// that identity. The same request gets the receipt of the commit, with no artifact, and no second commit.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    /// Only the commit driver calls it, with an outcome record that it read from the store. A receipt releases
+    /// authority, such as the evidence of a sign-in, so no caller can make one without a durable commit.
     #[must_use]
-    pub fn answer(&self, submitted: &Self) -> Outcome {
+    pub(crate) fn answer(&self, submitted: &Self) -> Outcome {
         if self == submitted {
             Outcome::Accepted(Receipt {
                 operation: self.id.clone(),
