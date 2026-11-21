@@ -617,6 +617,11 @@ impl Issuer {
         &self.authority
     }
 
+    /// The number of its keys: the current key, and the previous key during a rotation.
+    pub(crate) const fn keys(&self) -> usize {
+        if self.previous.is_some() { 2 } else { 1 }
+    }
+
     /// The audiences, sorted.
     #[must_use]
     pub fn audiences(&self) -> &[Id<Audience>] {
@@ -748,9 +753,12 @@ impl Registration {
     /// of [`admits`] compares the thumbprint of the key, so it makes no trusted key.
     #[expect(
         clippy::type_complexity,
-        reason = "the four fields of the record form, which only two callers read"
+        reason = "the four fields of the record form, which only three callers read"
     )]
-    fn fields(data: &[u8], limits: Limits) -> Result<(Id<Workload>, &[u8], Serial, Vec<(Serial, Duration)>), Error> {
+    pub(crate) fn fields(
+        data: &[u8],
+        limits: Limits,
+    ) -> Result<(Id<Workload>, &[u8], Serial, Vec<(Serial, Duration)>), Error> {
         let value = cbor::decode(data, limits).map_err(|_| Error::Record)?;
         let Value::Array(items) = &value else {
             return Err(Error::Record);
@@ -885,19 +893,43 @@ pub fn admits(
 ) -> Result<(), Error> {
     let registration = registration.ok_or(Error::Unregistered)?;
     let (workload, key, generation, revoked) = Registration::fields(&registration.data, limits)?;
-    let claims = verified.claims();
     let registered = Key::decode(key, limits).map_err(|_| Error::Record)?.public.thumbprint();
-    let named = matches!(&claims.subject, Subject::Workload(named) if *named == workload);
-    (claims.purpose == purpose() && claims.issuer == *registration.version.owner() && named)
-        .ok_or(Error::Possession)?;
-    let ended = claims.serial < generation || revoked.iter().any(|(serial, _)| *serial == claims.serial);
-    (!ended).ok_or(Error::Revoked)?;
-    // Each credential at or above the generation has the registered key, so another key is no credential of the
-    // registration.
-    let bound = verified
-        .confirmation()
-        .is_some_and(|confirmation| *confirmation.kid() == registered);
-    bound.ok_or(Error::Possession)
+    let member = Admitted {
+        issuer: registration.version.owner(),
+        workload: &workload,
+        thumbprint: &registered,
+        generation,
+        revoked: &revoked,
+    };
+    member.admits(verified)
+}
+
+/// What a verifier knows of a registration: its issuer, its workload, the COSE Key Thumbprint of its key, its
+/// generation, and its revoked credentials. The current registration record gives it, or a trust snapshot
+/// ([`crate::trust`]).
+pub(crate) struct Admitted<'a> {
+    pub(crate) issuer: &'a Id<Authority>,
+    pub(crate) workload: &'a Id<Workload>,
+    pub(crate) thumbprint: &'a [u8; 32],
+    pub(crate) generation: Serial,
+    pub(crate) revoked: &'a [(Serial, Duration)],
+}
+
+impl Admitted<'_> {
+    /// The check of [`admits`].
+    pub(crate) fn admits(&self, verified: &credential::Verified<'_, '_>) -> Result<(), Error> {
+        let claims = verified.claims();
+        let named = matches!(&claims.subject, Subject::Workload(named) if named == self.workload);
+        (claims.purpose == purpose() && claims.issuer == *self.issuer && named).ok_or(Error::Possession)?;
+        let ended = claims.serial < self.generation || self.revoked.iter().any(|(serial, _)| *serial == claims.serial);
+        (!ended).ok_or(Error::Revoked)?;
+        // Each credential at or above the generation has the registered key, so another key is no credential of the
+        // registration.
+        let bound = verified
+            .confirmation()
+            .is_some_and(|confirmation| confirmation.kid() == self.thumbprint);
+        bound.ok_or(Error::Possession)
+    }
 }
 
 /// A request for a workload credential.

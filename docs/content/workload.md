@@ -252,6 +252,7 @@ A verifier chooses what it reads:
 | Verifier | Reads | Refuses a credential that a rotation, a recovery, or a revocation ended |
 | --- | --- | --- |
 | Reads the current state | The issuer record, to make `Issuer`, and the registration record of the workload of the credential | At once |
+| Reads a trust snapshot | The issuers and the registrations of a signed snapshot of the authority ([Refresh trust with snapshots](trust-snapshots.md)) | After the refresh that installs a snapshot issued after the change |
 | Reads nothing | Its configuration, to make `Issuer` with `Issuer::new`. During a routine issuer rotation, it adds the previous key with `profile.with_previous(previous_key, until)` | When the credential ends |
 
 A verifier that reads the current state makes two keyed reads, and then calls

@@ -170,6 +170,11 @@ impl<'a> Sign1<'a> {
         self.payload
     }
 
+    /// The untrusted signature.
+    pub(crate) const fn signature(&self) -> &'a [u8] {
+        self.signature
+    }
+
     /// Verifies the signature with `key`, and gives the payload. The check charges `budget`, the budget of the
     /// artifact, before its signature work. The externally supplied data of RFC 9052 section 4.3 is empty.
     ///

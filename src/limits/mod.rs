@@ -2,7 +2,7 @@
 //!
 //! [`Limits`] is the one limit set of the crate. Each parser, each verifier, and each transition proposal checks its
 //! input against it before expensive work, and a refusal names the [`Limit`] that refused the input. A future bound
-//! joins [`Limits`] in the change that adds its first consumer: grants, resource scopes, and the keys of a key set.
+//! joins [`Limits`] in the change that adds its first consumer: grants and resource scopes.
 //! [`SignatureBudget`] bounds the signature checks of one artifact.
 //!
 //! [`Class`] is the cost class of an operation. Each public function names its class in its documentation, in the
@@ -44,6 +44,9 @@ pub struct Limits {
     /// The most signature checks of one artifact. A composite signature is two checks, one for each component. The
     /// default is 2: one composite signature. [`SignatureBudget`] counts them.
     pub signature_checks: usize,
+    /// The most keys of one key set, such as the issuer keys of a trust snapshot ([`crate::trust`]). The check counts
+    /// them before it makes a trusted key of one. The default is 64.
+    pub keys: usize,
 }
 
 impl Limits {
@@ -59,6 +62,7 @@ impl Limits {
         dependencies: usize::MAX,
         intents: usize::MAX,
         signature_checks: usize::MAX,
+        keys: usize::MAX,
     };
 }
 
@@ -73,6 +77,7 @@ impl Default for Limits {
             dependencies: 64,
             intents: 8,
             signature_checks: 2,
+            keys: 64,
         }
     }
 }
@@ -97,6 +102,8 @@ pub enum Limit {
     Intents,
     /// [`Limits::signature_checks`].
     SignatureChecks,
+    /// [`Limits::keys`].
+    Keys,
 }
 
 /// The signature checks that one artifact can still make. Make one budget for each artifact, and give it to each

@@ -20,6 +20,7 @@ from `Limits::default()`, and set each field that you change. A refusal names it
 | `items` | 1,024 | Data items. The outer item counts, and so does each array element, map key, map value, and tagged item | `Limit::Items` |
 | `map_keys` | 64 | Keys in one map | `Limit::MapKeys` |
 | `string_bytes` | 16,384 | Bytes in one byte string or text string | `Limit::StringBytes` |
+| `keys` | 64 | Keys in one key set, such as the issuer keys of a [trust snapshot](trust-snapshots.md). The check counts them before it makes a trusted key | `Limit::Keys` |
 
 The fields `dependencies` and `intents` bound a transition proposal, not a codec. [Propose a
 transition](transitions.md#limits) gives them. The field `signature_checks` bounds the signature checks of one

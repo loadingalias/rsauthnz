@@ -5,6 +5,9 @@
 //! an issuance or a restore follows them. An issuer-key rotation keeps the credentials of the old key until they end,
 //! unless it retires the old key at once.
 
+#[path = "workload/trust.rs"]
+mod trust;
+
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;

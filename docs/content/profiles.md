@@ -78,12 +78,13 @@ SLH-DSA-SHA2-192s, which rsauthnz does not have.
 
 The profile has no COSE identifier yet. [draft-ietf-cose-sphincs-plus-11](https://datatracker.ietf.org/doc/draft-ietf-cose-sphincs-plus/)
 requests -51, but IANA assigned -51 to ESP384 ([RFC 9864](https://www.rfc-editor.org/rfc/rfc9864)). Thus the
-`cose` field of its report is `None`, `TrustedKey::new` refuses the algorithm, and no COSE artifact of rsauthnz uses
-it. The credential format refuses it too.
+`cose` field of its report is `None`, and `TrustedKey::new` refuses the algorithm. The credential format refuses it
+too. The one artifact that a root signs is a [trust snapshot](trust-snapshots.md): its protected bucket has no `alg`,
+and the custody handle of the trusted root names the algorithm.
 
 Custody makes, signs with, rotates, and deletes root keys ([Hold keys in custody](custody.md)), and a custody handle
 verifies their signatures. The three NIST ACVP cases of `tests/slh-dsa/` verify through the facade, with the empty
-context. The formats of rsauthnz refuse the profile, because a root signs issuer keys and no artifact.
+context. The other formats of rsauthnz refuse the profile, because a root signs issuer keys and trust snapshots only.
 
 ## The profile report
 

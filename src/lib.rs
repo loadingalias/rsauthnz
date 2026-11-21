@@ -18,6 +18,7 @@ pub mod passkey;
 pub mod session;
 pub mod store;
 pub mod transition;
+pub mod trust;
 pub mod workload;
 
 /// Physical time: the reading of the family's shared types, which evidence times, expiry, and
