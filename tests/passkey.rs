@@ -2,6 +2,8 @@
 //! response, one commit for each ceremony, the decision of the application in the credential commit, the completion of
 //! a registration in doubt at a restore, the records of each relying party, and the sign-in.
 
+#[path = "passkey/account.rs"]
+mod account;
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
 #[path = "passkey/session.rs"]
@@ -13,13 +15,14 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
+use rsauthnz::account::{FRESH_MAX, Fresh};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::crypto::Authentication;
 use rsauthnz::evidence::{Backup, Evidence, Method};
 use rsauthnz::id::{Authority, AuthorityVersion, Human, Id, Principal};
 use rsauthnz::limits::Limits;
-use rsauthnz::passkey::{self, Assertion, Error, Failure, RelyingParty, Response, User, UserHandle};
+use rsauthnz::passkey::{self, Assertion, Decision, Error, Failure, RelyingParty, Response, User, UserHandle};
 use rsauthnz::session::{Access, Opened, Opening, Policy, Sessions};
 use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
 use rsauthnz::store::{self, Kind, Profile, Record, Store};
@@ -219,7 +222,7 @@ impl Site {
         let start = self.rp.start(
             &mut self.node.memory,
             &user,
-            &[],
+            Decision::SignUp(&[]),
             at(0),
             &mut self.random,
             &mut self.node.driver,
@@ -248,6 +251,57 @@ impl Site {
         let mut registration = Registration::new(&passkey, RP_ID, ORIGIN, challenge);
         registration.sign_count = count;
         let (proposal, plan) = self.propose(&registration.json(), at(1));
+        assert!(matches!(self.node.commit(proposal, plan), Outcome::Accepted(_)));
+        passkey
+    }
+
+    /// A fresh user verification of alice with her passkey `with`: a sign-in at 11, checked at 12.
+    fn fresh(&mut self, with: &Passkey) -> Fresh {
+        let json = Get::new(with, RP_ID, ORIGIN, self.options(at(10)), HANDLE).json();
+        let opened = self.opened(&json, at(11), None);
+        let access = match ready(
+            self.sessions
+                .check(&mut self.node.memory, opened.session.identifier(), at(12)),
+        ) {
+            Ok(rsauthnz::session::Check::Active(access)) => access,
+            other => panic!("the session does not serve: {other:?}"),
+        };
+        Fresh::check(&access, FRESH_MAX, at(12)).expect("a fresh verification")
+    }
+
+    /// Commits the start of an additional passkey of alice at 12 with the verification `fresh`, and gives its options.
+    fn add_options(&mut self, fresh: &Fresh) -> Vec<u8> {
+        let alice = alice();
+        let user = User {
+            account: &alice,
+            handle: UserHandle::from_bytes(HANDLE),
+            name: "user@app.example",
+            display_name: "User",
+        };
+        let start = self.rp.start(
+            &mut self.node.memory,
+            &user,
+            Decision::Add(fresh, &[]),
+            at(12),
+            &mut self.random,
+            &mut self.node.driver,
+        );
+        let (proposal, plan) = ready(start).map_err(refused).expect("a start");
+        let Outcome::Accepted(receipt) = self.node.commit(proposal, plan) else {
+            panic!("the start does not commit");
+        };
+        receipt.artifact().expect("the options").to_vec()
+    }
+
+    /// Adds a passkey of `algorithm` for alice, with `alg` in its key, after a fresh user verification with her
+    /// passkey `with`. The registration finishes at 13.
+    fn add(&mut self, with: &Passkey, algorithm: Algorithm, alg: i64, seed: u8) -> Passkey {
+        let fresh = self.fresh(with);
+        let challenge = authenticator::challenge(&self.add_options(&fresh));
+        let passkey = Passkey::new(algorithm, alg, seed);
+        let json = Registration::new(&passkey, RP_ID, ORIGIN, challenge).json();
+        let registration = self.finish(&json, at(13)).expect("a finish");
+        let (proposal, plan) = registration.propose(Decision::Add(&fresh, &[])).expect("a proposal");
         assert!(matches!(self.node.commit(proposal, plan), Outcome::Accepted(_)));
         passkey
     }
@@ -325,7 +379,7 @@ impl Site {
     /// The commit of the finish of `json`, with a decision of the application that reads nothing.
     fn propose(&mut self, json: &[u8], now: Reading) -> (Proposal, Plan) {
         let registration = self.finish(json, now).expect("a finish");
-        registration.propose(&[]).expect("a proposal")
+        registration.propose(Decision::SignUp(&[])).expect("a proposal")
     }
 }
 
@@ -471,7 +525,6 @@ fn the_options_offer_the_profile_and_release_only_after_the_start_commits() {
 
 #[test]
 fn each_algorithm_of_the_profile_registers_through_the_ceremony() {
-    let mut site = Site::new();
     let cases = [
         (Algorithm::MlDsa65, -49, 1),
         (Algorithm::Ed25519, -8, 2),
@@ -481,12 +534,13 @@ fn each_algorithm_of_the_profile_registers_through_the_ceremony() {
         (Algorithm::Es256, -9, 5),
     ];
     for (algorithm, alg, seed) in cases {
+        let mut site = Site::new();
         let challenge = site.start();
         let passkey = Passkey::new(algorithm, alg, seed);
         let json = Registration::new(&passkey, RP_ID, ORIGIN, challenge.clone()).json();
         let registration = site.finish(&json, at(1)).expect("a finish");
         assert_eq!(registration.credential().algorithm(), algorithm, "{alg}");
-        let (proposal, plan) = registration.propose(&[]).expect("a proposal");
+        let (proposal, plan) = registration.propose(Decision::SignUp(&[])).expect("a proposal");
         let ceremony = ceremony(&challenge);
         assert!(
             matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)),
@@ -733,7 +787,7 @@ fn a_decision_read_that_changes_before_the_credential_commit_stops_it() {
     let registration = site.finish(&json, at(1)).expect("a finish");
     assert_eq!(registration.account(), &alice());
     let (proposal, plan) = registration
-        .propose(&[Dependency::Policy(permitted.clone())])
+        .propose(Decision::SignUp(&[Dependency::Policy(permitted.clone())]))
         .expect("a proposal");
     // A policy change after the decision ends the permission before the commit.
     let changed = site.node.policy(Some(&permitted), 2);
@@ -744,7 +798,7 @@ fn a_decision_read_that_changes_before_the_credential_commit_stops_it() {
     let (proposal, plan) = site
         .finish(&json, at(2))
         .expect("a finish")
-        .propose(&[Dependency::Policy(changed)])
+        .propose(Decision::SignUp(&[Dependency::Policy(changed)]))
         .expect("a proposal");
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
     assert!(site.node.read(&key).is_some());
@@ -801,7 +855,7 @@ fn records_of_one_relying_party_serve_no_other_relying_party_of_the_store() {
 fn the_options_exclude_each_passkey_of_the_account() {
     let mut site = Site::new();
     let first = site.register(Algorithm::Es256, -7, 1, 0);
-    let second = site.register(Algorithm::Ed25519, -8, 2, 0);
+    let second = site.add(&first, Algorithm::Ed25519, -8, 2);
     // A passkey of bob, another account of the store.
     let bob = Id::new("acme", "bob").expect("an identifier");
     let challenge = authenticator::challenge(&site.options_of(&bob, [8; 32]));
@@ -810,7 +864,8 @@ fn the_options_exclude_each_passkey_of_the_account() {
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
 
     // The options of alice list each of her passkeys with the transports of its registration, and no passkey of bob.
-    let options = String::from_utf8(site.options_of(&alice(), HANDLE)).expect("UTF-8");
+    let fresh = site.fresh(&first);
+    let options = String::from_utf8(site.add_options(&fresh)).expect("UTF-8");
     let descriptor = |passkey: &Passkey| {
         let mut text = [0; 32];
         let id = Url.encode(&passkey.id, &mut text).expect("base64url");
@@ -825,10 +880,12 @@ fn the_options_exclude_each_passkey_of_the_account() {
 
     // An account holds at most `CREDENTIALS_MAX` passkeys, so the options always list each one.
     for seed in 4..=u8::try_from(passkey::CREDENTIALS_MAX + 1).expect("a small bound") {
-        site.register(Algorithm::Es256, -7, seed, 0);
+        site.add(&first, Algorithm::Es256, -7, seed);
     }
     assert_eq!(site.propose_start(&alice(), HANDLE).err(), Some(Error::Full));
-    site.propose_start(&bob, [8; 32]).unwrap();
+    // The bound is of each account: the start of bob passes it, and refuses only at its decision, because bob has a
+    // passkey and the decision is no addition.
+    assert_eq!(site.propose_start(&bob, [8; 32]).err(), Some(Error::Fresh));
 }
 
 #[test]
@@ -956,7 +1013,6 @@ fn a_response_from_a_related_origin_verifies_and_one_from_an_unlisted_origin_ref
 
 #[test]
 fn each_counter_case_gives_its_stored_value_and_signal() {
-    let mut site = Site::new();
     // The stored counter, the received counter, the stored counter after the sign-in, and the possible-clone signal.
     let cases = [
         (0, 0, 0, false),
@@ -967,6 +1023,7 @@ fn each_counter_case_gives_its_stored_value_and_signal() {
         (5, 0, 5, true),
     ];
     for (seed, (stored, received, after, signal)) in (1..).zip(cases) {
+        let mut site = Site::new();
         let passkey = site.register(Algorithm::Es256, -7, seed, stored);
         let mut get = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
         get.sign_count = received;
@@ -1042,13 +1099,13 @@ fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
 
 #[test]
 fn each_algorithm_of_the_profile_signs_in_and_reports_its_authentication() {
-    let mut site = Site::new();
     let cases = [
         (Algorithm::MlDsa65, -49, Authentication::PostQuantum),
         (Algorithm::Ed25519, -8, Authentication::Classical),
         (Algorithm::Es256, -7, Authentication::Classical),
     ];
     for (seed, (algorithm, alg, authentication)) in (1..).zip(cases) {
+        let mut site = Site::new();
         let passkey = site.register(algorithm, alg, seed, 0);
         // A signature of another key of the same algorithm refuses.
         let mut stranger = Passkey::new(algorithm, alg, seed + 100);

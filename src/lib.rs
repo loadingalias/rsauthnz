@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod account;
 pub mod authz;
 pub mod cbor;
 pub mod cli;

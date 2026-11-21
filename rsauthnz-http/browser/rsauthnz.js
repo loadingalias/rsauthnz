@@ -2,8 +2,8 @@
 // The browser runs each ceremony. This module only moves JSON between the server and the WebAuthn API.
 
 /** A refusal of the server, or an outcome that the browser cannot know. `recovery` is the action of the page:
- * "restart" (start the ceremony again), "check" (load the current state, and never send the request again), or
- * "refuse" (stop). `status` is the HTTP status, or 0 when no response arrived. */
+ * "restart" (start the ceremony again), "check" (load the current state, and never send the request again), "verify"
+ * (sign in again with a passkey, then start the change again), or "refuse" (stop). `status` is the HTTP status, or 0 when no response arrived. */
 export class Problem extends Error {
   constructor(recovery, status) {
     super(`rsauthnz: ${recovery} (${status})`);
@@ -113,7 +113,7 @@ async function post(path, body, signal, lost) {
   }
   if (!response.ok) {
     const problem = await response.json().catch(() => ({}));
-    throw new Problem(["restart", "check"].includes(problem.recovery) ? problem.recovery : "refuse", response.status);
+    throw new Problem(["restart", "check", "verify"].includes(problem.recovery) ? problem.recovery : "refuse", response.status);
   }
   return response.json();
 }

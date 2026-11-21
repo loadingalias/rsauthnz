@@ -399,6 +399,7 @@ fn an_error_response_holds_only_its_recovery() {
         // The browser holds no operation to look up: it checks the current state. Not 503: a client can send a
         // request again after a 503, and the first attempt can have committed.
         (problem(Recovery::Lookup), 500, br#"{"recovery":"check"}"#),
+        (problem(Recovery::Verify), 403, br#"{"recovery":"verify"}"#),
         (problem(Recovery::Refuse), 403, refuse),
     ];
     for (response, status, body) in cases {

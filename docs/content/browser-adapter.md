@@ -42,8 +42,8 @@ sign-in.
 
 ## Register
 
-Call `register({ options, finish, body })`. `body` is the JSON of the start request, such as the account of an
-invitation. The call calls `navigator.credentials.create()` and sends the credential to `finish`.
+Call `register({ options, finish, body })`. `body` is the JSON of the start request, such as the invitation value of
+an activation ([Activate an invitation](accounts.md#activate-an-invitation)). The call calls `navigator.credentials.create()` and sends the credential to `finish`.
 
 With `conditional: true`, the browser can create a passkey with no prompt, for a user who just signed in another way
 (conditional create, an upgrade). In a browser with no conditional create, the call gives `null`. Conditional create
@@ -62,6 +62,7 @@ action of the page, and its `status` is the HTTP status, or 0 when no response a
 | --- | --- | --- |
 | `restart` | Nothing committed, such as a conflict or a challenge that ended | Starts the ceremony again |
 | `check` | The outcome is unknown: the server could not resolve it, or the finish got no response | Loads the current state, such as the account page. It never sends the request again |
+| `verify` | The change needs a fresh user verification ([Manage accounts](accounts.md#fresh-user-verification)) | Calls `signIn` again, which replaces the session, then starts the change again |
 | `refuse` | The server refused the request | Stops, and shows the refusal |
 
 A finish that gets no response can have committed, so its recovery is `check`. An abort of the `signal` of a request

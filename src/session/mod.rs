@@ -20,7 +20,9 @@
 //! the family ([`Check::Reused`]).
 //!
 //! [`Sessions::list`] reads the sessions of an account from one range read, [`Sessions::revoke`] ends one, and
-//! [`Sessions::confirm`] checks that a session still holds, for example before each part of a stream.
+//! [`Sessions::confirm`] checks that a session still holds, for example before each part of a stream. A sign-out ends
+//! the own session of a request. The end of another session of the account is a sensitive change, so it needs a
+//! fresh user verification ([`Revoker`]).
 //!
 //! ```
 //! use core::pin::pin;
@@ -82,6 +84,7 @@ use core::time::Duration;
 use rscodec::base64::Profile::Url;
 use rscrypto::{ChaCha20Rng, SecretBytes};
 
+use crate::account::Fresh;
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::evidence::Evidence;
@@ -261,23 +264,42 @@ impl Sessions {
         Ok((proposal, plan, renewal))
     }
 
-    /// Proposes the end of `session` for `actor`, such as the account at its sign-out, or an administrator. `decision`
-    /// holds the reads of the decision of the application that `actor` can end the session, and the commit reads each
-    /// one. A stream of the session stops at its next [`Self::confirm`].
+    /// Proposes the end of `session` by `by`: the sign-out of the session of a request, the account of the session with
+    /// a fresh user verification, or another principal, such as an administrator. `decision` holds the reads of the
+    /// decision of the application that `by` can end the session, and the commit reads each one. A stream of the
+    /// session stops at its next [`Self::confirm`].
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
-    /// [`Error::Transition`] for the proposal, also for a `decision` that reads more records than the limits permit.
+    /// [`Error::Fresh`] for a [`Revoker::Own`] of another session, a [`Revoker::Fresh`] of another account, and a
+    /// [`Revoker::Other`] that is the account of the session: the end of another session of the account needs a fresh
+    /// user verification. [`Error::Transition`] for the proposal, also for a `decision` that reads more records than
+    /// the limits permit.
     pub fn revoke(
         &self,
         session: &Session,
-        actor: Principal,
+        by: Revoker<'_>,
         decision: &[Dependency],
         now: Reading,
         random: &mut ChaCha20Rng,
     ) -> Result<(Proposal, Plan), Error> {
+        let account = Principal::Human(session.account.clone());
+        let (actor, fresh) = match by {
+            Revoker::Own(access) => {
+                (access.session.key == session.key).ok_or(Error::Fresh)?;
+                (account, None)
+            }
+            Revoker::Fresh(fresh) => {
+                (*fresh.account() == session.account).ok_or(Error::Fresh)?;
+                (account, Some(fresh))
+            }
+            Revoker::Other(actor) => {
+                (actor != account).ok_or(Error::Fresh)?;
+                (actor, None)
+            }
+        };
         let audit = Audit {
             actor,
             action: action(REVOKE),
@@ -285,6 +307,9 @@ impl Sessions {
         };
         let request = self.request(&session.key);
         let mut proposal = Proposal::new(operation(random), audit, &request, self.limits)?;
+        if let Some(fresh) = fresh {
+            fresh.gate(&mut proposal)?;
+        }
         decision.iter().try_for_each(|read| proposal.read(read.clone()))?;
         end(&mut proposal, session)?;
         Ok((proposal, Plan::default()))
@@ -681,6 +706,11 @@ impl Session {
         &self.evidence
     }
 
+    /// The version of the record of the family. A renewal changes it.
+    pub(crate) const fn version(&self) -> &AuthorityVersion {
+        &self.version
+    }
+
     /// The time of the sign-in, since the Unix epoch.
     #[must_use]
     pub const fn started(&self) -> Duration {
@@ -764,6 +794,20 @@ impl Access {
     pub fn renewal_due(&self, now: Reading) -> bool {
         self.generation == Generation::Current && now.estimate() >= self.session.renew
     }
+}
+
+/// Who ends a session ([`Sessions::revoke`]).
+#[derive(Clone, Debug)]
+pub enum Revoker<'a> {
+    /// The sign-out of the session of the request: `access` is the session that ends.
+    Own(&'a Access),
+    /// The account of the session, with a fresh user verification, such as at the end of a session of another device.
+    /// The commit reads the session of the verification at its version, and its deadline is the end of the
+    /// verification.
+    Fresh(&'a Fresh),
+    /// Another principal, such as an administrator, under the decision of the application. It is never the account of
+    /// the session.
+    Other(Principal),
 }
 
 /// The result of [`Sessions::check`].
@@ -920,15 +964,19 @@ pub enum Error {
     Driver(driver::Error),
     /// The proposal refuses.
     Transition(transition::Error),
+    /// The end of another session of the account needs a fresh user verification of the account ([`Revoker::Fresh`]).
+    Fresh,
 }
 
 impl Error {
-    /// The recovery of the caller: the recovery of the proposal after [`Error::Transition`]. Refuse each other
-    /// request: after [`Error::Unknown`] and [`Error::Ended`], as a request that is signed out.
+    /// The recovery of the caller: the recovery of the proposal after [`Error::Transition`], and a new user
+    /// verification after [`Error::Fresh`]. Refuse each other request: after [`Error::Unknown`] and [`Error::Ended`], as
+    /// a request that is signed out.
     #[must_use]
     pub const fn recovery(&self) -> Recovery {
         match self {
             Self::Transition(error) => error.recovery(),
+            Self::Fresh => Recovery::Verify,
             _ => Recovery::Refuse,
         }
     }
@@ -948,6 +996,7 @@ impl fmt::Display for Error {
             Self::Time(error) => write!(f, "the time reading gave no value: {error}"),
             Self::Driver(error) => write!(f, "the commit driver gave no value: {error}"),
             Self::Transition(error) => write!(f, "the proposal refuses: {error}"),
+            Self::Fresh => f.write_str("the end of another session of the account needs a fresh user verification"),
         }
     }
 }

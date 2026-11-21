@@ -141,7 +141,8 @@ Never submit the request of an unknown outcome as a new operation. The first att
 new operation can, for example, issue a second grant. A lookup of the same identity gives the first commit.
 On a site, the server looks up an unknown outcome itself, because the browser does not know the operation.
 `rsauthnz_http::problem(recovery)` gives the response of each recovery to the browser ([Lost
-responses](http-binding.md#lost-responses)).
+responses](http-binding.md#lost-responses)). No outcome gives `Recovery::Verify`: only the gate of a sensitive change
+refuses with it, before the proposal ([Fresh user verification](accounts.md#fresh-user-verification)).
 
 `receipt.artifact()` gives the prepared artifact. Only the acceptance of the exact proposal releases it: a
 proposal has no accessor for it, and only a proposal that writes its issuance record takes it. The store never keeps

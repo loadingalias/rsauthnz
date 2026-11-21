@@ -691,6 +691,10 @@ pub enum Recovery {
     Lookup,
     /// Nothing committed. Read the current state again, and propose again as a new operation.
     Restart,
+    /// Nothing committed. The change needs a fresh user verification of the account
+    /// ([`account::Fresh`](crate::account::Fresh)): sign in with a passkey that replaces the session, then propose
+    /// again as a new operation.
+    Verify,
     /// Refuse the request. The same request refuses again.
     Refuse,
 }

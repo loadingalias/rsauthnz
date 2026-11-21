@@ -2,10 +2,13 @@
 
 use core::num::NonZeroUsize;
 
+use rsauthnz::account::{FRESH_MAX, Fresh};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz::id::{Human, Id, Principal};
+use rsauthnz::id::{Human, Id};
 use rsauthnz::limits::Limits;
-use rsauthnz::session::{self, Access, Check, Error, Generation, Identifier, Issued, Opened, Renewal, Sessions};
+use rsauthnz::session::{
+    self, Access, Check, Error, Generation, Identifier, Issued, Opened, Renewal, Revoker, Sessions,
+};
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
 use rsauthnz::store::{Kind, Store};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
@@ -18,7 +21,7 @@ use super::authenticator::{self, Get, Passkey, Registration};
 use super::{HANDLE, ORIGIN, POLICY, RP_ID, START, Site, alice, at, authority, ready};
 
 /// The user handle of bob.
-const BOB: [u8; 32] = [8; 32];
+pub(super) const BOB: [u8; 32] = [8; 32];
 
 /// The refusal of a failure of an operation of the memory binding, which reads with no failure.
 fn refused(failure: session::Failure<memory::Error>) -> Error {
@@ -66,7 +69,7 @@ impl Site {
     }
 
     /// Registers a passkey for bob, with the user handle [`BOB`].
-    fn register_bob(&mut self) -> Passkey {
+    pub(super) fn register_bob(&mut self) -> Passkey {
         let bob = Id::<Human>::new("acme", "bob").expect("an identifier");
         let challenge = authenticator::challenge(&self.options_of(&bob, BOB));
         let passkey = Passkey::new(Algorithm::Ed25519, -8, 7);
@@ -135,13 +138,7 @@ fn a_revoked_session_refuses_at_its_next_use_also_in_an_open_stream() {
     let access = site.active(current.identifier(), at(72));
     let (proposal, plan) = site
         .sessions
-        .revoke(
-            access.session(),
-            Principal::Human(alice()),
-            &[],
-            at(72),
-            &mut site.random,
-        )
+        .revoke(access.session(), Revoker::Own(&access), &[], at(72), &mut site.random)
         .expect("a revocation");
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
     assert_eq!(confirm(&mut site, at(73)), Err(session::Failure::Refused(Error::Ended)));
@@ -284,16 +281,12 @@ fn the_listing_gives_each_session_of_the_account_that_did_not_end() {
     both.sort();
     assert_eq!(list(&mut site, at(50)), both);
 
-    // The account ends the session of the laptop from the listing.
+    // The account ends the session of the laptop from the listing on the phone, with the fresh verification of its
+    // sign-in at 31.
+    let fresh = Fresh::check(&phone, FRESH_MAX, at(51)).expect("a fresh verification");
     let (proposal, plan) = site
         .sessions
-        .revoke(
-            laptop.session(),
-            Principal::Human(alice()),
-            &[],
-            at(51),
-            &mut site.random,
-        )
+        .revoke(laptop.session(), Revoker::Fresh(&fresh), &[], at(51), &mut site.random)
         .expect("a revocation");
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
     assert_eq!(list(&mut site, at(52)), vec![phone.session().key().clone()]);

@@ -7,7 +7,8 @@ challenge of the site.
 
 The core checks the response and proposes each commit. The storage binding of the application accepts the commit
 ([Propose a transition](transitions.md)). The HTTP binding checks each browser request and writes its response
-([Mount the HTTP binding](http-binding.md)).
+([Mount the HTTP binding](http-binding.md)). [Manage accounts](accounts.md) gives the invitation of a new account, an
+additional passkey, the rename and the removal of a passkey, and the fresh user verification of a sensitive change.
 
 ## The model
 
@@ -27,9 +28,10 @@ The core checks the response and proposes each commit. The storage binding of th
   record never holds the challenge. The response is not signed, so the challenge is the only proof that the response
   comes from the ceremony of the account.
 - The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(&handle, id)`. Its key
-  is the kind, the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.1", authority, relying party ID,
+  is the kind, the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID,
   user handle]`, and the SHA-256 digest of the credential ID. It holds the account, the user handle, the credential
-  ID, the public key of the passkey, its algorithm, its signature counter, and its backup flags. It has no end. The
+  ID, the public key of the passkey, its algorithm, its signature counter, its backup flags, its transports, and its
+  name. A new passkey has the empty name ([Rename a passkey](accounts.md#list-and-rename-passkeys)). It has no end. The
   public key is the deterministic CBOR of a `COSE_Key` with only `kty`, `alg`, and the checked public parameters: no
   other member of the key of the response enters the store.
 - Each key names the authority and the relying party ID. Thus two relying parties can share one store: neither one
@@ -49,11 +51,14 @@ The core checks the response and proposes each commit. The storage binding of th
    `limits` bound the CBOR of each response ([Parser limits](parser-limits.md)).
 2. The application decides that the account can register, for example a new account of an open sign-up, or a
    signed-in account that adds a passkey. Call
-   `rp.start(&mut store, &user, &decision, now, &mut random, &mut driver).await`. `user` names the account, its user
+   `rp.start(&mut store, &user, decision, now, &mut random, &mut driver).await`. `user` names the account, its user
    handle, and the name and the display name that the authenticator shows. The options hold the names, and no record
-   does. `decision` is a slice of `transition::Dependency`: each record and policy that the decision read, such as the
-   session and the policy version. The proposal reads each one. The start reads each passkey of the account and lists
-   it in `excludeCredentials`. Thus an authenticator that holds one of them makes no second passkey, which would
+   does. `decision` is a `passkey::Decision`. `Decision::SignUp(&reads)` is the first passkey of an account, and it
+   refuses with `Error::Fresh` for an account that has a passkey. `Decision::Add(&fresh, &reads)` adds a passkey with
+   a fresh user verification of the account ([Add a passkey](accounts.md#add-a-passkey)). `reads` is a slice of
+   `transition::Dependency`: each record and policy that the decision read, such as the state of the sign-up and the
+   policy version. The proposal reads each one. The start reads each passkey of the account and lists it in
+   `excludeCredentials`. Thus an authenticator that holds one of them makes no second passkey, which would
    replace the first one on the authenticator while the store still counts it as a sign-in method. A start for an
    account with `CREDENTIALS_MAX` passkeys refuses with `Error::Full`. Submit the proposal with its plan.
 3. Only the accepted commit releases the options: `receipt.artifact()`. Send them to the browser with
@@ -64,10 +69,12 @@ The core checks the response and proposes each commit. The storage binding of th
 5. Check the request with `site.json_change`, then read the body with `Response::parse`.
 6. Call `rp.finish(&mut store, &response, now, &mut driver)`. It reads the pending record of the ceremony and checks
    the response. With no record, the ceremony ended or never started, and it refuses with `Error::Challenge`
-   (`Recovery::Restart`). It gives a `Registration`: `account()` and `credential()`.
+   (`Recovery::Restart`). One range read tells whether the account has a passkey. It gives a `Registration`:
+   `account()` and `credential()`.
 7. Decide again, with the current state, that `registration.account()` can register this passkey. Do not reuse the
    decision of the start: a session or a permission can end during the ceremony. Call
-   `registration.propose(&decision)`, and submit the proposal with its plan. The commit reads each read of the
+   `registration.propose(decision)` with `Decision::SignUp` or `Decision::Add` as in step 2, and submit the proposal
+   with its plan. The commit reads each read of the
    decision, consumes the pending record, and writes the credential record. Thus a decision that changed after its
    read makes the commit conflict, and no credential is written. The plan names the passkey as a sign-in method of the
    account, so a restore completes a registration that a crash left in doubt.
@@ -147,7 +154,7 @@ use core::time::Duration;
 
 use rsauthnz::id::{Human, Id};
 use rsauthnz::limits::Limits;
-use rsauthnz::passkey::{Error, RelyingParty, Response, User, UserHandle};
+use rsauthnz::passkey::{Decision, Error, RelyingParty, Response, User, UserHandle};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
@@ -185,8 +192,8 @@ fn commit(memory: &mut Memory, driver: &mut Driver, proposal: Proposal, plan: Pl
     }
 }
 
-/// The decision of the application that `account` can register a passkey: an open sign-up. The sign-up is open
-/// while no record has the key `sign-up/closed`, so the decision reads that absence.
+/// The reads of the decision of the application that `account` can register its first passkey: an open sign-up. The
+/// sign-up is open while no record has the key `sign-up/closed`, so the decision reads that absence.
 fn can_register(_account: &Id<Human>) -> Result<[Dependency; 1], Failure> {
     Ok([Dependency::Absent(Key::new(b"sign-up/closed")?)])
 }
@@ -197,7 +204,7 @@ fn finish(rp: &RelyingParty, memory: &mut Memory, driver: &mut Driver, body: &[u
     let registration = ready(rp.finish(memory, &response, now, driver))?;
     // Decide again with the current state: the decision of the start can have changed.
     let decision = can_register(registration.account())?;
-    let (proposal, plan) = registration.propose(&decision)?;
+    let (proposal, plan) = registration.propose(Decision::SignUp(&decision))?;
     commit(memory, driver, proposal, plan)
 }
 
@@ -220,7 +227,7 @@ let user = User {
     display_name: "Alice",
 };
 let decision = can_register(&account)?;
-let (proposal, plan) = ready(rp.start(&mut memory, &user, &decision, now, &mut random, &mut driver))?;
+let (proposal, plan) = ready(rp.start(&mut memory, &user, Decision::SignUp(&decision), now, &mut random, &mut driver))?;
 let Outcome::Accepted(receipt) = commit(&mut memory, &mut driver, proposal, plan)? else {
     return Err("the start did not commit".into());
 };
@@ -315,13 +322,20 @@ Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()`
 | `Driver` | The commit driver does not serve | `Refuse` |
 | `Transition(error)` | The proposal refuses, also for a decision with more reads than the limits permit | `error.recovery()` |
 | `Session(error)` | The session of a sign-in refuses ([Keep a browser session](sessions.md#errors)) | `error.recovery()` |
+| `Fresh` | A `Decision::SignUp` of an account that has a passkey, or a fresh user verification of another account | `Verify`: verify the user again ([Manage accounts](accounts.md#fresh-user-verification)) |
+| `Invitation` | No open invitation has the value or the challenge: it ended, or an activation consumed it | `Refuse` |
+| `Recipient` | The invitation names another recipient | `Refuse` |
+| `Activated` | The recipient of the invitation has a passkey | `Refuse` |
+| `Issuer` | The current policy does not permit the action of the issuer of the invitation | `Refuse` |
+| `Lifetime` | The lifetime of an invitation is zero or longer than `INVITATION_LIFETIME_MAX` (7 days) | `Refuse` |
+| `Authorization(refusal)` | The policy refuses the issue of an invitation ([Authorize an operation](authorization.md)) | `Refuse` |
 
 `finish` and `sign_in` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for a
 failed read, which is a crash of the binding.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
-The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `sign_in` makes
-one signature check and three keyed reads. The cost class of `start` is `Mutate`: one range read of at most
+The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `finish` makes
+one keyed read and one range read, and `sign_in` makes one signature check and three keyed reads. The cost class of `start` is `Mutate`: one range read of at most
 `CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 
 ## Support

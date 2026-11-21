@@ -120,15 +120,19 @@ Thus a restore from a snapshot before a renewal ends that family, and no generat
 
 ## Sign out, list, and revoke
 
-- **Sign out:** call `sessions.revoke(access.session(), Principal::Human(account), &[], now, &mut random)`, submit
-  the proposal, and clear the cookie.
+- **Sign out:** call `sessions.revoke(access.session(), Revoker::Own(&access), &[], now, &mut random)`, submit the
+  proposal, and clear the cookie. A sign-out needs no fresh user verification.
 - **List:** `sessions.list(&mut store, &account, after, now)` gives one `Page` from one range read of at most
   `PAGE_MAX` (64) records: each session of the account that did not end. `page.next` is the key after which the next
   page starts, or `None`. Each `Session` gives its `key()`, its `evidence()`, `started()`, `issued()`, `end()`, and
   `expires()`.
-- **Revoke:** give a listed session to `sessions.revoke`. `actor` is the principal that acts, such as the account or
-  an administrator. `decision` holds the reads of the decision of the application that the actor can end the session,
-  and the commit reads each one. A revocation of a session that renewed after its read conflicts: list again.
+- **Revoke:** give a listed session to `sessions.revoke` with its `Revoker`. The end of another session of the
+  account, such as the session of a lost laptop, is a sensitive change: give `Revoker::Fresh(&fresh)`, a fresh user
+  verification of the account ([Manage accounts](accounts.md#fresh-user-verification)). The commit reads the session
+  of the verification at its version, and it refuses after the end of the verification. `Revoker::Other(principal)`
+  is another principal, such as an administrator, and never the account of the session. `decision` holds the reads of
+  the decision of the application that the revoker can end the session, and the commit reads each one. A revocation
+  of a session that renewed after its read conflicts: list again.
 
 ## Streams and queued output
 
@@ -193,8 +197,8 @@ assert_eq!(refused, Failure::Refused(Error::Unknown));
 
 ## Errors
 
-Each `session::Error` is a small `Copy` value with no secret. `error.recovery()` gives `Refuse`, or the recovery of
-the proposal for `Transition`.
+Each `session::Error` is a small `Copy` value with no secret. `error.recovery()` gives `Refuse`, `Verify` for
+`Fresh`, or the recovery of the proposal for `Transition`.
 
 | `Error` | Cause | Response |
 | --- | --- | --- |
@@ -209,6 +213,7 @@ the proposal for `Transition`.
 | `Time` | The reading has no bound, or a time overflows | Give a reading with a known bound |
 | `Driver` | The commit driver does not serve | Refuse |
 | `Transition(error)` | The proposal refuses | `error.recovery()` |
+| `Fresh` | A `Revoker::Own` of another session, a `Revoker::Fresh` of another account, or a `Revoker::Other` that is the account of the session | `Recovery::Verify`: verify the user again, and end the session with `Revoker::Fresh` |
 
 `check`, `list`, and `confirm` read the store, so they return `session::Failure`: `Refused(error)`, or
 `Store(error)` for a failed read, which is a crash of the binding. A sign-in gives a refusal of its session as

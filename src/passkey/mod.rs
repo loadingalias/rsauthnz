@@ -49,7 +49,7 @@
 //!
 //! use rsauthnz::id::{Human, Id};
 //! use rsauthnz::limits::Limits;
-//! use rsauthnz::passkey::{Error, RelyingParty, Response, User, UserHandle};
+//! use rsauthnz::passkey::{Decision, Error, RelyingParty, Response, User, UserHandle};
 //! use rsauthnz::store::driver::{Answer, Driver, Plan};
 //! use rsauthnz::store::{Profile, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
@@ -87,8 +87,8 @@
 //!     }
 //! }
 //!
-//! /// The decision of the application that `account` can register a passkey: an open sign-up. The sign-up is open
-//! /// while no record has the key `sign-up/closed`, so the decision reads that absence.
+//! /// The reads of the decision of the application that `account` can register its first passkey: an open sign-up. The
+//! /// sign-up is open while no record has the key `sign-up/closed`, so the decision reads that absence.
 //! fn can_register(_account: &Id<Human>) -> Result<[Dependency; 1], Failure> {
 //!     Ok([Dependency::Absent(Key::new(b"sign-up/closed")?)])
 //! }
@@ -99,7 +99,7 @@
 //!     let registration = ready(rp.finish(memory, &response, now, driver))?;
 //!     // Decide again with the current state: the decision of the start can have changed.
 //!     let decision = can_register(registration.account())?;
-//!     let (proposal, plan) = registration.propose(&decision)?;
+//!     let (proposal, plan) = registration.propose(Decision::SignUp(&decision))?;
 //!     commit(memory, driver, proposal, plan)
 //! }
 //!
@@ -122,7 +122,7 @@
 //!     display_name: "Alice",
 //! };
 //! let decision = can_register(&account)?;
-//! let (proposal, plan) = ready(rp.start(&mut memory, &user, &decision, now, &mut random, &mut driver))?;
+//! let (proposal, plan) = ready(rp.start(&mut memory, &user, Decision::SignUp(&decision), now, &mut random, &mut driver))?;
 //! let Outcome::Accepted(receipt) = commit(&mut memory, &mut driver, proposal, plan)? else {
 //!     return Err("the start did not commit".into());
 //! };
@@ -156,6 +156,8 @@ use rscodec::base64::Profile::Url;
 use rscodec::json::{self, Profile::Rfc8259, Slot, Str};
 use rscrypto::{ChaCha20Rng, SecretBytes};
 
+use crate::account::Fresh;
+use crate::authz;
 use crate::cbor::{self, Value};
 use crate::cose::{self, Key, TrustedKey};
 use crate::crypto::{self, Algorithm};
@@ -180,6 +182,10 @@ pub const SIGN_IN_LIFETIME: Duration = Duration::from_secs(300);
 /// and the HMAC-SHA256 tag of both under the key of the relying party.
 const SIGN_IN_CHALLENGE_BYTES: usize = 72;
 
+/// The bytes of an activation challenge: 32 random bytes, the time of its creation in nanoseconds since the Unix epoch,
+/// the digest in the key of its invitation, and the HMAC-SHA256 tag of the three under the key of the relying party.
+pub(crate) const ACTIVATION_CHALLENGE_BYTES: usize = 104;
+
 /// The most bytes of a credential ID. WebAuthn Level 3 asks a relying party to refuse a longer one.
 pub const CREDENTIAL_ID_BYTES_MAX: usize = 1023;
 
@@ -195,7 +201,7 @@ pub const RELATED_MAX: usize = 32;
 pub const CREDENTIALS_MAX: usize = 32;
 
 /// The records of one range read of the passkeys of an account.
-const CREDENTIALS: NonZeroUsize = NonZeroUsize::new(CREDENTIALS_MAX).expect("the bound is not zero");
+pub(crate) const CREDENTIALS: NonZeroUsize = NonZeroUsize::new(CREDENTIALS_MAX).expect("the bound is not zero");
 
 /// The transports that this crate knows, in the order of their bits.
 const TRANSPORTS: [&str; 6] = ["usb", "nfc", "ble", "smart-card", "hybrid", "internal"];
@@ -248,7 +254,7 @@ const EXTENSIONS: u8 = 0x80;
 /// The record forms.
 const PENDING_FORM: &str = "rsauthnz.passkey.registration.1";
 const SIGN_IN_FORM: &str = "rsauthnz.passkey.sign-in.1";
-const CREDENTIAL_FORM: &str = "rsauthnz.passkey.credential.1";
+const CREDENTIAL_FORM: &str = "rsauthnz.passkey.credential.2";
 
 /// The audit actions.
 const START: &str = "passkey.start";
@@ -259,15 +265,15 @@ const SIGN_IN_CLONE: &str = "passkey.sign-in.possible-clone";
 /// The relying party of a site.
 #[derive(Debug)]
 pub struct RelyingParty {
-    authority: Id<Authority>,
-    id: String,
+    pub(crate) authority: Id<Authority>,
+    pub(crate) id: String,
     origin: String,
     /// The other origins of the application that use the relying party ID ([`Self::with_related`]).
     related: Vec<String>,
     name: String,
-    /// The HMAC-SHA256 key of the sign-in challenges.
-    key: SecretBytes<32>,
-    limits: Limits,
+    /// The HMAC-SHA256 key of the sign-in and activation challenges.
+    pub(crate) key: SecretBytes<32>,
+    pub(crate) limits: Limits,
 }
 
 impl RelyingParty {
@@ -356,10 +362,10 @@ impl RelyingParty {
     /// authenticator that holds one of them refuses to make another passkey for the account, so it cannot replace a
     /// passkey that the store counts as a sign-in method.
     ///
-    /// `decision` holds the reads of the decision of the application that the account can register: for example, the
-    /// session and the policy of a signed-in account, or the state of an open sign-up. The proposal reads each one, so
-    /// the start commits only while the decision holds. The finish does not keep it: decide again there
-    /// ([`Registration::propose`]).
+    /// `decision` is the decision of the application that the account can register: [`Decision::SignUp`] for an account
+    /// with no passkey, such as an open sign-up, and [`Decision::Add`] with a fresh user verification of the account
+    /// for an additional passkey. The proposal reads each read of the decision, so the start commits only while the
+    /// decision holds. The finish does not keep it: decide again there ([`Registration::propose`]).
     ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One range read of at most [`CREDENTIALS_MAX`] credential
     /// records.
@@ -367,15 +373,16 @@ impl RelyingParty {
     /// # Errors
     ///
     /// [`Error::Name`] if a name of `user` is empty or longer than [`NAME_BYTES_MAX`]. [`Error::Full`] if the account
-    /// has [`CREDENTIALS_MAX`] passkeys, and [`Error::Record`] if one of them has no valid form. [`Error::Time`] if the
-    /// end of the record overflows. [`Error::Driver`] if the driver does not serve, and [`Error::Transition`] for the
-    /// proposal, also for a `decision` that reads more records than the limits permit. [`Failure::Store`] if the read
-    /// fails.
+    /// has [`CREDENTIALS_MAX`] passkeys, and [`Error::Record`] if one of them has no valid form. [`Error::Fresh`] for a
+    /// [`Decision::SignUp`] of an account with a passkey, or a [`Decision::Add`] whose verification is of another
+    /// account. [`Error::Time`] if the end of the record overflows. [`Error::Driver`] if the driver does not serve, and
+    /// [`Error::Transition`] for the proposal, also for a `decision` that reads more records than the limits permit.
+    /// [`Failure::Store`] if the read fails.
     pub async fn start<S: Store>(
         &self,
         store: &mut S,
         user: &User<'_>,
-        decision: &[Dependency],
+        decision: Decision<'_>,
         now: Reading,
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
@@ -403,7 +410,7 @@ impl RelyingParty {
         let request = Value::Array(vec![account.to_cbor(), Value::Bytes(&handle.0)]);
         let mut proposal = self.proposal(operation(random), account, START, &request, now)?;
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
-        decide(&mut proposal, decision).map_err(Error::from)?;
+        decision.apply(&mut proposal, account, !records.is_empty())?;
         let version = self.version(driver.allocate(Kind::Registration).map_err(Error::from)?);
         let form = Value::Array(vec![
             Value::Text(PENDING_FORM),
@@ -427,12 +434,12 @@ impl RelyingParty {
 
     /// The options of `PublicKeyCredentialCreationOptionsJSON` for the challenge `challenge`, with the passkeys
     /// `excluded` of the account.
-    fn options(&self, user: &User<'_>, challenge: &[u8; 32], excluded: &[Credential]) -> Vec<u8> {
-        // Each name can grow six times by its escapes, and base64url makes each ID less than twice as long. Each
-        // passkey has less than 128 more bytes, and the rest is less than 1 KiB.
+    pub(crate) fn options(&self, user: &User<'_>, challenge: &[u8], excluded: &[Credential]) -> Vec<u8> {
+        // Each name can grow six times by its escapes, and base64url makes each ID and the challenge less than twice as
+        // long. Each passkey has less than 128 more bytes, and the rest is less than 1 KiB.
         let names = self.id.len() + self.name.len() + user.name.len() + user.display_name.len();
         let ids: usize = excluded.iter().map(|credential| 2 * credential.id.len() + 128).sum();
-        let mut out = vec![0; 1024 + 6 * names + ids];
+        let mut out = vec![0; 1024 + 6 * names + ids + 2 * challenge.len()];
         let len = json::write(&mut out, |options| {
             options.object(|options| {
                 options.member("rp").object(|rp| {
@@ -553,6 +560,7 @@ impl RelyingParty {
             sign_count,
             backup,
             transports: response.transports,
+            name: Box::default(),
         })
     }
 
@@ -582,7 +590,8 @@ impl RelyingParty {
     /// Checks the registration `response` against its pending record in `store`, and gives the [`Registration`]: the
     /// account of the ceremony, the credential, and the commit, which waits for the decision of the application
     /// ([`Registration::propose`]). The commit consumes the pending record and writes the credential record, at the
-    /// key of [`Self::credential_key`]. Its plan names the passkey as a sign-in method of the account.
+    /// key of [`Self::credential_key`]. Its plan names the passkey as a sign-in method of the account. One range read
+    /// tells whether the account has a passkey, so that only a [`Decision::Add`] can add another one.
     ///
     /// The operation identity is the key of the pending record, so two concurrent finishes of one ceremony are one
     /// operation. Its request binds the credential record: the key, the algorithm, the counter, and the flags. Thus the
@@ -591,7 +600,8 @@ impl RelyingParty {
     /// up the operation of the proposal. A finish after the commit refuses with [`Error::Challenge`]: the commit
     /// consumed the pending record. The deadline of the proposal is the end of the pending record.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`].
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`], and one range read of at
+    /// most [`CREDENTIALS_MAX`] credential records.
     ///
     /// # Errors
     ///
@@ -612,6 +622,11 @@ impl RelyingParty {
         (now.latest().map_err(Error::Time)? < end).ok_or(Error::Challenge)?;
         let (account, handle) = pending_form(&pending.data, self.limits)?;
         let credential = self.verify(response, &response.client_data.challenge)?;
+        let existing = !store
+            .range(&self.account_prefix(&handle), None, CREDENTIALS)
+            .await
+            .map_err(Failure::Store)?
+            .is_empty();
         let key = self.credential_key(&handle, &credential.id);
         let data = credential.record(&account, &handle);
         let request = Value::Array(vec![Value::Bytes(ceremony.as_bytes()), Value::Bytes(&data)]);
@@ -639,6 +654,7 @@ impl RelyingParty {
         Ok(Registration {
             account,
             credential,
+            existing,
             proposal,
             plan,
         })
@@ -666,7 +682,7 @@ impl RelyingParty {
         let earliest = now.earliest().map_err(Error::Time)?;
         let created = u64::try_from(earliest.as_nanos()).map_err(|_| Error::Time(TimeError::Overflow))?;
         challenge[32..40].copy_from_slice(&created.to_be_bytes());
-        let tag = crypto::hmac_sha256(self.key.as_bytes(), &self.signed(&challenge[..40]));
+        let tag = crypto::hmac_sha256(self.key.as_bytes(), &self.signed(SIGN_IN_FORM, &challenge[..40]));
         challenge[40..].copy_from_slice(&tag);
         // The ID can grow six times by its escapes. The rest is less than 512 bytes.
         let mut out = vec![0; 512 + 6 * self.id.len()];
@@ -824,24 +840,26 @@ impl RelyingParty {
         Ok(SignIn { proposal, evidence })
     }
 
-    /// The bytes that the tag of a sign-in challenge covers: the form, the relying party ID, and `body`: the random
-    /// bytes and the time of the challenge. The body has a fixed length, so the bytes have one reading.
-    fn signed(&self, body: &[u8]) -> Vec<u8> {
-        [SIGN_IN_FORM.as_bytes(), self.id.as_bytes(), body].concat()
+    /// The bytes that the tag of a challenge covers: the form of its ceremony, the relying party ID, and `body`: the
+    /// random bytes, the time of the challenge, and the invitation of an activation. The body of each form has a fixed
+    /// length, so the bytes have one reading.
+    pub(crate) fn signed(&self, form: &str, body: &[u8]) -> Vec<u8> {
+        [form.as_bytes(), self.id.as_bytes(), body].concat()
     }
 
     /// The time of creation of the sign-in challenge `challenge`, if the key made it.
     fn created(&self, challenge: &[u8]) -> Result<Duration, Error> {
         let (body, tag) = challenge.split_at_checked(40).ok_or(Error::Challenge)?;
         let tag = <&[u8; 32]>::try_from(tag).map_err(|_| Error::Challenge)?;
-        crypto::hmac_sha256_verify(self.key.as_bytes(), &self.signed(body), tag).ok_or(Error::Challenge)?;
+        crypto::hmac_sha256_verify(self.key.as_bytes(), &self.signed(SIGN_IN_FORM, body), tag)
+            .ok_or(Error::Challenge)?;
         let time = body.last_chunk::<8>().ok_or(Error::Challenge)?;
         Ok(Duration::from_nanos(u64::from_be_bytes(*time)))
     }
 
     /// A proposal of `account` for `action` on `request`. Its request is `[authority, relying party ID, request]`, so
     /// one operation identity under two relying parties of one store binds two requests.
-    fn proposal(
+    pub(crate) fn proposal(
         &self,
         operation: OperationId,
         account: &Id<Human>,
@@ -849,8 +867,20 @@ impl RelyingParty {
         request: &Value<'_>,
         now: Reading,
     ) -> Result<Proposal, Error> {
+        self.proposal_by(operation, Principal::Human(account.clone()), action, request, now)
+    }
+
+    /// A proposal of `actor` for `action` on `request`, as [`Self::proposal`] makes it.
+    pub(crate) fn proposal_by(
+        &self,
+        operation: OperationId,
+        actor: Principal,
+        action: &str,
+        request: &Value<'_>,
+        now: Reading,
+    ) -> Result<Proposal, Error> {
         let audit = Audit {
-            actor: Principal::Human(account.clone()),
+            actor,
             action: Id::<Action>::new("rsauthnz", action).expect("each action of this module is a valid identifier"),
             time: now,
         };
@@ -859,12 +889,12 @@ impl RelyingParty {
     }
 
     /// The version of a write: the authority and `value`, a new value of a counter of the driver.
-    fn version(&self, value: u64) -> AuthorityVersion {
+    pub(crate) fn version(&self, value: u64) -> AuthorityVersion {
         AuthorityVersion::new(self.authority.clone(), &value.to_be_bytes()).expect("an 8-byte coordinate is valid")
     }
 
     /// The key of the record of the credential `id` of the account with the user handle `handle`: [`Kind::Credential`],
-    /// the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.1", authority, relying party ID, user
+    /// the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID, user
     /// handle]`, and the SHA-256 digest of `id`. Thus each relying party of a store has its own credentials, and the
     /// first 33 bytes are the prefix of each passkey of the account. No key of a credential of this crate (an 8-byte
     /// serial) has this length.
@@ -879,7 +909,7 @@ impl RelyingParty {
     }
 
     /// The prefix of the keys of the passkeys of the account with the user handle `handle` ([`Self::credential_key`]).
-    fn account_prefix(&self, handle: &UserHandle) -> transition::Key {
+    pub(crate) fn account_prefix(&self, handle: &UserHandle) -> transition::Key {
         Kind::Credential
             .key(&self.digest(CREDENTIAL_FORM, &handle.0))
             .expect("a key of 33 bytes is valid")
@@ -894,7 +924,7 @@ impl RelyingParty {
     }
 
     /// The SHA-256 digest of the CBOR form `[form, authority, relying party ID, value]`.
-    fn digest(&self, form: &str, value: &[u8]) -> [u8; 32] {
+    pub(crate) fn digest(&self, form: &str, value: &[u8]) -> [u8; 32] {
         crypto::sha256(&encode(&Value::Array(vec![
             Value::Text(form),
             self.authority.to_cbor(),
@@ -963,6 +993,11 @@ pub struct Response {
 }
 
 impl Response {
+    /// The challenge of `clientDataJSON`.
+    pub(crate) fn challenge(&self) -> &[u8] {
+        &self.client_data.challenge
+    }
+
     /// Reads the JSON text `json`. It reads `id`, `rawId`, `type`, `response.clientDataJSON`,
     /// `response.attestationObject`, `response.transports`, and `clientExtensionResults.credProps.rk`, and it skips
     /// each other member.
@@ -973,11 +1008,14 @@ impl Response {
     ///
     /// [`Error::CredentialId`] if `id` and `rawId` differ, and [`Error::Malformed`] for each other difference from
     /// the form, such as a `type` other than `public-key`, a member that is not base64url, or a `clientDataJSON` that is
-    /// not JSON of the type `webauthn.create` with a challenge of 32 bytes.
+    /// not JSON of the type `webauthn.create` with the challenge of a registration (32 bytes) or of an activation
+    /// ([`RelyingParty::activate`]).
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
         let (id, client_data) = fields.credential("webauthn.create")?;
-        (client_data.challenge.len() == 32).ok_or(Error::Malformed)?;
+        [32, ACTIVATION_CHALLENGE_BYTES]
+            .contains(&client_data.challenge.len())
+            .ok_or(Error::Malformed)?;
         Ok(Self {
             id,
             client_data,
@@ -1196,6 +1234,9 @@ pub struct Credential {
     backup: Backup,
     /// The transports of the response, one bit for each one that [`transport`] knows.
     transports: u8,
+    /// The name that the user gave the passkey, or the empty name of a new one
+    /// ([`RelyingParty::rename`]).
+    pub(crate) name: Box<str>,
 }
 
 impl Credential {
@@ -1224,9 +1265,15 @@ impl Credential {
         self.backup
     }
 
-    /// The record form: `["rsauthnz.passkey.credential.1", account, user handle, credential ID, COSE key, COSE
-    /// algorithm, signature counter, backup eligible, backup state, transports]`.
-    fn record(&self, account: &Id<Human>, handle: &UserHandle) -> Box<[u8]> {
+    /// The name that the user gave the passkey, such as "Work laptop". A new passkey has the empty name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The record form: `["rsauthnz.passkey.credential.2", account, user handle, credential ID, COSE key, COSE
+    /// algorithm, signature counter, backup eligible, backup state, transports, name]`.
+    pub(crate) fn record(&self, account: &Id<Human>, handle: &UserHandle) -> Box<[u8]> {
         let algorithm = self
             .algorithm
             .report()
@@ -1243,6 +1290,7 @@ impl Credential {
             Value::Bool(self.backup != Backup::SingleDevice),
             Value::Bool(self.backup == Backup::BackedUp),
             Value::Unsigned(u64::from(self.transports)),
+            Value::Text(&self.name),
         ]))
     }
 }
@@ -1254,6 +1302,7 @@ impl fmt::Debug for Credential {
             .field("algorithm", &self.algorithm)
             .field("sign_count", &self.sign_count)
             .field("backup", &self.backup)
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -1263,6 +1312,8 @@ impl fmt::Debug for Credential {
 pub struct Registration {
     account: Id<Human>,
     credential: Credential,
+    /// Whether the account had a passkey at the finish.
+    existing: bool,
     proposal: Proposal,
     plan: Plan,
 }
@@ -1280,23 +1331,26 @@ impl Registration {
         &self.credential
     }
 
-    /// The commit of the registration, with the reads of `decision`. Submit the proposal with the plan, and give the
-    /// browser the response of the outcome.
+    /// The commit of the registration, with `decision`. Submit the proposal with the plan, and give the browser the
+    /// response of the outcome.
     ///
-    /// `decision` holds the reads of the decision of the application that [`Self::account`] can register this passkey
-    /// now. Decide again with the current state, not with the decision of the start: a session or a permission can
-    /// end during the ceremony. The commit that writes the credential reads each one, so a change after the decision
-    /// makes it conflict. A conflict commits nothing, and the pending record stays: finish again with a new decision,
-    /// or start a new ceremony.
+    /// `decision` is the decision of the application that [`Self::account`] can register this passkey now:
+    /// [`Decision::SignUp`] when the account has no passkey, and [`Decision::Add`] when it has one. Decide again with
+    /// the current state, not with the decision of the start: a session or a permission can end during the ceremony.
+    /// The commit that writes the credential reads each read of the decision, so a change after the decision makes it
+    /// conflict. A conflict commits nothing, and the pending record stays: finish again with a new decision, or start
+    /// a new ceremony. The fresh user verification of an addition must hold at the commit: after [`Error::Fresh`] or
+    /// an expired commit, verify the user again and finish again.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
-    /// [`Error::Transition`] if `decision` reads a record of the registration with another result, or reads more records
-    /// than the limits permit.
-    pub fn propose(mut self, decision: &[Dependency]) -> Result<(Proposal, Plan), Error> {
-        decide(&mut self.proposal, decision)?;
+    /// [`Error::Fresh`] for a [`Decision::SignUp`] of an account that has a passkey, and for a [`Decision::Add`] whose
+    /// verification is of another account. [`Error::Transition`] if `decision` reads a record of the registration with
+    /// another result, or reads more records than the limits permit.
+    pub fn propose(mut self, decision: Decision<'_>) -> Result<(Proposal, Plan), Error> {
+        decision.apply(&mut self.proposal, &self.account, self.existing)?;
         Ok((self.proposal, self.plan))
     }
 }
@@ -1307,6 +1361,36 @@ impl fmt::Debug for Registration {
             .field("account", &self.account)
             .field("credential", &self.credential)
             .finish_non_exhaustive()
+    }
+}
+
+/// The decision of the application that an account can register a passkey: the reads of the decision, which the
+/// commit reads. An additional passkey of an account is a sensitive change, so it needs a fresh user verification.
+#[derive(Clone, Copy, Debug)]
+pub enum Decision<'a> {
+    /// The first passkey of an account, such as at an open sign-up. It refuses for an account that has a passkey.
+    SignUp(&'a [Dependency]),
+    /// An additional passkey of the signed-in account of the fresh user verification. The commit reads its session at
+    /// its version, and its deadline is the end of the verification.
+    Add(&'a Fresh, &'a [Dependency]),
+}
+
+impl Decision<'_> {
+    /// Adds the decision for `account` to `proposal`. `existing` tells whether the account has a passkey.
+    fn apply(self, proposal: &mut Proposal, account: &Id<Human>, existing: bool) -> Result<(), Error> {
+        let reads = match self {
+            Self::SignUp(reads) => {
+                (!existing).ok_or(Error::Fresh)?;
+                reads
+            }
+            Self::Add(fresh, reads) => {
+                (fresh.account() == account).ok_or(Error::Fresh)?;
+                fresh.gate(proposal)?;
+                reads
+            }
+        };
+        decide(proposal, reads)?;
+        Ok(())
     }
 }
 
@@ -1348,7 +1432,7 @@ impl SignIn {
 }
 
 /// The account, the user handle, and the credential of the credential record form `data`.
-fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle, Credential), Error> {
+pub(crate) fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle, Credential), Error> {
     let form = cbor::decode(data, limits).map_err(|_| Error::Record)?;
     let Value::Array(items) = &form else {
         return Err(Error::Record);
@@ -1364,10 +1448,12 @@ fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle
         Value::Bool(backup_eligible),
         Value::Bool(backup_state),
         Value::Unsigned(transports),
+        Value::Text(name),
     ] = items.as_slice()
     else {
         return Err(Error::Record);
     };
+    name_length(name)?;
     let algorithm = ALGORITHMS
         .into_iter()
         .find(|algorithm| algorithm.report().cose.map(int).as_ref() == Some(alg))
@@ -1379,6 +1465,7 @@ fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle
         sign_count: u32::try_from(*count).map_err(|_| Error::Record)?,
         backup: backup(*backup_eligible, *backup_state).ok_or(Error::Record)?,
         transports: u8::try_from(*transports).map_err(|_| Error::Record)?,
+        name: (*name).into(),
     };
     let account = Id::from_cbor(account).map_err(|_| Error::Record)?;
     let handle = <[u8; 32]>::try_from(*handle).map_err(|_| Error::Record)?;
@@ -1386,7 +1473,7 @@ fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle
 }
 
 /// The record at `key`.
-async fn read<S: Store>(store: &mut S, key: &transition::Key) -> Result<Option<Record>, Failure<S::Error>> {
+pub(crate) async fn read<S: Store>(store: &mut S, key: &transition::Key) -> Result<Option<Record>, Failure<S::Error>> {
     store.read(key).await.map_err(Failure::Store)
 }
 
@@ -1405,14 +1492,14 @@ fn pending_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle), 
 }
 
 /// A new operation identity: 32 bytes from `random`.
-fn operation(random: &mut ChaCha20Rng) -> OperationId {
+pub(crate) fn operation(random: &mut ChaCha20Rng) -> OperationId {
     let mut id = [0; 32];
     random.fill_bytes(&mut id);
     OperationId::new(&id).expect("32 bytes are a valid operation identity")
 }
 
 /// The reads of `decision`, the decision of the application, in `proposal`.
-fn decide(proposal: &mut Proposal, decision: &[Dependency]) -> Result<(), transition::Error> {
+pub(crate) fn decide(proposal: &mut Proposal, decision: &[Dependency]) -> Result<(), transition::Error> {
     decision.iter().try_for_each(|read| proposal.read(read.clone()))
 }
 
@@ -1485,8 +1572,13 @@ fn domain(text: &str) -> bool {
 }
 
 /// Refuses a name that is empty or longer than [`NAME_BYTES_MAX`].
-fn name_valid(name: &str) -> Result<(), Error> {
+pub(crate) fn name_valid(name: &str) -> Result<(), Error> {
     (1..=NAME_BYTES_MAX).contains(&name.len()).ok_or(Error::Name)
+}
+
+/// Refuses the stored name of a passkey that is longer than [`NAME_BYTES_MAX`]. A new passkey has the empty name.
+fn name_length(name: &str) -> Result<(), Error> {
+    (name.len() <= NAME_BYTES_MAX).ok_or(Error::Record)
 }
 
 /// The CBOR value of the integer `value`.
@@ -1499,7 +1591,7 @@ const fn int(value: i64) -> Value<'static> {
 }
 
 /// The deterministic CBOR of the record form `form`.
-fn encode(form: &Value<'_>) -> Box<[u8]> {
+pub(crate) fn encode(form: &Value<'_>) -> Box<[u8]> {
     cbor::encode(form, Limits::FORM)
         .expect("a record form has no map and no simple value")
         .into_boxed_slice()
@@ -1549,15 +1641,33 @@ pub enum Error {
     Transition(transition::Error),
     /// The session of the sign-in refuses.
     Session(session::Error),
+    /// The change needs a fresh user verification of the account ([`Fresh`]): a [`Decision::SignUp`] of an account
+    /// that has a passkey, or a verification of another account.
+    Fresh,
+    /// No open invitation has the value or the challenge: the invitation ended, or an activation consumed it.
+    Invitation,
+    /// The invitation names another recipient.
+    Recipient,
+    /// The recipient of the invitation has a passkey, so the invitation activates nothing.
+    Activated,
+    /// The current policy does not permit the action of the issuer of the invitation.
+    Issuer,
+    /// The lifetime of an invitation is zero or longer than
+    /// [`INVITATION_LIFETIME_MAX`](crate::account::INVITATION_LIFETIME_MAX).
+    Lifetime,
+    /// The policy refuses the issue of an invitation.
+    Authorization(authz::Refusal),
 }
 
 impl Error {
-    /// The recovery of the caller: start a new ceremony after [`Error::Challenge`], and the recovery of the proposal
-    /// after [`Error::Transition`] and [`Error::Session`]. Refuse each other request.
+    /// The recovery of the caller: start a new ceremony after [`Error::Challenge`], verify the user again after
+    /// [`Error::Fresh`], and the recovery of the proposal after [`Error::Transition`] and [`Error::Session`]. Refuse each
+    /// other request.
     #[must_use]
     pub const fn recovery(&self) -> Recovery {
         match self {
             Self::Challenge => Recovery::Restart,
+            Self::Fresh => Recovery::Verify,
             Self::Transition(error) => error.recovery(),
             Self::Session(error) => error.recovery(),
             _ => Recovery::Refuse,
@@ -1588,6 +1698,13 @@ impl fmt::Display for Error {
             Self::Driver(error) => write!(f, "the commit driver gave no value: {error}"),
             Self::Transition(error) => write!(f, "the proposal refuses: {error}"),
             Self::Session(error) => write!(f, "the session refuses: {error}"),
+            Self::Fresh => f.write_str("the change needs a fresh user verification of the account"),
+            Self::Invitation => f.write_str("no open invitation has the value"),
+            Self::Recipient => f.write_str("the invitation names another recipient"),
+            Self::Activated => f.write_str("the recipient of the invitation has a passkey"),
+            Self::Issuer => f.write_str("the policy does not permit the action of the issuer of the invitation"),
+            Self::Lifetime => f.write_str("the lifetime of the invitation is not valid"),
+            Self::Authorization(refusal) => write!(f, "the policy refuses the invitation: {refusal}"),
         }
     }
 }
