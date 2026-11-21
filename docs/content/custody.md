@@ -18,8 +18,10 @@ A handle is not a permission. The authority of a key comes from the authority th
   also keeps it from a hostile process of the same account. A custody refuses a caller that requires more than it
   gives.
 
-A custody holds composite keys only: `MlDsa65Ed25519`, the default profile, and `MlDsa65EcdsaP256`. [Signature
-profiles](profiles.md) gives the profiles. Each random value comes from the seeded `rscrypto::ChaCha20Rng` of the
+A custody holds the composite keys, `MlDsa65Ed25519`, the default profile, and `MlDsa65EcdsaP256`, and the
+trust-root keys of `SlhDsaSha2_128s`. A root key signs issuer keys, and no credential or proof: as the issuer key of
+a local authority or the key of a CLI, it refuses with `credential::Error::Profile`. [Signature profiles](profiles.md)
+gives the profiles. Each random value comes from the seeded `rscrypto::ChaCha20Rng` of the
 caller: the key ID, each key, and the randomness of each signature. The signing is hedged: rscrypto takes fresh
 randomness from the generator for each signature.
 
@@ -176,7 +178,7 @@ delete it. Delete it only after the authority commits the successor, so a lost c
 | Property | Value |
 | --- | --- |
 | Name | The key ID as 32 lowercase hexadecimal digits, then `.key`, in the directory of the custody |
-| Content | The PKCS #8 (version 1) DER encoding of the composite key, as rscrypto writes it |
+| Content | The PKCS #8 (version 1) DER encoding of the key, as rscrypto writes it. A root key has the form of [RFC 9909](https://www.rfc-editor.org/rfc/rfc9909): 84 bytes |
 | Linux and macOS | A regular file of the effective user of the process, with the mode `0600`, set when the file is created. On macOS, also no extended ACL entry |
 | Windows | The user of the process is the owner. The DACL is protected and has one entry, which allows that user. The security descriptor applies when the file is created |
 | Durability | Enroll flushes the key file before the handle returns. On Linux and macOS, enroll and delete also flush the directory |
@@ -235,12 +237,14 @@ Use full-disk encryption on the volume of the key files, because a deleted key f
 | `KeychainCustody::open(service, required)` | `Parse` | The custody of the keychain items of `service`. It does no keychain work | `Isolation` |
 | `Custody::enroll(id, algorithm, random)` | `External` | The handle of a new key. The key is durable first | `Algorithm`, `Exists`, `Storage`, `Vault`, `Crypto` |
 | `Custody::rotate(from, id, random)` | `External` | The handle of the successor of `from` | The refusals of `sign` for `from`, then those of `enroll` |
-| `Custody::sign(handle, algorithm, message, random)` | `External` | The composite signature of `message` | `Algorithm`, `Unknown`, `Mismatch`, `Permissions`, `Storage`, `Vault`, `Crypto` |
+| `Custody::sign(handle, algorithm, message, random)` | `External` | The signature of `message`: a composite signature, or an SLH-DSA signature of 7,856 bytes for a root key | `Algorithm`, `Unknown`, `Mismatch`, `Permissions`, `Storage`, `Vault`, `Crypto` |
 | `Custody::delete(id)` | `External` | The key file or the keychain item is gone | `Unknown`, `Storage`, `Vault` |
 | `Handle::new(id, algorithm, public)` | `Verify` | The handle of a stored key | `Algorithm`, `Mismatch` |
-| `Handle::verify(message, signature, budget)` | `Verify` | Whether the signature is valid | `Limit::SignatureChecks` if the budget has less than two checks |
+| `Handle::verify(message, signature, budget)` | `Verify` | Whether the signature is valid | `Limit::SignatureChecks` if the budget has less than the checks of the key: two for a composite key, and one for a root key |
 
-[Admit rsauthnz work](admission.md) explains the cost classes.
+[Admit rsauthnz work](admission.md) explains the cost classes. A root signature is about 2.5 million SHA-256
+compressions, because SLH-DSA signs with hashes only. A root signs rarely, so the cost is named and not optimized: a
+debug build takes several seconds for one signature.
 
 ## Errors
 

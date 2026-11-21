@@ -283,8 +283,8 @@ impl fmt::Debug for Call {
 ///
 /// # Errors
 ///
-/// [`Error::Custody`] if custody refuses to sign. [`Error::Credential`] if the proof can be longer than
-/// [`credential::MAX_BYTES`], or the signature does not verify with the key of `handle`.
+/// [`Error::Custody`] if custody refuses to sign. [`Error::Credential`] if `handle` is a trust-root key, if the proof
+/// can be longer than [`credential::MAX_BYTES`], or if the signature does not verify with the key of `handle`.
 pub fn prove(
     custody: &dyn Custody,
     handle: &Handle,
@@ -294,8 +294,8 @@ pub fn prove(
     now: Reading,
     random: &mut ChaCha20Rng,
 ) -> Result<Vec<u8>, Error> {
-    let draft =
-        ProofDraft::new(&handle.trusted(), credential, audience, &call.binding, now).map_err(Error::Credential)?;
+    let key = handle.trusted().ok_or(Error::Credential(credential::Error::Profile))?;
+    let draft = ProofDraft::new(&key, credential, audience, &call.binding, now).map_err(Error::Credential)?;
     let signature = custody
         .sign(handle, handle.algorithm(), &draft.to_be_signed(), random)
         .map_err(Error::Custody)?;

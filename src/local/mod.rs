@@ -309,7 +309,8 @@ impl Authority {
     ///
     /// [`Error::Grant`] if the record of the authority, or an administrator binding when the store has no record, has
     /// another owner or origin. [`Error::Issuer`] if it has another issuer key. [`Error::Record`] if the record has no
-    /// valid form. [`Failure::Store`] if the read fails.
+    /// valid form. [`Failure::Store`] if the read fails. [`Error::Credential`] if `issuer` is a trust-root key, which
+    /// signs issuer keys and no credential.
     pub async fn open<S: Store>(
         store: &mut S,
         grant: &HostGrant,
@@ -317,7 +318,7 @@ impl Authority {
         issuer: Handle,
         limits: Limits,
     ) -> Result<Self, Failure<S::Error>> {
-        let key = issuer.trusted();
+        let key = issuer.trusted().ok_or(Error::Credential(credential::Error::Profile))?;
         let profile = credential::Profile::new(key.clone(), id.clone(), grant.origin.clone(), cli(), limits)
             .map_err(Error::Credential)?;
         let authority = Self {

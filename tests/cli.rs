@@ -821,3 +821,30 @@ fn one_operation_under_two_authorities_binds_two_requests() {
     let proposal = offer(&mut world, &second);
     assert_matches!(world.commit(proposal), Outcome::Refused(transition::Error::Reuse));
 }
+
+/// A trust-root key signs issuer keys, and no credential or proof. As the issuer key of an authority, or as the key of
+/// a CLI, it refuses.
+#[test]
+fn a_root_key_refuses_as_an_issuer_key_and_as_a_cli_key() {
+    let files = Files::new("root");
+    let root = Handle::new(KeyId::from_bytes([3; 16]), Algorithm::SlhDsaSha2_128s, &[7; 32]).unwrap();
+    let mut world = World::with(&files.custody, root.clone(), ChaCha20Rng::from_seed([5; 32]));
+    let id = Id::new("acme", "auth").unwrap();
+    assert_matches!(
+        ready(Authority::open(
+            &mut world.memory,
+            &world.grant,
+            id,
+            root.clone(),
+            Limits::default()
+        )),
+        Err(Failure::Refused(Error::Credential(credential::Error::Profile)))
+    );
+    let audience = Id::new("acme", "build-app").unwrap();
+    let call = call(Challenge::from_bytes([1; 32]), "call-1", "status");
+    let mut random = ChaCha20Rng::from_seed([6; 32]);
+    assert_matches!(
+        cli::prove(&files.custody, &root, b"", &audience, &call, now(), &mut random),
+        Err(cli::Error::Credential(credential::Error::Profile))
+    );
+}

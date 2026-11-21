@@ -67,7 +67,7 @@ source = "git+https://github.com/loadingalias/rscodec?branch=main#e2708865e2e7ab
 [[package]]
 name = "rscrypto"
 version = "0.12.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#4b1899d17821da07a2866510036fe57e3a820e89"
+source = "git+https://github.com/loadingalias/rscrypto?branch=main#0154011b1eb89ef1688f720b21b77a9ceb6d3dbf"
 
 [[package]]
 name = "rstypes"

@@ -282,3 +282,43 @@ fn a_key_file_whose_dacl_is_not_protected_refuses() {
         Err(Error::Permissions)
     );
 }
+
+#[test]
+fn a_root_key_enrolls_signs_rotates_and_deletes_and_refuses_as_a_composite_handle() {
+    let dir = scratch("root");
+    let custody = FileCustody::open(&*dir, Isolation::User).unwrap();
+    let mut random = ChaCha20Rng::from_seed([8; 32]);
+    let id = KeyId::random(&mut random);
+    let root = custody.enroll(id, Algorithm::SlhDsaSha2_128s, &mut random).unwrap();
+    // The key file holds the PKCS #8 form of RFC 9909, and the handle holds PK.seed and PK.root.
+    assert_eq!(fs::metadata(key_file(&dir, id)).unwrap().len(), 84);
+    let stored = Handle::new(id, Algorithm::SlhDsaSha2_128s, &root.public_key()).unwrap();
+    let signature = custody
+        .sign(&stored, Algorithm::SlhDsaSha2_128s, b"issuer key", &mut random)
+        .unwrap();
+    assert!(verifies(&root, b"issuer key", &signature));
+    assert!(!verifies(&root, b"another key", &signature));
+
+    // A request for another algorithm refuses before storage work, and so does a root handle whose ID names a
+    // composite key.
+    assert_eq!(
+        custody.sign(&root, Algorithm::MlDsa65Ed25519, b"issuer key", &mut random),
+        Err(Error::Algorithm)
+    );
+    let other = KeyId::random(&mut random);
+    custody.enroll(other, Algorithm::MlDsa65Ed25519, &mut random).unwrap();
+    let wrong = Handle::new(other, Algorithm::SlhDsaSha2_128s, &root.public_key()).unwrap();
+    assert_eq!(
+        custody.sign(&wrong, Algorithm::SlhDsaSha2_128s, b"issuer key", &mut random),
+        Err(Error::Mismatch)
+    );
+
+    let next = custody.rotate(&root, KeyId::random(&mut random), &mut random).unwrap();
+    assert_eq!(next.algorithm(), Algorithm::SlhDsaSha2_128s);
+    assert_ne!(next.public_key(), root.public_key());
+    custody.delete(id).unwrap();
+    assert_eq!(
+        custody.sign(&root, Algorithm::SlhDsaSha2_128s, b"issuer key", &mut random),
+        Err(Error::Unknown)
+    );
+}

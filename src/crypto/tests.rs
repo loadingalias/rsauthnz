@@ -161,3 +161,72 @@ fn a_composite_costs_two_checks_of_the_budget() {
         assert_eq!(budget.remaining(), 1, "{:?}", case.algorithm);
     }
 }
+
+/// Three NIST ACVP cases of SLH-DSA-SHA2-128s (FIPS 205) with the empty context. `tests/slh-dsa/README.md` gives the
+/// source.
+const SLH_DSA_VECTORS: &str = include_str!("../../tests/slh-dsa/vectors.json");
+
+/// The limits of `SLH_DSA_VECTORS`: 50 KiB of text, and a signature of 7,856 bytes as the longest string.
+const SLH_DSA_LIMITS: json::Limits = json::Limits {
+    input_bytes_max: 64 * 1024,
+    depth_max: 3,
+    string_bytes_max: 16 * 1024,
+    members_max: 8,
+    elements_max: 4,
+    number_digits_max: 4,
+};
+
+#[test]
+fn the_fips_205_vectors_verify_through_the_facade() {
+    let mut scratch = [Slot::EMPTY; 16];
+    let cases = json::read(
+        SLH_DSA_VECTORS.as_bytes(),
+        &SLH_DSA_LIMITS,
+        Rfc8259,
+        &mut scratch,
+        |reader| {
+            let mut cases = Vec::new();
+            let mut members = reader.value().members()?;
+            while let Some((name, value)) = members.next()? {
+                if name == "tests" {
+                    let mut tests = value.elements()?;
+                    while let Some(test) = tests.next()? {
+                        let (mut id, mut passed, mut public, mut message, mut signature) = (0, false, None, None, None);
+                        let mut fields = test.members()?;
+                        while let Some((name, value)) = fields.next()? {
+                            if name == "tcId" {
+                                id = value.number()?.to_u64()?;
+                            } else if name == "testPassed" {
+                                passed = value.bool()?;
+                            } else if name == "pk" {
+                                public = Some(base64(value.str()?));
+                            } else if name == "message" {
+                                message = Some(base64(value.str()?));
+                            } else if name == "signature" {
+                                signature = Some(base64(value.str()?));
+                            }
+                        }
+                        cases.push((id, passed, public.unwrap(), message.unwrap(), signature.unwrap()));
+                    }
+                }
+            }
+            Ok(cases)
+        },
+    )
+    .unwrap();
+    let ids: Vec<_> = cases.iter().map(|case| case.0).collect();
+    assert_eq!(ids, [162, 474, 255]);
+    for (id, passed, public, mut message, signature) in cases {
+        let key = Verifier::slh_dsa_sha2_128s(public.as_slice().try_into().unwrap());
+        let mut budget = SignatureBudget::new(&Limits::default());
+        assert_eq!(key.verify(&message, &signature, &mut budget), Ok(passed), "{id}");
+        // One SLH-DSA signature is one check.
+        assert_eq!(budget.remaining(), 1);
+        message[0] ^= 1;
+        assert_eq!(
+            key.verify(&message, &signature, &mut budget),
+            Ok(false),
+            "a changed message: {id}"
+        );
+    }
+}

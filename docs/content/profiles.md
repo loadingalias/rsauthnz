@@ -80,9 +80,9 @@ requests -51, but IANA assigned -51 to ESP384 ([RFC 9864](https://www.rfc-editor
 `cose` field of its report is `None`, `TrustedKey::new` refuses the algorithm, and no COSE artifact of rsauthnz uses
 it. The credential format refuses it too.
 
-rsauthnz does not verify or sign SLH-DSA yet. The profile is in the registry, with its report, so that each format
-can refuse it. The operations of the trust root bring the verifier and the signer, with the evidence of the FIPS 205
-vectors.
+Custody makes, signs with, rotates, and deletes root keys ([Hold keys in custody](custody.md)), and a custody handle
+verifies their signatures. The three NIST ACVP cases of `tests/slh-dsa/` verify through the facade, with the empty
+context. The formats of rsauthnz refuse the profile, because a root signs issuer keys and no artifact.
 
 ## The profile report
 

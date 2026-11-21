@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rscrypto::ChaCha20Rng;
-use rscrypto::auth::MlDsa65Ed25519;
+use rscrypto::auth::{MlDsa65Ed25519, SlhDsaSha2_128s};
 
 /// The bytes of a part of the secret that the scan looks for.
 const PART: usize = 16;
@@ -131,6 +131,48 @@ fn custody_frees_no_heap_block_that_holds_key_bytes() {
         );
         custody
             .sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)
+            .unwrap();
+        custody
+            .rotate(&handle, KeyId::random(&mut random), &mut random)
+            .unwrap();
+        custody.delete(id).unwrap();
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found, 0);
+}
+
+#[test]
+fn custody_frees_no_heap_block_that_holds_root_key_bytes() {
+    os::open();
+    let dir = std::env::temp_dir().join(format!("rsauthnz-custody-root-residue-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let custody = FileCustody::open(&dir, Isolation::User).unwrap();
+    let seed = [7; 32];
+    let mut random = ChaCha20Rng::from_seed(seed);
+    let id = KeyId::random(&mut random);
+    let mut twin = ChaCha20Rng::from_seed(seed);
+    assert_eq!(KeyId::random(&mut twin), id);
+    let (public, key) = SlhDsaSha2_128s::generate_keypair(|out| {
+        twin.fill_bytes(out);
+        Ok(())
+    })
+    .unwrap();
+    // The needle is SK.seed || SK.prf: the handle holds the public half of the key.
+    KEY.set(key.expose_secret().as_bytes()[..32].to_vec()).unwrap();
+    drop(key);
+
+    // The positive control: a copy of the key in a `Vec` that drops with no zeroization.
+    assert_eq!(freed_with_key(|| drop(black_box(KEY.get().unwrap().to_vec()))), 1);
+
+    let found = freed_with_key(|| {
+        let handle = custody.enroll(id, Algorithm::SlhDsaSha2_128s, &mut random).unwrap();
+        assert_eq!(
+            handle.public_key(),
+            public.as_bytes(),
+            "enroll made the key of the twin"
+        );
+        custody
+            .sign(&handle, Algorithm::SlhDsaSha2_128s, b"issuer key", &mut random)
             .unwrap();
         custody
             .rotate(&handle, KeyId::random(&mut random), &mut random)

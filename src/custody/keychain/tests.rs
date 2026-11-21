@@ -60,39 +60,41 @@ fn verifies(handle: &Handle, message: &[u8], signature: &[u8]) -> bool {
 
 #[test]
 fn sign_rotate_and_delete_work_through_the_keychain() {
+    // The keychain is the stronger store of a root key on macOS, so a root key runs the same life.
+    for (name, algorithm) in [
+        ("lifecycle", Algorithm::MlDsa65Ed25519),
+        ("root", Algorithm::SlhDsaSha2_128s),
+    ] {
+        lifecycle(name, algorithm);
+    }
+}
+
+/// Enroll, sign, rotate, and delete of a key of `algorithm` in a scratch service `name`.
+fn lifecycle(name: &str, algorithm: Algorithm) {
     let mut random = ChaCha20Rng::from_seed([1; 32]);
-    let scratch = Scratch::<2>::new("lifecycle", &mut random);
+    let scratch = Scratch::<2>::new(name, &mut random);
     let (custody, [first_id, second_id]) = (&scratch.custody, scratch.ids);
-    let first = custody
-        .enroll(first_id, Algorithm::MlDsa65Ed25519, &mut random)
-        .unwrap();
+    let first = custody.enroll(first_id, algorithm, &mut random).unwrap();
     assert!(in_vault(custody, first_id));
-    assert_eq!(
-        custody.enroll(first_id, Algorithm::MlDsa65Ed25519, &mut random),
-        Err(Error::Exists)
-    );
+    assert_eq!(custody.enroll(first_id, algorithm, &mut random), Err(Error::Exists));
     // The application stores the parts of a handle, and it makes the handle again after a restart.
     let stored = Handle::new(first_id, first.algorithm(), &first.public_key()).unwrap();
     let second = custody.rotate(&stored, second_id, &mut random).unwrap();
-    assert_eq!(second.algorithm(), Algorithm::MlDsa65Ed25519);
+    assert_eq!(second.algorithm(), algorithm);
     for handle in [&stored, &second] {
-        let signature = custody
-            .sign(handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)
-            .unwrap();
+        let signature = custody.sign(handle, algorithm, b"message", &mut random).unwrap();
         assert!(verifies(handle, b"message", &signature));
     }
 
     custody.delete(first_id).unwrap();
     assert!(!in_vault(custody, first_id));
     assert_eq!(
-        custody.sign(&stored, Algorithm::MlDsa65Ed25519, b"message", &mut random),
+        custody.sign(&stored, algorithm, b"message", &mut random),
         Err(Error::Unknown)
     );
     assert_eq!(custody.delete(first_id), Err(Error::Unknown));
     // The successor stays until its own delete.
-    let signature = custody
-        .sign(&second, Algorithm::MlDsa65Ed25519, b"message", &mut random)
-        .unwrap();
+    let signature = custody.sign(&second, algorithm, b"message", &mut random).unwrap();
     assert!(verifies(&second, b"message", &signature));
 }
 

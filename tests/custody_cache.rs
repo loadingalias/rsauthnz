@@ -13,7 +13,7 @@ use std::thread;
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, Isolation, KeyId, KeychainCustody};
 use rscrypto::ChaCha20Rng;
-use rscrypto::auth::MlDsa65Ed25519;
+use rscrypto::auth::{MlDsa65Ed25519, SlhDsaSha2_128s};
 
 /// The bytes of a part of the key: the scan reads each word of 8 bytes at an address that is a multiple of 8. Each copy
 /// of 16 or more bytes of the key holds such a word.
@@ -29,54 +29,80 @@ const CHUNK: usize = 1 << 16;
 
 #[test]
 fn keychain_custody_leaves_no_key_bytes_in_the_process() {
-    // A twin generator draws what enroll draws. Thus the test knows the key, and it reads no custody memory.
-    let (needle, public) = thread::spawn(|| {
-        let mut twin = ChaCha20Rng::from_seed(SEED);
-        let (public, key) = MlDsa65Ed25519::generate_keypair(|out| {
-            twin.fill_bytes(out);
-            Ok(())
-        })
-        .unwrap();
-        // The raw key: the ML-DSA-65 seed, then the Ed25519 key.
-        (
-            Needle::new(key.expose_secret().as_bytes()),
-            Vec::from(public.to_bytes()),
-        )
-    })
-    .join()
-    .unwrap();
     let mut chunk = vec![0; CHUNK];
-    assert_eq!(scan(&needle, &mut chunk), [], "the derivation of the key left a copy");
-
-    let service = format!("rsauthnz-test-{}-keychain-cache", std::process::id());
-    let enrolled = thread::spawn(move || {
-        let custody = KeychainCustody::open(service, Isolation::User).unwrap();
-        // The guard deletes each key if a step fails, so the test leaves no item in the keychain.
-        let custody = DropGuard::new(custody, |custody| {
-            for id in IDS {
-                custody.delete(id).unwrap_or_default();
+    for algorithm in [Algorithm::MlDsa65Ed25519, Algorithm::SlhDsaSha2_128s] {
+        // A twin generator draws what enroll draws. Thus the test knows the key, and it reads no custody memory.
+        let (needle, public) = thread::spawn(move || {
+            let mut twin = ChaCha20Rng::from_seed(SEED);
+            let mut fill = |out: &mut [u8]| twin.fill_bytes(out);
+            if algorithm == Algorithm::SlhDsaSha2_128s {
+                let (public, key) = SlhDsaSha2_128s::generate_keypair(|out| {
+                    let _: () = fill(out);
+                    Ok(())
+                })
+                .unwrap();
+                // SK.seed, then SK.prf: the handle holds the public half of the key.
+                (
+                    Needle::new(&key.expose_secret().as_bytes()[..32]),
+                    public.as_bytes().to_vec(),
+                )
+            } else {
+                let (public, key) = MlDsa65Ed25519::generate_keypair(|out| {
+                    let _: () = fill(out);
+                    Ok(())
+                })
+                .unwrap();
+                // The raw key: the ML-DSA-65 seed, then the Ed25519 key.
+                (
+                    Needle::new(key.expose_secret().as_bytes()),
+                    Vec::from(public.to_bytes()),
+                )
             }
-        });
-        let mut random = ChaCha20Rng::from_seed(SEED);
-        let handle = custody.enroll(IDS[0], Algorithm::MlDsa65Ed25519, &mut random).unwrap();
-        custody
-            .sign(&handle, Algorithm::MlDsa65Ed25519, b"message", &mut random)
-            .unwrap();
-        custody.rotate(&handle, IDS[1], &mut random).unwrap();
-        for id in IDS {
-            custody.delete(id).unwrap();
-        }
-        handle.public_key()
-    })
-    .join()
-    .unwrap();
-    assert_eq!(enrolled, public, "enroll made the key of the twin");
-    assert_eq!(scan(&needle, &mut chunk), [], "the custody left a copy of the key");
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            scan(&needle, &mut chunk),
+            [],
+            "the derivation of the key left a copy: {algorithm:?}"
+        );
 
-    // The positive control: a planted copy of one part of the key.
-    let plant = black_box(Box::new((needle.parts[0] ^ MASK).to_ne_bytes()));
-    assert_ne!(scan(&needle, &mut chunk), [], "the scan missed the planted copy");
-    drop(plant);
+        let service = format!("rsauthnz-test-{}-keychain-cache-{algorithm:?}", std::process::id());
+        let enrolled = thread::spawn(move || {
+            let custody = KeychainCustody::open(service, Isolation::User).unwrap();
+            // The guard deletes each key if a step fails, so the test leaves no item in the keychain.
+            let custody = DropGuard::new(custody, |custody| {
+                for id in IDS {
+                    custody.delete(id).unwrap_or_default();
+                }
+            });
+            let mut random = ChaCha20Rng::from_seed(SEED);
+            let handle = custody.enroll(IDS[0], algorithm, &mut random).unwrap();
+            custody.sign(&handle, algorithm, b"message", &mut random).unwrap();
+            custody.rotate(&handle, IDS[1], &mut random).unwrap();
+            for id in IDS {
+                custody.delete(id).unwrap();
+            }
+            handle.public_key()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(enrolled, public, "enroll made the key of the twin: {algorithm:?}");
+        assert_eq!(
+            scan(&needle, &mut chunk),
+            [],
+            "the custody left a copy of the key: {algorithm:?}"
+        );
+
+        // The positive control: a planted copy of one part of the key.
+        let plant = black_box(Box::new((needle.parts[0] ^ MASK).to_ne_bytes()));
+        assert_ne!(
+            scan(&needle, &mut chunk),
+            [],
+            "the scan missed the planted copy: {algorithm:?}"
+        );
+        drop(plant);
+    }
 }
 
 /// The parts of a key, masked: each window of `PART` bytes of the key.

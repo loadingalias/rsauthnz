@@ -7,8 +7,9 @@
 //!
 //! The contract is portable, so a host, such as a browser application, can supply its own custody. With the feature
 //! `native-custody`, on Linux, macOS, and Windows, `FileCustody` keeps each key in a key file under OS file
-//! permissions. On macOS, `KeychainCustody` keeps each key in the login keychain. A custody holds the composite keys:
-//! [`Algorithm::MlDsa65Ed25519`] and [`Algorithm::MlDsa65EcdsaP256`].
+//! permissions. On macOS, `KeychainCustody` keeps each key in the login keychain. A custody holds the composite keys,
+//! [`Algorithm::MlDsa65Ed25519`] and [`Algorithm::MlDsa65EcdsaP256`], and the trust-root keys of
+//! [`Algorithm::SlhDsaSha2_128s`], which sign issuer keys.
 //!
 //! Each random value comes from the seeded [`ChaCha20Rng`] of the caller: the key ID, each key, and the randomness
 //! of each signature. The signing is hedged: rscrypto takes fresh randomness from the generator for each signature.
@@ -148,17 +149,14 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// [`Error::Algorithm`] if `algorithm` is not a composite. [`Error::Mismatch`] if `public` is not a public key
-    /// of `algorithm`.
+    /// [`Error::Algorithm`] if `algorithm` is not a composite or SLH-DSA. [`Error::Mismatch`] if `public` is not a
+    /// public key of `algorithm`.
     pub fn new(id: KeyId, algorithm: Algorithm, public: &[u8]) -> Result<Self, Error> {
         let key = match algorithm {
             Algorithm::MlDsa65Ed25519 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ed25519),
             Algorithm::MlDsa65EcdsaP256 => public.try_into().ok().and_then(Verifier::ml_dsa_65_ecdsa_p256),
-            Algorithm::Ed25519
-            | Algorithm::Es256
-            | Algorithm::Rs256
-            | Algorithm::MlDsa65
-            | Algorithm::SlhDsaSha2_128s => {
+            Algorithm::SlhDsaSha2_128s => public.try_into().ok().map(Verifier::slh_dsa_sha2_128s),
+            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::MlDsa65 => {
                 return Err(Error::Algorithm);
             }
         };
@@ -180,26 +178,29 @@ impl Handle {
         self.key.algorithm()
     }
 
-    /// The public key in the encoding of the LAMPS draft: the `pub` of a composite `COSE_Key`.
+    /// The public key: the encoding of the LAMPS draft for a composite key (the `pub` of its `COSE_Key`), and PK.seed
+    /// then PK.root for an SLH-DSA key.
     #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
         self.key.to_bytes()
     }
 
     /// Whether `signature` is a valid signature of `message` by the key, with the empty context. The check first
-    /// charges `budget` with two checks, one for each component.
+    /// charges `budget` with one check for each component: two for a composite key, and one for an SLH-DSA key.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify).
     ///
     /// # Errors
     ///
-    /// [`Limit::SignatureChecks`] if `budget` has less than two checks. Then the check does no signature work.
+    /// [`Limit::SignatureChecks`] if `budget` has less than the checks of the key. Then the check does no signature
+    /// work.
     pub fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<bool, Limit> {
         self.key.verify(message, signature, budget)
     }
 
-    /// The trusted key of the public key, which checks the artifacts that the key signs.
-    pub(crate) fn trusted(&self) -> TrustedKey {
+    /// The trusted key of the public key, which checks the artifacts that the key signs, or `None` for an SLH-DSA
+    /// key, which has no COSE identifier and signs no artifact of this crate.
+    pub(crate) fn trusted(&self) -> Option<TrustedKey> {
         let bytes = self.key.to_bytes();
         let public = match self.algorithm() {
             Algorithm::MlDsa65Ed25519 => bytes.as_slice().try_into().map(PublicKey::MlDsa65Ed25519).ok(),
@@ -211,9 +212,8 @@ impl Handle {
             alg: None,
             public,
         });
-        // `Handle::new` made the same verifier from the same bytes, so the trusted key exists.
+        // `Handle::new` made the same verifier from the same bytes, so a composite key gives its trusted key.
         key.and_then(|key| TrustedKey::new(self.algorithm(), &key).ok())
-            .expect("a handle holds a valid composite key")
     }
 }
 

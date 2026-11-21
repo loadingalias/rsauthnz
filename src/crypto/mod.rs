@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 use rscrypto::auth::{
     EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
     MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
+    SlhDsaSha2_128sPublicKey,
 };
 use rscrypto::{RsaPkcs1v15Profile, RsaPublicKey, RsaPublicKeyPolicy};
 
@@ -76,8 +77,7 @@ pub enum Algorithm {
     MlDsa65EcdsaP256,
     /// SLH-DSA-SHA2-128s ([FIPS 205](https://csrc.nist.gov/pubs/fips/205/final)), pure, with the empty context: the
     /// trust-root profile. A root signs issuer keys, not credentials. Its security rests only on SHA-256. It is in NIST
-    /// security category 1, below the category 3 of ML-DSA-65. The profile has no COSE identifier yet. The crate does
-    /// not verify it yet: the operations of the trust root bring its verifier.
+    /// security category 1, below the category 3 of ML-DSA-65. The profile has no COSE identifier yet.
     SlhDsaSha2_128s,
 }
 
@@ -178,6 +178,7 @@ pub(crate) enum Verifier {
     MlDsa65(Box<MlDsa65PublicKey>),
     MlDsa65Ed25519(Box<MlDsa65Ed25519PublicKey>),
     MlDsa65EcdsaP256(Box<MlDsa65EcdsaP256PublicKey>),
+    SlhDsaSha2_128s(SlhDsaSha2_128sPublicKey),
 }
 
 impl Verifier {
@@ -221,9 +222,14 @@ impl Verifier {
         Some(Self::MlDsa65EcdsaP256(Box::new(key)))
     }
 
+    /// The SLH-DSA-SHA2-128s key with the encoding `public`: PK.seed, then PK.root.
+    pub(crate) fn slh_dsa_sha2_128s(public: &[u8; 32]) -> Self {
+        Self::SlhDsaSha2_128s(SlhDsaSha2_128sPublicKey::from_bytes(*public))
+    }
+
     /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, the
-    /// `RSAPublicKey` DER of an RSA key, and the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or
-    /// composite key.
+    /// `RSAPublicKey` DER of an RSA key, the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite
+    /// key, and PK.seed then PK.root for an SLH-DSA key.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(key) => key.as_bytes().to_vec(),
@@ -232,6 +238,7 @@ impl Verifier {
             Self::MlDsa65(key) => key.as_bytes().to_vec(),
             Self::MlDsa65Ed25519(key) => key.to_bytes().to_vec(),
             Self::MlDsa65EcdsaP256(key) => key.to_bytes().to_vec(),
+            Self::SlhDsaSha2_128s(key) => key.as_bytes().to_vec(),
         }
     }
 
@@ -244,10 +251,12 @@ impl Verifier {
             Self::MlDsa65(_) => Algorithm::MlDsa65,
             Self::MlDsa65Ed25519(_) => Algorithm::MlDsa65Ed25519,
             Self::MlDsa65EcdsaP256(_) => Algorithm::MlDsa65EcdsaP256,
+            Self::SlhDsaSha2_128s(_) => Algorithm::SlhDsaSha2_128s,
         }
     }
 
-    /// Whether `signature` is a valid signature over `message`. ML-DSA-65 and the composites use the empty context.
+    /// Whether `signature` is a valid signature over `message`. ML-DSA-65, the composites, and SLH-DSA use the empty
+    /// context.
     ///
     /// The check first charges `budget` with its cost: one check for each component. If the budget has less, the
     /// check refuses with [`Limit::SignatureChecks`] and does no signature work.
@@ -269,6 +278,7 @@ impl Verifier {
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
             Self::MlDsa65EcdsaP256(key) => MlDsa65EcdsaP256Signature::try_from_slice(signature)
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
+            Self::SlhDsaSha2_128s(key) => key.verify(message, signature).is_ok(),
         })
     }
 }
@@ -298,6 +308,7 @@ impl PartialEq for Verifier {
             (Self::MlDsa65(a), Self::MlDsa65(b)) => a == b,
             (Self::MlDsa65Ed25519(a), Self::MlDsa65Ed25519(b)) => a == b,
             (Self::MlDsa65EcdsaP256(a), Self::MlDsa65EcdsaP256(b)) => a == b,
+            (Self::SlhDsaSha2_128s(a), Self::SlhDsaSha2_128s(b)) => a == b,
             _ => false,
         }
     }
