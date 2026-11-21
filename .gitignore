@@ -9,3 +9,7 @@ AGENTS.md
 # docs/content/ is versioned.
 /docs/*
 !/docs/content/
+# The corpus that a fuzz campaign grows, its crash artifacts, and its coverage. The seeds in fuzz/seeds/ are versioned.
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

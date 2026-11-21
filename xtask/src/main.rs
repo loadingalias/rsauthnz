@@ -39,7 +39,9 @@ Commands
 
 fix, check, and test select the whole workspace unless their arguments select
 packages with -p or --package. They build all features; check also lints the
-default features.
+default features. With no arguments, fix and check also format and lint the
+fuzz targets of fuzz/, a separate workspace, without the libFuzzer link, so
+they build no C++ (docs/content/fuzzing.md).
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -131,6 +133,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// The manifest of the fuzz workspace, which is not a member of the workspace.
+const FUZZ: &str = "fuzz/Cargo.toml";
+
+/// The lint of the fuzz targets, without the libFuzzer link, which holds C++.
+const FUZZ_CLIPPY: [&str; 10] = [
+    "clippy",
+    "--manifest-path",
+    FUZZ,
+    "--locked",
+    "--no-default-features",
+    "--all-targets",
+    "--quiet",
+    "--",
+    "-D",
+    "warnings",
+];
+
 /// The workspace root and the toolchain channel that it pins.
 struct Repo {
     root: PathBuf,
@@ -199,7 +218,12 @@ impl Repo {
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--all-features", "--quiet"])
                 .args(&scope),
-        )
+        )?;
+        if args.is_empty() {
+            step("fmt fuzz", &mut self.cargo(&["fmt", "--manifest-path", FUZZ, "--all"]))?;
+            step("clippy fuzz", &mut self.cargo(&FUZZ_CLIPPY))?;
+        }
+        Ok(())
     }
 
     /// Checks formatting, lints, and rustdoc. It changes no file. Clippy
@@ -208,6 +232,13 @@ impl Repo {
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
+        if args.is_empty() {
+            step(
+                "fmt --check fuzz",
+                &mut self.cargo(&["fmt", "--manifest-path", FUZZ, "--all", "--check"]),
+            )?;
+            step("clippy fuzz", &mut self.cargo(&FUZZ_CLIPPY))?;
+        }
         step(
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])

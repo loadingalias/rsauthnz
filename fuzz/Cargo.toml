@@ -1,0 +1,84 @@
+# The fuzz targets of rsauthnz. This workspace is not a member of the main one, and it has its own lock file, so
+# libFuzzer, which holds C++, stays out of each library closure. `docs/content/fuzzing.md` gives the campaign.
+[package]
+name = "rsauthnz-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = ["link"]
+# The libFuzzer runtime that `cargo fuzz run` links. `cargo xtask check` checks the targets without it, so the gate
+# builds no C++.
+link = ["libfuzzer-sys/link_libfuzzer"]
+
+[dependencies]
+libfuzzer-sys = { version = "=0.4.13", default-features = false }
+rsauthnz = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "cbor"
+path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cose"
+path = "fuzz_targets/cose.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credential"
+path = "fuzz_targets/credential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "passkey"
+path = "fuzz_targets/passkey.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jose"
+path = "fuzz_targets/jose.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509"
+path = "fuzz_targets/x509.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootstrap"
+path = "fuzz_targets/bootstrap.rs"
+test = false
+doc = false
+bench = false
+
+# Integer overflow is a defect in every profile, and an assertion of the crate must fire under the fuzzer.
+[profile.release]
+overflow-checks = true
+debug-assertions = true

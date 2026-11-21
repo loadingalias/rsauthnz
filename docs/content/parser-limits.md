@@ -9,7 +9,8 @@ all of them.
 
 The X.509 reader has fixed bounds of its own: at most `CERTIFICATE_BYTES_MAX` (16,384) bytes, refused before a read,
 and lengths that fit in the input, so it allocates nothing for the DER ([Read and verify a
-certificate](certificates.md#read-and-verify-a-certificate)).
+certificate](certificates.md#read-and-verify-a-certificate)). [Fuzz the parsers](fuzzing.md) gives hostile input to each
+parser with these bounds.
 
 ## The limit set
 
