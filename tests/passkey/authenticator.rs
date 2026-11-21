@@ -232,14 +232,14 @@ fn crypto_sha256(bytes: &[u8]) -> [u8; 32] {
     rscrypto::Sha256::digest(bytes)
 }
 
-/// The challenge of the creation options `options`.
+/// The challenge of the creation options `options`, which can list `passkey::CREDENTIALS_MAX` passkeys.
 pub(crate) fn challenge(options: &[u8]) -> Vec<u8> {
     let limits = json::Limits {
-        input_bytes_max: 8192,
+        input_bytes_max: 64 * 1024,
         depth_max: 4,
         string_bytes_max: 1024,
         members_max: 16,
-        elements_max: 8,
+        elements_max: 64,
         number_digits_max: 16,
     };
     let mut scratch = [Slot::EMPTY; 80];

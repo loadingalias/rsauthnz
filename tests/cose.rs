@@ -433,6 +433,28 @@ fn a_composite_profile_verifies_its_akp_key_and_its_signature() {
 }
 
 #[test]
+fn an_rsa_key_with_a_private_parameter_refuses() {
+    let (n, e) = ([0xc5; 256], [1, 0, 1]);
+    let rsa = |private: Option<i64>| {
+        let mut key = vec![
+            (Value::Unsigned(1), Value::Unsigned(3)),
+            (Value::Unsigned(3), Value::Negative(256)),
+            (Value::Negative(0), Value::Bytes(&n)),
+            (Value::Negative(1), Value::Bytes(&e)),
+        ];
+        key.extend(private.map(|label| (Value::Negative(label.unsigned_abs() - 1), Value::Bytes(&[7; 128]))));
+        encode(&Value::Map(key), Limits::default()).expect("a COSE_Key")
+    };
+    let public = rsa(None);
+    Key::decode(&public, Limits::default()).unwrap();
+    // RFC 8230 section 4: `d`, `p`, `q`, `dP`, `dQ`, `qInv`, `other`, `r_i`, `d_i`, and `t_i`.
+    for label in -12..=-3 {
+        let key = rsa(Some(label));
+        assert_eq!(Key::decode(&key, Limits::default()), Err(Error::Unsupported), "{label}");
+    }
+}
+
+#[test]
 fn cose_keys_and_cnf_decode_and_a_private_key_refuses() {
     // The COSE_Key of the cnf example of RFC 8747 section 3.2.
     let x = hex("d7cc072de2205bdc1537a543d53c60a6acb62eccd890c7fa27c9e354089bbe13");

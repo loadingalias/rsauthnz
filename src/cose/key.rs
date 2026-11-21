@@ -112,7 +112,8 @@ impl<'a> Key<'a> {
                 if !matches!(alg.ok_or(Error::Malformed)?, Algorithm::Rs256 | Algorithm::Ps256) {
                     return Err(Error::KeyAlgorithm);
                 }
-                private(get(-3))?;
+                // RFC 8230 section 4: `d` (-3) to `t_i` (-12) are the private parameters of an RSA key.
+                (-12..=-3).try_for_each(|label| private(get(label)))?;
                 PublicKey::Rsa {
                     n: bytes(-1)?,
                     e: bytes(-2)?,

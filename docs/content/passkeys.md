@@ -24,12 +24,16 @@ The core checks the response and proposes each commit. The storage binding of th
   party ID, challenge]`, with a challenge of 32 random bytes. It ends after `REGISTRATION_LIFETIME` (300 seconds). The
   record never holds the challenge. The response is not signed, so the challenge is the only proof that the response
   comes from the ceremony of the account.
-- The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(id)`: the SHA-256 digest
-  of the CBOR form `["rsauthnz.passkey.credential.1", authority, relying party ID, credential ID]`. It holds the
-  account, the user handle, the credential ID, the `COSE_Key` of the passkey, its algorithm, its signature counter,
-  and its backup flags. It has no end.
+- The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(&handle, id)`. Its key
+  is the kind, the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.1", authority, relying party ID,
+  user handle]`, and the SHA-256 digest of the credential ID. It holds the account, the user handle, the credential
+  ID, the public key of the passkey, its algorithm, its signature counter, and its backup flags. It has no end. The
+  public key is the deterministic CBOR of a `COSE_Key` with only `kty`, `alg`, and the checked public parameters: no
+  other member of the key of the response enters the store.
 - Each key names the authority and the relying party ID. Thus two relying parties can share one store: neither one
-  finds a pending registration or a credential of the other.
+  finds a pending registration or a credential of the other. The first 33 bytes of a credential key are the same for
+  each passkey of an account, so one range read gives them all. An account has at most `CREDENTIALS_MAX` (32)
+  passkeys.
 - A **sign-in challenge** is 72 bytes: 32 random bytes, the time of its creation, and an HMAC-SHA256 tag of both
   under the key of the relying party. The time of creation is the earliest time of the reading, so it is never later
   than the true time. No record holds the challenge until it serves a sign-in. Then the commit writes its **replay
@@ -42,14 +46,17 @@ The core checks the response and proposes each commit. The storage binding of th
    that the host keeps secret, the same on each node of the site. A new key ends each open sign-in challenge.
    `limits` bound the CBOR of each response ([Parser limits](parser-limits.md)).
 2. The application decides that the account can register, for example a new account of an open sign-up, or a
-   signed-in account that adds a passkey. Call `rp.start(&user, &decision, operation, now, &mut random, &mut driver)`.
-   `user` names the account, its user handle, and the name and the display name that the authenticator shows. The
-   options hold the names, and no record does. `decision` is a slice of `transition::Dependency`: each record and
-   policy that the decision read, such as the session and the policy version. The proposal reads each one. Submit it
-   with its plan.
+   signed-in account that adds a passkey. Call
+   `rp.start(&mut store, &user, &decision, now, &mut random, &mut driver).await`. `user` names the account, its user
+   handle, and the name and the display name that the authenticator shows. The options hold the names, and no record
+   does. `decision` is a slice of `transition::Dependency`: each record and policy that the decision read, such as the
+   session and the policy version. The proposal reads each one. The start reads each passkey of the account and lists
+   it in `excludeCredentials`. Thus an authenticator that holds one of them makes no second passkey, which would
+   replace the first one on the authenticator while the store still counts it as a sign-in method. A start for an
+   account with `CREDENTIALS_MAX` passkeys refuses with `Error::Full`. Submit the proposal with its plan.
 3. Only the accepted commit releases the options: `receipt.artifact()`. Send them to the browser with
-   `rsauthnz_http::json`. After a lost response, start again with a new operation identity. The receipt of a lookup
-   has no artifact.
+   `rsauthnz_http::json`. Each start has a new operation identity. After a lost response, start again: the receipt
+   of a lookup has no artifact.
 4. The browser gives the options to `PublicKeyCredential.parseCreationOptionsFromJSON()`, calls
    `navigator.credentials.create()`, and sends `credential.toJSON()` as the JSON body of a state change.
 5. Check the request with `site.json_change`, then read the body with `Response::parse`.
@@ -62,8 +69,10 @@ The core checks the response and proposes each commit. The storage binding of th
    decision, consumes the pending record, and writes the credential record. Thus a decision that changed after its
    read makes the commit conflict, and no credential is written. The plan names the passkey as a sign-in method of the
    account, so a restore completes a registration that a crash left in doubt.
-8. Return the response of the outcome. The operation identity is the key of the pending record, so a second finish
-   of the ceremony refuses: with `transition::Error::Reuse` when both run at once, and with `Error::Challenge` after the
+8. Return the response of the outcome. The operation identity is the key of the pending record, and the request
+   binds the credential record: the public key, the algorithm, the counter, and the flags. Thus the same response
+   again gets the receipt of the commit. Another response of the ceremony refuses: with `transition::Error::Reuse`
+   when both run at once, also with the same credential ID and another key, and with `Error::Challenge` after the
    commit. After a lost response, look up the operation of the proposal (`proposal.operation()`). After a conflict,
    the pending record stays: finish again with a new decision, or start a new ceremony.
 
@@ -102,8 +111,10 @@ The stored counter never decreases. A counter that did not advance can come from
 authenticator, or two sign-ins that committed out of order. The signal locks nothing out: the policy of the
 application decides the response. The audit action of such a sign-in is `rsauthnz:passkey.sign-in.possible-clone`,
 and of each other sign-in `rsauthnz:passkey.sign-in`. A counter update reads the credential record at its version, so
-two concurrent sign-ins conflict, and the second one runs again from the stored counter. A passkey with no counter
-writes no credential record at a sign-in.
+two concurrent sign-ins conflict, and the second one runs again from the stored counter. A sign-in writes the
+credential record only when the counter advances or the backup state (BS) changes, as [WebAuthn Level 3, section
+7.2](https://www.w3.org/TR/webauthn-3/#sctn-verifying-assertion) asks. Thus a synchronized passkey with no counter
+writes no record until its provider backs it up.
 
 The evidence records the account, `Method::Passkey`, the time, whether the authenticator verified the user, phishing
 resistance, the backup state that the authenticator reports (`evidence.backup()`), and the authentication of the
@@ -128,7 +139,7 @@ use rsauthnz::passkey::{Error, RelyingParty, Response, User, UserHandle};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::{Dependency, Key, OperationId, Outcome, Proposal};
+use rsauthnz::transition::{Dependency, Key, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
 use rscrypto::ChaCha20Rng;
@@ -197,7 +208,7 @@ let user = User {
     display_name: "Alice",
 };
 let decision = can_register(&account)?;
-let (proposal, plan) = rp.start(&user, &decision, OperationId::new(b"start-1")?, now, &mut random, &mut driver)?;
+let (proposal, plan) = ready(rp.start(&mut memory, &user, &decision, now, &mut random, &mut driver))?;
 let Outcome::Accepted(receipt) = commit(&mut memory, &mut driver, proposal, plan)? else {
     return Err("the start did not commit".into());
 };
@@ -223,6 +234,7 @@ The options are `PublicKeyCredentialCreationOptionsJSON`:
 | --- | --- |
 | `pubKeyCredParams` | ML-DSA-65 (-49), EdDSA (-8), ES256 (-7), and RS256 (-257), in this order |
 | `timeout` | 300,000 milliseconds |
+| `excludeCredentials` | Each passkey of the account: its ID and its transports, in the order `usb`, `nfc`, `ble`, `smart-card`, `hybrid`, `internal`. `[]` for an account with no passkey |
 | `attestation` | `none` |
 | `authenticatorSelection` | `residentKey: required`, `requireResidentKey: true`, `userVerification: required` |
 | `extensions` | `credProps: true` |
@@ -240,7 +252,9 @@ refuses: no passkey profile offers one.
 - The authenticator data has the SHA-256 digest of the relying party ID, and the flags of user presence and of user
   verification. A backup state with no backup eligibility refuses.
 - The credential ID has at most 1,023 bytes, and it is the ID of the response.
-- The credential public key has an algorithm of the profile, and it is a valid key of that algorithm.
+- The credential public key has an algorithm of the profile, and it is a valid key of that algorithm. A key with a
+  private parameter refuses, such as `d` of an EC2 or OKP key, `priv` of an AKP key, and each of `d` to `t_i` of an
+  RSA key.
 - A `credProps` result of `rk: false` refuses: the profile requires a discoverable credential. A browser that gives no
   `credProps` registers.
 
@@ -280,7 +294,8 @@ Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()`
 | `Key` | The key is not a valid key of its algorithm | `Refuse` |
 | `CredentialId` | The ID has more than 1,023 bytes, or the response and the authenticator data have two IDs | `Refuse` |
 | `NotDiscoverable` | `credProps` reports a credential that is not discoverable | `Refuse` |
-| `Credential` | The store has no record of the credential of an assertion under this relying party, or the assertion names another user handle | `Refuse` |
+| `Full` | The account has `CREDENTIALS_MAX` (32) passkeys | `Refuse` |
+| `Credential` | The assertion has no user handle of 32 bytes, or the store has no record of its credential under this relying party and that handle | `Refuse` |
 | `Signature` | The signature of an assertion does not verify with the stored key | `Refuse` |
 | `Name` | A name is empty or has more than 256 bytes | `Refuse` |
 | `Record` | A record has no valid form | `Refuse` |
@@ -293,7 +308,8 @@ failed read, which is a crash of the binding.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
 The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `sign_in` makes
-one signature check and three keyed reads. A response has at most 64 KiB of JSON.
+one signature check and three keyed reads. The cost class of `start` is `Mutate`: one range read of at most
+`CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 
 ## Support
 
