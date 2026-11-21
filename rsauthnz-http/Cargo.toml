@@ -1,0 +1,18 @@
+[package]
+name = "rsauthnz-http"
+version = "0.1.0-alpha.1"
+description = "The HTTP binding of rsauthnz on `http` 1.x values: origin and CSRF checks, cookies, JSON bodies, redirects, and safe error responses."
+repository = "https://github.com/loadingalias/rsauthnz"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The request and response values of the frameworks that mount the binding, such as axum, hyper, and tower. A caret
+# requirement lets an application unify `http` 1.x with its framework.
+http = "1.5"
+# The recovery of each outcome of a transition.
+rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
+
+[lints]
+workspace = true
