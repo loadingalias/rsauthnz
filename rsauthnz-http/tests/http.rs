@@ -5,9 +5,15 @@ use core::time::Duration;
 
 use http::header::{HeaderMap, HeaderValue};
 use http::{Request, StatusCode, Version};
+use rsauthnz::id::Id;
+use rsauthnz::limits::Limits;
+use rsauthnz::passkey::RelyingParty;
 use rsauthnz::session::Identifier;
 use rsauthnz::transition::Recovery;
-use rsauthnz_http::{CookieName, Error, Refusal, SameSite, Site, json, problem, redirect};
+use rsauthnz_http::{
+    CookieName, Error, RELATED_ORIGINS, Refusal, SameSite, Site, browser_module, json, problem, redirect,
+    related_origins,
+};
 
 const ORIGIN: &str = "https://app.example";
 const SESSION: CookieName = CookieName::new("session").expect("a token");
@@ -261,6 +267,45 @@ fn a_session_cookie_holds_86_base64url_characters_and_reads_back_as_its_identifi
         assert_eq!(SESSION.session(&request).err(), Some(Refusal::Cookie));
     }
     assert!(matches!(SESSION.session(&HeaderMap::new()), Ok(None)));
+}
+
+#[test]
+fn the_related_origins_document_is_the_webauthn_object_of_each_related_origin() {
+    let rp = RelyingParty::new(
+        Id::new("acme", "auth").unwrap(),
+        "app.example",
+        ORIGIN,
+        "Acme",
+        [3; 32],
+        Limits::default(),
+    )
+    .unwrap()
+    .with_related(&["https://app.example.de", "https://shop.example:8443"])
+    .unwrap();
+    let response = related_origins(&rp);
+    assert_eq!(RELATED_ORIGINS, "/.well-known/webauthn");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    // WebAuthn Level 3, section 5.11: an object whose `origins` member is an array of web origins.
+    assert_eq!(
+        response.body(),
+        br#"{"origins":["https://app.example.de","https://shop.example:8443"]}"#
+    );
+}
+
+#[test]
+fn the_browser_module_imports_nothing_and_stays_under_8_kib() {
+    let response = browser_module();
+    assert_eq!(response.headers()["content-type"], "text/javascript; charset=utf-8");
+    let module = str::from_utf8(response.body()).unwrap();
+    assert!(module.len() <= 8 * 1024, "{} bytes", module.len());
+    // The positive control: the search sees the statements of the module.
+    assert!(module.lines().any(|line| line.starts_with("export ")));
+    let imports = module.lines().filter(|line| {
+        let line = line.trim_start();
+        line.starts_with("import ") || line.contains("import(") || line.contains("require(")
+    });
+    assert_eq!(imports.count(), 0);
 }
 
 #[test]

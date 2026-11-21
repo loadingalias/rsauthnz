@@ -144,6 +144,8 @@ Each response of the binding has `Cache-Control: no-store`.
 | --- | --- |
 | `json(body)` | `200 OK`, `Content-Type: application/json` |
 | `redirect(path)` | `303 See Other` to `path` |
+| `related_origins(&rp)` | `200 OK`, the document of the related origins of a relying party, for `RELATED_ORIGINS` (`/.well-known/webauthn`) ([Serve several domains](browser-adapter.md#serve-several-domains)) |
+| `browser_module()` | `200 OK`, `Content-Type: text/javascript; charset=utf-8`: the [browser adapter](browser-adapter.md) |
 | `problem(recovery)` and `Refusal::response` | A problem body ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)), `Content-Type: application/problem+json` |
 
 `redirect` takes only a path of the site. A target that does not start with one `/`, or that has a `\`, a space, or a

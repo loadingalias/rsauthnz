@@ -15,8 +15,9 @@
 //! - [`Site::set_session`] and [`CookieName::session`] write and read a session identifier
 //!   ([`rsauthnz::session`]) in a cookie, with the base64url of data-independent timing.
 //!
-//! Each response of the binding has `Cache-Control: no-store`: [`json`], [`redirect`] to a path of the site, and the
-//! problem responses of [`Refusal::response`] and [`problem`]. A problem body holds only its recovery, never a byte of
+//! Each response of the binding has `Cache-Control: no-store`: [`json`], [`redirect`] to a path of the site, the
+//! problem responses of [`Refusal::response`] and [`problem`], the document of [`related_origins`], and the
+//! [`browser_module`] of passkey ceremonies. A problem body holds only its recovery, never a byte of
 //! the request. The HTTP version of a message changes no result.
 //!
 //! ```
@@ -72,7 +73,7 @@ use http::Request;
 use http::header::{AsHeaderName, CONTENT_TYPE, HeaderMap, HeaderValue, ORIGIN};
 
 pub use cookie::CookieName;
-pub use response::{json, problem, redirect};
+pub use response::{RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins};
 
 /// The site that the binding serves: its origin, and the `SameSite` value of its cookies.
 #[derive(Clone, Debug)]

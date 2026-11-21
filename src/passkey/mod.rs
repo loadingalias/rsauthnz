@@ -186,6 +186,10 @@ pub const CREDENTIAL_ID_BYTES_MAX: usize = 1023;
 /// The most bytes of the relying party name and of the name and the display name of a user.
 pub const NAME_BYTES_MAX: usize = 256;
 
+/// The most related origins of a relying party ([`RelyingParty::with_related`]). A browser takes the related origins of
+/// at least five registrable domains, and WebAuthn Level 3 lets it ignore the others.
+pub const RELATED_MAX: usize = 32;
+
 /// The most passkeys of one account at one relying party. The options of a registration list each one, so a start at
 /// this bound refuses. Concurrent registrations can pass it by their number, and the next start refuses then too.
 pub const CREDENTIALS_MAX: usize = 32;
@@ -258,6 +262,8 @@ pub struct RelyingParty {
     authority: Id<Authority>,
     id: String,
     origin: String,
+    /// The other origins of the application that use the relying party ID ([`Self::with_related`]).
+    related: Vec<String>,
     name: String,
     /// The HMAC-SHA256 key of the sign-in challenges.
     key: SecretBytes<32>,
@@ -289,36 +295,56 @@ impl RelyingParty {
         limits: Limits,
     ) -> Result<Self, Error> {
         domain(id).ok_or(Error::RelyingParty)?;
-        let host = match origin.strip_prefix("https://") {
-            Some(rest) => rest,
-            None if id == "localhost" => origin.strip_prefix("http://").ok_or(Error::RelyingParty)?,
-            None => return Err(Error::RelyingParty),
-        };
-        let default = if origin.starts_with("https://") { 443 } else { 80 };
-        let (host, port) = host
-            .split_once(':')
-            .map_or((host, None), |(host, port)| (host, Some(port)));
-        // A browser writes a port with no leading zero, and no default port.
-        let port_valid = port.is_none_or(|port| {
-            port.bytes().all(|byte| byte.is_ascii_digit())
-                && !port.starts_with('0')
-                && port.parse::<u16>().is_ok_and(|port| port != default)
-        });
+        let host = origin_host(origin, id == "localhost").ok_or(Error::RelyingParty)?;
         let within = host == id
             || host
                 .strip_suffix(id)
                 .and_then(|sub| sub.strip_suffix('.'))
                 .is_some_and(domain);
-        (port_valid && domain(host) && within).ok_or(Error::RelyingParty)?;
+        within.ok_or(Error::RelyingParty)?;
         name_valid(name)?;
         Ok(Self {
             authority,
             id: id.into(),
             origin: origin.into(),
+            related: Vec::new(),
             name: name.into(),
             key: SecretBytes::new(key),
             limits,
         })
+    }
+
+    /// The relying party with the related origins `origins` ([WebAuthn Level 3, section 5.11]): other origins of the
+    /// application that use the relying party ID, such as `https://app.example.de` for the ID `app.example`. A response
+    /// from a related origin verifies as one from the origin of the site. Each one is `https://` and a domain name in
+    /// lowercase, with a port only when it is not 443. The browser of a related origin accepts the relying party ID only
+    /// when the document of related origins at `https://{id}/.well-known/webauthn` lists the origin, so serve it there
+    /// from this list (`rsauthnz_http::related_origins`).
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RelyingParty`] for an origin that is not in this form, the origin of the site, an origin that is in
+    /// `origins` twice, and more than [`RELATED_MAX`] origins.
+    ///
+    /// [WebAuthn Level 3, section 5.11]: https://www.w3.org/TR/webauthn-3/#sctn-related-origins
+    pub fn with_related(mut self, origins: &[&str]) -> Result<Self, Error> {
+        (origins.len() <= RELATED_MAX).ok_or(Error::RelyingParty)?;
+        let mut related = Vec::with_capacity(origins.len());
+        for (at, origin) in origins.iter().enumerate() {
+            let fresh = *origin != self.origin && !origins[..at].contains(origin);
+            (fresh && origin_host(origin, false).is_some()).ok_or(Error::RelyingParty)?;
+            related.push(String::from(*origin));
+        }
+        self.related = related;
+        Ok(self)
+    }
+
+    /// The related origins, in the order of [`Self::with_related`].
+    #[must_use]
+    pub fn related(&self) -> &[String] {
+        &self.related
     }
 
     /// Proposes the start of the registration of a passkey for the account of `user`, with its user handle. The options
@@ -482,7 +508,7 @@ impl RelyingParty {
     /// - [`Error::Malformed`] for each other difference from the forms of WebAuthn Level 3.
     pub fn verify(&self, response: &Response, challenge: &[u8]) -> Result<Credential, Error> {
         (*response.client_data.challenge == *challenge).ok_or(Error::Challenge)?;
-        response.client_data.check(&self.origin)?;
+        response.client_data.check(self)?;
         let attestation = cbor::decode(&response.attestation, self.limits).map_err(|_| Error::Malformed)?;
         let Value::Map(entries) = &attestation else {
             return Err(Error::Malformed);
@@ -699,7 +725,7 @@ impl RelyingParty {
             .ok_or(Error::Time(TimeError::Overflow))?;
         let latest = now.latest().map_err(Error::Time)?;
         (created <= latest && latest < expires).ok_or(Error::Challenge)?;
-        assertion.client_data.check(&self.origin)?;
+        assertion.client_data.check(self)?;
 
         let handle = assertion.user_handle.as_deref().ok_or(Error::Credential)?;
         let handle = UserHandle(<[u8; 32]>::try_from(handle).map_err(|_| Error::Credential)?);
@@ -1150,8 +1176,10 @@ impl ClientData {
     }
 
     /// Checks the origin and the frame.
-    fn check(&self, origin: &str) -> Result<(), Error> {
-        (self.origin == origin).ok_or(Error::Origin)?;
+    /// Checks the origin of the site of `rp`, or one of its related origins, and no frame of another origin.
+    fn check(&self, rp: &RelyingParty) -> Result<(), Error> {
+        let origin = self.origin.as_str();
+        (rp.origin == origin || rp.related.iter().any(|related| related == origin)).ok_or(Error::Origin)?;
         (!self.cross_origin).ok_or(Error::CrossOrigin)
     }
 }
@@ -1422,6 +1450,26 @@ fn base64url(text: Str<'_>) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// The host of `origin` in the form that a browser writes in `clientDataJSON`: `https://` and a domain name in lowercase,
+/// with a port only when it is not 443, or, when `localhost` is true, `http://` and a domain name with an optional port.
+/// A browser writes a port with no leading zero, and no default port.
+fn origin_host(origin: &str, localhost: bool) -> Option<&str> {
+    let (rest, default) = match origin.strip_prefix("https://") {
+        Some(rest) => (rest, 443),
+        None if localhost => (origin.strip_prefix("http://")?, 80),
+        None => return None,
+    };
+    let (host, port) = rest
+        .split_once(':')
+        .map_or((rest, None), |(host, port)| (host, Some(port)));
+    let port_valid = port.is_none_or(|port| {
+        port.bytes().all(|byte| byte.is_ascii_digit())
+            && !port.starts_with('0')
+            && port.parse::<u16>().is_ok_and(|port| port != default)
+    });
+    (port_valid && domain(host)).then_some(host)
+}
+
 /// Whether `text` is a domain name in lowercase ASCII: labels of 1 to 63 letters, digits, and hyphens, with no hyphen
 /// at an end, and at most 253 bytes.
 fn domain(text: &str) -> bool {
@@ -1469,7 +1517,7 @@ pub enum Error {
     Malformed,
     /// The challenge is not the challenge of the ceremony, or the pending record ended.
     Challenge,
-    /// The origin of `clientDataJSON` is not the origin of the site.
+    /// The origin of `clientDataJSON` is not the origin of the site or one of its related origins.
     Origin,
     /// The ceremony ran in a frame of another origin.
     CrossOrigin,
@@ -1524,7 +1572,7 @@ impl fmt::Display for Error {
             Self::Name => f.write_str("a name is empty or too long"),
             Self::Malformed => f.write_str("the response is not in the forms of WebAuthn Level 3"),
             Self::Challenge => f.write_str("the challenge is not the challenge of a pending ceremony"),
-            Self::Origin => f.write_str("the origin of the response is not the origin of the site"),
+            Self::Origin => f.write_str("the origin of the response is not an origin of the site"),
             Self::CrossOrigin => f.write_str("the ceremony ran in a frame of another origin"),
             Self::UserPresence => f.write_str("the authenticator did not report the presence of the user"),
             Self::UserVerification => f.write_str("the authenticator did not verify the user"),

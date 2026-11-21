@@ -919,6 +919,42 @@ fn a_relying_party_takes_only_an_origin_of_its_id() {
 }
 
 #[test]
+fn a_response_from_a_related_origin_verifies_and_one_from_an_unlisted_origin_refuses() {
+    let mut site = Site::new();
+    let related = ["https://app.example.de", "https://shop.example:8443"];
+    site.rp = rp().with_related(&related).expect("the related origins");
+    assert_eq!(site.rp.related(), related);
+    // A registration and a sign-in from a related origin, with the relying party ID of the site.
+    let passkey = Passkey::new(Algorithm::Ed25519, -8, 1);
+    let challenge = site.start();
+    let (proposal, plan) = site.propose(&Registration::new(&passkey, RP_ID, related[0], challenge).json(), at(1));
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    let get = Get::new(&passkey, RP_ID, related[1], site.options(at(10)), HANDLE);
+    site.signed_in(&get.json(), at(11));
+    let unlisted = Get::new(&passkey, RP_ID, "https://app.example.fr", site.options(at(10)), HANDLE);
+    assert_eq!(site.sign_in(&unlisted.json(), at(11)).err(), Some(Error::Origin));
+    // An origin that is not https and a domain, the origin of the site, a repeated origin, and too many origins refuse.
+    let many: Vec<String> = (0..=passkey::RELATED_MAX)
+        .map(|at| format!("https://a{at}.example"))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    for origins in [
+        &["http://app.example.de"][..],
+        &["https://app.example.de/"],
+        &["https://app.example.de:443"],
+        &[ORIGIN],
+        &["https://app.example.de", "https://app.example.de"],
+        &many,
+    ] {
+        assert_eq!(
+            rp().with_related(origins).err(),
+            Some(Error::RelyingParty),
+            "{origins:?}"
+        );
+    }
+}
+
+#[test]
 fn each_counter_case_gives_its_stored_value_and_signal() {
     let mut site = Site::new();
     // The stored counter, the received counter, the stored counter after the sign-in, and the possible-clone signal.

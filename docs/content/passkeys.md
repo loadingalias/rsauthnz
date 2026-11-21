@@ -15,7 +15,9 @@ The core checks the response and proposes each commit. The storage binding of th
   as `https://app.example`, the name that an authenticator shows, the authority that owns its records, and the key of
   its sign-in challenges. The origin
   is the origin of the relying party ID or of a subdomain of it, in the form that a browser writes: no default port and
-  no final `/`. For development, the relying party ID `localhost` takes `http://localhost` with an optional port.
+  no final `/`. For development, the relying party ID `localhost` takes `http://localhost` with an optional port. An
+  application on several domains adds its other origins with `with_related` ([Serve several
+  domains](browser-adapter.md#serve-several-domains)).
 - The **user handle** (`UserHandle`) is 32 random bytes with no personal data. Each passkey of an account has the
   same handle, so an authenticator keeps one passkey for each account. Draw it once for a new account
   (`UserHandle::random`), and keep it with the account.
@@ -85,7 +87,8 @@ The core checks the response and proposes each commit. The storage binding of th
    The options name no credential, so the browser offers each passkey of the site, also in the autofill of
    conditional mediation. They ask for user verification when the authenticator can do it.
 2. The browser gives the options to `PublicKeyCredential.parseRequestOptionsFromJSON()`, calls
-   `navigator.credentials.get()`, and sends `credential.toJSON()` as the JSON body of a state change.
+   `navigator.credentials.get()`, and sends `credential.toJSON()` as the JSON body of a state change. The `signIn`
+   function of the [browser adapter](browser-adapter.md) does this step.
 3. Check the request with `site.json_change`, then read the body with `Assertion::parse`.
 4. Call `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It checks the tag and the lifetime of
    the challenge before any read. Then it reads the credential record, the replay floor, and the replay record of the
@@ -294,7 +297,7 @@ Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()`
 | --- | --- | --- |
 | `Malformed` | The response is not in the forms of WebAuthn Level 3 | `Refuse` |
 | `Challenge` | The challenge is not the challenge of a ceremony of this relying party or of its key, the ceremony ended, or the challenge is not later than the replay floor or served a sign-in already | `Restart`: start a new ceremony |
-| `Origin` | The origin of `clientDataJSON` is not the origin of the site | `Refuse` |
+| `Origin` | The origin of `clientDataJSON` is not the origin of the site or one of its related origins | `Refuse` |
 | `CrossOrigin` | The ceremony ran in a frame of another origin | `Refuse` |
 | `RelyingParty` | The authenticator data has the hash of another relying party ID, or `RelyingParty::new` has no valid ID and origin | `Refuse` |
 | `UserPresence` | The UP flag is not set | `Refuse` |
