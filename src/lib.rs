@@ -11,7 +11,6 @@ pub mod crypto;
 pub mod custody;
 pub mod evidence;
 pub mod id;
-pub mod json;
 pub mod limits;
 pub mod local;
 pub mod store;

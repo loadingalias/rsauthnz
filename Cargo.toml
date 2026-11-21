@@ -24,6 +24,8 @@ native-custody = []
 # The memory binding and the effect executor commit the transitions of the tests and of the doctests: only the
 # receipt of an accepted transition gives a prepared artifact.
 rsauthnz-conformance = { path = "rsauthnz-conformance" }
+# The composite tests read the LAMPS vectors: a JSON file of base64 fields.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json"] }
 
 [lints]
 workspace = true

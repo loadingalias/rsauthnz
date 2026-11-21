@@ -16,6 +16,7 @@ name = "rsauthnz"
 version = "0.1.0-alpha.1"
 dependencies = [
  "rsauthnz-conformance",
+ "rscodec",
  "rscrypto",
  "rstypes",
 ]
@@ -27,6 +28,11 @@ dependencies = [
  "rsauthnz",
  "rscrypto",
 ]
+
+[[package]]
+name = "rscodec"
+version = "0.1.0-alpha.2"
+source = "git+https://github.com/loadingalias/rscodec?branch=main#e2708865e2e7abe75d72e765ee0e5abc7871edbe"
 
 [[package]]
 name = "rscrypto"

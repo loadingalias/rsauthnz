@@ -1,49 +1,35 @@
 use alloc::vec::Vec;
 
+use rscodec::base64::Profile::Standard;
+use rscodec::json::{self, Profile::Rfc8259, Slot, Str};
+
 use super::{Algorithm, Verifier};
-use crate::json::{self, Value};
 use crate::limits::{Limit, Limits, SignatureBudget};
 
 /// The composite cases of draft-ietf-lamps-pq-composite-sigs-19, Appendix E. `tests/composite-sigs/README.md` gives
 /// the source.
 const VECTORS: &str = include_str!("../../tests/composite-sigs/vectors.json");
 
+/// The limits of `VECTORS`: 39 KiB of text, an array of objects in an object, and a certificate of 7,572 bytes as the
+/// longest string.
+const VECTORS_LIMITS: json::Limits = json::Limits {
+    input_bytes_max: 64 * 1024,
+    depth_max: 3,
+    string_bytes_max: 8 * 1024,
+    members_max: 8,
+    elements_max: 2,
+    number_digits_max: 1,
+};
+
 /// The bytes of an ML-DSA-65 signature: the first component of a composite signature.
 const ML_DSA_65_SIGNATURE: usize = 3_309;
 
-/// The bytes of the standard base64 text `text`, with its padding.
-fn base64(text: &str) -> Vec<u8> {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let digits: Vec<u32> = text
-        .bytes()
-        .filter(|&byte| byte != b'=')
-        .map(|byte| u32::try_from(DIGITS.iter().position(|&digit| digit == byte).unwrap()).unwrap())
-        .collect();
-    let mut out = Vec::new();
-    for chunk in digits.chunks(4) {
-        let word = chunk
-            .iter()
-            .enumerate()
-            .fold(0, |word, (at, digit)| word | digit << (18 - 6 * at));
-        out.extend_from_slice(&word.to_be_bytes()[1..chunk.len()]);
-    }
+/// The bytes of the base64 string `text`.
+fn base64(text: Str<'_>) -> Vec<u8> {
+    let text = text.borrowed().unwrap().as_bytes();
+    let mut out = alloc::vec![0; Standard.decoded_len(text).unwrap()];
+    Standard.decode(text, &mut out).unwrap();
     out
-}
-
-/// The member `name` of the JSON object `object`.
-fn member<'v, 'a>(object: &'v Value<'a>, name: &str) -> &'v Value<'a> {
-    let Value::Object(members) = object else {
-        panic!("{name} is not in an object");
-    };
-    &members.iter().find(|(key, _)| key == name).unwrap().1
-}
-
-/// The bytes of the base64 member `name` of `object`.
-fn bytes(object: &Value<'_>, name: &str) -> Vec<u8> {
-    let Value::String(text) = member(object, name) else {
-        panic!("{name} is not a string");
-    };
-    base64(text)
 }
 
 /// The verifier of the composite `algorithm` with the public key `public`.
@@ -63,28 +49,53 @@ struct Case {
     signature: Vec<u8>,
 }
 
+/// The case in the object `test`. The walk skips the members that it does not read.
+fn case(test: json::Value<'_, '_, '_>) -> Result<Case, json::Error> {
+    let (mut algorithm, mut public, mut signature) = (None, None, None);
+    let mut members = test.members()?;
+    while let Some((name, value)) = members.next()? {
+        if name == "tcId" {
+            let id = value.str()?;
+            algorithm = Some(if id == "id-MLDSA65-Ed25519-SHA512" {
+                Algorithm::MlDsa65Ed25519
+            } else if id == "id-MLDSA65-ECDSA-P256-SHA512" {
+                Algorithm::MlDsa65EcdsaP256
+            } else {
+                panic!("the case {id:?} is not a composite of the crate")
+            });
+        } else if name == "pk" {
+            public = Some(base64(value.str()?));
+        } else if name == "s" {
+            signature = Some(base64(value.str()?));
+        }
+    }
+    let algorithm = algorithm.unwrap();
+    Ok(Case {
+        algorithm,
+        key: verifier(algorithm, &public.unwrap()),
+        signature: signature.unwrap(),
+    })
+}
+
 /// The message of the vectors, and each case.
 fn vectors() -> (Vec<u8>, Vec<Case>) {
-    let root = json::decode(VECTORS.as_bytes(), Limits::default()).unwrap();
-    let Value::Array(tests) = member(&root, "tests") else {
-        panic!("the cases are not an array");
-    };
-    let cases = tests
-        .iter()
-        .map(|test| {
-            let algorithm = match member(test, "tcId") {
-                Value::String(id) if id == "id-MLDSA65-Ed25519-SHA512" => Algorithm::MlDsa65Ed25519,
-                Value::String(id) if id == "id-MLDSA65-ECDSA-P256-SHA512" => Algorithm::MlDsa65EcdsaP256,
-                id => panic!("the case {id:?} is not a composite of the crate"),
-            };
-            Case {
-                algorithm,
-                key: verifier(algorithm, &bytes(test, "pk")),
-                signature: bytes(test, "s"),
+    let mut scratch = [Slot::EMPTY; 16];
+    json::read(VECTORS.as_bytes(), &VECTORS_LIMITS, Rfc8259, &mut scratch, |reader| {
+        let (mut message, mut cases) = (None, Vec::new());
+        let mut members = reader.value().members()?;
+        while let Some((name, value)) = members.next()? {
+            if name == "m" {
+                message = Some(base64(value.str()?));
+            } else if name == "tests" {
+                let mut tests = value.elements()?;
+                while let Some(test) = tests.next()? {
+                    cases.push(case(test)?);
+                }
             }
-        })
-        .collect();
-    (bytes(&root, "m"), cases)
+        }
+        Ok((message.unwrap(), cases))
+    })
+    .unwrap()
 }
 
 #[test]
