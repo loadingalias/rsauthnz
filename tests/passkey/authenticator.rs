@@ -1,6 +1,6 @@
-//! A test authenticator: it makes passkeys with rscrypto, and the registration responses of WebAuthn Level 3
-//! (`RegistrationResponseJSON`) with the algorithm, the flags, the counter, the challenge, and the origin that a test
-//! chooses. A test of a defect that a browser shows uses it. It is never exit evidence: real browsers and
+//! A test authenticator: it makes passkeys with rscrypto, and the registration and sign-in responses of WebAuthn
+//! Level 3 (`RegistrationResponseJSON` and `AuthenticationResponseJSON`) with the algorithm, the flags, the counter,
+//! the challenge, and the origin that a test chooses. It signs each assertion with rscrypto. A test of a defect that a browser shows uses it. It is never exit evidence: real browsers and
 //! authenticators are.
 
 use rsauthnz::cbor::{self, Value};
@@ -29,10 +29,12 @@ pub(crate) fn int(value: i64) -> Value<'static> {
     }
 }
 
-/// A passkey: its credential ID and its `COSE_Key`.
+/// A passkey: its credential ID, its `COSE_Key`, and the algorithm and the seed of its secret key.
 pub(crate) struct Passkey {
     pub id: Vec<u8>,
     pub cose_key: Vec<u8>,
+    algorithm: Algorithm,
+    seed: u8,
 }
 
 impl Passkey {
@@ -69,6 +71,40 @@ impl Passkey {
         Self {
             id: vec![seed; 16],
             cose_key,
+            algorithm,
+            seed,
+        }
+    }
+
+    /// The signature of `message` in the form of a WebAuthn assertion: DER for ES256.
+    pub(crate) fn sign(&self, message: &[u8]) -> Vec<u8> {
+        match self.algorithm {
+            Algorithm::Ed25519 => Ed25519SecretKey::from_bytes([self.seed; 32])
+                .sign(message)
+                .to_bytes()
+                .to_vec(),
+            Algorithm::Es256 => {
+                let signature = EcdsaP256SecretKey::from_bytes([self.seed; 32])
+                    .expect("a P-256 scalar")
+                    .try_sign(message)
+                    .expect("a signature");
+                let mut der = [0; 72];
+                signature.to_der_into(&mut der).to_vec()
+            }
+            Algorithm::MlDsa65 => {
+                let seed = self.seed;
+                let fill = move |out: &mut [u8]| -> Result<(), MlDsaError> {
+                    out.fill(seed);
+                    Ok(())
+                };
+                let (_, secret) = MlDsa65::generate_keypair(fill).expect("an ML-DSA-65 key");
+                secret
+                    .sign_deterministic(message, &[])
+                    .expect("a signature")
+                    .as_bytes()
+                    .to_vec()
+            }
+            algorithm => panic!("the test authenticator has no {algorithm:?} key"),
         }
     }
 }
@@ -88,7 +124,7 @@ pub(crate) struct Registration<'a> {
     pub passkey: &'a Passkey,
     pub rp_id: &'a str,
     pub origin: &'a str,
-    pub challenge: [u8; 32],
+    pub challenge: Vec<u8>,
     pub kind: &'a str,
     pub cross_origin: bool,
     pub flags: u8,
@@ -101,7 +137,7 @@ pub(crate) struct Registration<'a> {
 
 impl<'a> Registration<'a> {
     /// The registration of `passkey` at `rp_id` and `origin` for `challenge`, as a synchronized platform passkey.
-    pub(crate) fn new(passkey: &'a Passkey, rp_id: &'a str, origin: &'a str, challenge: [u8; 32]) -> Self {
+    pub(crate) fn new(passkey: &'a Passkey, rp_id: &'a str, origin: &'a str, challenge: Vec<u8>) -> Self {
         Self {
             passkey,
             rp_id,
@@ -197,7 +233,7 @@ fn crypto_sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// The challenge of the creation options `options`.
-pub(crate) fn challenge(options: &[u8]) -> [u8; 32] {
+pub(crate) fn challenge(options: &[u8]) -> Vec<u8> {
     let limits = json::Limits {
         input_bytes_max: 8192,
         depth_max: 4,
@@ -219,9 +255,77 @@ pub(crate) fn challenge(options: &[u8]) -> [u8; 32] {
     })
     .expect("options in JSON")
     .expect("a challenge");
-    let mut bytes = [0; 32];
+    let mut bytes = [0; 128];
     rscodec::base64::Profile::Url
         .decode(text.as_bytes(), &mut bytes)
-        .expect("a challenge of 32 bytes");
-    bytes
+        .expect("a challenge of at most 128 bytes")
+        .to_vec()
+}
+
+/// A sign-in (`navigator.credentials.get()`) that a test makes: each part of the assertion that a test can change.
+pub(crate) struct Get<'a> {
+    pub passkey: &'a Passkey,
+    pub rp_id: &'a str,
+    pub origin: &'a str,
+    pub challenge: Vec<u8>,
+    pub flags: u8,
+    pub sign_count: u32,
+    pub user_handle: Option<[u8; 32]>,
+}
+
+impl<'a> Get<'a> {
+    /// The sign-in of `passkey` of the account with the user handle `handle` for `challenge`, with user presence and
+    /// verification, as a synchronized passkey.
+    pub(crate) fn new(
+        passkey: &'a Passkey,
+        rp_id: &'a str,
+        origin: &'a str,
+        challenge: Vec<u8>,
+        handle: [u8; 32],
+    ) -> Self {
+        Self {
+            passkey,
+            rp_id,
+            origin,
+            challenge,
+            flags: USER_PRESENT | USER_VERIFIED | BACKUP_ELIGIBLE | BACKUP_STATE,
+            sign_count: 0,
+            user_handle: Some(handle),
+        }
+    }
+
+    /// The `AuthenticationResponseJSON`, with the signature over the authenticator data and the digest of the client
+    /// data.
+    pub(crate) fn json(&self) -> Vec<u8> {
+        let client_data = write(|place| {
+            place.object(|data| {
+                data.member("type").str("webauthn.get")?;
+                data.member("challenge").base64url(&self.challenge)?;
+                data.member("origin").str(self.origin)?;
+                data.member("crossOrigin").bool(false)
+            })
+        });
+        let mut data = crypto_sha256(self.rp_id.as_bytes()).to_vec();
+        data.push(self.flags);
+        data.extend_from_slice(&self.sign_count.to_be_bytes());
+        let signature = self.passkey.sign(&[&data[..], &crypto_sha256(&client_data)].concat());
+        write(|place| {
+            place.object(|response| {
+                response.member("id").base64url(&self.passkey.id)?;
+                response.member("rawId").base64url(&self.passkey.id)?;
+                response.member("response").object(|inner| {
+                    inner.member("clientDataJSON").base64url(&client_data)?;
+                    inner.member("authenticatorData").base64url(&data)?;
+                    inner.member("signature").base64url(&signature)?;
+                    match &self.user_handle {
+                        Some(handle) => inner.member("userHandle").base64url(handle),
+                        None => inner.member("userHandle").null(),
+                    }
+                })?;
+                response.member("type").str("public-key")?;
+                response.member("authenticatorAttachment").str("platform")?;
+                response.member("clientExtensionResults").object(|_| Ok(()))
+            })
+        })
+    }
 }

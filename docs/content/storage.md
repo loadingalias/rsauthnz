@@ -96,7 +96,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Agent` | An agent identity | `None` |
 | `Grant` | A grant and its current revision | `None` |
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
-| `Replay` | The replay record of one accepted signature | `None` |
+| `Replay` | The replay record of one accepted signature, or of the challenge of one passkey sign-in | `None` |
 | `ReplayFloor` | The replay floor of the store. Each replay insert reads it as a dependency | `None` |
 | `Audit` | The audit record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |

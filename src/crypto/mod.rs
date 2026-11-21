@@ -39,7 +39,7 @@ use rscrypto::auth::{
     MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
     SlhDsaSha2_128sPublicKey,
 };
-use rscrypto::{RsaPkcs1v15Profile, RsaPublicKey, RsaPublicKeyPolicy};
+use rscrypto::{HmacSha256, HmacSha256Tag, RsaPkcs1v15Profile, RsaPublicKey, RsaPublicKeyPolicy};
 
 use crate::limits::{Limit, SignatureBudget};
 
@@ -255,6 +255,22 @@ impl Verifier {
         }
     }
 
+    /// Whether `signature` is a valid WebAuthn assertion signature over `message`: as [`Self::verify`], but an ES256
+    /// signature is the DER `Ecdsa-Sig-Value` that WebAuthn uses, and not `r || s`.
+    pub(crate) fn verify_assertion(
+        &self,
+        message: &[u8],
+        signature: &[u8],
+        budget: &mut SignatureBudget,
+    ) -> Result<bool, Limit> {
+        let Self::Es256(_) = self else {
+            return self.verify(message, signature, budget);
+        };
+        // A signature that is not canonical DER becomes no signature, which the check refuses after its charge.
+        let raw = EcdsaP256Signature::from_der(signature).map(EcdsaP256Signature::to_bytes);
+        self.verify(message, raw.as_ref().map_or(&[][..], |raw| raw), budget)
+    }
+
     /// Whether `signature` is a valid signature over `message`. ML-DSA-65, the composites, and SLH-DSA use the empty
     /// context.
     ///
@@ -281,6 +297,16 @@ impl Verifier {
             Self::SlhDsaSha2_128s(key) => key.verify(message, signature).is_ok(),
         })
     }
+}
+
+/// The HMAC-SHA256 tag of `data` under `key`.
+pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    HmacSha256::mac(key, data).to_bytes()
+}
+
+/// Whether `tag` is the HMAC-SHA256 tag of `data` under `key`. The comparison takes the same time for each tag.
+pub(crate) fn hmac_sha256_verify(key: &[u8; 32], data: &[u8], tag: &[u8; 32]) -> bool {
+    HmacSha256::verify_tag(key, data, &HmacSha256Tag::from_bytes(*tag)).is_ok()
 }
 
 /// The SHA-256 digest of `message`.

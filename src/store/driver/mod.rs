@@ -38,7 +38,7 @@
 //! only commits with no creation entry, such as an unlink or a renewal, followed the snapshot. The journal holds no
 //! proof that such a commit landed, so its loss looks the same as a crash before the commit.
 
-mod record;
+pub(crate) mod record;
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;

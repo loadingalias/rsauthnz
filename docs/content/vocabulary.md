@@ -96,6 +96,7 @@ let version = AuthorityVersion::new(owner, &7_u64.to_be_bytes())?;
 | The authentication of the signature: `Hybrid`, `PostQuantum`, or `Classical` (`crypto::Authentication`), or `None` when rsauthnz verified no signature | `authentication()` |
 | The credential of the authentication: its verified claims, with the issuer, the audience, the purpose, the serial, the validity interval, and the owner of an agent, the SHA-256 digest of its bytes, and the end of its authority (`evidence::Artifact`), or `None` with no credential | `artifact()` |
 | The end of the credential, or the end of the previous issuer key that verified it when that is earlier, after which the evidence gives no authority (`Artifact::end`) | `expires()` |
+| A possible clone of a passkey: its signature counter did not advance, with a nonzero counter on either side | `possible_clone()` |
 
 A `Classical` authentication gives no post-quantum guarantee. Post-quantum key exchange is a separate
 guarantee of the transport, and the evidence does not record it. Evidence has no strength score. A recovery never records phishing resistance. Only the verifiers of

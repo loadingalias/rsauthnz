@@ -30,6 +30,8 @@ pub struct Evidence {
     authentication: Option<Authentication>,
     /// The credential of the authentication, or `None` when it used no credential.
     pub(crate) artifact: Option<Artifact>,
+    /// Whether the signature counter of a passkey did not increase: a possible clone of the credential.
+    pub(crate) possible_clone: bool,
 }
 
 /// The credential that an authentication used: its verified claims, the SHA-256 digest of its exact bytes, and the end
@@ -114,6 +116,7 @@ impl Evidence {
             binding,
             authentication,
             artifact: None,
+            possible_clone: false,
         }
     }
 
@@ -169,6 +172,14 @@ impl Evidence {
         self.authentication
     }
 
+    /// Whether the signature counter of the passkey did not increase, with a nonzero counter on either side: the
+    /// credential can be cloned, the authenticator can be faulty, or two sign-ins can have committed out of order. The
+    /// signal locks nothing out. The policy of the application decides the response.
+    #[must_use]
+    pub const fn possible_clone(&self) -> bool {
+        self.possible_clone
+    }
+
     /// The credential of the authentication, or `None` when it used no credential, as for a passkey assertion.
     #[must_use]
     pub const fn artifact(&self) -> Option<&Artifact> {
@@ -184,7 +195,7 @@ impl Evidence {
     }
 
     /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
-    /// resistant, binding, authentication, artifact]`. The method, the binding, and the
+    /// resistant, binding, authentication, artifact, possible clone]`. The method, the binding, and the
     /// authentication are numbers, with `null` for no binding and for no authentication. The time is
     /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
     /// bound in the same form or `null` when it is unknown, and the source as a number. The artifact
@@ -236,6 +247,7 @@ impl Evidence {
                         duration_to_cbor(*end),
                     ])
                 }),
+            Value::Bool(self.possible_clone),
         ])
     }
 
@@ -266,6 +278,7 @@ impl Evidence {
             binding,
             authentication,
             artifact,
+            Value::Bool(possible_clone),
         ] = items.as_slice()
         else {
             return Err(EvidenceError::Form);
@@ -306,6 +319,7 @@ impl Evidence {
                 Value::Null => None,
                 artifact => Some(artifact_from_cbor(artifact).ok_or(EvidenceError::Form)?),
             },
+            possible_clone: *possible_clone,
         })
     }
 }

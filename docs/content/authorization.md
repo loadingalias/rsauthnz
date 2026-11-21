@@ -4,8 +4,9 @@ The application owns the meaning of its policy. rsauthnz binds the decision of t
 caller and to one exact request. It gives a checked scope, and the operation enforces it where it acts. A valid
 signature or an authentication alone gives no permission.
 
-No verifier of this release gives `Evidence` yet. Thus the example on this page compiles, but it does not run a
-check.
+A passkey sign-in ([Register a passkey and sign in](passkeys.md#sign-in)) and a workload proof ([Issue and manage
+workload credentials](workload.md)) give `Evidence`. The example on this page compiles, but it does not run a check:
+it has no verifier input.
 
 ## Implement the policy
 

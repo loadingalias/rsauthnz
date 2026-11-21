@@ -89,7 +89,7 @@ pub enum Kind {
     Grant = 13,
     /// A one-use approval of an operation. Its consumption pays for no anchor.
     Approval = 14,
-    /// The replay record of one accepted signature.
+    /// The replay record of one accepted signature, or of the challenge of one passkey sign-in.
     Replay = 15,
     /// The replay floor of the store. Each replay insert reads it.
     ReplayFloor = 16,

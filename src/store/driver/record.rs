@@ -87,7 +87,7 @@ pub(super) fn mark_key() -> Key {
 }
 
 /// The key of the replay floor record.
-pub(super) fn floor_key() -> Key {
+pub(crate) fn floor_key() -> Key {
     Kind::ReplayFloor.key(&[]).expect("a key of one byte is valid")
 }
 
@@ -178,6 +178,28 @@ impl State {
         self.version = Some(version);
         Some(proposal)
     }
+}
+
+/// The time after which a value that the replay floor record `data` admits was created: the estimate of the floor plus
+/// twice its bound. `None` if the floor has an unknown bound, which admits no value, or no valid form.
+pub(crate) fn floor_end(data: &[u8], limits: Limits) -> Option<Duration> {
+    let duration = |value: &Value<'_>| match value {
+        Value::Array(parts) => match parts.as_slice() {
+            [Value::Unsigned(seconds), Value::Unsigned(nanos)] => Some(Duration::new(
+                *seconds,
+                u32::try_from(*nanos).ok().filter(|&nanos| nanos < 1_000_000_000)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Ok(Value::Array(items)) = cbor::decode(data, limits) else {
+        return None;
+    };
+    let [estimate, bound] = items.as_slice() else {
+        return None;
+    };
+    duration(estimate)?.checked_add(duration(bound)?.checked_mul(2)?)
 }
 
 /// The commit that writes the replay floor record: the reading `now` of a start or a restore, as the CBOR array
