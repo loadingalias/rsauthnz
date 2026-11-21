@@ -19,6 +19,10 @@ use crate::crypto::Authentication;
 use crate::id::{Id, IdError, Principal};
 use crate::time::{Reading, ReadingSource};
 
+/// The name of the stored form of evidence. Each change of the form gets a new name. After the first release, the
+/// reader keeps each released form.
+const FORM: &str = "rsauthnz.evidence.1";
+
 /// The facts that one authentication proved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evidence {
@@ -220,8 +224,9 @@ impl Evidence {
         self.artifact.as_ref().map(|artifact| artifact.end)
     }
 
-    /// The canonical CBOR form: the array `[subject, method, time, user verified, phishing
-    /// resistant, binding, authentication, artifact, backup, possible clone]`. The method, the binding,
+    /// The canonical CBOR form: the array `["rsauthnz.evidence.1", subject, method, time, user
+    /// verified, phishing resistant, binding, authentication, artifact, backup, possible clone]`. The
+    /// name gives the version of the form. The method, the binding,
     /// the authentication, and the backup state are numbers, with `null` for no binding, for no
     /// authentication, and for no backup state. The time is
     /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
@@ -232,6 +237,7 @@ impl Evidence {
     #[must_use]
     pub fn to_cbor(&self) -> Value<'_> {
         Value::Array(vec![
+            Value::Text(FORM),
             self.subject.to_cbor(),
             Value::Unsigned(match self.method {
                 Method::Passkey => 1,
@@ -292,8 +298,8 @@ impl Evidence {
     /// # Errors
     ///
     /// [`EvidenceError::Subject`] for a subject that is not a principal, and [`EvidenceError::Form`]
-    /// for each other difference from the canonical form, also a recovery that records phishing
-    /// resistance.
+    /// for each other difference from the canonical form, also a form with another name or with no
+    /// name, and a recovery that records phishing resistance.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the sessions of A2 read the evidence that they store")
@@ -303,6 +309,7 @@ impl Evidence {
             return Err(EvidenceError::Form);
         };
         let [
+            Value::Text(FORM),
             subject,
             Value::Unsigned(method),
             time,

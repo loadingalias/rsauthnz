@@ -55,8 +55,9 @@
 //! assert_eq!(response.status(), 403);
 //! assert_eq!(response.body(), br#"{"recovery":"refuse"}"#);
 //!
-//! // The response of a commit was lost: the browser looks up the same operation, and does not sign in again.
-//! assert_eq!(rsauthnz_http::problem(Recovery::Lookup).body(), br#"{"recovery":"lookup"}"#);
+//! // The server looked up a commit whose response was lost, and its outcome stays unknown. The browser loads the current
+//! // state, and does not send the request again.
+//! assert_eq!(rsauthnz_http::problem(Recovery::Lookup).body(), br#"{"recovery":"check"}"#);
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
 

@@ -74,8 +74,9 @@ let response = site.check_change(&forged).unwrap_err().response();
 assert_eq!(response.status(), 403);
 assert_eq!(response.body(), br#"{"recovery":"refuse"}"#);
 
-// The response of a commit was lost: the browser looks up the same operation, and does not sign in again.
-assert_eq!(rsauthnz_http::problem(Recovery::Lookup).body(), br#"{"recovery":"lookup"}"#);
+// The server looked up a commit whose response was lost, and its outcome stays unknown. The browser loads the current
+// state, and does not send the request again.
+assert_eq!(rsauthnz_http::problem(Recovery::Lookup).body(), br#"{"recovery":"check"}"#);
 ```
 
 ## The state change check
@@ -143,7 +144,7 @@ A problem body holds only its recovery, never a byte of the request:
 | Recovery | Status | Body | The client |
 | --- | --- | --- | --- |
 | `Restart` | `409 Conflict` | `{"recovery":"restart"}` | Starts the ceremony again as a new operation |
-| `Lookup` | `500 Internal Server Error` | `{"recovery":"lookup"}` | Looks up the outcome of the same operation. It never sends the request again as a new operation: the first attempt can have committed |
+| `Lookup` | `500 Internal Server Error` | `{"recovery":"check"}` | Loads the current state, such as the account page. It never sends the request again: the first attempt can have committed |
 | `Refuse` | `403 Forbidden` | `{"recovery":"refuse"}` | Stops. The same request refuses again |
 
 `Lookup` is not `503 Service Unavailable`, because a client can send a request again after a `503`.
@@ -162,3 +163,20 @@ Each refusal of a request has the body `{"recovery":"refuse"}`:
 
 The cost class of each check is `Parse` ([Admit rsauthnz work](admission.md)). Its work is linear in the bytes of the
 fields that it reads, which the server bounds.
+
+### Lost responses
+
+The server owns `Recovery::Lookup`, because only the server holds the operation of the proposal (`Outcome::Unknown`).
+The browser does not know the operation, so it cannot resolve the outcome itself. After a lost response, look up the
+operation with `Driver::lookup` when the driver serves again, within the time that the request can wait. Then answer
+the same request with the result of the lookup:
+
+| `Lookup` | Response |
+| --- | --- |
+| `Committed(receipt)` | The response of the commit, such as the sign-in of `release(&Outcome::Accepted(receipt))` |
+| `Absent` | `problem(Recovery::Restart)`: nothing committed |
+| `Refused(error)` | `problem(error.recovery())` |
+| `Unknown`, or the driver does not serve in time | `problem(Recovery::Lookup)` |
+
+After `{"recovery":"check"}`, the current state shows what committed. For a sign-in, the user is not signed in, and
+signs in again with a new challenge.

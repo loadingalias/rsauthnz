@@ -28,7 +28,7 @@ fn a_recovery_never_reports_phishing_resistance() {
     let cbor::Value::Array(mut items) = recovery.to_cbor() else {
         panic!("evidence is an array");
     };
-    items[4] = cbor::Value::Bool(true);
+    items[5] = cbor::Value::Bool(true);
     assert_eq!(
         Evidence::from_cbor(&cbor::Value::Array(items)),
         Err(EvidenceError::Form)
@@ -92,4 +92,23 @@ fn evidence_reads_back_from_its_cbor_form() {
         let value = cbor::decode(&encoded, crate::limits::Limits::default()).unwrap();
         assert_eq!(Evidence::from_cbor(&value), Ok(evidence));
     }
+}
+
+/// A form that another version wrote does not read as this one: the form of A216 with no name, and a form of another
+/// name with the same items.
+#[test]
+fn a_stored_form_of_another_version_refuses() {
+    let evidence = Evidence::new(human(), Method::Passkey, time(None), true, true, None, None);
+    let cbor::Value::Array(items) = evidence.to_cbor() else {
+        panic!("evidence is an array");
+    };
+    assert_eq!(items[0], cbor::Value::Text("rsauthnz.evidence.1"));
+    let unnamed = cbor::Value::Array(items[1..].to_vec());
+    assert_eq!(Evidence::from_cbor(&unnamed), Err(EvidenceError::Form));
+    let mut renamed = items;
+    renamed[0] = cbor::Value::Text("rsauthnz.evidence.2");
+    assert_eq!(
+        Evidence::from_cbor(&cbor::Value::Array(renamed)),
+        Err(EvidenceError::Form)
+    );
 }

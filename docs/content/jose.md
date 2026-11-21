@@ -17,7 +17,10 @@ and the kind of each JWT. A token can only match its profile:
 - The `kid` of the header selects among the keys of the profile only. A header with no `kid` selects the key of a
   profile with one key.
 - A header that names a key URL or carries a key (`jku`, `jwk`, `x5u`, `x5c`, `x5t`, `x5t#S256`) refuses with
-  `Error::Header`, and so does `crit`. A name with escapes, such as `\u006aku`, is the same name.
+  `Error::Header`, and so do `crit` and `b64`. [RFC 7797](https://www.rfc-editor.org/rfc/rfc7797.html#section-6)
+  requires `crit` with `b64`, so no `b64` is valid here. A name with escapes, such as `\u006aku`, is the same name.
+- A token has at most `TOKEN_BYTES_MAX` (16,384) bytes. Its header has at most 4,096 bytes of JSON, and each string of
+  the header has at most 1,024 bytes as written: an escape counts with each of its bytes.
 
 ## Algorithms
 
@@ -84,7 +87,10 @@ assert_eq!(profile.verify(&forged).err(), Some(Error::Algorithm));
 
 1. Write the payload: the JSON of the claims.
 2. Call `jose::signing_input(algorithm, kid, typ, payload)`. It gives `BASE64URL(header) '.' BASE64URL(payload)`,
-   with the header `{"alg":…,"kid":…,"typ":…}`.
+   with the header `{"alg":…,"kid":…,"typ":…}`. It refuses with `Error::Limit` if the header passes a limit of the
+   header, or if the token with the longest signature of the algorithm would pass `TOKEN_BYTES_MAX`. Thus each token
+   that it starts passes the limits of `verify`. With Ed25519 and no `kid` or `typ`, a payload has at most 12,204
+   bytes.
 3. Sign the bytes of the signing input with the key of the algorithm, such as in custody ([Hold keys in
    custody](custody.md)).
 4. Call `jose::compact(&input, &signature)` for the token.
@@ -96,9 +102,9 @@ Each `jose::Error` is a small `Copy` value with no part of the token. For each o
 | `Error` | Cause |
 | --- | --- |
 | `Malformed` | The token is not in the compact serialization, or a part is not JSON or base64url |
-| `Limit` | The token has more than `TOKEN_BYTES_MAX` (16 KiB) bytes, a key set passes a bound, or the signature checks pass the limits |
+| `Limit` | The token has more than `TOKEN_BYTES_MAX` (16 KiB) bytes, the header passes a limit of the header, a key set passes a bound, or the signature checks pass the limits |
 | `Algorithm` | `alg` does not name the algorithm of the profile, or the algorithm has no JOSE name |
-| `Header` | The header names a key URL, carries a key, or has `crit` |
+| `Header` | The header names a key URL, carries a key, or has `crit` or `b64` |
 | `Key` | No key of the profile fits the header, a key of the set has a private member, or a key of the type of the profile is not valid |
 | `Signature` | The signature does not verify |
 | `Type` | `typ` is not `at+jwt` for `Kind::Access` |
@@ -114,6 +120,7 @@ of `with_key_set` is `Verify`, and of `signing_input` and `compact` is `Parse` (
 
 ## Support
 
-The JWS cases of RFC 7515 (RS256 and ES256) and RFC 8037 (Ed25519) and the key set of RFC 7517 pass on this Mac.
-PS256, ML-DSA-65, and composite ML-DSA-65 + Ed25519 tokens that rscrypto signs pass too: no RFC has a PS256 JWS, and
-no published JOSE case has an ML-DSA key yet.
+The JWS cases of RFC 7515 (RS256 and ES256), RFC 8037 (Ed25519), RFC 7520 section 6.3 (PS256), and RFC 9964
+appendix A.1 (ML-DSA-65), and the key set of RFC 7517, pass on this Mac. A composite ML-DSA-65 + Ed25519 token that
+rscrypto signs passes too: no published JOSE case has a composite key yet. rscodec's JSON reader reads each header,
+the claims, and each key set, and its fuzz campaign is not complete.

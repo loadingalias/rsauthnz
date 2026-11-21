@@ -1290,8 +1290,9 @@ pub struct SignIn {
 
 impl SignIn {
     /// The evidence of the sign-in, if `outcome` is the accepted commit of its proposal. A conflict, a refusal, and an
-    /// unknown outcome release nothing. After a lost response, the user signs in again: no second sign-in runs by
-    /// itself.
+    /// unknown outcome release nothing. After a lost response, keep the sign-in, and look up the operation of the
+    /// proposal when the driver serves again. Give the receipt of a commit as [`Outcome::Accepted`]. No second sign-in
+    /// runs by itself.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     #[must_use]

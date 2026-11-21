@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use rscrypto::auth::{
     EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
     MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
-    SlhDsaSha2_128sPublicKey,
+    SlhDsaSha2_128s, SlhDsaSha2_128sPublicKey,
 };
 use rscrypto::{HmacSha256, HmacSha256Tag, RsaPkcs1v15Profile, RsaPssProfile, RsaPublicKey, RsaPublicKeyPolicy};
 
@@ -50,6 +50,9 @@ const ML_DSA_65_ED25519_DRAFT: i64 = -59;
 /// The COSE identifier of composite ML-DSA-65 + ECDSA P-256. DRAFT: draft-ietf-jose-pq-composite-sigs-06 (section
 /// 7.2.2) requests -55, and IANA has not assigned it. A change of the draft changes only this constant.
 const ML_DSA_65_ECDSA_P256_DRAFT: i64 = -55;
+
+/// The most bits of the modulus of an RSA key of [`Algorithm::Rs256`] and [`Algorithm::Ps256`].
+const RSA_MODULUS_BITS_MAX: usize = 4096;
 
 /// A trusted signature profile: the algorithm of a trusted key. A trusted profile fixes the algorithm, so input never
 /// selects one.
@@ -133,6 +136,19 @@ impl Algorithm {
         match self {
             Self::Ed25519 | Self::Es256 | Self::Rs256 | Self::Ps256 | Self::MlDsa65 | Self::SlhDsaSha2_128s => 1,
             Self::MlDsa65Ed25519 | Self::MlDsa65EcdsaP256 => 2,
+        }
+    }
+
+    /// The most bytes of one signature.
+    pub(crate) const fn signature_bytes_max(self) -> usize {
+        match self {
+            Self::Ed25519 => Ed25519Signature::LENGTH,
+            Self::Es256 => EcdsaP256Signature::LENGTH,
+            Self::Rs256 | Self::Ps256 => RSA_MODULUS_BITS_MAX / 8,
+            Self::MlDsa65 => MlDsa65Signature::LENGTH,
+            Self::MlDsa65Ed25519 => MlDsa65Ed25519Signature::LENGTH,
+            Self::MlDsa65EcdsaP256 => MlDsa65EcdsaP256Signature::MAX_LENGTH,
+            Self::SlhDsaSha2_128s => SlhDsaSha2_128s::SIGNATURE_LENGTH,
         }
     }
 }
@@ -314,7 +330,7 @@ impl Verifier {
 /// modulus does not have 2,048 to 4,096 bits or the exponent is not 65,537 in its shortest form.
 fn rsa(n: &[u8], e: &[u8]) -> Option<Box<RsaPublicKey>> {
     (e == [1, 0, 1]).then_some(())?;
-    let policy = RsaPublicKeyPolicy::MODULUS_2048_TO_8192.with_max_modulus_bits(4096);
+    let policy = RsaPublicKeyPolicy::MODULUS_2048_TO_8192.with_max_modulus_bits(RSA_MODULUS_BITS_MAX);
     RsaPublicKey::from_modulus_exponent_with_policy(n, 65_537, &policy)
         .ok()
         .map(Box::new)

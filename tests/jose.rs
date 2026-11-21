@@ -12,8 +12,8 @@ use rsauthnz::limits::Limits;
 use rsauthnz::time::{Reading, ReadingSource};
 use rscodec::base64::Profile::Url;
 use rscodec::json::{self, Slot};
-use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65, MlDsa65Ed25519, MlDsaError};
-use rscrypto::{HmacSha256, RsaPrivateKey, RsaPrivateKeyParts, RsaPssProfile, RsaPublicKey, RsaPublicKeyPolicy};
+use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65Ed25519};
+use rscrypto::{HmacSha256, RsaPublicKey, RsaPublicKeyPolicy};
 
 /// The RSA policy of the profiles of rsauthnz: the RFC key has 2,048 bits, below the default of rscrypto.
 const RSA_POLICY: RsaPublicKeyPolicy = RsaPublicKeyPolicy::MODULUS_2048_TO_8192;
@@ -106,19 +106,31 @@ fn the_published_jws_cases_verify_under_their_profiles() {
             vectors::ED25519_KEY,
             vectors::ED25519_TOKEN,
         ),
+        ("PS256", Algorithm::Ps256, vectors::PS256_KEY, vectors::PS256_TOKEN),
+        (
+            "ML-DSA-65",
+            Algorithm::MlDsa65,
+            vectors::ML_DSA_65_KEY,
+            vectors::ML_DSA_65_TOKEN,
+        ),
     ];
     for (name, algorithm, key, token) in cases {
         let profile = profile(algorithm, Kind::Jwt, &set(&[key])).expect("a profile");
         let jws = profile.verify(token).expect(name);
-        let (_, rest) = token.split_once('.').expect("a header");
-        let (payload, _) = rest.split_once('.').expect("a payload");
+        let (header, rest) = token.split_once('.').expect("a header");
+        let (payload, signature) = rest.split_once('.').expect("a payload");
         let mut expected = vec![0; Url.decoded_len(payload.as_bytes()).expect("base64url")];
         Url.decode(payload.as_bytes(), &mut expected).expect("base64url");
         assert_eq!(jws.payload(), expected, "{name}");
         // A change of the payload refuses: the signature covers it.
-        let changed = token.replacen(".eyJ", ".eyK", 1).replacen(".RXh", ".RXi", 1);
+        let (first, others) = payload.split_at(1);
+        let other = if first == "A" { "B" } else { "A" };
+        let changed = format!("{header}.{other}{others}.{signature}");
         assert_eq!(profile.verify(&changed).err(), Some(Error::Signature), "{name}");
     }
+    // The RSA key of the PS256 case under RS256 refuses the token: its `alg` names another algorithm.
+    let rs256 = profile(Algorithm::Rs256, Kind::Jwt, &set(&[vectors::PS256_KEY])).expect("a profile");
+    assert_eq!(rs256.verify(vectors::PS256_TOKEN).err(), Some(Error::Algorithm));
     assert_eq!(
         vectors::ED25519_TOKEN
             .split('.')
@@ -199,67 +211,10 @@ fn a_key_set_keeps_the_restrictions_of_each_key() {
     assert_eq!(profile(Algorithm::Rs256, Kind::Jwt, &oth).err(), Some(Error::Malformed));
 }
 
+/// No published JOSE case has a composite key yet, so rscrypto signs this one.
 #[test]
-fn ps256_and_the_post_quantum_algorithms_verify_with_rscrypto_signed_tokens() {
+fn a_composite_token_that_rscrypto_signs_verifies() {
     let payload = br#"{"iss":"joe"}"#;
-    // PS256 with the RSA key of RFC 7515, appendix A.2.
-    let private = vectors::RS256_PRIVATE;
-    let parts = ["n", "d", "p", "q", "dp", "dq", "qi"].map(|name| member(private, name));
-    let key = RsaPrivateKey::from_components_with_policy(
-        RsaPrivateKeyParts {
-            modulus: &parts[0],
-            public_exponent: 65_537,
-            private_exponent: &parts[1],
-            prime_p: &parts[2],
-            prime_q: &parts[3],
-            exponent_p: &parts[4],
-            exponent_q: &parts[5],
-            coefficient: &parts[6],
-        },
-        &RSA_POLICY,
-    )
-    .expect("an RSA key");
-    let input = jose::signing_input(Algorithm::Ps256, Some("rsa"), None, payload).expect("a signing input");
-    let mut signature = vec![0; parts[0].len()];
-    let fill = |out: &mut [u8]| -> Result<(), ()> {
-        out.fill(7);
-        Ok(())
-    };
-    key.sign_pss_with_random_fill(RsaPssProfile::Sha256, input.as_bytes(), &mut signature, fill)
-        .expect("a PS256 signature");
-    let jwk = vectors::RS256_KEY.replacen('{', r#"{"kid":"rsa","#, 1);
-    let ps256 = profile(Algorithm::Ps256, Kind::Jwt, &set(&[&jwk])).expect("a profile");
-    assert_eq!(
-        ps256
-            .verify(&jose::compact(&input, &signature))
-            .map(|jws| jws.kid().map(String::from)),
-        Ok(Some("rsa".into()))
-    );
-    // The same RSA key under RS256 refuses the PS256 token: its `alg` names another algorithm.
-    let rs256 = profile(Algorithm::Rs256, Kind::Jwt, &set(&[&jwk])).expect("a profile");
-    assert_eq!(
-        rs256.verify(&jose::compact(&input, &signature)).err(),
-        Some(Error::Algorithm)
-    );
-
-    // ML-DSA-65 (RFC 9964) and composite ML-DSA-65 + Ed25519, as AKP keys.
-    let (public, secret) = MlDsa65::generate_keypair(|out: &mut [u8]| -> Result<(), MlDsaError> {
-        out.fill(5);
-        Ok(())
-    })
-    .expect("an ML-DSA-65 key");
-    let input = jose::signing_input(Algorithm::MlDsa65, None, None, payload).expect("a signing input");
-    let signature = secret.sign_deterministic(input.as_bytes(), &[]).expect("a signature");
-    let jwk = format!(
-        r#"{{"kty":"AKP","alg":"ML-DSA-65","pub":"{}"}}"#,
-        b64(public.as_bytes())
-    );
-    let token = jose::compact(&input, signature.as_bytes());
-    profile(Algorithm::MlDsa65, Kind::Jwt, &set(&[&jwk]))
-        .expect("a profile")
-        .verify(&token)
-        .unwrap();
-
     let (public, secret) = MlDsa65Ed25519::generate_keypair(|out: &mut [u8]| -> Result<(), CompositeMlDsaError> {
         out.fill(6);
         Ok(())
@@ -281,6 +236,37 @@ fn ps256_and_the_post_quantum_algorithms_verify_with_rscrypto_signed_tokens() {
 }
 
 #[test]
+fn a_signing_input_gives_only_tokens_that_verify() {
+    let (key, jwk) = ed25519();
+    let token = |kid: Option<&str>, payload: &[u8]| {
+        jose::signing_input(Algorithm::Ed25519, kid, None, payload)
+            .map(|input| jose::compact(&input, &key.sign(input.as_bytes()).to_bytes()))
+    };
+    // In base64url the header `{"alg":"Ed25519"}` has 23 characters and a signature of 64 bytes has 86. Of the 16,384
+    // bytes of a token, 16,273 then remain for the payload, after the two dots. 12,204 bytes take 16,272 of them.
+    let unnamed = profile(Algorithm::Ed25519, Kind::Jwt, &set(&[&jwk])).expect("a profile");
+    let longest = token(None, &[7; 12_204]).expect("a token");
+    assert_eq!(longest.len(), jose::TOKEN_BYTES_MAX - 1);
+    assert_eq!(unnamed.verify(&longest).map(|jws| jws.payload().len()), Ok(12_204));
+    assert_eq!(token(None, &[7; 12_205]).err(), Some(Error::Limit));
+    // A string of the header has at most 1,024 bytes as written, and an escape counts with each of its bytes.
+    let kid = "k".repeat(1024);
+    let named = profile(
+        Algorithm::Ed25519,
+        Kind::Jwt,
+        &set(&[&jwk.replacen('{', &format!(r#"{{"kid":"{kid}","#), 1)]),
+    )
+    .expect("a profile");
+    let longest_kid = token(Some(&kid), b"{}").expect("a token");
+    assert_eq!(
+        named.verify(&longest_kid).map(|jws| jws.kid().map(String::from)),
+        Ok(Some(kid))
+    );
+    assert_eq!(token(Some(&"k".repeat(1025)), b"{}").err(), Some(Error::Limit));
+    assert_eq!(token(Some(&"\"".repeat(513)), b"{}").err(), Some(Error::Limit));
+}
+
+#[test]
 fn a_header_that_does_not_match_its_profile_refuses() {
     let rs256 = profile(Algorithm::Rs256, Kind::Jwt, &set(&[vectors::RS256_KEY])).expect("a profile");
     let cases = [
@@ -297,6 +283,8 @@ fn a_header_that_does_not_match_its_profile_refuses() {
         ),
         (r#"{"alg":"RS256","jwk":{"kty":"oct","k":"AA"}}"#, Error::Header),
         (r#"{"alg":"RS256","crit":["exp"],"exp":1}"#, Error::Header),
+        // RFC 7797 requires `crit` with `b64`, so a `b64` with no `crit` refuses too.
+        (r#"{"alg":"RS256","b64":false}"#, Error::Header),
         // The names compare after unescape: `\u006aku` is `jku`.
         (
             r#"{"alg":"RS256","\u006aku":"https://attacker.example/keys"}"#,

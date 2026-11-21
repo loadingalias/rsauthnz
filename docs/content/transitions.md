@@ -139,8 +139,9 @@ The commit of a proposal has one of four outcomes. `outcome.recovery()` gives th
 
 Never submit the request of an unknown outcome as a new operation. The first attempt can have committed, so a
 new operation can, for example, issue a second grant. A lookup of the same identity gives the first commit.
-On a site, `rsauthnz_http::problem(recovery)` gives the response of each recovery to the browser ([Mount the HTTP
-binding](http-binding.md#responses)).
+On a site, the server looks up an unknown outcome itself, because the browser does not know the operation.
+`rsauthnz_http::problem(recovery)` gives the response of each recovery to the browser ([Lost
+responses](http-binding.md#lost-responses)).
 
 `receipt.artifact()` gives the prepared artifact. Only the acceptance of the exact proposal releases it: a
 proposal has no accessor for it, and only a proposal that writes its issuance record takes it. The store never keeps

@@ -372,7 +372,13 @@ fn the_published_registration_cases_verify_under_the_profile() {
     for (name, vector, expected) in cases {
         assert_eq!(verify(vector, false), expected, "{name}");
     }
-    // With only the UV flag set, each other check of these cases passes: the EdDSA key, and the longest ID.
+}
+
+/// Derived cases, not published evidence: the UV bit changes the authenticator data, which the attestation signature of
+/// packed EdDSA covers, so that signature no longer verifies. The profile reads no attestation statement.
+#[test]
+fn a_published_case_with_only_the_uv_bit_set_passes_each_other_check() {
+    use vectors::*;
     let verified = [
         ("packed EdDSA", &PACKED_EDDSA, (Algorithm::Ed25519, false, 32)),
         ("ES256 with no attestation", &NONE_ES256, (Algorithm::Es256, true, 32)),
@@ -920,25 +926,36 @@ fn two_concurrent_sign_ins_with_counters_5_and_4_store_5_and_signal_on_4() {
 }
 
 #[test]
-fn a_lost_sign_in_response_is_unknown_and_its_lookup_shows_the_commit() {
+fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
     let mut site = Site::new();
     let passkey = site.register(Algorithm::Ed25519, -8, 1, 0);
+    // The commit lands and its response is lost: the unknown outcome releases nothing.
     let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE).json();
     let (proposal, plan, sign_in) = site.sign_in(&json, at(11)).expect("a sign-in");
-    let operation = proposal.operation().clone();
     site.node.memory.inject(Fault::LostResponse);
     let outcome = site.node.commit(proposal, plan);
     assert!(matches!(outcome, Outcome::Unknown(_)));
     assert_eq!(sign_in.release(&outcome), None);
     site.node.start();
+    // The browser holds no operation of a sign-in. The server keeps the sign-in, looks up its operation when the driver
+    // serves again, and gives the evidence to the same request.
+    let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(20)), HANDLE).json();
+    let (proposal, plan, sign_in) = site.sign_in(&json, at(21)).expect("a sign-in");
+    let operation = proposal.operation().clone();
+    site.node.memory.inject(Fault::LostResponse);
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
+    site.node.start();
     let ticket = site.node.driver.lookup(operation).expect("a lookup");
     site.node.run();
-    assert!(matches!(
-        site.node.driver.take(ticket),
-        Some(Answer::Lookup(Lookup::Committed(_)))
-    ));
-    // The same assertion again refuses, because its challenge served the commit: the user signs in again.
-    assert_eq!(site.sign_in(&json, at(12)).err(), Some(Error::Challenge));
+    let Some(Answer::Lookup(Lookup::Committed(receipt))) = site.node.driver.take(ticket) else {
+        panic!("the lookup shows the commit");
+    };
+    let evidence = sign_in
+        .release(&Outcome::Accepted(receipt))
+        .expect("the evidence of the commit");
+    assert_eq!(evidence.subject(), &Principal::Human(alice()));
+    // The same assertion again refuses, because its challenge served the commit.
+    assert_eq!(site.sign_in(&json, at(22)).err(), Some(Error::Challenge));
 }
 
 #[test]

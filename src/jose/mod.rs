@@ -4,7 +4,7 @@
 //! A [`Profile`] fixes the algorithm and the keys of the tokens that it accepts, and the issuer, the audience, and the
 //! kind of each JWT. A header can only match the profile: an `alg` that names another algorithm refuses, also `none`
 //! and each HMAC algorithm, and a `kid` selects only among the keys of the profile. A header that names a key URL or
-//! carries a key (`jku`, `jwk`, `x5u`, `x5c`, `x5t`, `x5t#S256`) refuses, and so does `crit`.
+//! carries a key (`jku`, `jwk`, `x5u`, `x5c`, `x5t`, `x5t#S256`) refuses, and so do `crit` and `b64`.
 //!
 //! The JOSE names are `Ed25519` ([RFC 9864], which also takes the `EdDSA` of [RFC 8037]), `ES256`, `RS256`, `PS256`,
 //! `ML-DSA-65` ([RFC 9964]), and the two composite names of draft 06 of the JOSE and COSE composite draft, each in one
@@ -99,8 +99,9 @@ const KEY_SET: json::Limits = json::Limits {
     number_digits_max: 32,
 };
 
-/// The header members that name a key URL or carry a key, and `crit`: each one refuses the token.
-const REFUSED: [&str; 7] = ["jku", "jwk", "x5u", "x5c", "x5t", "x5t#S256", "crit"];
+/// The header members that name a key URL or carry a key, `crit`, and `b64`: each one refuses the token. RFC 7797
+/// requires `crit` with `b64`, so no `b64` is valid here.
+const REFUSED: [&str; 8] = ["jku", "jwk", "x5u", "x5c", "x5t", "x5t#S256", "crit", "b64"];
 
 /// The members of a private JWK. A key set is public, so each one refuses the set.
 const PRIVATE: [&str; 9] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"];
@@ -281,7 +282,7 @@ impl Profile {
     ///
     /// - [`Error::Limit`] if the token is longer than [`TOKEN_BYTES_MAX`], or the signature checks pass the limits.
     /// - [`Error::Algorithm`] if `alg` does not name the algorithm of the profile, such as `none` or `HS256`.
-    /// - [`Error::Header`] if the header names a key URL or carries a key, or has `crit`.
+    /// - [`Error::Header`] if the header names a key URL or carries a key, or has `crit` or `b64`.
     /// - [`Error::Key`] if no key of the profile has the `kid` of the header, or the header has no `kid` and the
     ///   profile has more than one key.
     /// - [`Error::Signature`] if the signature does not verify, and [`Error::Malformed`] for each other difference from
@@ -619,14 +620,16 @@ struct RawClaims<'a> {
 }
 
 /// The JWS signing input of `payload` with the header `{"alg":…,"kid":…,"typ":…}`: `BASE64URL(header) '.'
-/// BASE64URL(payload)`. Sign its bytes with the key of `algorithm`, such as in custody, then call [`compact`].
+/// BASE64URL(payload)`. Sign its bytes with the key of `algorithm`, such as in custody, then call [`compact`]. The
+/// token then passes each limit of [`Profile::verify`].
 ///
 /// Cost class: [`Parse`](crate::limits::Class::Parse).
 ///
 /// # Errors
 ///
-/// [`Error::Algorithm`] if `algorithm` has no JOSE name, and [`Error::Limit`] if the token would be longer than
-/// [`TOKEN_BYTES_MAX`] with a signature of `algorithm`.
+/// [`Error::Algorithm`] if `algorithm` has no JOSE name. [`Error::Limit`] if the header passes a limit of the header
+/// of the verifier, or if the token with the longest signature of `algorithm` would be longer than
+/// [`TOKEN_BYTES_MAX`].
 pub fn signing_input(
     algorithm: Algorithm,
     kid: Option<&str>,
@@ -634,9 +637,8 @@ pub fn signing_input(
     payload: &[u8],
 ) -> Result<String, Error> {
     let name = alg(algorithm).ok_or(Error::Algorithm)?;
-    let header_len = 64 + 6 * (kid.map_or(0, str::len) + typ.map_or(0, str::len));
-    (header_len + payload.len() < TOKEN_BYTES_MAX).ok_or(Error::Limit)?;
-    let mut header = vec![0; header_len];
+    // A header longer than the buffer, or with a longer string, refuses here as it would at the verifier.
+    let mut header = [0; HEADER.input_bytes_max as usize];
     let len = json::write(&mut header, |place| {
         place.object(|header| {
             header.member("alg").str(name)?;
@@ -650,7 +652,17 @@ pub fn signing_input(
         })
     })
     .map_err(|_| Error::Limit)?;
-    let mut input = encode(&header[..len]);
+    let header = &header[..len];
+    json::read(header, &HEADER, IJson, &mut [Slot::EMPTY; SLOTS], |reader| {
+        reader.value().skip()
+    })
+    .map_err(|_| Error::Limit)?;
+    // The base64url of the header, the payload, and the signature, and two dots.
+    let token = [header.len(), payload.len(), algorithm.signature_bytes_max()]
+        .into_iter()
+        .try_fold(2, |len: usize, bytes| len.checked_add(Url.encoded_len(bytes)?));
+    token.is_some_and(|len| len <= TOKEN_BYTES_MAX).ok_or(Error::Limit)?;
+    let mut input = encode(header);
     input.push('.');
     input.push_str(&encode(payload));
     Ok(input)
@@ -700,7 +712,7 @@ pub enum Error {
     Limit,
     /// The `alg` of the header does not name the algorithm of the profile, or the algorithm has no JOSE name.
     Algorithm,
-    /// The header names a key URL, carries a key, or has `crit`.
+    /// The header names a key URL, carries a key, or has `crit` or `b64`.
     Header,
     /// No key of the profile fits the header, or a key is not valid or has a private member.
     Key,
@@ -728,7 +740,7 @@ impl fmt::Display for Error {
             Self::Malformed => f.write_str("the token is not a JWS in the compact serialization"),
             Self::Limit => f.write_str("the token is larger than a bound"),
             Self::Algorithm => f.write_str("the alg of the token is not the algorithm of the profile"),
-            Self::Header => f.write_str("the header names a key URL, carries a key, or has crit"),
+            Self::Header => f.write_str("the header names a key URL, carries a key, or has crit or b64"),
             Self::Key => f.write_str("no key of the profile fits the token"),
             Self::Signature => f.write_str("the signature of the token does not verify"),
             Self::Type => f.write_str("the typ of the token is not the type of the profile"),

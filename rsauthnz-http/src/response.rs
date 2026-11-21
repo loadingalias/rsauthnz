@@ -49,16 +49,17 @@ pub fn redirect(path: &str) -> Result<Response<Vec<u8>>, Refusal> {
 /// | Recovery | Status | Body |
 /// | --- | --- | --- |
 /// | [`Recovery::Restart`] | `409 Conflict` | `{"recovery":"restart"}` |
-/// | [`Recovery::Lookup`] | `500 Internal Server Error` | `{"recovery":"lookup"}` |
+/// | [`Recovery::Lookup`] | `500 Internal Server Error` | `{"recovery":"check"}` |
 /// | [`Recovery::Refuse`] | `403 Forbidden` | `{"recovery":"refuse"}` |
 ///
-/// The client of `lookup` looks up the outcome of the same operation. It never sends the request again as a new
-/// operation: the first attempt can have committed.
+/// Only the server holds the operation of an unknown outcome, so the server looks it up first. Send
+/// [`Recovery::Lookup`] only when the outcome stays unknown after that lookup. The client of `check` then loads the
+/// current state, such as the account page. It never sends the request again: the first attempt can have committed.
 #[must_use]
 pub fn problem(recovery: Recovery) -> Response<Vec<u8>> {
     let (status, body): (_, &[u8]) = match recovery {
         Recovery::Restart => (StatusCode::CONFLICT, br#"{"recovery":"restart"}"#),
-        Recovery::Lookup => (StatusCode::INTERNAL_SERVER_ERROR, br#"{"recovery":"lookup"}"#),
+        Recovery::Lookup => (StatusCode::INTERNAL_SERVER_ERROR, br#"{"recovery":"check"}"#),
         Recovery::Refuse => (StatusCode::FORBIDDEN, br#"{"recovery":"refuse"}"#),
     };
     response(status, PROBLEM, body.to_vec())

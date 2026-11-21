@@ -685,8 +685,9 @@ impl Outcome {
 /// The recovery of the caller after an outcome or an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Recovery {
-    /// Look up the outcome of the same operation identity. Never submit the request as a new operation: the first
-    /// attempt can have committed.
+    /// Look up the outcome of the same operation identity
+    /// ([`Driver::lookup`](crate::store::driver::Driver::lookup)). Only the holder of the [`Operation`], such as the
+    /// server, can look it up. Never submit the request as a new operation: the first attempt can have committed.
     Lookup,
     /// Nothing committed. Read the current state again, and propose again as a new operation.
     Restart,

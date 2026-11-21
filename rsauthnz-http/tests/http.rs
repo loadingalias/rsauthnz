@@ -318,8 +318,9 @@ fn an_error_response_holds_only_its_recovery() {
         (Refusal::Cookie.response(), 400, refuse),
         (Refusal::Redirect.response(), 400, refuse),
         (problem(Recovery::Restart), 409, br#"{"recovery":"restart"}"#),
-        // Not 503: a client can send a request again after a 503, and the first attempt can have committed.
-        (problem(Recovery::Lookup), 500, br#"{"recovery":"lookup"}"#),
+        // The browser holds no operation to look up: it checks the current state. Not 503: a client can send a
+        // request again after a 503, and the first attempt can have committed.
+        (problem(Recovery::Lookup), 500, br#"{"recovery":"check"}"#),
         (problem(Recovery::Refuse), 403, refuse),
     ];
     for (response, status, body) in cases {

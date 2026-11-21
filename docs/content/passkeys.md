@@ -73,8 +73,9 @@ The core checks the response and proposes each commit. The storage binding of th
    binds the credential record: the public key, the algorithm, the counter, and the flags. Thus the same response
    again gets the receipt of the commit. Another response of the ceremony refuses: with `transition::Error::Reuse`
    when both run at once, also with the same credential ID and another key, and with `Error::Challenge` after the
-   commit. After a lost response, look up the operation of the proposal (`proposal.operation()`). After a conflict,
-   the pending record stays: finish again with a new decision, or start a new ceremony.
+   commit. After a lost response, look up the operation of the proposal (`proposal.operation()`) when the driver
+   serves again, and answer with its result ([HTTP binding](http-binding.md)). After a conflict, the pending record
+   stays: finish again with a new decision, or start a new ceremony.
 
 ## Sign in
 
@@ -91,8 +92,12 @@ The core checks the response and proposes each commit. The storage binding of th
    challenge, and it checks the assertion and its signature.
 5. Submit the proposal with its plan, and give the outcome to `sign_in.release(&outcome)`. Only the accepted commit
    gives the `Evidence`. Only the commit driver makes an accepted receipt, from a durable commit or its outcome
-   record, so no evidence leaves before the store holds the replay record and the audit. After a lost response, the
-   user signs in again: the same assertion is a new operation, and its challenge refuses.
+   record. Thus no evidence leaves before the store holds the replay record and the audit.
+6. After a lost response (`Outcome::Unknown`), keep `sign_in`. When the driver serves again, look up the operation of
+   the proposal with `driver.lookup`. Give a commit to `sign_in.release(&Outcome::Accepted(receipt))`, and answer the
+   same request with its sign-in. Answer each other result of the lookup as [Lost
+   responses](http-binding.md#lost-responses) shows: the user signs in again with a new challenge. The same assertion
+   again is a new operation, and its challenge refuses after a commit.
 
 The commit inserts the replay record of the challenge, so each challenge serves one sign-in. The commit reads the
 replay floor of the store. A restore raises the floor, so a challenge from before a restore refuses after it. The
@@ -313,6 +318,10 @@ one signature check and three keyed reads. The cost class of `start` is `Mutate`
 
 ## Support
 
-The checks above have test evidence on this Mac: the published registration cases and the published assertions of
-ES256, EdDSA, and RS256 of WebAuthn Level 3, and the cases of a test authenticator, which signs ML-DSA-65 assertions
-with rscrypto. No real browser or authenticator has run a registration or a sign-in of rsauthnz yet.
+The checks above have test evidence on this Mac: the published registration cases of ES256 and RS256 and the
+published assertions of ES256, EdDSA, and RS256 of WebAuthn Level 3, and the cases of a test authenticator, which
+makes ML-DSA-65, EdDSA, and ES256 passkeys with rscrypto. The published EdDSA registration case has no UV flag, so the
+profile refuses it. With only the UV bit set, it passes each other check. That is a derived case: the UV bit changes
+the authenticator data, so its attestation signature no longer verifies. rscodec's JSON reader reads each response,
+and its fuzz campaign is not complete. No real browser or authenticator has run a registration or a sign-in of
+rsauthnz yet.
