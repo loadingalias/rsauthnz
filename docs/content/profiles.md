@@ -14,6 +14,7 @@ verification with each profile.
 | `MlDsa65` | -49 | Assigned | `PostQuantum` | 1 | 1,952 bytes | 3,309 bytes | A verifier that supports ML-DSA but not the composite |
 | `Ed25519` | -19 | Assigned | `Classical` | 1 | 32 bytes | 64 bytes | A verifier that supports nothing else |
 | `Es256` | -7 | Assigned | `Classical` | 1 | Two coordinates of 32 bytes | 64 bytes | A verifier that supports nothing else |
+| `Rs256` | -257 | Assigned | `Classical` | 1 | A modulus of 2,048 to 4,096 bits, and the exponent 65,537 | The bytes of the modulus | Verification only: a [passkey](passkeys.md) of an authenticator that has no other algorithm, such as Windows Hello. No credential and no custody key of rsauthnz has it |
 | `SlhDsaSha2_128s` | None yet | Draft | `PostQuantum` | 1 | 32 bytes | 7,856 bytes | The trust-root profile: a root that signs issuer keys |
 
 rsauthnz never selects a classical profile for you, and it never reports a classical profile as post-quantum.
@@ -115,6 +116,6 @@ assert_eq!(Algorithm::SlhDsaSha2_128s.report().cose, None);
 ## Cost
 
 Each signature check charges the signature budget of its artifact before its work: one check for `MlDsa65`,
-`Ed25519`, `Es256`, and `SlhDsaSha2_128s`, and two checks for a composite. [Verify COSE and CWT
+`Ed25519`, `Es256`, `Rs256`, and `SlhDsaSha2_128s`, and two checks for a composite. [Verify COSE and CWT
 artifacts](verification.md#bound-the-signature-checks) gives the budget. A signature check is in the cost class
 `Verify` of [Admit rsauthnz work](admission.md).

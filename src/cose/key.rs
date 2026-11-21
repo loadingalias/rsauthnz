@@ -33,6 +33,14 @@ pub enum PublicKey<'a> {
         /// The y coordinate.
         y: &'a [u8; 32],
     },
+    /// An `RSA` (3) key with the algorithm RS256: the modulus `n` (-1) and the exponent `e` (-2), each an unsigned
+    /// big-endian integer.
+    Rsa {
+        /// The modulus.
+        n: &'a [u8],
+        /// The exponent.
+        e: &'a [u8],
+    },
     /// An `AKP` (7) key with the algorithm ML-DSA-65: the 1,952 bytes of `pub` (-1).
     MlDsa65(&'a [u8; 1952]),
     /// An `AKP` (7) key with the algorithm ML-DSA-65 + Ed25519: the 1,984 bytes of `pub` (-1). They are the ML-DSA-65
@@ -77,7 +85,9 @@ impl<'a> Key<'a> {
             Some(Value::Bytes(kid)) => Some(*kid),
             Some(_) => return Err(Error::Malformed),
         };
-        let alg = get(3).map(|alg| algorithm(alg).ok_or(Error::Unsupported)).transpose()?;
+        let alg = get(3)
+            .map(|alg| key_algorithm(alg).ok_or(Error::Unsupported))
+            .transpose()?;
         let bytes = |key: i64| match get(key) {
             Some(Value::Bytes(bytes)) => Ok(*bytes),
             _ => Err(Error::Malformed),
@@ -97,6 +107,17 @@ impl<'a> Key<'a> {
                 let (x, y) = (fixed(bytes(-2)?)?, fixed(bytes(-3)?)?);
                 PublicKey::P256 { x, y }
             }
+            Some(Value::Unsigned(3)) => {
+                // An RSA key serves more than one algorithm, so this crate requires `alg`: only RS256 is supported.
+                if alg.ok_or(Error::Malformed)? != Algorithm::Rs256 {
+                    return Err(Error::KeyAlgorithm);
+                }
+                private(get(-3))?;
+                PublicKey::Rsa {
+                    n: bytes(-1)?,
+                    e: bytes(-2)?,
+                }
+            }
             Some(Value::Unsigned(7)) => {
                 // RFC 9964 requires `alg` in an `AKP` key, because the form of the key depends on it.
                 let alg = alg.ok_or(Error::Malformed)?;
@@ -105,7 +126,7 @@ impl<'a> Key<'a> {
                     Algorithm::MlDsa65 => PublicKey::MlDsa65(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65Ed25519 => PublicKey::MlDsa65Ed25519(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65EcdsaP256 => PublicKey::MlDsa65EcdsaP256(fixed(bytes(-1)?)?),
-                    Algorithm::Ed25519 | Algorithm::Es256 => return Err(Error::KeyAlgorithm),
+                    Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 => return Err(Error::KeyAlgorithm),
                     // SLH-DSA has no COSE identifier yet, so no `alg` names it.
                     Algorithm::SlhDsaSha2_128s => return Err(Error::Unsupported),
                 }
@@ -126,6 +147,7 @@ impl<'a> PublicKey<'a> {
         match self {
             Self::Ed25519(_) => Algorithm::Ed25519,
             Self::P256 { .. } => Algorithm::Es256,
+            Self::Rsa { .. } => Algorithm::Rs256,
             Self::MlDsa65(_) => Algorithm::MlDsa65,
             Self::MlDsa65Ed25519(_) => Algorithm::MlDsa65Ed25519,
             Self::MlDsa65EcdsaP256(_) => Algorithm::MlDsa65EcdsaP256,
@@ -133,7 +155,8 @@ impl<'a> PublicKey<'a> {
     }
 
     /// The `COSE_Key` of the key, with its `alg` (3): an `OKP` (1) key with `crv` (-1) `Ed25519` (6) and `x` (-2), an
-    /// `EC2` (2) key with `crv` `P-256` (1), `x`, and `y` (-3), or an `AKP` (7) key with `pub` (-1).
+    /// `EC2` (2) key with `crv` `P-256` (1), `x`, and `y` (-3), an `RSA` (3) key with `n` (-1) and `e` (-2), or an
+    /// `AKP` (7) key with `pub` (-1).
     pub(crate) fn to_cbor(&self) -> Value<'a> {
         let (kty, mut entries) = self.members();
         let alg = alg(self.algorithm()).expect("each key type of this crate has a COSE algorithm");
@@ -142,8 +165,8 @@ impl<'a> PublicKey<'a> {
     }
 
     /// The COSE Key Thumbprint of the key ([RFC 9679]): the SHA-256 digest of the deterministic CBOR of its required
-    /// parameters. An `OKP` or `EC2` key has `kty`, `crv`, and its coordinates (RFC 9679 section 4). An `AKP` key has
-    /// `kty`, `alg`, and `pub` (RFC 9964 section 6).
+    /// parameters. An `OKP` or `EC2` key has `kty`, `crv`, and its coordinates, and an `RSA` key has `kty`, `n`, and `e`
+    /// (RFC 9679 section 4). An `AKP` key has `kty`, `alg`, and `pub` (RFC 9964 section 6).
     ///
     /// [RFC 9679]: https://www.rfc-editor.org/rfc/rfc9679
     pub(crate) fn thumbprint(&self) -> [u8; 32] {
@@ -172,6 +195,7 @@ impl<'a> PublicKey<'a> {
                     (label(-3), Value::Bytes(y)),
                 ],
             ),
+            Self::Rsa { n, e } => (3, vec![(label(-1), Value::Bytes(n)), (label(-2), Value::Bytes(e))]),
             Self::MlDsa65(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
             Self::MlDsa65Ed25519(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
             Self::MlDsa65EcdsaP256(public) => (AKP, vec![(label(-1), Value::Bytes(public))]),
@@ -181,6 +205,19 @@ impl<'a> PublicKey<'a> {
 
 /// The `kty` of an `AKP` key (RFC 9964): ML-DSA-65 and the composites.
 const AKP: u64 = 7;
+
+/// The algorithm of the `alg` (3) of a key. A key also takes the polymorphic EdDSA (-8) as Ed25519 and ESP256 (-9) as
+/// ES256 ([RFC 9864]): the type of the key fixes the curve, so each one names one algorithm of this crate. WebAuthn
+/// authenticators write -8.
+///
+/// [RFC 9864]: https://www.rfc-editor.org/rfc/rfc9864
+fn key_algorithm(value: &Value<'_>) -> Option<Algorithm> {
+    match value {
+        Value::Negative(7) => Some(Algorithm::Ed25519),
+        Value::Negative(8) => Some(Algorithm::Es256),
+        _ => algorithm(value),
+    }
+}
 
 /// Refuses a curve other than `expected`.
 fn curve(crv: Option<&Value<'_>>, expected: u64) -> Result<(), Error> {
@@ -221,7 +258,8 @@ impl TrustedKey {
     /// # Errors
     ///
     /// [`Error::KeyAlgorithm`] if `key` does not fit `algorithm`, or its `alg` is a different algorithm.
-    /// [`Error::Malformed`] if a P-256 point, alone or in a composite key, is not on the curve.
+    /// [`Error::Malformed`] if a P-256 point, alone or in a composite key, is not on the curve, or if an RSA key does not
+    /// have a modulus of 2,048 to 4,096 bits and the exponent 65,537.
     pub fn new(algorithm: Algorithm, key: &Key<'_>) -> Result<Self, Error> {
         if key.alg.is_some_and(|alg| alg != algorithm) {
             return Err(Error::KeyAlgorithm);
@@ -229,6 +267,7 @@ impl TrustedKey {
         let verifier = match (algorithm, &key.public) {
             (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
             (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
+            (Algorithm::Rs256, PublicKey::Rsa { n, e }) => Verifier::rs256(n, e).ok_or(Error::Malformed)?,
             (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
             (Algorithm::MlDsa65Ed25519, PublicKey::MlDsa65Ed25519(public)) => {
                 Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Malformed)?

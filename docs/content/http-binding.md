@@ -5,9 +5,10 @@ It works on `http` 1.x values: `http::Request`, `http::Response`, and `http::Hea
 framework, server, or runtime. A framework that gives `http::Request` values, such as axum or hyper, calls it with no
 conversion.
 
-The binding gives no ceremony and no session of its own. A ceremony, such as a passkey sign-in, gives the body to its
-verifier and commits its transition ([Propose a transition](transitions.md)). The binding checks the request before
-that work, and it writes the response after the commit.
+The binding gives no ceremony and no session of its own. A ceremony, such as a [passkey
+registration](passkeys.md), gives the body to its verifier and commits its transition ([Propose a
+transition](transitions.md)). The binding checks the request before that work, and it writes the response after the
+commit.
 
 ## Before you start
 

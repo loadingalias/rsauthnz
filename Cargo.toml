@@ -13,7 +13,9 @@ publish.workspace = true
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # The only source of signatures, digests, and the seeded random generator. Its `alloc` gives the owners that clear a
 # secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "sha2"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2"] }
+# The JSON reader and writer and base64url of the passkey ceremonies.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json"] }
 
 [features]
 # The native custody bindings: key files under OS file permissions on Linux, macOS, and Windows, and the login
@@ -24,8 +26,6 @@ native-custody = []
 # The memory binding and the effect executor commit the transitions of the tests and of the doctests: only the
 # receipt of an accepted transition gives a prepared artifact.
 rsauthnz-conformance = { path = "rsauthnz-conformance" }
-# The composite tests read the LAMPS vectors: a JSON file of base64 fields.
-rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json"] }
 
 [lints]
 workspace = true

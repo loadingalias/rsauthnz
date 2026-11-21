@@ -38,6 +38,7 @@ use rscrypto::auth::{
     EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
     MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
 };
+use rscrypto::{RsaPkcs1v15Profile, RsaPublicKey, RsaPublicKeyPolicy};
 
 use crate::limits::{Limit, SignatureBudget};
 
@@ -59,6 +60,10 @@ pub enum Algorithm {
     /// [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864), which assigns ESP256 (-9). This profile keeps -7, because it
     /// serves a verifier that supports nothing else.
     Es256,
+    /// RSASSA-PKCS1-v1_5 with SHA-256 (COSE algorithm -257), with a modulus of 2,048 to 4,096 bits and the exponent
+    /// 65,537. A classical profile that only verifies: the passkeys of some authenticators, such as Windows Hello, use
+    /// it. No credential of this crate and no custody key has it.
+    Rs256,
     /// ML-DSA-65 (COSE algorithm -49, [RFC 9964](https://www.rfc-editor.org/rfc/rfc9964)), for a verifier that
     /// supports ML-DSA but not the composite.
     MlDsa65,
@@ -78,9 +83,10 @@ pub enum Algorithm {
 
 impl Algorithm {
     /// Each algorithm of the registry.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Ed25519,
         Self::Es256,
+        Self::Rs256,
         Self::MlDsa65,
         Self::MlDsa65Ed25519,
         Self::MlDsa65EcdsaP256,
@@ -93,6 +99,7 @@ impl Algorithm {
         let (cose, registration, authentication) = match self {
             Self::Ed25519 => (Some(-19), Registration::Assigned, Authentication::Classical),
             Self::Es256 => (Some(-7), Registration::Assigned, Authentication::Classical),
+            Self::Rs256 => (Some(-257), Registration::Assigned, Authentication::Classical),
             Self::MlDsa65 => (Some(-49), Registration::Assigned, Authentication::PostQuantum),
             Self::MlDsa65Ed25519 => (
                 Some(ML_DSA_65_ED25519_DRAFT),
@@ -118,7 +125,7 @@ impl Algorithm {
     /// The signature checks of one signature: one for each component.
     const fn checks(self) -> usize {
         match self {
-            Self::Ed25519 | Self::Es256 | Self::MlDsa65 | Self::SlhDsaSha2_128s => 1,
+            Self::Ed25519 | Self::Es256 | Self::Rs256 | Self::MlDsa65 | Self::SlhDsaSha2_128s => 1,
             Self::MlDsa65Ed25519 | Self::MlDsa65EcdsaP256 => 2,
         }
     }
@@ -167,6 +174,7 @@ pub enum Authentication {
 pub(crate) enum Verifier {
     Ed25519(Ed25519PublicKey),
     Es256(Box<EcdsaP256PublicKey>),
+    Rs256(Box<RsaPublicKey>),
     MlDsa65(Box<MlDsa65PublicKey>),
     MlDsa65Ed25519(Box<MlDsa65Ed25519PublicKey>),
     MlDsa65EcdsaP256(Box<MlDsa65EcdsaP256PublicKey>),
@@ -187,6 +195,15 @@ impl Verifier {
         Some(Self::Es256(Box::new(key)))
     }
 
+    /// The RSA key with the modulus `n` and the exponent `e`, each as an unsigned big-endian integer, or `None` if the
+    /// modulus does not have 2,048 to 4,096 bits or the exponent is not 65,537 in its shortest form.
+    pub(crate) fn rs256(n: &[u8], e: &[u8]) -> Option<Self> {
+        (e == [1, 0, 1]).then_some(())?;
+        let policy = RsaPublicKeyPolicy::MODULUS_2048_TO_8192.with_max_modulus_bits(4096);
+        let key = RsaPublicKey::from_modulus_exponent_with_policy(n, 65_537, &policy).ok()?;
+        Some(Self::Rs256(Box::new(key)))
+    }
+
     /// The ML-DSA-65 key with the encoding `public`.
     pub(crate) fn ml_dsa_65(public: &[u8; 1952]) -> Self {
         Self::MlDsa65(Box::new(MlDsa65PublicKey::from_bytes(*public)))
@@ -204,12 +221,14 @@ impl Verifier {
         Some(Self::MlDsa65EcdsaP256(Box::new(key)))
     }
 
-    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, and the
-    /// encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite key.
+    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, the
+    /// `RSAPublicKey` DER of an RSA key, and the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or
+    /// composite key.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(key) => key.as_bytes().to_vec(),
             Self::Es256(key) => key.to_sec1_bytes().to_vec(),
+            Self::Rs256(key) => key.to_pkcs1_der(),
             Self::MlDsa65(key) => key.as_bytes().to_vec(),
             Self::MlDsa65Ed25519(key) => key.to_bytes().to_vec(),
             Self::MlDsa65EcdsaP256(key) => key.to_bytes().to_vec(),
@@ -221,6 +240,7 @@ impl Verifier {
         match self {
             Self::Ed25519(_) => Algorithm::Ed25519,
             Self::Es256(_) => Algorithm::Es256,
+            Self::Rs256(_) => Algorithm::Rs256,
             Self::MlDsa65(_) => Algorithm::MlDsa65,
             Self::MlDsa65Ed25519(_) => Algorithm::MlDsa65Ed25519,
             Self::MlDsa65EcdsaP256(_) => Algorithm::MlDsa65EcdsaP256,
@@ -240,6 +260,9 @@ impl Verifier {
                 .ok()
                 .and_then(|signature| EcdsaP256Signature::from_bytes(signature).ok())
                 .is_some_and(|signature| key.verify(message, &signature).is_ok()),
+            Self::Rs256(key) => key
+                .verify_pkcs1v15(RsaPkcs1v15Profile::Sha256, message, signature)
+                .is_ok(),
             Self::MlDsa65(key) => MlDsa65Signature::try_from_slice(signature)
                 .is_ok_and(|signature| key.verify(message, &signature).is_ok()),
             Self::MlDsa65Ed25519(key) => MlDsa65Ed25519Signature::try_from_slice(signature)
@@ -271,6 +294,7 @@ impl PartialEq for Verifier {
         match (self, other) {
             (Self::Ed25519(a), Self::Ed25519(b)) => a.as_bytes() == b.as_bytes(),
             (Self::Es256(a), Self::Es256(b)) => a.to_sec1_bytes() == b.to_sec1_bytes(),
+            (Self::Rs256(a), Self::Rs256(b)) => a.modulus() == b.modulus(),
             (Self::MlDsa65(a), Self::MlDsa65(b)) => a == b,
             (Self::MlDsa65Ed25519(a), Self::MlDsa65Ed25519(b)) => a == b,
             (Self::MlDsa65EcdsaP256(a), Self::MlDsa65EcdsaP256(b)) => a == b,

@@ -35,6 +35,13 @@ in a composite key, is not on the curve.
 | `MlDsa65` | -49 | `MlDsa65(&[u8; 1952])` | `kty` 7 (`AKP`), `alg` -49, `pub` |
 | `Ed25519` | -19 | `Ed25519(&[u8; 32])` | `kty` 1 (`OKP`), `crv` 6, `x` |
 | `Es256` | -7 | `P256 { x, y }`, 32 bytes each | `kty` 2 (`EC2`), `crv` 1, `x`, `y` |
+| `Rs256` | -257 | `Rsa { n, e }` | `kty` 3 (`RSA`), `alg` -257, `n`, `e` |
+
+A `COSE_Key` also takes `alg` -8 (EdDSA) for an `OKP` key and -9 (ESP256) for an `EC2` key ([RFC
+9864](https://www.rfc-editor.org/rfc/rfc9864)). The key type fixes the curve, so each one names `Ed25519` or `Es256`.
+WebAuthn authenticators write -8. An `RSA` key needs `alg`, because the key type serves more than one algorithm, and
+only -257 is supported. `TrustedKey::new` returns `Error::Malformed` for an RSA key that does not have a modulus of
+2,048 to 4,096 bits and the exponent 65,537.
 
 [Signature profiles](profiles.md) gives the guarantee of each profile, and the state of the draft identifiers.
 `MlDsa65Ed25519` is the default profile. Ed25519 and ES256 are classical profiles. Select one only for a verifier

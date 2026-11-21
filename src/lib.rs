@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod id;
 pub mod limits;
 pub mod local;
+pub mod passkey;
 pub mod store;
 pub mod transition;
 pub mod workload;
