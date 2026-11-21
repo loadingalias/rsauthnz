@@ -15,6 +15,7 @@ pub mod jose;
 pub mod limits;
 pub mod local;
 pub mod passkey;
+pub mod session;
 pub mod store;
 pub mod transition;
 pub mod workload;

@@ -4,6 +4,8 @@
 
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
+#[path = "passkey/session.rs"]
+mod session;
 #[path = "passkey/vectors.rs"]
 mod vectors;
 
@@ -17,7 +19,8 @@ use rsauthnz::crypto::Authentication;
 use rsauthnz::evidence::{Backup, Evidence, Method};
 use rsauthnz::id::{Authority, AuthorityVersion, Human, Id, Principal};
 use rsauthnz::limits::Limits;
-use rsauthnz::passkey::{self, Assertion, Error, Failure, RelyingParty, Response, SignIn, User, UserHandle};
+use rsauthnz::passkey::{self, Assertion, Error, Failure, RelyingParty, Response, User, UserHandle};
+use rsauthnz::session::{Access, Opened, Opening, Policy, Sessions};
 use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
 use rsauthnz::store::{self, Kind, Profile, Record, Store};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
@@ -89,6 +92,25 @@ fn authority() -> Id<Authority> {
 
 fn rp() -> RelyingParty {
     RelyingParty::new(authority(), RP_ID, ORIGIN, "Acme", KEY, Limits::default()).expect("a relying party")
+}
+
+/// The times of the sessions of the tests: a family lives 1,000 seconds, a generation 100 seconds, and a replaced
+/// identifier serves 10 seconds after its renewal.
+const POLICY: Policy = Policy {
+    lifetime: Duration::from_secs(1_000),
+    idle: Duration::from_secs(100),
+    grace: Duration::from_secs(10),
+};
+
+/// The sessions of the site.
+fn sessions() -> Sessions {
+    Sessions::new(
+        authority(),
+        Id::new("acme", "app").expect("an identifier"),
+        POLICY,
+        Limits::default(),
+    )
+    .expect("the sessions")
 }
 
 /// The memory binding and the commit driver on it.
@@ -168,10 +190,11 @@ impl Node {
     }
 }
 
-/// A site: its node, its relying party, and its random generator.
+/// A site: its node, its relying party, its sessions, and its random generator.
 struct Site {
     node: Node,
     rp: RelyingParty,
+    sessions: Sessions,
     random: ChaCha20Rng,
 }
 
@@ -180,6 +203,7 @@ impl Site {
         Self {
             node: Node::new(),
             rp: rp(),
+            sessions: sessions(),
             random: ChaCha20Rng::from_seed([5; 32]),
         }
     }
@@ -233,8 +257,13 @@ impl Site {
         authenticator::challenge(&self.rp.sign_in_options(now, &mut self.random).expect("the options"))
     }
 
-    /// Proposes the sign-in of `json` at `now`.
-    fn sign_in(&mut self, json: &[u8], now: Reading) -> Result<(Proposal, Plan, SignIn), Error> {
+    /// Proposes the sign-in of `json` at `now`, with a new session that ends the family of `replaces`.
+    fn sign_in_replacing(
+        &mut self,
+        json: &[u8],
+        now: Reading,
+        replaces: Option<&Access>,
+    ) -> Result<(Proposal, Plan, Opening), Error> {
         let assertion = Assertion::parse(json)?;
         let sign_in = self.rp.sign_in(
             &mut self.node.memory,
@@ -243,14 +272,27 @@ impl Site {
             &mut self.random,
             &mut self.node.driver,
         );
-        ready(sign_in).map_err(refused)
+        let sign_in = ready(sign_in).map_err(refused)?;
+        sign_in.open(&self.sessions, replaces, &mut self.random, &mut self.node.driver)
+    }
+
+    /// Proposes the sign-in of `json` at `now`, with a new session.
+    fn sign_in(&mut self, json: &[u8], now: Reading) -> Result<(Proposal, Plan, Opening), Error> {
+        self.sign_in_replacing(json, now, None)
+    }
+
+    /// The evidence and the session of the accepted sign-in of `json` at `now`, which ends the family of `replaces`.
+    fn opened(&mut self, json: &[u8], now: Reading, replaces: Option<&Access>) -> Opened {
+        let (proposal, plan, opening) = self.sign_in_replacing(json, now, replaces).expect("a sign-in");
+        let outcome = self.node.commit(proposal, plan);
+        opening
+            .release(&outcome)
+            .expect("the evidence and the session of the accepted sign-in")
     }
 
     /// The evidence of the accepted sign-in of `json` at `now`.
     fn signed_in(&mut self, json: &[u8], now: Reading) -> Evidence {
-        let (proposal, plan, sign_in) = self.sign_in(json, now).expect("a sign-in");
-        let outcome = self.node.commit(proposal, plan);
-        sign_in.release(&outcome).expect("the evidence of the accepted sign-in")
+        self.opened(json, now, None).evidence
     }
 
     /// The key of the credential record of the passkey `passkey` of alice.
@@ -917,7 +959,7 @@ fn two_concurrent_sign_ins_with_counters_5_and_4_store_5_and_signal_on_4() {
     assert!(
         first
             .release(&outcome)
-            .is_some_and(|evidence| !evidence.possible_clone())
+            .is_some_and(|opened| !opened.evidence.possible_clone())
     );
     assert!(matches!(site.node.commit(two, two_plan), Outcome::Conflict));
     // The conflict restarts the sign-in: it reads the record again, and its challenge is still open.
@@ -931,16 +973,16 @@ fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
     let passkey = site.register(Algorithm::Ed25519, -8, 1, 0);
     // The commit lands and its response is lost: the unknown outcome releases nothing.
     let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE).json();
-    let (proposal, plan, sign_in) = site.sign_in(&json, at(11)).expect("a sign-in");
+    let (proposal, plan, opening) = site.sign_in(&json, at(11)).expect("a sign-in");
     site.node.memory.inject(Fault::LostResponse);
     let outcome = site.node.commit(proposal, plan);
     assert!(matches!(outcome, Outcome::Unknown(_)));
-    assert_eq!(sign_in.release(&outcome), None);
+    assert!(opening.release(&outcome).is_none());
     site.node.start();
     // The browser holds no operation of a sign-in. The server keeps the sign-in, looks up its operation when the driver
-    // serves again, and gives the evidence to the same request.
+    // serves again, and gives the evidence and the session to the same request.
     let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(20)), HANDLE).json();
-    let (proposal, plan, sign_in) = site.sign_in(&json, at(21)).expect("a sign-in");
+    let (proposal, plan, opening) = site.sign_in(&json, at(21)).expect("a sign-in");
     let operation = proposal.operation().clone();
     site.node.memory.inject(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
@@ -950,10 +992,14 @@ fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
     let Some(Answer::Lookup(Lookup::Committed(receipt))) = site.node.driver.take(ticket) else {
         panic!("the lookup shows the commit");
     };
-    let evidence = sign_in
+    let opened = opening
         .release(&Outcome::Accepted(receipt))
-        .expect("the evidence of the commit");
-    assert_eq!(evidence.subject(), &Principal::Human(alice()));
+        .expect("the evidence and the session of the commit");
+    assert_eq!(opened.evidence.subject(), &Principal::Human(alice()));
+    let check = site
+        .sessions
+        .check(&mut site.node.memory, opened.session.identifier(), at(22));
+    assert!(matches!(ready(check), Ok(rsauthnz::session::Check::Active(_))));
     // The same assertion again refuses, because its challenge served the commit.
     assert_eq!(site.sign_in(&json, at(22)).err(), Some(Error::Challenge));
 }

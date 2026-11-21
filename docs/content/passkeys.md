@@ -89,13 +89,17 @@ The core checks the response and proposes each commit. The storage binding of th
 3. Check the request with `site.json_change`, then read the body with `Assertion::parse`.
 4. Call `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It checks the tag and the lifetime of
    the challenge before any read. Then it reads the credential record, the replay floor, and the replay record of the
-   challenge, and it checks the assertion and its signature.
-5. Submit the proposal with its plan, and give the outcome to `sign_in.release(&outcome)`. Only the accepted commit
-   gives the `Evidence`. Only the commit driver makes an accepted receipt, from a durable commit or its outcome
-   record. Thus no evidence leaves before the store holds the replay record and the audit.
-6. After a lost response (`Outcome::Unknown`), keep `sign_in`. When the driver serves again, look up the operation of
-   the proposal with `driver.lookup`. Give a commit to `sign_in.release(&Outcome::Accepted(receipt))`, and answer the
-   same request with its sign-in. Answer each other result of the lookup as [Lost
+   challenge, and it checks the assertion and its signature. It gives a `SignIn`.
+5. Call `sign_in.open(&sessions, replaces, &mut random, &mut driver)`. It adds a new [session](sessions.md) to the
+   commit, and ends the family of `replaces`, the current session of the browser, if it has one. It gives the
+   proposal, its plan, and a `session::Opening`.
+6. Submit the proposal with its plan, and give the outcome to `opening.release(&outcome)`. Only the accepted commit
+   gives `Opened`: the `Evidence` and the session. Only the commit driver makes an accepted receipt, from a durable
+   commit or its outcome record. Thus no evidence and no session leave before the store holds the replay record, the
+   session, and the audit.
+7. After a lost response (`Outcome::Unknown`), keep the opening. When the driver serves again, look up the operation
+   of the proposal with `driver.lookup`. Give a commit to `opening.release(&Outcome::Accepted(receipt))`, and answer
+   the same request with its session. Answer each other result of the lookup as [Lost
    responses](http-binding.md#lost-responses) shows: the user signs in again with a new challenge. The same assertion
    again is a new operation, and its challenge refuses after a commit.
 
@@ -307,6 +311,7 @@ Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()`
 | `Time` | The reading has no bound, or a time overflows | `Refuse`: give a reading with a known bound |
 | `Driver` | The commit driver does not serve | `Refuse` |
 | `Transition(error)` | The proposal refuses, also for a decision with more reads than the limits permit | `error.recovery()` |
+| `Session(error)` | The session of a sign-in refuses ([Keep a browser session](sessions.md#errors)) | `error.recovery()` |
 
 `finish` and `sign_in` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for a
 failed read, which is a crash of the binding.

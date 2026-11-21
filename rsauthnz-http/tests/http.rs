@@ -5,6 +5,7 @@ use core::time::Duration;
 
 use http::header::{HeaderMap, HeaderValue};
 use http::{Request, StatusCode, Version};
+use rsauthnz::session::Identifier;
 use rsauthnz::transition::Recovery;
 use rsauthnz_http::{CookieName, Error, Refusal, SameSite, Site, json, problem, redirect};
 
@@ -228,6 +229,38 @@ fn a_cookie_that_is_in_the_request_twice_or_not_valid_refuses() {
     ] {
         assert_eq!(SESSION.find(&cookies(fields)), Err(Refusal::Cookie), "{fields:?}");
     }
+}
+
+#[test]
+fn a_session_cookie_holds_86_base64url_characters_and_reads_back_as_its_identifier() {
+    let site = Site::new(ORIGIN).unwrap();
+    // Each character of the alphabet kinds. The last one carries 2 bits of the identifier and 4 zero bits.
+    let mut text: Vec<u8> = (0..86).map(|at| b"AZaz09-_"[at % 8]).collect();
+    text[85] = b'A';
+    let identifier = Identifier::parse(&text).unwrap();
+    let mut headers = HeaderMap::new();
+    site.set_session(&mut headers, SESSION, &identifier, Duration::from_secs(600))
+        .unwrap();
+    let field = headers["set-cookie"].to_str().unwrap();
+    let value = field
+        .strip_prefix("__Host-session=")
+        .and_then(|rest| rest.strip_suffix("; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Lax"))
+        .unwrap();
+    // An opaque value: base64url of the identifier, and no signed claim.
+    assert_eq!(value.as_bytes(), text);
+    let request = cookies(&[format!("__Host-session={value}").as_bytes()]);
+    let read = SESSION.session(&request).unwrap().unwrap();
+    assert_eq!(read.encode().unwrap().as_bytes()[..], text[..]);
+    // A value that is not an identifier refuses: too short, a character of standard base64, or bits after the bytes.
+    let mut standard = text.clone();
+    standard[3] = b'+';
+    let mut trailing = text.clone();
+    trailing[85] = b'B';
+    for value in [&text[..43], &standard[..], &trailing[..]] {
+        let request = cookies(&[&[b"__Host-session=", value].concat()]);
+        assert_eq!(SESSION.session(&request).err(), Some(Refusal::Cookie));
+    }
+    assert!(matches!(SESSION.session(&HeaderMap::new()), Ok(None)));
 }
 
 #[test]

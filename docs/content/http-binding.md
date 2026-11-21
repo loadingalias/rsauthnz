@@ -5,10 +5,10 @@ It works on `http` 1.x values: `http::Request`, `http::Response`, and `http::Hea
 framework, server, or runtime. A framework that gives `http::Request` values, such as axum or hyper, calls it with no
 conversion.
 
-The binding gives no ceremony and no session of its own. A ceremony, such as a [passkey
-registration](passkeys.md), gives the body to its verifier and commits its transition ([Propose a
-transition](transitions.md)). The binding checks the request before that work, and it writes the response after the
-commit.
+The binding gives no ceremony of its own. A ceremony, such as a [passkey registration](passkeys.md), gives the body to
+its verifier and commits its transition ([Propose a transition](transitions.md)). The binding checks the request
+before that work, and it writes the response after the commit. It writes and reads the cookie of a [browser
+session](sessions.md).
 
 ## Before you start
 
@@ -28,8 +28,9 @@ commit.
    `Err(refusal)`, return `refusal.response()`.
 3. Commit the transition of the ceremony. For each outcome other than an accepted one, return
    `problem(recovery)` with the recovery of the outcome (`Outcome::recovery`).
-4. After the commit accepts, write the response. Release a session with `site.set_cookie` on the headers of the
-   response, and end it with `site.clear_cookie`. Read a cookie with `name.find(request.headers())`.
+4. After the commit accepts, write the response. Release a session with `site.set_session` on the headers of the
+   response, and end it with `site.clear_cookie`. Read the session of a request with `name.session(request.headers())`,
+   and another cookie with `name.find(request.headers())`. Write another cookie with `site.set_cookie`.
 5. To send the browser to another page of the site, return `redirect(path)`.
 6. Each response has a `Vec<u8>` body. Give it to your framework with `Response::map`, which converts the body into
    the body type of the framework.
@@ -122,6 +123,16 @@ __Host-session=c2Vzc2lvbg; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Lax
 A cookie with no prefix, or with another prefix such as `__host-`, is not the cookie of the site. A cookie that is in
 the request twice refuses with `Refusal::Cookie`.
 
+### The session cookie
+
+`site.set_session(headers, name, identifier, max_age)` writes a session identifier as 86 base64url characters, with
+the attributes above. `name.session(headers)` reads it back as an `Identifier`, or `None` when the request has no
+such cookie. Both encode with the base64url kernels of rscodec that have data-independent timing, because the
+identifier is a bearer value. A value that is not the base64url text of 64 bytes refuses with `Refusal::Cookie`.
+After a refusal, clear the cookie with `clear_cookie` and treat the request as signed out: the browser cannot change
+an `HttpOnly` cookie. `set_session` refuses with `Error::Dit` when the build cannot encode with data-independent
+timing, as on Windows aarch64 without `-C target-feature=+dit`.
+
 No browser run of rsauthnz checks a `__Host-` cookie on `http://localhost` yet. A browser that does not treat
 `http://localhost` as a secure origin does not keep the cookie.
 
@@ -173,7 +184,7 @@ the same request with the result of the lookup:
 
 | `Lookup` | Response |
 | --- | --- |
-| `Committed(receipt)` | The response of the commit, such as the sign-in of `release(&Outcome::Accepted(receipt))` |
+| `Committed(receipt)` | The response of the commit, such as the session cookie of `opening.release(&Outcome::Accepted(receipt))` |
 | `Absent` | `problem(Recovery::Restart)`: nothing committed |
 | `Refused(error)` | `problem(error.recovery())` |
 | `Unknown`, or the driver does not serve in time | `problem(Recovery::Lookup)` |

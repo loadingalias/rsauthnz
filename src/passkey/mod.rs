@@ -22,9 +22,10 @@
 //!
 //! A sign-in has one commit. [`RelyingParty::sign_in_options`] gives the options with a challenge that holds the
 //! earliest time of its reading under an HMAC-SHA256 tag, and it writes nothing. [`Assertion::parse`] reads the
-//! response of `navigator.credentials.get()`, and [`RelyingParty::sign_in`] checks it and proposes the commit: the
-//! replay record of the challenge, the counter of the credential when it advances, and the audit. Only the accepted
-//! commit releases the [`Evidence`] ([`SignIn::release`]).
+//! response of `navigator.credentials.get()`, and [`RelyingParty::sign_in`] checks it. [`SignIn::open`] then proposes
+//! the commit: the replay record of the challenge, the counter of the credential when it advances, the new session,
+//! and the audit. Only the accepted commit releases the [`Evidence`] and the session
+//! ([`Opening::release`](crate::session::Opening::release)).
 //!
 //! The options offer ML-DSA-65 (-49), EdDSA (-8), ES256 (-7), and RS256 (-257), in this order, and the check also
 //! takes Ed25519 (-19) and ESP256 (-9). They require a discoverable credential and user verification, and they ask for
@@ -161,11 +162,12 @@ use crate::crypto::{self, Algorithm};
 use crate::evidence::{Backup, Evidence, Method};
 use crate::id::{Action, Authority, AuthorityVersion, Human, Id, Principal};
 use crate::limits::{Limits, SignatureBudget};
+use crate::session::{self, Access, Opening, Sessions};
 use crate::store::driver::{self, Driver, Plan, record};
 use crate::store::journal::Role;
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Prepared, Proposal, Recovery};
+use crate::transition::{self, Audit, Change, Dependency, OperationId, Prepared, Proposal, Recovery};
 
 /// The time from the start of a registration to the end of its pending record: 300 seconds, the timeout of the
 /// options. WebAuthn Level 3 recommends 300 to 600 seconds when the ceremony requires user verification.
@@ -664,8 +666,8 @@ impl RelyingParty {
     /// counter advances or the backup state changes. A counter that does not advance, with a nonzero counter on either
     /// side, is a possible clone: the stored value stays, and the evidence and the audit action record the signal. The
     /// proposal inserts the replay record of the challenge, so the challenge serves once. Its operation identity is
-    /// new, so the same assertion again is a new operation that finds the replay record. Submit the proposal, and give
-    /// its outcome to [`SignIn::release`]: only the accepted commit releases the evidence.
+    /// new, so the same assertion again is a new operation that finds the replay record. [`SignIn::open`] adds the
+    /// session and gives the proposal: only its accepted commit releases the evidence and the session.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check, and three keyed reads.
     ///
@@ -689,7 +691,7 @@ impl RelyingParty {
         now: Reading,
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
-    ) -> Result<(Proposal, Plan, SignIn), Failure<S::Error>> {
+    ) -> Result<SignIn, Failure<S::Error>> {
         let challenge = &assertion.client_data.challenge;
         let created = self.created(challenge)?;
         let expires = created
@@ -732,10 +734,9 @@ impl RelyingParty {
 
         let advances = count > stored.sign_count;
         let possible_clone = !advances && (count | stored.sign_count) != 0;
-        let operation = operation(random);
         let request = Value::Array(vec![Value::Bytes(&assertion.id), Value::Bytes(challenge)]);
         let action = if possible_clone { SIGN_IN_CLONE } else { SIGN_IN };
-        let mut proposal = self.proposal(operation.clone(), &account, action, &request, now)?;
+        let mut proposal = self.proposal(operation(random), &account, action, &request, now)?;
         proposal
             .read(Dependency::Version(key.clone(), record.version))
             .map_err(Error::from)?;
@@ -794,7 +795,7 @@ impl RelyingParty {
             })
             .map_err(Error::from)?;
         proposal.until(expires);
-        Ok((proposal, Plan::default(), SignIn { operation, evidence }))
+        Ok(SignIn { proposal, evidence })
     }
 
     /// The bytes that the tag of a sign-in challenge covers: the form, the relying party ID, and `body`: the random
@@ -1281,26 +1282,40 @@ impl fmt::Debug for Registration {
     }
 }
 
-/// A proposed sign-in: its operation, and the evidence that only the accepted commit of its proposal releases.
+/// A checked sign-in that waits for its session: the evidence, and the commit that [`RelyingParty::sign_in`] made.
 #[derive(Debug)]
 pub struct SignIn {
-    operation: OperationId,
+    proposal: Proposal,
     evidence: Evidence,
 }
 
 impl SignIn {
-    /// The evidence of the sign-in, if `outcome` is the accepted commit of its proposal. A conflict, a refusal, and an
-    /// unknown outcome release nothing. After a lost response, keep the sign-in, and look up the operation of the
-    /// proposal when the driver serves again. Give the receipt of a commit as [`Outcome::Accepted`]. No second sign-in
+    /// The commit of the sign-in with a new session of `sessions`, and the [`Opening`] that only its accepted commit
+    /// releases. `replaces` is the current session of the browser, if it has one: the commit ends that family, so a
+    /// sign-in, also a fresh user verification of a signed-in account, always gives a new identifier and the old one
+    /// refuses. Submit the proposal with the plan, and give its outcome to [`Opening::release`].
+    ///
+    /// After a lost response, keep the opening, and look up the operation of the proposal when the driver serves again.
+    /// Give the receipt of the lookup as [`Outcome::Accepted`](crate::transition::Outcome::Accepted). No second sign-in
     /// runs by itself.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    #[must_use]
-    pub fn release(self, outcome: &Outcome) -> Option<Evidence> {
-        match outcome {
-            Outcome::Accepted(receipt) if *receipt.operation() == self.operation => Some(self.evidence),
-            _ => None,
-        }
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). One SHA-256 digest and one HMAC-SHA256 tag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Session`] if `replaces` is a session of another audience, and for the errors of the session: the time
+    /// of the proposal has no bound, the driver does not serve, or the proposal refuses.
+    pub fn open(
+        mut self,
+        sessions: &Sessions,
+        replaces: Option<&Access>,
+        random: &mut ChaCha20Rng,
+        driver: &mut Driver,
+    ) -> Result<(Proposal, Plan, Opening), Error> {
+        let opening = sessions
+            .open(&mut self.proposal, self.evidence, replaces, random, driver)
+            .map_err(Error::Session)?;
+        Ok((self.proposal, Plan::default(), opening))
     }
 }
 
@@ -1484,16 +1499,19 @@ pub enum Error {
     Driver(driver::Error),
     /// The proposal refuses.
     Transition(transition::Error),
+    /// The session of the sign-in refuses.
+    Session(session::Error),
 }
 
 impl Error {
     /// The recovery of the caller: start a new ceremony after [`Error::Challenge`], and the recovery of the proposal
-    /// after [`Error::Transition`]. Refuse each other request.
+    /// after [`Error::Transition`] and [`Error::Session`]. Refuse each other request.
     #[must_use]
     pub const fn recovery(&self) -> Recovery {
         match self {
             Self::Challenge => Recovery::Restart,
             Self::Transition(error) => error.recovery(),
+            Self::Session(error) => error.recovery(),
             _ => Recovery::Refuse,
         }
     }
@@ -1521,6 +1539,7 @@ impl fmt::Display for Error {
             Self::Time(error) => write!(f, "the time reading gave no value: {error}"),
             Self::Driver(error) => write!(f, "the commit driver gave no value: {error}"),
             Self::Transition(error) => write!(f, "the proposal refuses: {error}"),
+            Self::Session(error) => write!(f, "the session refuses: {error}"),
         }
     }
 }

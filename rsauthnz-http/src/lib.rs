@@ -12,6 +12,8 @@
 //! - [`Site::set_cookie`] and [`Site::clear_cookie`] write a `__Host-` cookie with `Secure`, `HttpOnly`, `Path=/`, and
 //!   the `SameSite` value of the site. [`CookieName::find`] reads it, also from the split `cookie` fields of HTTP/2 and
 //!   HTTP/3.
+//! - [`Site::set_session`] and [`CookieName::session`] write and read a session identifier
+//!   ([`rsauthnz::session`]) in a cookie, with the base64url of data-independent timing.
 //!
 //! Each response of the binding has `Cache-Control: no-store`: [`json`], [`redirect`] to a path of the site, and the
 //! problem responses of [`Refusal::response`] and [`problem`]. A problem body holds only its recovery, never a byte of
@@ -277,6 +279,9 @@ pub enum Error {
     /// The cookie value has a byte that a cookie value cannot have: a control character, a space, `"`, `,`, `;`, or
     /// `\`, or a byte that is not ASCII.
     CookieValue,
+    /// This build on this CPU cannot encode a session identifier with data-independent timing. Build with
+    /// `-C target-feature=+dit` on Windows aarch64.
+    Dit,
 }
 
 impl fmt::Display for Error {
@@ -284,6 +289,7 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::Origin => "the origin is not https:// and a domain name, or http://localhost",
             Self::CookieValue => "the cookie value has a byte that a cookie value cannot have",
+            Self::Dit => "this build cannot encode a session identifier with data-independent timing",
         })
     }
 }

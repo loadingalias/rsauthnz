@@ -300,10 +300,6 @@ impl Evidence {
     /// [`EvidenceError::Subject`] for a subject that is not a principal, and [`EvidenceError::Form`]
     /// for each other difference from the canonical form, also a form with another name or with no
     /// name, and a recovery that records phishing resistance.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the sessions of A2 read the evidence that they store")
-    )]
     pub(crate) fn from_cbor(value: &Value<'_>) -> Result<Self, EvidenceError> {
         let Value::Array(items) = value else {
             return Err(EvidenceError::Form);

@@ -89,7 +89,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Login` | A pending login transaction of an external identity provider | `Pays::Anchor` |
 | `CliEnrollment` | A pending enrollment request of a CLI | `Pays::Anchor` |
 | `Invitation` | An invitation value | `Pays::Anchor` |
-| `Session` | A session family and its current generation | `None` |
+| `Session` | A session family and its current generation ([Keep a browser session](sessions.md)) | `None` |
 | `Recovery` | A recovery value | `Pays::Anchor` |
 | `Bootstrap` | A bootstrap value of an authority | `Pays::Anchor` |
 | `Administrator` | An administrator binding of an authority. It ends with its CLI credential, so expiry removes it | `None` |

@@ -3,6 +3,7 @@
 use core::time::Duration;
 
 use http::header::{CACHE_CONTROL, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
+use rsauthnz::session::Identifier;
 
 use crate::response::NO_STORE;
 use crate::{Error, Refusal, SameSite, Site};
@@ -61,6 +62,21 @@ impl CookieName {
         }
         Ok(found)
     }
+
+    /// The session identifier in the cookie `name` of `headers` ([`Self::find`]), or `None` if no field has the cookie.
+    /// The decoder has data-independent timing. After a refusal, or when the session does not serve, clear the cookie
+    /// with [`Site::clear_cookie`] and treat the request as signed out: the browser cannot change an `HttpOnly` cookie.
+    ///
+    /// Cost class: [`Parse`](rsauthnz::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`Self::find`], and [`Refusal::Cookie`] if the value is not the base64url text of an identifier.
+    pub fn session(self, headers: &HeaderMap) -> Result<Option<Identifier>, Refusal> {
+        self.find(headers)?
+            .map(|value| Identifier::parse(value).map_err(|_| Refusal::Cookie))
+            .transpose()
+    }
 }
 
 /// Whether `byte` is a token character of RFC 9110.
@@ -98,6 +114,26 @@ impl Site {
         let value = str::from_utf8(value).map_err(|_| Error::CookieValue)?;
         self.write(headers, name, value, max_age.as_secs());
         Ok(())
+    }
+
+    /// Adds a `set-cookie` field to `headers` for the cookie `name` with the session identifier `identifier`, which the
+    /// browser keeps for `max_age`, such as [`Issued::max_age`](rsauthnz::session::Issued::max_age). The encoder has
+    /// data-independent timing, and the field is sensitive, as in [`Self::set_cookie`].
+    ///
+    /// Cost class: [`Parse`](rsauthnz::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Dit`] if this build on this CPU cannot encode the identifier with data-independent timing.
+    pub fn set_session(
+        &self,
+        headers: &mut HeaderMap,
+        name: CookieName,
+        identifier: &Identifier,
+        max_age: Duration,
+    ) -> Result<(), Error> {
+        let text = identifier.encode().map_err(|_| Error::Dit)?;
+        self.set_cookie(headers, name, text.as_bytes(), max_age)
     }
 
     /// Adds a `set-cookie` field to `headers` that ends the cookie `name` in the browser, and sets `Cache-Control:

@@ -14,8 +14,9 @@ rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", de
 # The only source of signatures, digests, and the seeded random generator. Its `alloc` gives the owners that clear a
 # secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation.
 rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2", "slh-dsa"] }
-# The JSON reader and writer and base64url of the passkey ceremonies.
-rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json"] }
+# The JSON reader and writer and base64url of the passkey ceremonies, and the base64url of session identifiers. Its
+# `std` detects DIT on aarch64, so the secret kernels run in a `with_dit` scope.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json", "std"] }
 
 [features]
 # The native custody bindings: key files under OS file permissions on Linux, macOS, and Windows, and the login
