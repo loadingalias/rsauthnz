@@ -39,8 +39,8 @@ in a composite key, is not on the curve.
 
 A `COSE_Key` also takes `alg` -8 (EdDSA) for an `OKP` key and -9 (ESP256) for an `EC2` key ([RFC
 9864](https://www.rfc-editor.org/rfc/rfc9864)). The key type fixes the curve, so each one names `Ed25519` or `Es256`.
-WebAuthn authenticators write -8. An `RSA` key needs `alg`, because the key type serves more than one algorithm, and
-only -257 is supported. `TrustedKey::new` returns `Error::Malformed` for an RSA key that does not have a modulus of
+WebAuthn authenticators write -8. An `RSA` key needs `alg`, because the key type serves more than one algorithm:
+-257 (`Rs256`) or -37 (`Ps256`). `TrustedKey::new` returns `Error::Malformed` for an RSA key that does not have a modulus of
 2,048 to 4,096 bits and the exponent 65,537.
 
 [Signature profiles](profiles.md) gives the guarantee of each profile, and the state of the draft identifiers.

@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod custody;
 pub mod evidence;
 pub mod id;
+pub mod jose;
 pub mod limits;
 pub mod local;
 pub mod passkey;

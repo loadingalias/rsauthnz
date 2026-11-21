@@ -108,8 +108,8 @@ impl<'a> Key<'a> {
                 PublicKey::P256 { x, y }
             }
             Some(Value::Unsigned(3)) => {
-                // An RSA key serves more than one algorithm, so this crate requires `alg`: only RS256 is supported.
-                if alg.ok_or(Error::Malformed)? != Algorithm::Rs256 {
+                // An RSA key serves more than one algorithm, so this crate requires `alg`: RS256 or PS256.
+                if !matches!(alg.ok_or(Error::Malformed)?, Algorithm::Rs256 | Algorithm::Ps256) {
                     return Err(Error::KeyAlgorithm);
                 }
                 private(get(-3))?;
@@ -126,7 +126,9 @@ impl<'a> Key<'a> {
                     Algorithm::MlDsa65 => PublicKey::MlDsa65(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65Ed25519 => PublicKey::MlDsa65Ed25519(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65EcdsaP256 => PublicKey::MlDsa65EcdsaP256(fixed(bytes(-1)?)?),
-                    Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 => return Err(Error::KeyAlgorithm),
+                    Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 => {
+                        return Err(Error::KeyAlgorithm);
+                    }
                     // SLH-DSA has no COSE identifier yet, so no `alg` names it.
                     Algorithm::SlhDsaSha2_128s => return Err(Error::Unsupported),
                 }
@@ -134,7 +136,8 @@ impl<'a> Key<'a> {
             Some(Value::Unsigned(_) | Value::Negative(_) | Value::Text(_)) => return Err(Error::Unsupported),
             _ => return Err(Error::Malformed),
         };
-        if alg.is_some_and(|alg| alg != public.algorithm()) {
+        // The RSA arm checked its `alg`: an RSA key serves RS256 and PS256.
+        if !matches!(public, PublicKey::Rsa { .. }) && alg.is_some_and(|alg| alg != public.algorithm()) {
             return Err(Error::KeyAlgorithm);
         }
         Ok(Self { kid, alg, public })
@@ -268,6 +271,7 @@ impl TrustedKey {
             (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
             (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
             (Algorithm::Rs256, PublicKey::Rsa { n, e }) => Verifier::rs256(n, e).ok_or(Error::Malformed)?,
+            (Algorithm::Ps256, PublicKey::Rsa { n, e }) => Verifier::ps256(n, e).ok_or(Error::Malformed)?,
             (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
             (Algorithm::MlDsa65Ed25519, PublicKey::MlDsa65Ed25519(public)) => {
                 Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Malformed)?

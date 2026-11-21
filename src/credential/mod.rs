@@ -1055,7 +1055,7 @@ impl fmt::Debug for Verified<'_, '_> {
 }
 
 /// The [`Authentication`] class of a profile of this format. The SLH-DSA trust-root profile signs issuer keys, and RS256
-/// only verifies passkeys, so this format refuses both.
+/// and PS256 only verify external artifacts, so this format refuses them.
 const fn class(algorithm: Algorithm) -> Result<Authentication, Error> {
     match algorithm {
         Algorithm::Ed25519
@@ -1063,7 +1063,7 @@ const fn class(algorithm: Algorithm) -> Result<Authentication, Error> {
         | Algorithm::MlDsa65
         | Algorithm::MlDsa65Ed25519
         | Algorithm::MlDsa65EcdsaP256 => Ok(algorithm.report().authentication),
-        Algorithm::Rs256 | Algorithm::SlhDsaSha2_128s => Err(Error::Profile),
+        Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::SlhDsaSha2_128s => Err(Error::Profile),
     }
 }
 
