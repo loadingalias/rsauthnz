@@ -166,6 +166,40 @@ fn a_key_set_gives_the_keys_of_the_algorithm_of_its_profile() {
 }
 
 #[test]
+fn a_key_set_keeps_the_restrictions_of_each_key() {
+    let verifies = |jwk: &str| {
+        profile(Algorithm::Rs256, Kind::Jwt, &set(&[jwk]))
+            .and_then(|profile| profile.verify(vectors::RS256_TOKEN).map(drop))
+    };
+    let with = |member: &str| vectors::RS256_KEY.replacen('{', &format!("{{{member},"), 1);
+    // The control: the key joins with a `key_ops` that permits a signature check.
+    assert_eq!(verifies(&with(r#""key_ops":["verify"]"#)), Ok(()));
+    // A key whose `key_ops` permits no signature check, or whose restriction the reader cannot read, does not join.
+    for member in [
+        r#""key_ops":["encrypt"]"#,
+        r#""key_ops":[]"#,
+        r#""key_ops":["verify","verify"]"#,
+        r#""key_ops":"verify""#,
+        r#""key_ops":["verify",1]"#,
+        r#""use":["sig"]"#,
+        r#""alg":256"#,
+    ] {
+        assert_eq!(verifies(&with(member)), Err(Error::Key), "{member}");
+    }
+    // A set is public: a private member of a key of another type refuses the set. The Ed25519 key is the private key
+    // of RFC 8037, appendix A.1.
+    let okp = concat!(
+        r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","#,
+        r#""d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"}"#
+    );
+    let private = set(&[vectors::RS256_KEY, okp]);
+    assert_eq!(profile(Algorithm::Rs256, Kind::Jwt, &private).err(), Some(Error::Key));
+    // The `oth` primes of a private RSA key are objects deeper than the bound of a set, so the set refuses.
+    let oth = set(&[&with(r#""oth":[{"r":"AQ","d":"AQ","t":"AQ"}]"#)]);
+    assert_eq!(profile(Algorithm::Rs256, Kind::Jwt, &oth).err(), Some(Error::Malformed));
+}
+
+#[test]
 fn ps256_and_the_post_quantum_algorithms_verify_with_rscrypto_signed_tokens() {
     let payload = br#"{"iss":"joe"}"#;
     // PS256 with the RSA key of RFC 7515, appendix A.2.

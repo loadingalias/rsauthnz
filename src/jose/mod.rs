@@ -103,7 +103,7 @@ const KEY_SET: json::Limits = json::Limits {
 const REFUSED: [&str; 7] = ["jku", "jwk", "x5u", "x5c", "x5t", "x5t#S256", "crit"];
 
 /// The members of a private JWK. A key set is public, so each one refuses the set.
-const PRIVATE: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "k", "priv"];
+const PRIVATE: [&str; 9] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"];
 
 /// The slots of the reader: each open container, and each key of each open object.
 const SLOTS: usize = 8 * (64 + 1);
@@ -188,15 +188,16 @@ impl Profile {
     }
 
     /// The profile with each key of the JWK set `set` ([RFC 7517]) whose type fits the algorithm of the profile. A key
-    /// whose `alg` names another algorithm, or whose `use` is not `sig`, does not join. A set is public, so a key with a
-    /// private member refuses the set.
+    /// whose `alg` names another algorithm, whose `use` is not `sig`, or whose `key_ops` has no `verify` does not join.
+    /// A key whose `alg`, `use`, or `key_ops` the reader cannot read does not join either: a `key_ops` is an array of
+    /// distinct strings (RFC 7517 section 4.3). A set is public, so a private member of any key refuses the set.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). A P-256 key checks its point, and an RSA key its modulus.
     ///
     /// # Errors
     ///
-    /// [`Error::Key`] if a key of the type of the profile is not valid or has a private member, [`Error::Limit`] if
-    /// the profile would have more than [`KEYS_MAX`] keys, and [`Error::Malformed`] if `set` is not a JWK set.
+    /// [`Error::Key`] if a key has a private member or a key of the type of the profile is not valid. [`Error::Limit`]
+    /// if the profile would have more than [`KEYS_MAX`] keys, and [`Error::Malformed`] if `set` is not a JWK set.
     ///
     /// [RFC 7517]: https://www.rfc-editor.org/rfc/rfc7517
     pub fn with_key_set(mut self, set: &[u8]) -> Result<Self, Error> {
@@ -213,10 +214,31 @@ impl Profile {
                     let mut jwk = Jwk::default();
                     let mut members = key.members()?;
                     while let Some((name, mut value)) = members.next()? {
-                        if value.kind()? != json::Kind::String {
+                        if PRIVATE.iter().any(|private| name == *private) {
+                            jwk.private = true;
                             continue;
                         }
-                        let text = Some(value.str()?);
+                        if name == "key_ops" {
+                            let mut ops: Vec<Str<'_>> = Vec::new();
+                            let mut valid = value.kind()? == json::Kind::Array;
+                            if valid {
+                                let mut items = value.elements()?;
+                                while let Some(mut item) = items.next()? {
+                                    if item.kind()? == json::Kind::String {
+                                        let op = item.str()?;
+                                        valid &= !ops.contains(&op);
+                                        ops.push(op);
+                                    } else {
+                                        valid = false;
+                                    }
+                                }
+                            }
+                            jwk.verify = Some(valid && ops.iter().any(|op| *op == "verify"));
+                            continue;
+                        }
+                        let text = (value.kind()? == json::Kind::String).then(|| value.str()).transpose()?;
+                        // A restriction that the reader cannot read keeps the key out (RFC 7517 section 5).
+                        jwk.unreadable |= text.is_none() && (name == "alg" || name == "use");
                         let slot = [
                             ("kty", &mut jwk.kty),
                             ("crv", &mut jwk.crv),
@@ -231,9 +253,8 @@ impl Profile {
                         ]
                         .into_iter()
                         .find(|(known, _)| name == *known);
-                        match slot {
-                            Some((_, slot)) => *slot = text,
-                            None => jwk.private |= PRIVATE.iter().any(|private| name == *private),
+                        if let Some((_, slot)) = slot {
+                            *slot = text;
                         }
                     }
                     jwks.push(jwk);
@@ -371,13 +392,18 @@ struct Jwk<'a> {
     n: Option<Str<'a>>,
     e: Option<Str<'a>>,
     public: Option<Str<'a>>,
+    /// Whether `key_ops` permits a signature check, or `None` with no `key_ops`.
+    verify: Option<bool>,
+    /// Whether the reader could not read the `alg` or the `use` of the key.
+    unreadable: bool,
     private: bool,
 }
 
 impl Jwk<'_> {
-    /// The key ID and the trusted key of the JWK for `algorithm`, or `None` if its type, its `alg`, or its `use` does
-    /// not fit.
+    /// The key ID and the trusted key of the JWK for `algorithm`, or `None` if its type, its `alg`, its `use`, or its
+    /// `key_ops` does not fit.
     fn key(&self, algorithm: Algorithm) -> Result<Option<Entry>, Error> {
+        (!self.private).ok_or(Error::Key)?;
         let fits = self.kty.is_some_and(|kty| match algorithm {
             Algorithm::Ed25519 => kty == "OKP" && self.crv.is_some_and(|crv| crv == "Ed25519"),
             Algorithm::Es256 => kty == "EC" && self.crv.is_some_and(|crv| crv == "P-256"),
@@ -387,11 +413,13 @@ impl Jwk<'_> {
             }
             Algorithm::SlhDsaSha2_128s => false,
         });
-        if !fits || self.alg.is_some_and(|alg| !names(algorithm, alg)) || self.usage.is_some_and(|usage| usage != "sig")
-        {
+        let restricted = self.unreadable
+            || self.verify == Some(false)
+            || self.alg.is_some_and(|alg| !names(algorithm, alg))
+            || self.usage.is_some_and(|usage| usage != "sig");
+        if !fits || restricted {
             return Ok(None);
         }
-        (!self.private).ok_or(Error::Key)?;
         let member = |member: Option<Str<'_>>| base64url(text(member.ok_or(Error::Key)?)?.as_bytes());
         let (first, second) = match algorithm {
             Algorithm::Ed25519 => (member(self.x)?, Vec::new()),

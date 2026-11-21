@@ -42,8 +42,11 @@ draft](https://datatracker.ietf.org/doc/draft-ietf-jose-pq-composite-sigs/), eac
    `Kind::Access` for a JWT access token. `limits` bound the signature checks of each token.
 2. Give it keys: `with_key(kid, trusted_key)` for a key that you hold, or `with_key_set(jwks)` for the JWK set
    ([RFC 7517](https://www.rfc-editor.org/rfc/rfc7517)) of the issuer. A key set gives each key whose type fits the
-   algorithm. A key whose `alg` names another algorithm, or whose `use` is not `sig`, does not join. A key with a
-   private member refuses the set with `Error::Key`. A profile has at most `KEYS_MAX` (16) keys.
+   algorithm. A key whose `alg` names another algorithm, whose `use` is not `sig`, or whose `key_ops` has no `verify`
+   does not join. A key whose `alg`, `use`, or `key_ops` has another form does not join either: `key_ops` is an
+   array of distinct strings ([RFC 7517, section 4.3](https://www.rfc-editor.org/rfc/rfc7517.html#section-4.3)). The
+   other keys of the set still join. A key set is public, so a private member of any key, of any type, refuses the
+   set with `Error::Key`. A profile has at most `KEYS_MAX` (16) keys.
 3. Call `profile.verify(token)` for a JWS, or `profile.verify_jwt(token, now)` for a JWT. `now` is the time reading
    with its uncertainty bound.
 
@@ -96,7 +99,7 @@ Each `jose::Error` is a small `Copy` value with no part of the token. For each o
 | `Limit` | The token has more than `TOKEN_BYTES_MAX` (16 KiB) bytes, a key set passes a bound, or the signature checks pass the limits |
 | `Algorithm` | `alg` does not name the algorithm of the profile, or the algorithm has no JOSE name |
 | `Header` | The header names a key URL, carries a key, or has `crit` |
-| `Key` | No key of the profile fits the header, or a key of the set is not valid or has a private member |
+| `Key` | No key of the profile fits the header, a key of the set has a private member, or a key of the type of the profile is not valid |
 | `Signature` | The signature does not verify |
 | `Type` | `typ` is not `at+jwt` for `Kind::Access` |
 | `Issuer` | `iss` is not the issuer of the profile |
