@@ -15,7 +15,9 @@ use crate::store::{
     Sequence, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
-use crate::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Outcome, Proposal};
+use crate::transition::{
+    self, Audit, Change, Dependency, Key, Operation, OperationId, Outcome, Proposal, Recover as _, Recovery,
+};
 
 fn now() -> Reading {
     Reading::new(
@@ -955,4 +957,22 @@ fn a_start_on_a_rolled_back_store_refuses_and_a_crashed_start_does_not() {
     harness.run(|_| None);
     assert_eq!(harness.driver.status(), Status::Serving);
     assert!(!harness.holds(&a1p));
+}
+
+/// A client starts an operation again only when the driver can serve it later: after a full queue, before a start, and
+/// as the refusal of the proposal gives it. Each other refusal of the driver stays until the operator acts, so the
+/// client refuses, and does not send the request again in a loop.
+#[test]
+fn a_driver_refusal_restarts_only_when_the_driver_can_serve_the_operation_later() {
+    for (error, recovery) in [
+        (Error::Full, Recovery::Restart),
+        (Error::Down, Recovery::Restart),
+        (Error::Transition(transition::Error::Changed), Recovery::Restart),
+        (Error::Transition(transition::Error::Reuse), Recovery::Refuse),
+        (Error::RecordBytes, Recovery::Refuse),
+        (Error::Binding, Recovery::Refuse),
+        (Error::Restored, Recovery::Refuse),
+    ] {
+        assert_eq!(error.recovery(), recovery, "{error:?}");
+    }
 }

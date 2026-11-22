@@ -54,6 +54,13 @@ registration with `Error::UserVerification`. Offer the explicit registration aft
 `consent(publicKey)` is an optional function of each call. The module calls it with the parsed options before the
 authenticator, and a result of `false` stops the ceremony with `null`.
 
+## Make a change
+
+Call `change(path, body)` for a state change with no ceremony, such as a rename, the removal of a passkey, or a
+sign-out. It sends a same-origin `POST` with the JSON `body`, and gives the JSON of the response, or throws a
+`Problem`. A request that gets no response can have committed, so its recovery is `check`. Give
+`{ signal }` as the third argument to abort it.
+
 ## Handle a problem
 
 Each refusal of the server, and each request that gets no response, throws a `Problem`. Its `recovery` names the

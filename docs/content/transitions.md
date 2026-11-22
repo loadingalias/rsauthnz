@@ -178,6 +178,14 @@ The first observed end stays. A cancel after an observed end changes nothing. A 
 
 Each `rsauthnz::transition::Error` is a small `Copy` value with no secret. `error.recovery()` gives its recovery.
 
+`recovery()` is the method of the trait `transition::Recover`. Each error that a request can reach implements it:
+`transition::Error`, `passkey::Error`, `account::Error`, `session::Error`, `store::driver::Error`, and
+`passkey::Failure` and `session::Failure`, whose failed read gives `Restart`. Bring it into scope with
+`use rsauthnz::transition::Recover as _;`. After a submission, the driver gives `Restart` after `Error::Full` and
+`Error::Down`, the recovery of the proposal after `Error::Transition`, and `Refuse` after each other error, which stays
+until the operator acts. A refused lookup (`Driver::lookup`) is a `driver::InDoubt`, whose recovery is `Lookup`: the
+operation stays in doubt, so the client never starts it again as a new operation.
+
 | `Error` | Cause | `Recovery` |
 | --- | --- | --- |
 | `OperationId` | The operation identity has no bytes or more than 64 bytes | `Refuse` |

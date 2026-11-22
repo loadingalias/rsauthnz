@@ -29,7 +29,7 @@ use rsauthnz::session::{Access, Opened, Opening, Policy, Sessions};
 use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
 use rsauthnz::store::{self, Kind, Profile, Record, Store};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
-use rsauthnz::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal};
+use rsauthnz::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal, Recover as _};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
 use rscodec::base64::Profile::Url;

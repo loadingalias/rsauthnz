@@ -93,7 +93,7 @@ use crate::limits::Limits;
 use crate::store::driver::{self, Driver, Plan};
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal, Recovery};
+use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal, Recover, Recovery};
 
 /// The bytes of an identifier: a locator of 16 bytes, a family number of 16 bytes, and a secret of 32 bytes.
 pub const IDENTIFIER_BYTES: usize = 64;
@@ -968,12 +968,11 @@ pub enum Error {
     Fresh,
 }
 
-impl Error {
+impl Recover for Error {
     /// The recovery of the caller: the recovery of the proposal after [`Error::Transition`], and a new user
     /// verification after [`Error::Fresh`]. Refuse each other request: after [`Error::Unknown`] and [`Error::Ended`], as
     /// a request that is signed out.
-    #[must_use]
-    pub const fn recovery(&self) -> Recovery {
+    fn recovery(&self) -> Recovery {
         match self {
             Self::Transition(error) => error.recovery(),
             Self::Fresh => Recovery::Verify,
@@ -1022,6 +1021,16 @@ pub enum Failure<E> {
     Refused(Error),
     /// A read failed. It is a crash of the binding: start the driver again.
     Store(E),
+}
+
+impl<E> Recover for Failure<E> {
+    /// The recovery of the refusal, and [`Recovery::Restart`] after a failed read: nothing committed.
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Refused(error) => error.recovery(),
+            Self::Store(_) => Recovery::Restart,
+        }
+    }
 }
 
 impl<E> From<Error> for Failure<E> {

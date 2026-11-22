@@ -3,9 +3,9 @@
 use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
 use http::{Response, StatusCode};
 use rsauthnz::passkey::RelyingParty;
-use rsauthnz::transition::Recovery;
+use rsauthnz::transition::{Recover, Recovery};
 
-use crate::Refusal;
+use crate::{CookieName, Error, Refusal, Site};
 
 /// The `Cache-Control` value of each response of the binding.
 pub(crate) const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
@@ -123,6 +123,84 @@ impl Refusal {
             Self::Cookie | Self::Redirect => StatusCode::BAD_REQUEST,
         };
         response(status, PROBLEM, br#"{"recovery":"refuse"}"#.to_vec())
+    }
+}
+
+/// A refused request. `?` gives it from a refusal of a check of the binding, and from each error of rsauthnz with a
+/// recovery ([`Recover`]), so a handler returns `Result<Response<Vec<u8>>, Problem>` and converts no error itself.
+/// [`Problem::response`] gives the response. A problem holds no byte of the request.
+///
+/// ```
+/// use http::Response;
+/// use rsauthnz::{account, session};
+/// use rsauthnz_http::{CookieName, Problem, Site};
+///
+/// const SESSION: CookieName = CookieName::new("session").expect("a token");
+///
+/// /// A sensitive change: `fresh` is the check of the fresh user verification of the session of the request.
+/// fn remove(fresh: Result<(), account::Error>) -> Result<Response<Vec<u8>>, Problem> {
+///     fresh?;
+///     Ok(rsauthnz_http::json(b"{}".to_vec()))
+/// }
+///
+/// let site = Site::new("https://app.example")?;
+/// let response = remove(Err(account::Error::Stale)).unwrap_or_else(|problem| problem.response(&site));
+/// assert_eq!(response.status(), 403);
+/// assert_eq!(response.body(), br#"{"recovery":"verify"}"#);
+///
+/// // A failed read of the store committed nothing, so the client starts again.
+/// let failed = Problem::from(session::Failure::Store("the store is down"));
+/// assert_eq!(failed.response(&site).status(), 409);
+///
+/// // A session that does not serve clears its cookie.
+/// let response = Problem::SignedOut(SESSION).response(&site);
+/// assert_eq!(response.headers()["set-cookie"], "__Host-session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// A check of the binding refused the request.
+    Refusal(Refusal),
+    /// An operation refused, with the recovery of the client.
+    Recovery(Recovery),
+    /// The session cookie of this name serves no session: its value is not valid, or its session is unknown, ended, or
+    /// reused. The client is signed out, and only the server can clear an `HttpOnly` cookie.
+    SignedOut(CookieName),
+}
+
+impl Problem {
+    /// The response: [`Refusal::response`] of a refusal, [`problem`] of a recovery, and for [`Problem::SignedOut`] the
+    /// response of [`Recovery::Refuse`] that clears the cookie ([`Site::clear_cookie`]).
+    #[must_use]
+    pub fn response(self, site: &Site) -> Response<Vec<u8>> {
+        match self {
+            Self::Refusal(refusal) => refusal.response(),
+            Self::Recovery(recovery) => problem(recovery),
+            Self::SignedOut(name) => {
+                let mut response = problem(Recovery::Refuse);
+                site.clear_cookie(response.headers_mut(), name);
+                response
+            }
+        }
+    }
+}
+
+impl From<Refusal> for Problem {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refusal(refusal)
+    }
+}
+
+impl<E: Recover> From<E> for Problem {
+    fn from(error: E) -> Self {
+        Self::Recovery(error.recovery())
+    }
+}
+
+impl Recover for Error {
+    /// [`Recovery::Refuse`]: a value of the host refuses, so the same request refuses again until the host changes it.
+    fn recovery(&self) -> Recovery {
+        Recovery::Refuse
     }
 }
 

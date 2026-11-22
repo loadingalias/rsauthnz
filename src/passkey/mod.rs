@@ -169,7 +169,7 @@ use crate::store::driver::{self, Driver, Plan, record};
 use crate::store::journal::Role;
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, OperationId, Prepared, Proposal, Recovery};
+use crate::transition::{self, Audit, Change, Dependency, OperationId, Prepared, Proposal, Recover, Recovery};
 
 /// The time from the start of a registration to the end of its pending record: 300 seconds, the timeout of the
 /// options. WebAuthn Level 3 recommends 300 to 600 seconds when the ceremony requires user verification.
@@ -1722,12 +1722,11 @@ pub enum Error {
     Dit,
 }
 
-impl Error {
+impl Recover for Error {
     /// The recovery of the caller: start a new ceremony after [`Error::Challenge`], verify the user again after
     /// [`Error::Fresh`], and the recovery of the proposal after [`Error::Transition`] and [`Error::Session`]. Refuse each
     /// other request.
-    #[must_use]
-    pub const fn recovery(&self) -> Recovery {
+    fn recovery(&self) -> Recovery {
         match self {
             Self::Challenge => Recovery::Restart,
             Self::Fresh => Recovery::Verify,
@@ -1796,6 +1795,16 @@ pub enum Failure<E> {
     Refused(Error),
     /// A read failed. It is a crash of the binding: start the driver again.
     Store(E),
+}
+
+impl<E> Recover for Failure<E> {
+    /// The recovery of the refusal, and [`Recovery::Restart`] after a failed read: nothing committed.
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Refused(error) => error.recovery(),
+            Self::Store(_) => Recovery::Restart,
+        }
+    }
 }
 
 impl<E> From<Error> for Failure<E> {

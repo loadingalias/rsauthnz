@@ -69,6 +69,12 @@ export async function register({ options, finish, body = {}, conditional = false
   return post(finish, credential.toJSON(), signal, "check");
 }
 
+/** A JSON state change with no ceremony, such as a rename or a sign-out: a `POST` of `body` to `path`. It gives the JSON
+ * of the response, or throws a `Problem`. A request with no response can have committed, so its recovery is `check`. */
+export function change(path, body = {}, { signal } = {}) {
+  return post(path, body, signal, "check");
+}
+
 /** After the deletion of the passkey `credentialId` (base64url): the provider removes it. Gives `false` when the
  * browser has no Signals API. */
 export function signalDeleted({ rpId, credentialId }) {

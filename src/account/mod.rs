@@ -86,7 +86,7 @@ use crate::store::driver::{Driver, Plan};
 use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Change, Dependency, Key, OperationId, Prepared, Proposal, Recovery};
+use crate::transition::{self, Change, Dependency, Key, OperationId, Prepared, Proposal, Recover, Recovery};
 
 /// The most time from the user verification of a session to the commit of a sensitive change: 300 seconds. An
 /// application can only make it shorter ([`Fresh::check`]).
@@ -736,11 +736,10 @@ pub enum Error {
     Time(TimeError),
 }
 
-impl Error {
+impl Recover for Error {
     /// The recovery of the caller: verify the user again after [`Error::Stale`], and send the request again with the
     /// current identifier after [`Error::Replaced`]. Refuse each other request.
-    #[must_use]
-    pub const fn recovery(&self) -> Recovery {
+    fn recovery(&self) -> Recovery {
         match self {
             Self::Stale => Recovery::Verify,
             Self::Replaced => Recovery::Restart,

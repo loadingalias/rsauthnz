@@ -53,7 +53,8 @@ use crate::id::AuthorityVersion;
 use crate::limits::Limits;
 use crate::time::Reading;
 use crate::transition::{
-    self, Change, Dependency, Effect as Call, Intent, Key, Operation, OperationId, Outcome, Proposal, Receipt,
+    self, Change, Dependency, Effect as Call, Intent, Key, Operation, OperationId, Outcome, Proposal, Receipt, Recover,
+    Recovery,
 };
 
 /// The most journal entries after the mark that the driver reads or keeps. A start refuses a longer journal with
@@ -233,6 +234,49 @@ pub enum Error {
     /// [`Driver::start`].
     Restored,
 }
+
+impl Recover for Error {
+    /// The recovery of a call that commits nothing when it refuses, such as [`Driver::submit`]. A refused lookup of an
+    /// operation in doubt is an [`InDoubt`], with its own recovery. The recovery of the proposal after
+    /// [`Error::Transition`]. [`Recovery::Restart`] after [`Error::Full`] and [`Error::Down`]: nothing committed, and
+    /// the driver serves the operation later. [`Recovery::Refuse`] after each other error: the record bound, a counter,
+    /// the binding, or the state of the store refuses the request until the operator acts.
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Transition(error) => error.recovery(),
+            Self::Full | Self::Down => Recovery::Restart,
+            Self::Unsupported
+            | Self::Journal(_)
+            | Self::Long
+            | Self::RecordBound(_)
+            | Self::RecordBytes
+            | Self::Overflow
+            | Self::Binding
+            | Self::Record
+            | Self::Restored => Recovery::Refuse,
+        }
+    }
+}
+
+/// A lookup that the driver refused ([`Driver::lookup`]). The operation stays in doubt: its first attempt can have
+/// committed. Look it up again when the driver serves, and never propose it again as a new operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InDoubt(pub Error);
+
+impl Recover for InDoubt {
+    /// [`Recovery::Lookup`], whatever the error of the driver: the first attempt can have committed.
+    fn recovery(&self) -> Recovery {
+        Recovery::Lookup
+    }
+}
+
+impl fmt::Display for InDoubt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the lookup refused, and the operation stays in doubt: {}", self.0)
+    }
+}
+
+impl core::error::Error for InDoubt {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -552,9 +596,9 @@ impl Driver {
     ///
     /// # Errors
     ///
-    /// [`Error::Full`].
-    pub fn lookup(&mut self, operation: Operation) -> Result<Ticket, Error> {
-        (self.queue.len() < QUEUE_MAX).ok_or(Error::Full)?;
+    /// [`InDoubt`] with [`Error::Full`]: the operation stays in doubt.
+    pub fn lookup(&mut self, operation: Operation) -> Result<Ticket, InDoubt> {
+        (self.queue.len() < QUEUE_MAX).ok_or(InDoubt(Error::Full))?;
         let ticket = self.ticket();
         let key = Kind::Outcome
             .key(operation.id.as_bytes())

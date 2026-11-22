@@ -20,6 +20,9 @@
 //! [`browser_module`] of passkey ceremonies. A problem body holds only its recovery, never a byte of
 //! the request. The HTTP version of a message changes no result.
 //!
+//! A handler returns `Result<Response<Vec<u8>>, Problem>`: `?` gives a [`Problem`] from each refusal of the binding and
+//! from each error of rsauthnz with a recovery, and [`Problem::response`] gives its response.
+//!
 //! ```
 //! use core::time::Duration;
 //!
@@ -73,7 +76,7 @@ use http::Request;
 use http::header::{AsHeaderName, CONTENT_TYPE, HeaderMap, HeaderValue, ORIGIN};
 
 pub use cookie::CookieName;
-pub use response::{RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins};
+pub use response::{Problem, RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins};
 
 /// The site that the binding serves: its origin, and the `SameSite` value of its cookies.
 #[derive(Clone, Debug)]

@@ -198,8 +198,8 @@ assert_eq!(refused, Failure::Refused(Error::Unknown));
 
 ## Errors
 
-Each `session::Error` is a small `Copy` value with no secret. `error.recovery()` gives `Refuse`, `Verify` for
-`Fresh`, or the recovery of the proposal for `Transition`.
+Each `session::Error` is a small `Copy` value with no secret. `error.recovery()` of the trait `transition::Recover`
+gives `Refuse`, `Verify` for `Fresh`, or the recovery of the proposal for `Transition`.
 
 | `Error` | Cause | Response |
 | --- | --- | --- |

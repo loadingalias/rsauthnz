@@ -24,8 +24,8 @@ session](sessions.md).
 1. At startup, build one `Site` with `Site::new(origin)`. Its cookies have `SameSite=Lax`. Call
    `.same_site(SameSite::Strict)` to change it.
 2. Before each state change, and before other work, call `site.check_change(&request)`. For a JSON body, call
-   `site.json_change(&request, bytes_max)` in its place: it also checks the body and gives its bytes. On
-   `Err(refusal)`, return `refusal.response()`.
+   `site.json_change(&request, bytes_max)` in its place: it also checks the body and gives its bytes. A refusal is
+   a `Problem` ([Return a problem](#return-a-problem)).
 3. Commit the transition of the ceremony. For each outcome other than an accepted one, return
    `problem(recovery)` with the recovery of the outcome (`Outcome::recovery`).
 4. After the commit accepts, write the response. Release a session with `site.set_session` on the headers of the
@@ -178,12 +178,28 @@ Each refusal of a request has the body `{"recovery":"refuse"}`:
 The cost class of each check is `Parse` ([Admit rsauthnz work](admission.md)). Its work is linear in the bytes of the
 fields that it reads, which the server bounds.
 
+### Return a problem
+
+A handler returns `Result<Response<Vec<u8>>, Problem>`. `?` gives a `Problem` from each `Refusal` of the binding and
+from each error of rsauthnz with a recovery (the trait `transition::Recover`), so the handler converts no error
+itself. On `Err(problem)`, return `problem.response(&site)`.
+
+| `Problem` | Response |
+| --- | --- |
+| `Refusal(refusal)` | `refusal.response()` |
+| `Recovery(recovery)` | `problem(recovery)` |
+| `SignedOut(name)` | `problem(Recovery::Refuse)`, and the cookie `name` cleared: give it when the session cookie is not valid, or its session is unknown, ended, or reused ([Check each request](sessions.md#check-each-request)) |
+
+The example of the `Problem` documentation, which `cargo xtask test` runs, returns a stale verification as
+`{"recovery":"verify"}`, a failed read as `409`, and a signed-out session with its cookie cleared.
+
 ### Lost responses
 
 The server owns `Recovery::Lookup`, because only the server holds the operation of the proposal (`Outcome::Unknown`).
 The browser does not know the operation, so it cannot resolve the outcome itself. After a lost response, look up the
-operation with `Driver::lookup` when the driver serves again, within the time that the request can wait. Then answer
-the same request with the result of the lookup:
+operation with `Driver::lookup` when the driver serves again, within the time that the request can wait. A lookup
+that the driver refuses is a `driver::InDoubt`, and `?` gives it `Recovery::Lookup`. Then answer the same request with
+the result of the lookup:
 
 | `Lookup` | Response |
 | --- | --- |

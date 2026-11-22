@@ -672,7 +672,7 @@ pub enum Outcome {
 impl Outcome {
     /// The recovery of the caller, or `None` for an accepted proposal.
     #[must_use]
-    pub const fn recovery(&self) -> Option<Recovery> {
+    pub fn recovery(&self) -> Option<Recovery> {
         match self {
             Self::Accepted(_) => None,
             Self::Conflict => Some(Recovery::Restart),
@@ -729,10 +729,17 @@ pub enum Error {
     Expired,
 }
 
-impl Error {
-    /// The recovery of the caller.
+/// The recovery of a refusal: the action of its caller. Each error that a request can reach implements it, so a
+/// binding maps each one to its response in one place, such as `rsauthnz_http::Problem`.
+pub trait Recover {
+    /// The recovery of the caller after this refusal.
     #[must_use]
-    pub const fn recovery(&self) -> Recovery {
+    fn recovery(&self) -> Recovery;
+}
+
+impl Recover for Error {
+    /// The recovery of the caller: propose again after [`Error::Changed`], and refuse each other request.
+    fn recovery(&self) -> Recovery {
         match self {
             Self::Changed => Recovery::Restart,
             Self::OperationId

@@ -298,8 +298,9 @@ to offer a second passkey to an account whose only passkey is on one device.
 
 ## Errors
 
-Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()` gives its recovery, and
-`rsauthnz_http::problem` gives its response.
+Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()` of the trait `transition::Recover`
+gives its recovery, and `?` in a handler gives the `rsauthnz_http::Problem` of its response
+([Return a problem](http-binding.md#return-a-problem)).
 
 | `Error` | Cause | Recovery |
 | --- | --- | --- |

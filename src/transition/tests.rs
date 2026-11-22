@@ -9,7 +9,7 @@ use core::time::Duration;
 
 use super::{
     Audit, Change, Dependency, Effect, Ended, Error, Intent, Key, Operation, OperationId, Outcome, Prepared, Proposal,
-    Recovery, State,
+    Recover as _, Recovery, State,
 };
 use crate::authz::{self, Permit, Policy, Request, Requirements};
 use crate::cbor::Value;
