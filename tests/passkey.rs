@@ -1,11 +1,13 @@
 //! The passkeys of WebAuthn Level 3: the published registration cases, the options of the profile, each refusal of a
 //! response, one commit for each ceremony, the decision of the application in the credential commit, the completion of
-//! a registration in doubt at a restore, the records of each relying party, and the sign-in.
+//! a registration in doubt at a restore, the records of each relying party, the sign-in, and recovery.
 
 #[path = "passkey/account.rs"]
 mod account;
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
+#[path = "passkey/recovery.rs"]
+mod recovery;
 #[path = "passkey/session.rs"]
 mod session;
 #[path = "passkey/vectors.rs"]
@@ -43,6 +45,8 @@ const RP_ID: &str = "app.example";
 const ORIGIN: &str = "https://app.example";
 /// The HMAC key of the sign-in challenges of the relying party.
 const KEY: [u8; 32] = [3; 32];
+/// The key of the digests of the recovery codes of the relying party.
+const RECOVERY_KEY: [u8; 32] = [4; 32];
 /// The user handle of alice.
 const HANDLE: [u8; 32] = [9; 32];
 
@@ -94,7 +98,9 @@ fn authority() -> Id<Authority> {
 }
 
 fn rp() -> RelyingParty {
-    RelyingParty::new(authority(), RP_ID, ORIGIN, "Acme", KEY, Limits::default()).expect("a relying party")
+    RelyingParty::new(authority(), RP_ID, ORIGIN, "Acme", KEY, Limits::default())
+        .expect("a relying party")
+        .with_recovery(RECOVERY_KEY)
 }
 
 /// The times of the sessions of the tests: a family lives 1,000 seconds, a generation 100 seconds, and a replaced

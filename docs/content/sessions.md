@@ -1,7 +1,8 @@
 # Keep a browser session
 
 `rsauthnz::session` keeps the session of a signed-in browser. The browser holds an opaque identifier in a `__Host-`
-cookie. The store holds one record for each session family. A [passkey sign-in](passkeys.md#sign-in) opens a family.
+cookie. The store holds one record for each session family. A [passkey sign-in](passkeys.md#sign-in) or a
+[recovery](recovery.md#recover) opens a family.
 Each request checks the identifier with one keyed read, and a renewal rotates the identifier in the same family.
 
 The core proposes each change, and the storage binding of the application commits it ([Propose a

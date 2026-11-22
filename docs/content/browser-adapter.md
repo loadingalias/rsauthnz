@@ -43,7 +43,8 @@ sign-in.
 ## Register
 
 Call `register({ options, finish, body })`. `body` is the JSON of the start request, such as the invitation value of
-an activation ([Activate an invitation](accounts.md#activate-an-invitation)). The call calls `navigator.credentials.create()` and sends the credential to `finish`.
+an activation ([Activate an invitation](accounts.md#activate-an-invitation)), or the account name and the code of a
+recovery ([Recover](recovery.md#recover)). The call calls `navigator.credentials.create()` and sends the credential to `finish`.
 
 With `conditional: true`, the browser can create a passkey with no prompt, for a user who just signed in another way
 (conditional create, an upgrade). In a browser with no conditional create, the call gives `null`. Conditional create

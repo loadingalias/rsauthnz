@@ -162,16 +162,19 @@ still owes. A worker skips it.
 ## Range reads
 
 A range read gives the records of one key prefix in key order. It reads only the keys of the prefix, so an ordered
-index serves it without a scan of other records. The core reads three prefixes:
+index serves it without a scan of other records. The core reads these prefixes:
 
 | Prefix | Records | Reader |
 | --- | --- | --- |
 | `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each start, and a worker after a crash |
 | The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md), and its open after a restore lost its record |
 | That prefix and the SHA-256 digest of the authority and an administrator: 65 bytes | The bindings of the administrator | The bootstrap, the challenge, and the recovery of a credential of a [local authority](local-authority.md) |
+| The kind byte of `Kind::Credential` and the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID, user handle]`: 33 bytes | The passkeys of an account | The start of a registration, the list and the removal of [passkeys](accounts.md), and a new recovery code and a [recovery](recovery.md) |
+| The kind byte of `Kind::Session` and the locator of an account: the first 16 bytes of the SHA-256 digest of the CBOR form `["rsauthnz.session.1", authority, audience, account]`, 17 bytes in all | The sessions of an account | The list of [sessions](sessions.md#sign-out-list-and-revoke) and a [recovery](recovery.md) |
 
 A store that partitions its keys can use the first 33 bytes of a key as its partition key. A shorter key is its own
-partition key. Then each range read of the core reads one partition.
+partition key. Then each range read of the core reads one partition, except the read of the sessions of an account:
+its prefix has 17 bytes, and each session key has 33, so it reads the partitions of each session of the account.
 
 ## Expiry
 

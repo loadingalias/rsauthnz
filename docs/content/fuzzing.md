@@ -16,6 +16,7 @@ lock file. libFuzzer holds C++, so it stays out of each library closure.
 | `x509` | `x509::Certificate::parse`, `Certificate::verify` | An input over `CERTIFICATE_BYTES_MAX` refuses with `Error::Bytes`. A signature check runs only for a certificate that parses |
 | `session` | `session::Identifier::parse` | A cookie value of another length than `IDENTIFIER_CHARS` refuses |
 | `bootstrap` | `local::Bootstrap::parse` | No input panics |
+| `recovery` | `recovery::Code::parse` | A text of more than 64 bytes, or with another number of digits than 32 outside the hyphens and spaces, refuses |
 
 A signature check charges its `SignatureBudget` before its work ([Bound the signature
 checks](verification.md#bound-the-signature-checks)). Thus a budget that still has each check shows that no signature
@@ -78,6 +79,7 @@ approval of the owner.
 | `passkey` | The registration of the ES256 case of WebAuthn Level 3, section 16.2, and an assertion of the same credential |
 | `x509` | The five certificates of `tests/x509/`, and the two composite certificates of the LAMPS draft |
 | `session`, `bootstrap` | One identifier and one bootstrap value in their forms |
+| `recovery` | One recovery code in its text form |
 
 ## Campaign record
 
@@ -99,6 +101,7 @@ rsauthnz `4680393` and the targets of this page. It ran the command of [Run a ta
 | `session` | 3,747,303 | 65 | 37,405 bytes |
 | `bootstrap` | 4,079,416 | 59 | 40,611 bytes |
 
-The longest input is the length limit that libFuzzer reached. Only `x509`, `session`, and `bootstrap` passed their
+The longest input is the length limit that libFuzzer reached. The `recovery` target came after this campaign, and no
+campaign has run it yet. Only `x509`, `session`, and `bootstrap` passed their
 byte limits. Thus the over-limit refusals of `cbor`, `cose`, `credential`, `passkey`, and `jose` did not run in this
 campaign, and the next campaign adds `-len_control=0`.

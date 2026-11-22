@@ -16,8 +16,8 @@
 //!
 //! A sensitive change needs a fresh user verification ([`Fresh`]): the evidence of the session has user
 //! verification, and it is at most [`FRESH_MAX`] old at the commit. The sensitive changes are an additional passkey
-//! ([`Decision::Add`](crate::passkey::Decision::Add)), the removal of a passkey ([`RelyingParty::remove`]), the
-//! setup of recovery, and the end of another session of the account
+//! ([`Decision::Add`](crate::passkey::Decision::Add)), the removal of a passkey ([`RelyingParty::remove`]), a new
+//! recovery code ([`RelyingParty::recovery_code`]), and the end of another session of the account
 //! ([`Revoker::Fresh`](crate::session::Revoker::Fresh)). A rename needs only the session of the account
 //! ([`RelyingParty::rename`]).
 //!
@@ -80,10 +80,7 @@ use crate::cbor::Value;
 use crate::crypto;
 use crate::evidence::Evidence;
 use crate::id::{Action, AuthorityVersion, Human, Id, Principal, Resource};
-use crate::passkey::{
-    self, ACTIVATION_CHALLENGE_BYTES, Credential, Failure, REGISTRATION_LIFETIME, RelyingParty, Response, User,
-    UserHandle,
-};
+use crate::passkey::{self, Credential, Failure, RelyingParty, Response, User, UserHandle};
 use crate::session::{Access, Generation};
 use crate::store::driver::{Driver, Plan};
 use crate::store::journal::{Anchor, Role};
@@ -302,9 +299,9 @@ impl Passkey {
 }
 
 /// A credential record of the passkeys of one account, with its record.
-struct Stored {
-    passkey: Passkey,
-    record: Record,
+pub(crate) struct Stored {
+    pub(crate) passkey: Passkey,
+    pub(crate) record: Record,
 }
 
 impl RelyingParty {
@@ -373,8 +370,8 @@ impl RelyingParty {
     /// `PublicKeyCredentialCreationOptionsJSON`, for `PublicKeyCredential.parseCreationOptionsFromJSON()`. The options
     /// require what the options of a registration require, and they exclude no credential. The start writes nothing:
     /// the challenge holds the invitation key and the earliest time of `now` under an HMAC-SHA256 tag of the key of the
-    /// relying party. It serves for [`REGISTRATION_LIFETIME`] from that time, and the activation consumes the
-    /// invitation, so it serves one activation.
+    /// relying party. It serves for [`REGISTRATION_LIFETIME`](crate::passkey::REGISTRATION_LIFETIME) from that time,
+    /// and the activation consumes the invitation, so it serves one activation.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read, and one range read of at most
     /// [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credential records.
@@ -401,14 +398,7 @@ impl RelyingParty {
         let (_, invitation) = self.invitation(store, &key, now).await?;
         (invitation.recipient == *invitee.account).ok_or(passkey::Error::Recipient)?;
         self.unregistered(store, &invitation.handle).await?;
-        let mut challenge = [0; ACTIVATION_CHALLENGE_BYTES];
-        random.fill_bytes(&mut challenge[..32]);
-        let earliest = now.earliest().map_err(passkey::Error::Time)?;
-        let created = u64::try_from(earliest.as_nanos()).map_err(|_| passkey::Error::Time(TimeError::Overflow))?;
-        challenge[32..40].copy_from_slice(&created.to_be_bytes());
-        challenge[40..72].copy_from_slice(&key.as_bytes()[1..]);
-        let tag = crypto::hmac_sha256(self.key.as_bytes(), &self.signed(ACTIVATION_FORM, &challenge[..72]));
-        challenge[72..].copy_from_slice(&tag);
+        let challenge = self.bound_challenge(ACTIVATION_FORM, &key.as_bytes()[1..], now, random)?;
         let user = User {
             account: invitee.account,
             handle: invitation.handle,
@@ -420,9 +410,10 @@ impl RelyingParty {
 
     /// Checks the registration `response` of an activation for `recipient`, and gives the [`Activation`]. The check
     /// refuses a challenge that the key of the relying party did not make, or that is older than
-    /// [`REGISTRATION_LIFETIME`], before any read. Then it reads the invitation of the challenge, checks its recipient,
-    /// checks that the recipient has no passkey, and checks the response as [`Self::verify`] does. The policy must still
-    /// permit the action of the issuer: its permit, and its policy version, are a read of the commit.
+    /// [`REGISTRATION_LIFETIME`](crate::passkey::REGISTRATION_LIFETIME), before any read. Then it reads the invitation of
+    /// the challenge, checks its recipient, checks that the recipient has no passkey, and checks the response as
+    /// [`Self::verify`] does. The policy must still permit the action of the issuer: its permit, and its policy version,
+    /// are a read of the commit.
     ///
     /// The commit consumes the invitation and writes the credential record of the first passkey of the account. Its
     /// plan names the passkey as a sign-in method, so a restore completes an activation that a crash left in doubt.
@@ -453,10 +444,8 @@ impl RelyingParty {
         driver: &mut Driver,
     ) -> Result<Activation, Failure<S::Error>> {
         let challenge = response.challenge();
-        let expires = self.activation_end(challenge, now)?;
-        let key = Kind::Invitation
-            .key(&challenge[40..72])
-            .expect("a key of 33 bytes is valid");
+        let (bound, expires) = self.bound_end(ACTIVATION_FORM, challenge, 32, now)?;
+        let key = Kind::Invitation.key(bound).expect("a key of 33 bytes is valid");
         let (record, invitation) = self.invitation(store, &key, now).await?;
         let end = record.end.ok_or(passkey::Error::Record)?;
         (invitation.recipient == *recipient).ok_or(passkey::Error::Recipient)?;
@@ -638,7 +627,11 @@ impl RelyingParty {
     }
 
     /// The credential records of the account with the user handle `handle`, from one range read of `store`.
-    async fn stored<S: Store>(&self, store: &mut S, handle: &UserHandle) -> Result<Vec<Stored>, Failure<S::Error>> {
+    pub(crate) async fn stored<S: Store>(
+        &self,
+        store: &mut S,
+        handle: &UserHandle,
+    ) -> Result<Vec<Stored>, Failure<S::Error>> {
         let records = store
             .range(&self.account_prefix(handle), None, passkey::CREDENTIALS)
             .await
@@ -682,23 +675,6 @@ impl RelyingParty {
         (now.latest().map_err(passkey::Error::Time)? < end).ok_or(passkey::Error::Invitation)?;
         let invitation = Invitation::decode(&record.data, self)?;
         Ok((record, invitation))
-    }
-
-    /// The end of the activation challenge `challenge` at `now`, if the key made it and it did not end.
-    fn activation_end(&self, challenge: &[u8], now: Reading) -> Result<Duration, passkey::Error> {
-        (challenge.len() == ACTIVATION_CHALLENGE_BYTES).ok_or(passkey::Error::Challenge)?;
-        let (body, tag) = challenge.split_at(72);
-        let tag = <&[u8; 32]>::try_from(tag).map_err(|_| passkey::Error::Challenge)?;
-        crypto::hmac_sha256_verify(self.key.as_bytes(), &self.signed(ACTIVATION_FORM, body), tag)
-            .ok_or(passkey::Error::Challenge)?;
-        let time = body[32..40].first_chunk::<8>().ok_or(passkey::Error::Challenge)?;
-        let created = Duration::from_nanos(u64::from_be_bytes(*time));
-        let expires = created
-            .checked_add(REGISTRATION_LIFETIME)
-            .ok_or(passkey::Error::Time(TimeError::Overflow))?;
-        let latest = now.latest().map_err(passkey::Error::Time)?;
-        (created <= latest && latest < expires).ok_or(passkey::Error::Challenge)?;
-        Ok(expires)
     }
 
     /// The key of the invitation record of the value `value`: [`Kind::Invitation`] with the SHA-256 digest of the CBOR

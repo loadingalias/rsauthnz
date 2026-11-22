@@ -20,7 +20,8 @@ of the application accepts it ([Propose a transition](transitions.md)).
   seconds).
 - A **fresh user verification** (`Fresh`) is a session whose evidence has user verification and is at most
   `FRESH_MAX` (300 seconds) old. A **sensitive change** needs one: an additional passkey, the removal of a passkey,
-  the setup of recovery, and the end of another session of the account. A rename and a sign-out need none.
+  a new recovery code ([Recover an account](recovery.md#make-a-recovery-code)), and the end of another session of the
+  account. A rename and a sign-out need none.
 
 ## Issue an invitation
 
@@ -110,7 +111,7 @@ removals of the last two passkeys cannot both commit. The plan holds each passke
 driver refuses the removal of the last sign-in method that the restore journal records as live.
 
 The removal of the last passkey refuses with `Error::Transition(transition::Error::LastAnchor)`, also when the
-account has a recovery value: a recovery value is no sign-in method. A removal ends no session. To end the sessions of
+account has a [recovery code](recovery.md): a recovery code is no sign-in method. A removal ends no session. To end the sessions of
 a lost device, list them and end each one with `Revoker::Fresh` ([Sign out, list, and
 revoke](sessions.md#sign-out-list-and-revoke)).
 

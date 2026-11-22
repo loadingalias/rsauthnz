@@ -5,24 +5,21 @@ use core::time::Duration;
 
 use rsauthnz::account::{self, Activation, Fresh, INVITATION_BYTES, Invite, Invitee};
 use rsauthnz::authz::{Permit, Policy, Request, Requirements};
-use rsauthnz::cbor::Value;
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::evidence::Evidence;
 use rsauthnz::id::{Action, AuthorityVersion, Human, Id, Principal, Resource};
-use rsauthnz::limits::Limits;
 use rsauthnz::passkey::{Error, Response, UserHandle};
 use rsauthnz::session::{Access, Revoker};
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
-use rsauthnz::store::journal::Role;
 use rsauthnz::store::{Kind, Store};
 use rsauthnz::time::Reading;
-use rsauthnz::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Proposal};
+use rsauthnz::transition::{self, Outcome, Proposal};
 use rsauthnz_conformance::suite::{Fault, Subject as _};
 
 use super::authenticator::{
     self, BACKUP_ELIGIBLE, BACKUP_STATE, Get, Passkey, Registration, USER_PRESENT, USER_VERIFIED,
 };
-use super::{HANDLE, ORIGIN, RP_ID, START, Site, alice, at, authority, ready, refused};
+use super::{HANDLE, ORIGIN, RP_ID, START, Site, alice, at, ready, refused};
 
 /// The user handle of the administrator, and of carol, the recipient of the invitations.
 const ADMIN: [u8; 32] = [7; 32];
@@ -413,39 +410,16 @@ fn a_sensitive_change_with_an_old_or_unverified_assertion_refuses_and_with_a_fre
 fn the_removal_of_the_last_passkey_refuses_also_when_a_recovery_value_is_set() {
     let mut site = Site::new();
     let passkey = site.register(Algorithm::Ed25519, -8, 1, 0);
-    // A recovery value of alice, as the anchor that a recovery setup creates.
-    let recovery = Kind::Recovery.key(b"alice-recovery").expect("a key");
-    let audit = Audit {
-        actor: Principal::Human(alice()),
-        action: Id::new("acme", "recovery.setup").expect("an identifier"),
-        time: at(2),
-    };
-    let operation = OperationId::new(b"recovery-setup").expect("an operation identity");
-    let mut proposal = Proposal::new(operation, audit, &Value::Null, Limits::default()).expect("a proposal");
-    proposal.read(Dependency::Absent(recovery.clone())).expect("a read");
-    let version = AuthorityVersion::new(authority(), &[1]).expect("a version");
-    proposal
-        .change(Change::Write {
-            key: recovery.clone(),
-            version,
-            end: None,
-            data: Box::from(*b"a recovery digest"),
-        })
-        .expect("a change");
-    let plan = Plan {
-        anchors: vec![(recovery.clone(), Role::Recovery(alice()))],
-        ..Plan::default()
-    };
-    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
-
     let access = site.signed_in_at(&passkey, 21, None, VERIFIED);
     let fresh = Fresh::check(&access, account::FRESH_MAX, at(22)).expect("a fresh verification");
+    // A recovery code of alice is an anchor and no sign-in method.
+    let code = site.new_code(&fresh, 22);
     assert_eq!(
-        site.remove(&fresh, &passkey, at(22)).err(),
+        site.remove(&fresh, &passkey, at(23)).err(),
         Some(Error::Transition(transition::Error::LastAnchor))
     );
     assert!(site.node.read(&site.key(&passkey)).is_some());
-    assert!(site.node.read(&recovery).is_some());
+    site.recovery_challenge(&alice(), &code, 24).unwrap();
 }
 
 /// Two removals of the last two passkeys each read the other one as the passkey that stays. One commits, and the read

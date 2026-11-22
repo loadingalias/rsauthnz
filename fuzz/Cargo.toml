@@ -78,6 +78,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "recovery"
+path = "fuzz_targets/recovery.rs"
+test = false
+doc = false
+bench = false
+
 # Integer overflow is a defect in every profile, and an assertion of the crate must fire under the fuzzer.
 [profile.release]
 overflow-checks = true

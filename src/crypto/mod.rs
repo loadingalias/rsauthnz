@@ -4,7 +4,8 @@
 //! [`Algorithm`] is the registry of the trusted signature profiles, and [`Algorithm::report`] gives the guarantee of
 //! each profile. The default profile is composite ML-DSA-65 + Ed25519. SLH-DSA-SHA2-128s is the trust-root profile.
 //! Each signature check of the crate goes through one function, which charges a [`SignatureBudget`] before its work.
-//! Each digest goes through one SHA-256 function.
+//! Each digest goes through one SHA-256 function, and each keyed digest of a recovery code through one keyed BLAKE3
+//! function.
 //!
 //! The composite profiles are those of the [LAMPS composite signatures] (draft 19, which becomes RFC 10073). Both
 //! components sign the same message, and a composite signature verifies only if both components verify. rscrypto
@@ -379,6 +380,25 @@ pub(crate) fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
         hasher.update(part);
     }
     hasher.finalize()
+}
+
+/// The keyed BLAKE3 digest of the concatenation of `parts` under `key`, with no buffer that holds it. Thus a part can
+/// be a secret: the hasher clears its state when it drops.
+pub(crate) fn blake3_keyed(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    use rscrypto::Digest as _;
+
+    let mut hasher = rscrypto::Blake3::new_keyed(key);
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize()
+}
+
+/// Whether two keyed BLAKE3 digests are equal. The comparison takes the same time for each pair.
+pub(crate) fn blake3_keyed_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    rscrypto::Blake3KeyedHash::from_bytes(*a)
+        .ct_eq(&rscrypto::Blake3KeyedHash::from_bytes(*b))
+        .declassify()
 }
 
 /// Two keys are equal when their algorithms and their public keys are equal.

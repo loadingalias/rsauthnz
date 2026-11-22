@@ -9,6 +9,7 @@ The core checks the response and proposes each commit. The storage binding of th
 ([Propose a transition](transitions.md)). The HTTP binding checks each browser request and writes its response
 ([Mount the HTTP binding](http-binding.md)). [Manage accounts](accounts.md) gives the invitation of a new account, an
 additional passkey, the rename and the removal of a passkey, and the fresh user verification of a sensitive change.
+[Recover an account](recovery.md) gives the recovery code of an account and the recovery with a new passkey.
 
 ## The model
 
@@ -329,6 +330,9 @@ Each `passkey::Error` is a small `Copy` value with no secret. `error.recovery()`
 | `Issuer` | The current policy does not permit the action of the issuer of the invitation | `Refuse` |
 | `Lifetime` | The lifetime of an invitation is zero or longer than `INVITATION_LIFETIME_MAX` (7 days) | `Refuse` |
 | `Authorization(refusal)` | The policy refuses the issue of an invitation ([Authorize an operation](authorization.md)) | `Refuse` |
+| `RecoveryKey` | The relying party has no recovery key ([Recover an account](recovery.md)) | `Refuse` |
+| `Code` | The text is not a recovery code, or the account has no recovery code with the value | `Refuse` |
+| `Dit` | This build on this CPU cannot handle a recovery code with data-independent timing | `Refuse` |
 
 `finish` and `sign_in` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for a
 failed read, which is a crash of the binding.

@@ -182,9 +182,13 @@ pub const SIGN_IN_LIFETIME: Duration = Duration::from_secs(300);
 /// and the HMAC-SHA256 tag of both under the key of the relying party.
 const SIGN_IN_CHALLENGE_BYTES: usize = 72;
 
-/// The bytes of an activation challenge: 32 random bytes, the time of its creation in nanoseconds since the Unix epoch,
-/// the digest in the key of its invitation, and the HMAC-SHA256 tag of the three under the key of the relying party.
-pub(crate) const ACTIVATION_CHALLENGE_BYTES: usize = 104;
+/// The bytes of an activation challenge ([`RelyingParty::bound_challenge`]): 32 random bytes, the time of its creation,
+/// the digest in the key of its invitation, and the tag.
+const ACTIVATION_CHALLENGE_BYTES: usize = 104;
+
+/// The bytes of a recovery challenge ([`RelyingParty::bound_challenge`]): 32 random bytes, the time of its creation,
+/// the digest in the key of the record of its recovery code, the version of the record, and the tag.
+const RECOVERY_CHALLENGE_BYTES: usize = 112;
 
 /// The most bytes of a credential ID. WebAuthn Level 3 asks a relying party to refuse a longer one.
 pub const CREDENTIAL_ID_BYTES_MAX: usize = 1023;
@@ -271,8 +275,11 @@ pub struct RelyingParty {
     /// The other origins of the application that use the relying party ID ([`Self::with_related`]).
     related: Vec<String>,
     name: String,
-    /// The HMAC-SHA256 key of the sign-in and activation challenges.
+    /// The HMAC-SHA256 key of the sign-in, activation, and recovery challenges.
     pub(crate) key: SecretBytes<32>,
+    /// The keyed BLAKE3 key of the digests of the recovery codes ([`Self::with_recovery`]), or `None` when the relying
+    /// party offers no recovery.
+    pub(crate) recovery: Option<SecretBytes<32>>,
     pub(crate) limits: Limits,
 }
 
@@ -316,6 +323,7 @@ impl RelyingParty {
             related: Vec::new(),
             name: name.into(),
             key: SecretBytes::new(key),
+            recovery: None,
             limits,
         })
     }
@@ -840,9 +848,55 @@ impl RelyingParty {
         Ok(SignIn { proposal, evidence })
     }
 
+    /// A registration challenge of `form` that writes nothing and serves the ceremony that consumes one record: 32 random
+    /// bytes, the earliest time of `now` in nanoseconds since the Unix epoch, and `bound`, which names the record,
+    /// under the HMAC-SHA256 tag of the key. The ceremony checks it with [`Self::bound_end`].
+    pub(crate) fn bound_challenge(
+        &self,
+        form: &str,
+        bound: &[u8],
+        now: Reading,
+        random: &mut ChaCha20Rng,
+    ) -> Result<Vec<u8>, Error> {
+        let earliest = now.earliest().map_err(Error::Time)?;
+        let created = u64::try_from(earliest.as_nanos()).map_err(|_| Error::Time(TimeError::Overflow))?;
+        let mut challenge = vec![0; 32];
+        random.fill_bytes(&mut challenge);
+        challenge.extend_from_slice(&created.to_be_bytes());
+        challenge.extend_from_slice(bound);
+        let tag = crypto::hmac_sha256(self.key.as_bytes(), &self.signed(form, &challenge));
+        challenge.extend_from_slice(&tag);
+        Ok(challenge)
+    }
+
+    /// The `bound` part of the challenge `challenge` of [`Self::bound_challenge`], with `bound_bytes` bytes, and the end
+    /// of the challenge, if the key made it for `form` and it did not end at `now`. It serves for
+    /// [`REGISTRATION_LIFETIME`] from its time.
+    pub(crate) fn bound_end<'c>(
+        &self,
+        form: &str,
+        challenge: &'c [u8],
+        bound_bytes: usize,
+        now: Reading,
+    ) -> Result<(&'c [u8], Duration), Error> {
+        (challenge.len() == 40 + bound_bytes + 32).ok_or(Error::Challenge)?;
+        let (body, tag) = challenge.split_at(40 + bound_bytes);
+        let tag = <&[u8; 32]>::try_from(tag).map_err(|_| Error::Challenge)?;
+        crypto::hmac_sha256_verify(self.key.as_bytes(), &self.signed(form, body), tag).ok_or(Error::Challenge)?;
+        let (head, bound) = body.split_at(40);
+        let time = head.last_chunk::<8>().ok_or(Error::Challenge)?;
+        let created = Duration::from_nanos(u64::from_be_bytes(*time));
+        let expires = created
+            .checked_add(REGISTRATION_LIFETIME)
+            .ok_or(Error::Time(TimeError::Overflow))?;
+        let latest = now.latest().map_err(Error::Time)?;
+        (created <= latest && latest < expires).ok_or(Error::Challenge)?;
+        Ok((bound, expires))
+    }
+
     /// The bytes that the tag of a challenge covers: the form of its ceremony, the relying party ID, and `body`: the
-    /// random bytes, the time of the challenge, and the invitation of an activation. The body of each form has a fixed
-    /// length, so the bytes have one reading.
+    /// random bytes, the time of the challenge, and the record of an activation or a recovery. The body of each form
+    /// has a fixed length, so the bytes have one reading.
     pub(crate) fn signed(&self, form: &str, body: &[u8]) -> Vec<u8> {
         [form.as_bytes(), self.id.as_bytes(), body].concat()
     }
@@ -1008,12 +1062,12 @@ impl Response {
     ///
     /// [`Error::CredentialId`] if `id` and `rawId` differ, and [`Error::Malformed`] for each other difference from
     /// the form, such as a `type` other than `public-key`, a member that is not base64url, or a `clientDataJSON` that is
-    /// not JSON of the type `webauthn.create` with the challenge of a registration (32 bytes) or of an activation
-    /// ([`RelyingParty::activate`]).
+    /// not JSON of the type `webauthn.create` with the challenge of a registration (32 bytes), of an activation
+    /// ([`RelyingParty::activate`]), or of a recovery ([`RelyingParty::recover`]).
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
         let (id, client_data) = fields.credential("webauthn.create")?;
-        [32, ACTIVATION_CHALLENGE_BYTES]
+        [32, ACTIVATION_CHALLENGE_BYTES, RECOVERY_CHALLENGE_BYTES]
             .contains(&client_data.challenge.len())
             .ok_or(Error::Malformed)?;
         Ok(Self {
@@ -1657,6 +1711,15 @@ pub enum Error {
     Lifetime,
     /// The policy refuses the issue of an invitation.
     Authorization(authz::Refusal),
+    /// The relying party has no recovery key ([`RelyingParty::with_recovery`]), so it issues and checks no recovery
+    /// code.
+    RecoveryKey,
+    /// The text is not a recovery code, or the account has no recovery code with the value: a recovery or a new code
+    /// ended it, or it is the code of another account.
+    Code,
+    /// This build on this CPU cannot encode or decode a recovery code with data-independent timing, as on Windows aarch64
+    /// without `-C target-feature=+dit`.
+    Dit,
 }
 
 impl Error {
@@ -1705,6 +1768,9 @@ impl fmt::Display for Error {
             Self::Issuer => f.write_str("the policy does not permit the action of the issuer of the invitation"),
             Self::Lifetime => f.write_str("the lifetime of the invitation is not valid"),
             Self::Authorization(refusal) => write!(f, "the policy refuses the invitation: {refusal}"),
+            Self::RecoveryKey => f.write_str("the relying party has no recovery key"),
+            Self::Code => f.write_str("the account has no recovery code with the value"),
+            Self::Dit => f.write_str("this CPU cannot handle a recovery code with data-independent timing"),
         }
     }
 }
