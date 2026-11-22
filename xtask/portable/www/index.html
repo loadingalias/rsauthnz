@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rsauthnz portable core</title>
+<script>
+  // The page of `cargo xtask portable`. It starts one dedicated Worker, which runs the core, and posts the report of
+  // the Worker, after the user agent, to the server of the command.
+  const send = (text) => fetch('/report' + location.search, { method: 'POST', body: navigator.userAgent + '\n' + text });
+  const worker = new Worker('worker.js');
+  worker.onmessage = (event) => send(event.data);
+  worker.onerror = (event) => {
+    event.preventDefault();
+    send('worker error: ' + event.message + '\n');
+  };
+</script>

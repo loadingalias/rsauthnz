@@ -3,8 +3,9 @@
 //! Each Cargo command runs Cargo from the toolchain that `rust-toolchain.toml`
 //! pins, in the workspace root, without ambient compiler overrides. The model
 //! command runs the pinned TLA+ checkers under `~/.local/opt`. Local work
-//! and CI use the same commands. Its one dependency is rscrypto, which gives
-//! the SHA-256 of the evidence digest.
+//! and CI use the same commands; the portable command runs only on this Mac,
+//! with its browsers. Its one dependency is rscrypto, which gives the SHA-256
+//! of the evidence digest.
 
 #![expect(
     clippy::print_stderr,
@@ -13,6 +14,7 @@
 
 mod evidence;
 mod induction;
+mod portable;
 
 use core::iter;
 
@@ -36,6 +38,8 @@ Commands
   test [Nextest args]  Run the tests; with no arguments, also run the doctests
   model [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
+  portable             Run the portable core in a browser Worker in Chrome, Firefox, and
+                       Safari, and build it for iOS and Android (this Mac only)
 
 fix, check, and test select the whole workspace unless their arguments select
 packages with -p or --package. They build all features; check also lints the
@@ -122,6 +126,7 @@ fn main() -> ExitCode {
         "check" => Repo::open().and_then(|repo| repo.check(rest)),
         "test" => Repo::open().and_then(|repo| repo.test(rest)),
         "model" => Repo::open().and_then(|repo| repo.model(rest)),
+        "portable" => Repo::open().and_then(|repo| repo.portable(rest)),
         other => Err(Failure::new(format!("unknown command `{other}`\n\n{USAGE}"))),
     };
     match result {

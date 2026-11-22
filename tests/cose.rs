@@ -11,6 +11,9 @@ use rsauthnz::limits::{Limits, SignatureBudget};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
 use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65EcdsaP256, MlDsa65Ed25519, MlDsa65Seed};
 
+#[path = "cose/vectors.rs"]
+mod vectors;
+
 /// The bytes of a string of hexadecimal digits.
 fn hex(digits: &str) -> Vec<u8> {
     digits
@@ -120,19 +123,12 @@ fn ed25519_profile(audience: &str) -> Profile {
 
 #[test]
 fn rfc_9052_c_2_1_sign1_verifies_and_a_changed_payload_refuses() {
-    // Key "11" of RFC 9052 C.7.1 as a COSE_Key, in deterministic order: kty 2, kid '11', crv 1, x, y.
-    let key = hex(concat!(
-        "a50102024231312001215820bac5b11cad8f99f9c72b05cf4b9e26d244dc189f745228255a219a86d6a09eff",
-        "22582020138bf82dc1b6d562be0fa54ab7804a3a64b6d72ccfed6b6fb6ed28bbfc117e",
-    ));
+    let key = hex(vectors::KEY_11);
     let key = Key::decode(&key, Limits::default()).expect("key 11");
     assert_eq!(key.kid, Some(&b"11"[..]));
     let key = TrustedKey::new(Algorithm::Es256, &key).expect("a P-256 key");
 
-    let mut message = hex(concat!(
-        "d28443a10126a10442313154546869732069732074686520636f6e74656e742e58408eb33e4ca31d1c465ab05aac34cc6b23",
-        "d58fef5c083106c4d25a91aef0b0117e2af9a291aa32e14ab834dc56ed2a223444547e01f11d3b0916e5a4c345cacb36",
-    ));
+    let mut message = hex(vectors::SIGN1_C_2_1);
     let sign1 = Sign1::decode(&message, Limits::default()).expect("C.2.1");
     assert_eq!(
         sign1.verify(&key, &mut SignatureBudget::new(&Limits::default())),
@@ -150,14 +146,9 @@ fn rfc_9052_c_2_1_sign1_verifies_and_a_changed_payload_refuses() {
 
 #[test]
 fn rfc_8392_a_3_cwt_verifies_with_the_claims_of_a_1() {
-    let cwt = hex(concat!(
-        "d28443a10126a104524173796d6d657472696345434453413235365850a70175636f61703a2f2f61732e6578616d706c652e",
-        "636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f006",
-        "1a5610d9f007420b7158405427c1ff28d23fbad1f29c4c7c6a555e601d6fa29f9179bc3d7438bacaca5acd08c8d4d4f96131",
-        "680c429a01f85951ecee743a52b9b63632c57209120e1c9e30",
-    ));
-    let x = hex("143329cce7868e416927599cf65a34f3ce2ffda55a7eca69ed8919a394d42f0f");
-    let y = hex("60f7f1a780d8a783bfb7a2dd6b2796e8128dbbcef9d3d168db9529971a36e7b9");
+    let cwt = hex(vectors::CWT_A_3);
+    let x = hex(vectors::CWT_A_3_X);
+    let y = hex(vectors::CWT_A_3_Y);
     let public = PublicKey::P256 {
         x: x[..].try_into().expect("x"),
         y: y[..].try_into().expect("y"),
@@ -176,10 +167,7 @@ fn rfc_8392_a_3_cwt_verifies_with_the_claims_of_a_1() {
     assert_eq!(verified.expires(), Duration::from_secs(1_444_064_944));
 
     // The payload of A.3 is the claims set of A.1, in Figure 2. Figure 3 gives its values.
-    let a1 = hex(concat!(
-        "a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e657861",
-        "6d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71",
-    ));
+    let a1 = hex(vectors::CLAIMS_A_1);
     let claims = Claims::decode(&a1, Limits::default()).expect("A.1");
     assert_eq!(&claims, verified.claims());
     assert_eq!(claims.iss, Some("coap://as.example.com"));

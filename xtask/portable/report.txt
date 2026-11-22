@@ -1,0 +1,12 @@
+cbor rfc8949 appendix-a deterministic: ok 64 vectors
+cbor rfc8949 appendix-a other encodings: ok 17 vectors refuse
+cbor limits: ok 8 limits
+cose rfc9052 c.2.1: ok verifies, and a changed payload refuses
+cwt rfc8392 a.3: ok verifies with the claims of A.1
+credential issue, verify, and possession: ok ML-DSA-65 + Ed25519
+credential refusals: ok a changed byte and another audience refuse
+authz permit and refusals: ok 6 refusals and one permit
+transition refusals: ok a change with no read and a read past the limit refuse
+conformance memory binding: ok 22 cases pass
+conformance lost outcome reads: ok fails LostResponse
+conformance no instance check: ok fails Fencing

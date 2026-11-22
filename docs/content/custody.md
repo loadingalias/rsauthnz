@@ -52,7 +52,8 @@ rsauthnz = { git = "https://github.com/loadingalias/rsauthnz", branch = "main", 
 ```
 
 The feature has an effect on Linux, macOS, and Windows only. A build for another target, such as WebAssembly, iOS,
-or Android, has no `FileCustody` and no `KeychainCustody`.
+or Android, has no `FileCustody` and no `KeychainCustody`: the host holds the keys ([Run the core in a browser Worker
+and on mobile](portable-core.md)).
 
 1. Select a directory for the key files. Give it to `FileCustody::open` with the isolation that you require. The
    library reads no environment variable and has no default directory.

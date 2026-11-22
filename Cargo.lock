@@ -60,6 +60,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsauthnz-portable"
+version = "0.0.0"
+dependencies = [
+ "rsauthnz",
+ "rsauthnz-conformance",
+ "rscodec",
+ "rscrypto",
+]
+
+[[package]]
 name = "rscodec"
 version = "0.1.0-alpha.2"
 source = "git+https://github.com/loadingalias/rscodec?branch=main#e2708865e2e7abe75d72e765ee0e5abc7871edbe"

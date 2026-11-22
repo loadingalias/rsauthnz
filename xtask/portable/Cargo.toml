@@ -1,0 +1,20 @@
+[package]
+name = "rsauthnz-portable"
+version = "0.0.0"
+description = "The portable consumer of rsauthnz: the cases of the A0 core through the public API, for a dedicated browser Worker and the mobile builds."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The portable core, with its default features: no native custody.
+rsauthnz = { path = "../.." }
+# The memory binding and the conformance suite.
+rsauthnz-conformance = { path = "../../rsauthnz-conformance" }
+# The hex of the vectors. The core takes rscodec with these features too.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["hex", "std"] }
+# The generator of the host seed, and the composite keys that sign in place of custody.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "mldsa65-ed25519"] }
+
+[lints]
+workspace = true
