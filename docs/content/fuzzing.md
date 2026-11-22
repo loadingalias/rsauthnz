@@ -1,16 +1,16 @@
 # Fuzz the parsers
 
-The fuzz targets of rsauthnz give hostile bytes to each parser that reads untrusted input, with the production limits,
-and check that each one refuses before expensive work. They live in `fuzz/`, a separate Cargo workspace with its own
+The fuzz targets of rsauthnz give hostile bytes to each parser that reads untrusted input, and check that each one
+refuses before expensive work. They live in `fuzz/`, a separate Cargo workspace with its own
 lock file. libFuzzer holds C++, so it stays out of each library closure.
 
 ## The targets
 
 | Target | Entry points | What the target checks |
 | --- | --- | --- |
-| `cbor` | `cbor::decode`, `cbor::decode_prefix` | An input over `Limits::bytes` refuses. Each item that decodes encodes to the same bytes again, because the decoder takes only the deterministic encoding |
-| `cose` | `cose::Key::decode`, `cose::Sign1::decode` and `Sign1::verify`, `cose::Profile::verify` | A decode or a limit that refuses does no signature work. A signature check runs only for a `Sign1` that decodes |
-| `credential` | `credential::Profile::verify` | An artifact over `credential::MAX_BYTES` refuses with `Error::Size`. A decode or a limit that refuses does no signature work |
+| `cbor` | `cbor::decode`, `cbor::decode_prefix` | With the default limits and with [drawn limits](#drawn-limits): an input over `Limits::bytes` refuses, and each item that decodes encodes to the same bytes again, because the decoder takes only the deterministic encoding. An item that decodes within the drawn limits decodes within the defaults, and a refusal that names no limit is the same within the defaults |
+| `cose` | `cose::Key::decode`, `cose::Sign1::decode` and `Sign1::verify`, `cose::Profile::verify` | With drawn limits: an input over `Limits::bytes` refuses, and a decode or a limit that refuses does no signature work. A signature check runs only for a `Sign1` that decodes |
+| `credential` | `credential::Profile::verify` | With drawn limits: an artifact over `credential::MAX_BYTES` refuses with `Error::Size`, an artifact over `Limits::bytes` refuses, and a decode or a limit that refuses does no signature work |
 | `passkey` | `passkey::Response::parse`, `RelyingParty::verify`, `passkey::Assertion::parse` | A response over 64 KiB refuses |
 | `jose` | `jose::Profile::verify_jwt`, `jose::Profile::with_key_set` | A token over `jose::TOKEN_BYTES_MAX` refuses with `Error::Limit` |
 | `x509` | `x509::Certificate::parse`, `Certificate::verify` | An input over `CERTIFICATE_BYTES_MAX` refuses with `Error::Bytes`. A signature check runs only for a certificate that parses |
@@ -25,6 +25,26 @@ work ran, and the targets read it from outside the crate.
 Each target also fails on a panic, on a report of AddressSanitizer, and on one allocation of more than 16 MB. The
 JSON reader and base64url are rscodec's, and rscodec fuzzes them. The `passkey`, `jose`, and `session` targets give
 their input to the core entry points that call them.
+
+## Drawn limits
+
+A fuzzer reaches a limit only with an input that passes it, and in a short run libFuzzer makes no input of 64 KiB. So
+`cbor`, `cose`, and `credential` take their limits from the last 8 bytes of each input, as the `FuzzedDataProvider` of
+libFuzzer takes its parameters from the end, and give the bytes before them to the parser:
+
+| Bytes | Limit | Range |
+| --- | --- | --- |
+| 1–2 | `bytes`, little-endian | 0 to 65,535 |
+| 3 | `depth` | 0 to 16 |
+| 4–5 | `items`, little-endian | 0 to 1,024 |
+| 6 | `map_keys` | 0 to 64 |
+| 7–8 | `string_bytes`, little-endian | 0 to 16,384 |
+
+Each limit is at most its default, so a short input passes each one. A run of 3 minutes reached the refusal of each
+limit of the decoder ([Campaign record](#campaign-record)).
+The production limit checks read these values as they read the defaults. `rsauthnz_fuzz::drawn` in `fuzz/src/lib.rs`
+reads them. Eight `0xff` bytes give the default limits, with 65,535 for `bytes`. The other targets use the default
+limits.
 
 ## Before you start
 
@@ -47,14 +67,12 @@ their input to the core entry points that call them.
    ```sh
    mkdir -p fuzz/corpus/x509
    cargo fuzz run --target aarch64-apple-darwin x509 fuzz/corpus/x509 fuzz/seeds/x509 -- \
-     -max_total_time=180 -max_len=70000 -len_control=0 -malloc_limit_mb=16 -timeout=10
+     -max_total_time=180 -max_len=70000 -malloc_limit_mb=16 -timeout=10
    ```
 
    libFuzzer writes the new inputs to the first directory, `fuzz/corpus/<target>`, which Git ignores. The seeds in
-   `fuzz/seeds/<target>` stay as they are. `-max_len=70000` lets an input pass each byte limit, and
-   `-len_control=0` lets libFuzzer make an input of that length from the start. libFuzzer still grows each input
-   from the seeds, and keeps an input only for new coverage. In runs of 3 minutes, `credential` passed its limit of
-   8 KiB, but the inputs of `cbor` and `cose` stayed under 5 KiB, below their limit of 64 KiB.
+   `fuzz/seeds/<target>` stay as they are. `-max_len=70000` lets an input pass each byte limit of 64 KiB. libFuzzer
+   grows each input from the seeds, so a run of 3 minutes passes such a limit only with [drawn limits](#drawn-limits).
 
 3. A run that ends at its time with no finding prints `Done` and its statistics. A finding stops the run, and
    libFuzzer writes its input to `fuzz/artifacts/<target>/`, which Git ignores. Run the target again with that file
@@ -76,7 +94,7 @@ approval of the owner.
 
 | Directory | Seeds |
 | --- | --- |
-| `cbor` | Small items: integers, an array, a map, a tag, floats, strings, and nested arrays. Also the credential and the COSE key of `cose` |
+| `cbor` | Small items: integers, an array, a map, a tag, floats, strings, and nested arrays. Also the credential and the COSE key of `cose`. Each seed of `cbor`, `cose`, and `credential` ends with eight `0xff` bytes: the default [drawn limits](#drawn-limits) |
 | `cose`, `credential` | A credential of the credential format, from `credential::Draft` and its commit, and a `COSE_Key`. The Ed25519 key of the secret `[1; 32]` signed the credential; `fuzz/src/lib.rs` holds its public key |
 | `jose` | A JWT from `jose::signing_input` and `jose::compact`, signed by the same key, and a JWK set of the key |
 | `passkey` | The registration of the ES256 case of WebAuthn Level 3, section 16.2, and an assertion of the same credential |
@@ -123,3 +141,18 @@ The corpus of `credential` holds an input over `credential::MAX_BYTES` (8,192 by
 ran. The over-limit refusals of `cbor` and `cose` did not run: `cbor::decode` refuses an input over
 `Limits::bytes` (65,536 bytes by default) in a branch of its own, so libFuzzer keeps the first input that reaches
 it, and no input of either corpus is that long.
+
+The third campaign of 2026-11-21 ran the same three targets with [drawn limits](#drawn-limits), for their budget, on
+this Mac, on rsauthnz `dbbb331` and the targets of this page, with the command of [Run a target](#run-a-target), from
+an empty corpus. No target found a crash, a leak, an assertion failure, or an allocation of more than 16 MB:
+
+| Target | Runs | Coverage | Inputs of the corpus that refuse at `Bytes`, `Depth`, `Items`, `MapKeys`, `StringBytes` |
+| --- | --- | --- | --- |
+| `cbor` | 2,635,000 | 409 | 78, 35, 66, 18, 10 |
+| `cose` | 2,523,676 | 934 | 1, 4, 8, 4, 2 |
+| `credential` | 2,324,478 | 1,042 | 1, 4, 6, 2, 2 |
+
+A replay of each corpus through `rsauthnz_fuzz::drawn` and `cbor::decode`, or `cose::Sign1::decode` for `cose` and
+`credential`, gave these counts. Thus the refusal of each limit of the decoder ran in each target. A copy of the
+crate whose decoder has no byte bound failed `cbor` after about 30 inputs, with an input of 14 bytes. With the default
+limits, the same defect needs an input of more than 64 KiB.

@@ -1,16 +1,19 @@
-//! Credentials: `credential::Profile::verify` of an untrusted artifact, with the default limits. An artifact over
-//! `MAX_BYTES`, or one that does not decode, refuses with no signature work.
+//! Credentials: `credential::Profile::verify` of an untrusted artifact, with the limits that the input draws
+//! (`rsauthnz_fuzz::drawn`). An artifact over `MAX_BYTES` or over the byte bound, or one that does not decode, refuses
+//! with no signature work.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use rsauthnz::cose;
 use rsauthnz::credential::{self, Error, MAX_BYTES};
 use rsauthnz::id::Id;
-use rsauthnz::limits::{Limits, SignatureBudget};
-use rsauthnz_fuzz::{issuer, now, untouched};
+use rsauthnz::limits::SignatureBudget;
+use rsauthnz_fuzz::{drawn, issuer, now, untouched};
 
-fuzz_target!(|input: &[u8]| {
-    let limits = Limits::default();
+fuzz_target!(|data: &[u8]| {
+    let Some((input, limits)) = drawn(data) else {
+        return;
+    };
     let profile = credential::Profile::new(
         issuer(),
         Id::new("acme", "auth").expect("an identifier"),
@@ -27,10 +30,14 @@ fuzz_target!(|input: &[u8]| {
             "an artifact over the bound passed its check"
         );
     }
-    if matches!(
+    let refused = matches!(
         checked,
         Err(Error::Size | Error::Cose(cose::Error::Cbor(_) | cose::Error::Malformed | cose::Error::Limit(_)))
-    ) {
+    );
+    if input.len() > limits.bytes {
+        assert!(refused, "an artifact over the byte bound passed its decode");
+    }
+    if refused {
         assert!(untouched(&budget, &limits), "a refused decode did signature work");
     }
 });

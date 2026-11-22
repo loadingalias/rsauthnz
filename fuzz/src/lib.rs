@@ -1,5 +1,5 @@
-//! The shared setup of the fuzz targets of rsauthnz: the trusted key of the seeds, the time of each check, and the
-//! check that no signature work ran.
+//! The shared setup of the fuzz targets of rsauthnz: the trusted key of the seeds, the time of each check, the limits
+//! that a fuzz input draws, and the check that no signature work ran.
 
 use core::time::Duration;
 
@@ -33,6 +33,27 @@ pub fn now() -> Reading {
         Some(Duration::from_secs(1)),
         ReadingSource::Caller,
     )
+}
+
+/// The length of the limits at the end of a fuzz input ([`drawn`]).
+pub const LIMITS_BYTES: usize = 8;
+
+/// The input and the limits of the fuzz input `data`. As in the `FuzzedDataProvider` of libFuzzer, the parameters come
+/// from the end: the last [`LIMITS_BYTES`] bytes give `bytes` (two bytes, little-endian), `depth` (one byte), `items`
+/// (two bytes), `map_keys` (one byte), and `string_bytes` (two bytes), each at most its default. The other limits keep
+/// their defaults. Thus a short input can pass each limit, and a short run reaches the refusal of each one. Eight
+/// `0xff` bytes give the default limits, with 65,535 for `bytes`. `None` if `data` is shorter than the limits.
+#[must_use]
+pub fn drawn(data: &[u8]) -> Option<(&[u8], Limits)> {
+    let (input, &[b0, b1, depth, i0, i1, map_keys, s0, s1]) = data.split_last_chunk::<LIMITS_BYTES>()?;
+    let default = Limits::default();
+    let mut limits = default;
+    limits.bytes = usize::from(u16::from_le_bytes([b0, b1])).min(default.bytes);
+    limits.depth = depth.min(default.depth);
+    limits.items = usize::from(u16::from_le_bytes([i0, i1])).min(default.items);
+    limits.map_keys = usize::from(map_keys).min(default.map_keys);
+    limits.string_bytes = usize::from(u16::from_le_bytes([s0, s1])).min(default.string_bytes);
+    Some((input, limits))
 }
 
 /// Whether `budget` still has each signature check of `limits`: no signature work ran.
