@@ -12,7 +12,8 @@ runtime, filesystem, socket, thread, or shared memory: the host supplies each in
 | Time | A `time::Reading`: the time since the Unix epoch, and the bound of its error | `Date.now()`, with a bound that the application declares |
 | Policy | An implementation of `authz::Policy` ([Authorize an operation](authorization.md)) | The policy of the application |
 | Storage | A storage binding ([Write a storage binding](storage-binding.md)) | The memory binding of `rsauthnz-conformance` keeps its state in the Worker, and the state ends with the Worker ([Test with the memory binding](memory-binding.md)). Persistent browser storage belongs to the application |
-| Custody | The keys that sign | The application holds them: no custody of the library builds for these targets ([Hold keys in custody](custody.md)) |
+| Custody | An implementation of `custody::Custody` that holds the keys that sign | The application supplies it: no custody of the library builds for these targets ([A custody of the host](#a-custody-of-the-host)) |
+| Grant | A `local::HostGrant`: the local owner and the origin of the application, for a [local authority](local-authority.md) | The application builds it at its trusted boundary. A remote caller cannot supply it |
 | Execution | Each operation that reads the store is a future | Poll it with the executor of the host. A future of the memory binding is ready at its first poll |
 
 ## Build the module
@@ -84,6 +85,38 @@ pub extern "C" fn rsauthnz_portable_report() -> *const u8 {
 })();
 ```
 
+## Open a local authority in a Worker
+
+A [local authority](local-authority.md) runs in the Worker with no daemon and no hosted account. The consumer
+`xtask/portable` runs this journey in each browser (`local_journey` in `xtask/portable/src/lib.rs`):
+
+1. Enroll the issuer key in the custody of the host, and open the authority with `Authority::open` under the host
+   grant, on the memory binding with a started commit driver.
+2. Issue a bootstrap value with `authority.issue`. Give a time reading with a known bound: a reading with no bound
+   refuses with `Error::Time`.
+3. Enroll the key of the client in custody. Then call `authority.bootstrap` with the value and the public key of the
+   client, have custody sign `pending.to_be_signed()` with the issuer key, and commit the proposal of `pending.finish`.
+   Only the receipt of the accepted commit gives the ML-DSA-65 + Ed25519 CLI credential.
+4. For each call, take a challenge with `authority.challenge`, prove the key with `cli::prove(&custody, …)`, and commit
+   the proposal of `authority.admit`. `Admission::release` gives the admitted call and its next challenge.
+
+The [cases](#the-cases) show the refusals: a grant of another origin, a consumed value, a changed credential, and a
+composite signature with one invalid half. A finish with no signature, or with the signature of another key, refuses
+and commits nothing. A lost response and an old-snapshot restore follow the journal rules of
+[Restore journal](restore.md). The conformance cases `Bootstrap` and `Rebootstrap` run them in each browser.
+
+### A custody of the host
+
+The application implements `custody::Custody` and makes each handle with `Handle::new` ([Supply a custody](custody.md#supply-a-custody)).
+The consumer's `HostCustody` keeps each composite key in the memory of the Worker, and signs with randomness from the
+generator of the caller. Its limits are those of each custody in a Worker:
+
+- The keys end with the Worker. A new Worker has no issuer key, so a persistent authority needs persistent custody,
+  which the application owns.
+- Each script that runs in the Worker can call the custody. `Report` states `Isolation::User`, the weakest level, and
+  claims no hardware protection.
+- A lost key has no recovery path: the owner issues a new value, and the client bootstraps a new key.
+
 ## Check the portable core
 
 `cargo xtask portable` runs each check of the portable core on this Mac (macOS aarch64). CI builds no wasm32 or
@@ -128,6 +161,9 @@ the seed or the time of the host.
 | `credential refusals` | a changed byte and another audience refuse |
 | `authz permit and refusals` | 6 refusals and one permit |
 | `transition refusals` | a change with no read and a read past the limit refuse |
+| `local authority bootstrap and call` | one administrator, an ML-DSA-65 + Ed25519 credential, and one admitted call |
+| `local authority refusals` | another origin, a reused value, an altered credential, and each invalid composite half refuse |
+| `local authority missing host inputs` | a time with no bound, no signature, and the signature of another key commit nothing |
 | `conformance memory binding` | 22 cases pass |
 | `conformance lost outcome reads` | fails LostResponse |
 | `conformance no instance check` | fails Fencing |
@@ -158,6 +194,6 @@ On `wasm32-unknown-unknown`, the consumer has exactly these crates. The core has
 | `aarch64-apple-ios`, `aarch64-linux-android` | The consumer compiles as an rlib. No device run, custody, or mobile binding is claimed |
 
 The browser runs establish the behavior of the core, not persistent browser custody or storage, and not a real
-authenticator. No WASI target, no thread, and no shared WebAssembly memory is claimed. The cases cover the A0 core:
-codecs, credentials, evidence, policy, transitions, and the memory binding. The local authority, trust snapshots, and
-grant checks join the cases with their stages.
+authenticator. No WASI target, no thread, and no shared WebAssembly memory is claimed. The cases cover the core:
+codecs, credentials, evidence, policy, transitions, the memory binding, and a local authority with a custody of the
+host. Trust snapshots and grant checks join the cases with their stages.

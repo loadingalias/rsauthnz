@@ -7,6 +7,9 @@ credential issue, verify, and possession: ok ML-DSA-65 + Ed25519
 credential refusals: ok a changed byte and another audience refuse
 authz permit and refusals: ok 6 refusals and one permit
 transition refusals: ok a change with no read and a read past the limit refuse
+local authority bootstrap and call: ok one administrator, an ML-DSA-65 + Ed25519 credential, and one admitted call
+local authority refusals: ok another origin, a reused value, an altered credential, and each invalid composite half refuse
+local authority missing host inputs: ok a time with no bound, no signature, and the signature of another key commit nothing
 conformance memory binding: ok 22 cases pass
 conformance lost outcome reads: ok fails LostResponse
 conformance no instance check: ok fails Fencing

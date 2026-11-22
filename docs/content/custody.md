@@ -276,7 +276,8 @@ These are the frequent `Vault` codes. macOS names each code in its `SecBase.h` h
 
 A host, such as a browser application, can supply its own custody. Implement the `Custody` trait, and give a
 `Report` that states your own guarantees. Make each handle with `Handle::new`. The trait is object safe, so a
-consumer takes `&dyn Custody`.
+consumer takes `&dyn Custody`. `HostCustody` in `xtask/portable/src/lib.rs` is a custody for a browser Worker, and
+[A custody of the host](portable-core.md#a-custody-of-the-host) gives its limits.
 
 ## Support
 

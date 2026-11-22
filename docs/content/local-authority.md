@@ -44,7 +44,8 @@ the credential.
    a restore lost the record of the authority, its administrator bindings name the owner, the origin, and the issuer
    key, so another grant or issuer key refuses too.
 2. Issue a value with `authority.issue(store, &grant, administrator, now, random, operation)`. Draw the operation
-   identity from `random`, and keep it. The artifact of the receipt is the text of the value. rsauthnz keeps the
+   identity from `random`, and keep it. `now` needs a known bound, because the end of the value comes from it: a
+   reading with no bound refuses with `Error::Time`. The artifact of the receipt is the text of the value. rsauthnz keeps the
    secret and the text only in memory that it clears when it drops: `Bootstrap`, and the receipt.
 3. Give the text to the client by a local path. Do not put it in a URL, a log, or an argument. Read it from the
    receipt in place, and clear each copy that you make.

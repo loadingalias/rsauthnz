@@ -388,6 +388,8 @@ impl Authority {
         operation: OperationId,
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
         (*grant == self.grant).ok_or(Error::Grant)?;
+        // The end of the value comes from `now`, so a reading with no bound would give the value no bounded lifetime.
+        now.latest().map_err(Error::Time)?;
         let issued = now.estimate().as_secs();
         let expires = issued
             .checked_add(LIFETIME.as_secs())
