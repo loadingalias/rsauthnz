@@ -33,7 +33,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "rsauthnz-conformance", "rsauthnz-http", "xtask", "xtask/portable", "examples/storage-binding", "examples/native-cli"]
+members = [".", "rsauthnz-conformance", "rsauthnz-http", "xtask", "xtask/portable", "examples/storage-binding", "examples/native-cli", "examples/web"]
 
 # No `rust-version`: development requires the nightly pinned in
 # rust-toolchain.toml, which a release number cannot express.

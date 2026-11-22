@@ -4,7 +4,7 @@ The browser adapter is one JavaScript module, `rsauthnz-http/browser/rsauthnz.js
 step. It runs the passkey ceremonies of [Register a passkey and sign in](passkeys.md) in the browser. It fetches the
 options from the server and calls the WebAuthn API. Then it sends `credential.toJSON()` back as a JSON state change. It also
 calls the Signals API, so that a password manager stays in step with the passkeys of the server. The browser runs each
-ceremony, and the server checks and commits it.
+ceremony, and the server checks and commits it. The page of the [web example](web-example.md) uses the module.
 
 The module is under 8 KiB. The adapter needs no WebAssembly, local database, or framework.
 

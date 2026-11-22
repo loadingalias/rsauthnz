@@ -1,0 +1,38 @@
+[package]
+name = "web"
+version = "0.0.0"
+description = "A web application on axum that mounts rsauthnz-http: passkeys, sessions, invitations, and recovery on the memory binding."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The interim host of the example (approved 2026-11-21): HTTP/1.1 and HTTP/2 on Tokio. No library crate depends on it.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "http2", "tokio"] }
+# The request and response values that axum and rsauthnz-http share.
+http = "1.5"
+# The ceremonies, the sessions, recovery, and the commit driver.
+rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
+# The memory binding of the storage contract, and the executor of the effects of the driver on it.
+rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
+# The checks and the responses of a site that serves browsers, and the browser adapter.
+rsauthnz-http = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-http" }
+# The JSON of the request bodies and the responses, and the base64url of the identifiers in them.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json", "std"] }
+# The seeded random generator that the ceremonies take.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"] }
+# The runtime of the server.
+tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt"] }
+
+[dev-dependencies]
+# The HTTP/2 client of the check of the protocol, from the closure of axum.
+h2 = "=0.4.20"
+# The test authenticator signs with these keys.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "sha2"] }
+# The macro of the tests, from the closure of axum.
+tokio = { version = "=1.54.1", default-features = false, features = ["macros", "net", "rt"] }
+# `oneshot` drives the router in process, from the closure of axum.
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+
+[lints]
+workspace = true

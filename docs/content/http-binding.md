@@ -35,6 +35,8 @@ session](sessions.md).
 6. Each response has a `Vec<u8>` body. Give it to your framework with `Response::map`, which converts the body into
    the body type of the framework.
 
+[Run the web example](web-example.md) mounts the binding on axum, with each ceremony of a site.
+
 This example is also the example of the `rsauthnz_http` crate documentation, and `cargo xtask test` runs it:
 
 ```rust
