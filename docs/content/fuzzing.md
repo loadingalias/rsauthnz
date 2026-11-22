@@ -41,17 +41,20 @@ their input to the core entry points that call them.
    cargo fuzz build --target aarch64-apple-darwin
    ```
 
-2. Run one target for 3 minutes, from its seeds:
+2. Make the corpus directory of the target, and run the target for 3 minutes, from its seeds. libFuzzer refuses a
+   corpus directory that does not exist:
 
    ```sh
+   mkdir -p fuzz/corpus/x509
    cargo fuzz run --target aarch64-apple-darwin x509 fuzz/corpus/x509 fuzz/seeds/x509 -- \
      -max_total_time=180 -max_len=70000 -len_control=0 -malloc_limit_mb=16 -timeout=10
    ```
 
    libFuzzer writes the new inputs to the first directory, `fuzz/corpus/<target>`, which Git ignores. The seeds in
    `fuzz/seeds/<target>` stay as they are. `-max_len=70000` lets an input pass each byte limit, and
-   `-len_control=0` gives the inputs that length from the start, so the over-limit paths run too. With no
-   `-len_control=0`, libFuzzer grows the length slowly, and a short run never passes a limit of 64 KiB.
+   `-len_control=0` lets libFuzzer make an input of that length from the start. libFuzzer still grows each input
+   from the seeds, and keeps an input only for new coverage. In runs of 3 minutes, `credential` passed its limit of
+   8 KiB, but the inputs of `cbor` and `cose` stayed under 5 KiB, below their limit of 64 KiB.
 
 3. A run that ends at its time with no finding prints `Done` and its statistics. A finding stops the run, and
    libFuzzer writes its input to `fuzz/artifacts/<target>/`, which Git ignores. Run the target again with that file
@@ -105,3 +108,18 @@ The longest input is the length limit that libFuzzer reached. The `recovery` tar
 campaign has run it yet. Only `x509`, `session`, and `bootstrap` passed their
 byte limits. Thus the over-limit refusals of `cbor`, `cose`, `credential`, `passkey`, and `jose` did not run in this
 campaign, and the next campaign adds `-len_control=0`.
+
+The second campaign of 2026-11-21 ran `cbor`, `cose`, and `credential` for their budget on this Mac, on rsauthnz
+`638be6f`, with the command of [Run a target](#run-a-target), so with `-len_control=0`. No target found a crash, a
+leak, an assertion failure, or an allocation of more than 16 MB:
+
+| Target | Runs | Coverage | Longest input of the corpus |
+| --- | --- | --- | --- |
+| `cbor` | 2,403,006 | 382 | 4,935 bytes |
+| `cose` | 2,456,590 | 910 | 1,861 bytes |
+| `credential` | 2,642,960 | 1,033 | 8,220 bytes |
+
+The corpus of `credential` holds an input over `credential::MAX_BYTES` (8,192 bytes), so its over-limit assertion
+ran. The over-limit refusals of `cbor` and `cose` did not run: `cbor::decode` refuses an input over
+`Limits::bytes` (65,536 bytes by default) in a branch of its own, so libFuzzer keeps the first input that reaches
+it, and no input of either corpus is that long.
