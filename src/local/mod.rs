@@ -29,6 +29,9 @@
 //! report ([`Authority::report`]) gives each issue of the log and each binding, also after a restore. After a lost
 //! response, custody signs the credential of the binding again ([`Authority::credential`]).
 //!
+//! Each operation other than the report refuses a reading of `now` with no bound with [`Error::Time`] before its first
+//! read: the end of a value, of a challenge, or of a credential comes from the reading.
+//!
 //! Each operation reads the store with [`Store::read`] and [`Store::range`], and gives a proposal and its plan. Submit
 //! them to the commit driver ([`Driver::submit`](crate::store::driver::Driver::submit)). A proposal that depends on a
 //! one-use value or a challenge carries its end as its deadline, so its commit refuses after it. Only the receipt of
@@ -388,7 +391,6 @@ impl Authority {
         operation: OperationId,
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
         (*grant == self.grant).ok_or(Error::Grant)?;
-        // The end of the value comes from `now`, so a reading with no bound would give the value no bounded lifetime.
         now.latest().map_err(Error::Time)?;
         let issued = now.estimate().as_secs();
         let expires = issued
@@ -502,6 +504,7 @@ impl Authority {
         serial: Serial,
         now: Reading,
     ) -> Result<Pending<'_>, Failure<S::Error>> {
+        now.latest().map_err(Error::Time)?;
         let identity = self.identity(value);
         let key = value_key(&identity);
         let record = read(store, &key).await?.ok_or(Error::Unknown)?;
@@ -570,6 +573,7 @@ impl Authority {
         holder: &[u8; 1984],
         now: Reading,
     ) -> Result<Reissue, Failure<S::Error>> {
+        now.latest().map_err(Error::Time)?;
         let (.., held) = self.bound(store, administrator, now).await?.ok_or(Error::Unknown)?;
         (held.holder == crypto::sha256(holder)).ok_or(Error::Unknown)?;
         Ok(Reissue {
@@ -605,6 +609,7 @@ impl Authority {
         random: &mut ChaCha20Rng,
         operation: OperationId,
     ) -> Result<Offer, Failure<S::Error>> {
+        now.latest().map_err(Error::Time)?;
         let (binding, record, _) = self.bound(store, administrator, now).await?.ok_or(Error::NotEnrolled)?;
         let key = cli::key(&self.id, administrator);
         let pending = read(store, &key).await?;
@@ -755,6 +760,7 @@ impl Authority {
         now: Reading,
         random: &mut ChaCha20Rng,
     ) -> Result<(Proposal, Admission, Key), Failure<S::Error>> {
+        now.latest().map_err(Error::Time)?;
         let verified = self
             .profile
             .verify(credential, now, &mut SignatureBudget::new(&self.limits))

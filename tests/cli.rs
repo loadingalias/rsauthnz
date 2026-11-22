@@ -848,3 +848,50 @@ fn a_root_key_refuses_as_an_issuer_key_and_as_a_cli_key() {
         Err(cli::Error::Credential(credential::Error::Profile))
     );
 }
+
+/// A host whose clock gives no bound gets `Error::Time` from each operation, before its reads: also for an
+/// administrator with no binding, and for a valid credential. Another error would send the host to the wrong recovery.
+#[test]
+fn a_reading_with_no_bound_refuses_each_operation_before_its_first_read() {
+    let files = Files::new("bound");
+    let mut world = World::new(&files.custody);
+    let auth = world.open("auth");
+    let value = world.issue(&auth, "alice", now()).unwrap();
+    let (key, credential) = world.enroll(&auth, "bob");
+    let unbounded = Reading::new(START, None, ReadingSource::Caller);
+    let time = Failure::Refused(Error::Time(rsauthnz::time::TimeError::UnknownBound));
+    let (alice, carol) = (Id::new("acme", "alice").unwrap(), Id::new("acme", "carol").unwrap());
+    let operation = world.operation();
+    let issued = ready(auth.issue(
+        &mut world.memory,
+        &world.grant,
+        carol.clone(),
+        unbounded,
+        &mut world.random,
+        operation,
+    ));
+    assert_eq!(issued.err(), Some(time));
+    let pending = ready(auth.bootstrap(&mut world.memory, &value, &holder(&key), Serial(9), unbounded));
+    assert_eq!(pending.err(), Some(time));
+    let reissue = ready(auth.credential(&mut world.memory, &carol, &holder(&key), unbounded));
+    assert_eq!(reissue.err(), Some(time), "an administrator with no binding");
+    let operation = world.operation();
+    let offer = ready(auth.challenge(&mut world.memory, &carol, unbounded, &mut world.random, operation));
+    assert_eq!(offer.err(), Some(time), "an administrator with no binding");
+    let challenge = world.challenge(&auth, "bob", now());
+    let request = call(challenge, "call-1", "status");
+    let proof = world.prove(&key, &credential, &request);
+    let admitted = world.admit(&auth, &credential, &proof, &request, unbounded);
+    assert_eq!(admitted.err(), Some(time), "a valid credential");
+    let unlink = Unlink::new(challenge, world.operation(), alice, Limits::default()).unwrap();
+    let proof = world.prove(&key, &credential, unlink.call());
+    let unlinked = ready(auth.unlink(
+        &mut world.memory,
+        &credential,
+        &proof,
+        &unlink,
+        unbounded,
+        &mut world.random,
+    ));
+    assert_eq!(unlinked.err(), Some(time), "a valid credential");
+}

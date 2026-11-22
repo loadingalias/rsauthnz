@@ -268,7 +268,7 @@ administrator is one range read of its prefix, and it gives at most `ADMINISTRAT
 | `NotEnrolled` | No administrator binding with a valid CLI credential holds the credential or the administrator, or the credential is not the credential of its binding | Refuse the call |
 | `Challenge` | The binding holds no pending challenge, another one, or one whose end passed: a call consumed it, its end passed, or a restore ended it | Refuse the call. The client asks for a challenge, and makes a new call |
 | `Record` | A record of the authority has no valid form | Restore the store from a snapshot |
-| `Time` | The reading has no bound, or a time overflows | Use a reading with a bound |
+| `Time` | The reading has no bound, or a time overflows. Each operation other than the report checks the bound before its first read | Use a reading with a bound |
 | `Credential` | The credential, its signature, or the proof refuses | Refuse the call. A refused signature shows a fault of custody or another key |
 | `Transition` | The proposal refuses. `transition::Error::LastAnchor` for the unlink of the last administrator with a valid CLI credential | Follow the recovery of the `transition::Error` |
 
