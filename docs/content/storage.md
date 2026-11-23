@@ -106,6 +106,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Local` | The record of a [local authority](local-authority.md): its host grant, its issuer key, and the log of its bootstrap values | `None` |
 | `Issuer` | An issuer of workload credentials: its authority, its current key and its previous key, its audiences, and its ceiling ([Issue and manage workload credentials](workload.md)) | `None` |
 | `Workload` | The registration of a workload: the workload, its registered proof key, and its generation | `None` |
+| `Removal` | The removal mark of a passkey, at the identifier of its credential key. It ends after 400 days, and a restore can lose it: a sign-in then refuses, which is safe ([Remove a passkey](accounts.md#remove-a-passkey)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for

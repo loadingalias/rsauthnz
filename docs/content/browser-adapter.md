@@ -31,7 +31,9 @@ Serve `rsauthnz_http::browser_module()` at a path of the site, such as `/rsauthn
 
 Call `signIn({ options, finish })` from the click of a sign-in button. `options` and `finish` are the paths of the
 server. The call fetches new options, calls `navigator.credentials.get()`, and sends the credential to `finish`. It
-gives the JSON of the finish response, or throws a `Problem`.
+gives the JSON of the finish response, or throws a `Problem`. When the server answers `forget`, the passkey was
+removed. The call then tells the provider to forget it (`signalUnknownCredential`) before it throws, so the page
+needs no code for it.
 
 For the autofill of conditional mediation, give the username input `autocomplete="username webauthn"`. On page load,
 call `signIn({ options, finish, conditional: true, signal })`. The browser offers each passkey of the site in the
@@ -71,6 +73,7 @@ action of the page, and its `status` is the HTTP status, or 0 when no response a
 | `restart` | Nothing committed, such as a conflict or a challenge that ended | Starts the ceremony again |
 | `check` | The outcome is unknown: the server could not resolve it, or the finish got no response | Loads the current state, such as the account page. It never sends the request again |
 | `verify` | The change needs a fresh user verification ([Manage accounts](accounts.md#fresh-user-verification)) | Calls `signIn` again, which replaces the session, then starts the change again |
+| `forget` | A removal ended the passkey of the sign-in ([Remove a passkey](accounts.md#remove-a-passkey)). `signIn` has called `signalDeleted` for it already | Asks for a sign-in with another passkey |
 | `refuse` | The server refused the request | Stops, and shows the refusal |
 
 A finish that gets no response can have committed, so its recovery is `check`. An abort of the `signal` of a request
@@ -85,7 +88,7 @@ device then learns a change at the next sign-in there.
 
 | Function | When | Signals API call |
 | --- | --- | --- |
-| `signalDeleted({ rpId, credentialId })` | After the deletion of a passkey | `signalUnknownCredential` |
+| `signalDeleted({ rpId, credentialId })` | After the deletion of a passkey. `signIn` also calls it after `forget` | `signalUnknownCredential` |
 | `signalAccepted({ rpId, userId, credentialIds })` | After a change of the passkeys of an account, and at each sign-in. `userId` is the user handle. `credentialIds` holds each passkey of the account: the provider hides each other one | `signalAllAcceptedCredentials` |
 | `signalRenamed({ rpId, userId, name, displayName })` | After a rename of the account ([Rename an account](accounts.md#rename-an-account)), and at each sign-in | `signalCurrentUserDetails` |
 

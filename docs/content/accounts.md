@@ -107,10 +107,18 @@ expired commit, verify the user again and finish again. The pending registration
 
 ## Remove a passkey
 
-Call `rp.remove(&mut store, &fresh, &handle, id, now, &mut random)`, and submit the proposal with its plan. The commit
-ends the credential record of the passkey `id`. It reads another passkey of the account at its version, so two
-removals of the last two passkeys cannot both commit. The plan holds each passkey of the account, and the commit
-driver refuses the removal of the last sign-in method that the restore journal records as live.
+Call `rp.remove(&mut store, &fresh, &passkey, now, &mut random, &mut driver)` with a listed `passkey`, and submit
+the proposal with its plan. The commit ends the credential record of the passkey. It reads another passkey of the
+account at its version, so two removals of the last two passkeys cannot both commit. The plan holds each passkey of
+the account, and the commit driver refuses the removal of the last sign-in method that the restore journal records as
+live.
+
+The commit also writes the **removal mark** of the passkey (`Kind::Removal`), which ends after
+`REMOVAL_MARK_LIFETIME` (400 days). A provider that no Signals call reached still offers the passkey. Until the mark
+ends, a sign-in with it refuses with `Error::Removed`, whose recovery is `Forget`, so the provider can forget it. A
+passkey that the store never held refuses with `Error::Credential`: its registration finish can come late, so the
+provider keeps it. Each commit that writes a passkey reads its removal mark as absent, so a removed passkey never
+registers again. A recovery ends passkeys with no mark ([Recover](recovery.md#recover)).
 
 The removal of the last passkey refuses with `Error::Transition(transition::Error::LastAnchor)`, also when the
 account has a [recovery code](recovery.md): a recovery code is no sign-in method. A removal ends no session. To end the sessions of
@@ -208,5 +216,6 @@ The tests on this Mac (macOS aarch64) run on the memory binding with the test au
 cover one activation of an invitation, two concurrent activations, another recipient, a policy that no longer permits
 the issuer, an activation in doubt at a restore, and a dump of the store with no invitation value. They also cover
 an old and an unverified assertion, the deadline of a verification, the last passkey with a recovery value, two
-concurrent removals, a rename, and the end of another session. The [web example](web-example.md) tests the rename of
-an account through its HTTP API. No real browser or authenticator has run an activation or a Signals call yet.
+concurrent removals, a rename, a sign-in with a removed passkey and its second registration, and the end of another
+session. The [web example](web-example.md) tests the rename of an account and a sign-in with a removed passkey through
+its HTTP API. No real browser or authenticator has run an activation or a Signals call yet.

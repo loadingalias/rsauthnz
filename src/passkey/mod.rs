@@ -645,6 +645,9 @@ impl RelyingParty {
             .map_err(Error::from)?;
         proposal.change(Change::End(ceremony)).map_err(Error::from)?;
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
+        proposal
+            .read(Dependency::Absent(Self::removal_key(&key)))
+            .map_err(Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
         proposal
             .change(Change::Write {
@@ -719,7 +722,8 @@ impl RelyingParty {
     /// new, so the same assertion again is a new operation that finds the replay record. [`SignIn::open`] adds the
     /// session and gives the proposal: only its accepted commit releases the evidence and the session.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check, and three keyed reads.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check, and three keyed reads. A credential
+    /// read that finds no record makes one more keyed read, of the removal mark, and then refuses.
     ///
     /// # Errors
     ///
@@ -727,9 +731,10 @@ impl RelyingParty {
     ///   or served a sign-in already: start a new ceremony.
     /// - [`Error::Origin`] and [`Error::CrossOrigin`] as for a registration, and [`Error::RelyingParty`] and
     ///   [`Error::UserPresence`] for the authenticator data.
+    /// - [`Error::Removed`] if the store has no record of the credential under this relying party and that handle,
+    ///   and a removal ended it ([`RelyingParty::remove`]): tell the provider to forget the passkey.
     /// - [`Error::Credential`] if the assertion has no user handle of 32 bytes, or the store has no record of the
-    ///   credential under this relying party and that handle. [`Error::Signature`] if the signature does not verify
-    ///   with the stored key.
+    ///   credential and no removal mark. [`Error::Signature`] if the signature does not verify with the stored key.
     /// - [`Error::Malformed`] if the backup eligibility differs from the registration, and for each other difference
     ///   from the forms of WebAuthn Level 3.
     /// - [`Error::Record`] if a record has no valid form, [`Error::Time`] if `now` has no bound, [`Error::Driver`] if
@@ -754,7 +759,16 @@ impl RelyingParty {
         let handle = assertion.user_handle.as_deref().ok_or(Error::Credential)?;
         let handle = UserHandle(<[u8; 32]>::try_from(handle).map_err(|_| Error::Credential)?);
         let key = self.credential_key(&handle, &assertion.id);
-        let record = read(store, &key).await?.ok_or(Error::Credential)?;
+        let Some(record) = read(store, &key).await? else {
+            // Only a removal mark proves that the server never accepts the passkey: a registration finish that comes
+            // late can still commit a passkey that the store never held, and a provider can delete it at `Forget`.
+            let removed = read(store, &Self::removal_key(&key)).await?.is_some();
+            return Err(Failure::Refused(if removed {
+                Error::Removed
+            } else {
+                Error::Credential
+            }));
+        };
         let floor_key = record::floor_key();
         let floor = read(store, &floor_key).await?;
         if let Some(floor) = &floor {
@@ -960,6 +974,14 @@ impl RelyingParty {
         Kind::Credential
             .key(&[account, crypto::sha256(id)].concat())
             .expect("a key of 65 bytes is valid")
+    }
+
+    /// The key of the removal mark of the credential record `credential`: [`Kind::Removal`], then the identifier of
+    /// `credential`.
+    pub(crate) fn removal_key(credential: &transition::Key) -> transition::Key {
+        Kind::Removal
+            .key(&credential.as_bytes()[1..])
+            .expect("the identifier of a key fits under another kind")
     }
 
     /// The prefix of the keys of the passkeys of the account with the user handle `handle` ([`Self::credential_key`]).
@@ -1683,6 +1705,9 @@ pub enum Error {
     Full,
     /// The store has no record of the credential of an assertion, or the assertion names another user handle.
     Credential,
+    /// A removal ended the passkey of an assertion ([`RelyingParty::remove`]), so the server never accepts it again.
+    /// Tell the provider to forget it.
+    Removed,
     /// The signature of an assertion does not verify with the key of its credential.
     Signature,
     /// A record has no valid form.
@@ -1724,12 +1749,13 @@ pub enum Error {
 
 impl Recover for Error {
     /// The recovery of the caller: start a new ceremony after [`Error::Challenge`], verify the user again after
-    /// [`Error::Fresh`], and the recovery of the proposal after [`Error::Transition`] and [`Error::Session`]. Refuse each
-    /// other request.
+    /// [`Error::Fresh`], forget the passkey after [`Error::Removed`], and the recovery of the proposal after
+    /// [`Error::Transition`] and [`Error::Session`]. Refuse each other request.
     fn recovery(&self) -> Recovery {
         match self {
             Self::Challenge => Recovery::Restart,
             Self::Fresh => Recovery::Verify,
+            Self::Removed => Recovery::Forget,
             Self::Transition(error) => error.recovery(),
             Self::Session(error) => error.recovery(),
             _ => Recovery::Refuse,
@@ -1754,6 +1780,7 @@ impl fmt::Display for Error {
             Self::NotDiscoverable => f.write_str("the credential is not discoverable"),
             Self::Full => f.write_str("the account has the most passkeys"),
             Self::Credential => f.write_str("the credential is not a passkey of the account"),
+            Self::Removed => f.write_str("a removal ended the passkey"),
             Self::Signature => f.write_str("the signature of the assertion does not verify"),
             Self::Record => f.write_str("a record has no valid form"),
             Self::Time(error) => write!(f, "the time reading gave no value: {error}"),

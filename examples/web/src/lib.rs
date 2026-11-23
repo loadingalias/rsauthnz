@@ -591,10 +591,10 @@ impl State {
         let proposal = ready(self.rp.remove(
             &mut self.memory,
             &fresh,
-            &account.handle,
-            removed.credential().id(),
+            &removed,
             now,
             &mut self.random,
+            &mut self.driver,
         ))?;
         self.commit(proposal, now)?;
         Ok(json_reply(b"{}".to_vec()))

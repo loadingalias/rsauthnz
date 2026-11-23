@@ -26,7 +26,8 @@ export async function capabilities() {
  * server. With `conditional`, the browser offers each passkey in the autofill of an input with
  * `autocomplete="username webauthn"`, and the call waits until the user picks one. It gets new options when the
  * challenge ends. Abort it with `signal` before an explicit sign-in. A browser with no conditional mediation gives
- * `null`: show the explicit sign-in. `consent(publicKey)` can stop the ceremony before the authenticator with `false`. */
+ * `null`: show the explicit sign-in. `consent(publicKey)` can stop the ceremony before the authenticator with `false`.
+ * After the recovery `forget`, it calls `signalDeleted` for the passkey, then throws the `Problem`. */
 export async function signIn({ options, finish, conditional = false, signal, consent }) {
   if (conditional && !(await capabilities()).conditionalGet) return null;
   for (;;) {
@@ -51,7 +52,13 @@ export async function signIn({ options, finish, conditional = false, signal, con
     } finally {
       clearTimeout(ended);
     }
-    return post(finish, credential.toJSON(), signal, "check");
+    try {
+      return await post(finish, credential.toJSON(), signal, "check");
+    } catch (error) {
+      // The server removed this passkey for good, so the provider forgets it.
+      if (error.recovery === "forget") await signalDeleted({ rpId: publicKey.rpId, credentialId: credential.id });
+      throw error;
+    }
   }
 }
 
@@ -119,7 +126,8 @@ async function post(path, body, signal, lost) {
   }
   if (!response.ok) {
     const problem = await response.json().catch(() => ({}));
-    throw new Problem(["restart", "check", "verify"].includes(problem.recovery) ? problem.recovery : "refuse", response.status);
+    const known = ["restart", "check", "verify", "forget"].includes(problem.recovery);
+    throw new Problem(known ? problem.recovery : "refuse", response.status);
   }
   return response.json();
 }

@@ -43,7 +43,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Rename the account | `/account/rename` | A change of the directory of the example, with `name` and `displayName` ([Rename an account](accounts.md#rename-an-account)). A new name needs a `Fresh`, and a new display name needs only the session. A name of another account refuses |
 | Rename a passkey | `/passkeys/rename` | `rp.rename`. It needs no fresh user verification |
 | Add a passkey | `/passkeys/add/options`, `/passkeys/add/finish` | `rp.start` and `registration.propose` with `Decision::Add` ([Add a passkey](accounts.md#add-a-passkey)) |
-| Remove a passkey | `/passkeys/remove` | `rp.remove` with a `Fresh` |
+| Remove a passkey | `/passkeys/remove` | `rp.remove` with a `Fresh`. Its commit writes the removal mark of the passkey ([Remove a passkey](accounts.md#remove-a-passkey)) |
 | End a session | `/sessions/revoke` | `sessions.revoke` with `Revoker::Own` for the session of the request, and `Revoker::Fresh` for another one |
 | Invite | `/invitations` | `rp.invite` under the policy of the example: each account that signed in with user verification may invite ([Issue an invitation](accounts.md#issue-an-invitation)) |
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
@@ -59,6 +59,10 @@ At each load of the account, also after each sign-in, the page calls `signalRena
 data of `/account`. Thus a provider on another device learns a rename or a removal at the next sign-in there. After
 the removal of a passkey, the page also calls `signalDeleted`. After a rename of a passkey, it makes no Signals call: a
 provider keeps its own label of a passkey.
+
+A sign-in with a removed passkey, such as from a provider that no call reached, gets `410` with
+`{"recovery":"forget"}`. `signIn` of the browser module then calls `signalDeleted` for it, and the page asks for a
+sign-in with another passkey.
 
 ## Failures and recovery
 

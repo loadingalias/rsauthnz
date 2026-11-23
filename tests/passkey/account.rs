@@ -8,12 +8,12 @@ use rsauthnz::authz::{Permit, Policy, Request, Requirements};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::evidence::Evidence;
 use rsauthnz::id::{Action, AuthorityVersion, Human, Id, Principal, Resource};
-use rsauthnz::passkey::{Error, Response, UserHandle};
+use rsauthnz::passkey::{Decision, Error, Response, UserHandle};
 use rsauthnz::session::{Access, Revoker};
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
 use rsauthnz::store::{Kind, Store};
 use rsauthnz::time::Reading;
-use rsauthnz::transition::{self, Outcome, Proposal};
+use rsauthnz::transition::{self, Outcome, Proposal, Recover as _, Recovery};
 use rsauthnz_conformance::suite::{Fault, Subject as _};
 
 use super::authenticator::{
@@ -348,16 +348,21 @@ impl Site {
         }
     }
 
-    /// The proposal of the removal of `passkey` of alice with `fresh` at `now`.
+    /// The proposal of the removal of `passkey` of alice with `fresh` at `now`, from the list of her passkeys.
     fn remove(&mut self, fresh: &Fresh, passkey: &Passkey, now: Reading) -> Result<(Proposal, Plan), Error> {
         let handle = UserHandle::from_bytes(HANDLE);
+        let listed = ready(self.rp.passkeys(&mut self.node.memory, &handle)).map_err(refused)?;
+        let listed = listed
+            .into_iter()
+            .find(|listed| listed.credential().id() == passkey.id.as_slice())
+            .ok_or(Error::Credential)?;
         let remove = self.rp.remove(
             &mut self.node.memory,
             fresh,
-            &handle,
-            &passkey.id,
+            &listed,
             now,
             &mut self.random,
+            &mut self.node.driver,
         );
         ready(remove).map_err(refused)
     }
@@ -453,6 +458,31 @@ fn two_concurrent_removals_keep_one_passkey() {
     );
     assert_eq!(site.node.read(&site.key(&first)), None);
     assert!(site.node.read(&site.key(&second)).is_some());
+}
+
+/// A provider that no Signals call reached at a removal still offers the passkey. The removal mark makes a sign-in
+/// with it answer `Forget`, so the provider can delete it. No registration writes the passkey again, so the answer
+/// stays true. A passkey that the store never held gives `Credential` (the sign-in tests): its finish can come late.
+#[test]
+fn a_sign_in_with_a_removed_passkey_tells_the_provider_to_forget_it() {
+    let mut site = Site::new();
+    let first = site.register(Algorithm::Ed25519, -8, 1, 0);
+    let second = site.add(&first, Algorithm::Es256, -7, 2);
+    let fresh = site.fresh(&first);
+    let (proposal, plan) = site.remove(&fresh, &second, at(12)).expect("a removal");
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+
+    let get = Get::new(&second, RP_ID, ORIGIN, site.options(at(14)), HANDLE);
+    let refused = site.sign_in(&get.json(), at(15)).err();
+    assert_eq!(refused, Some(Error::Removed));
+    assert_eq!(refused.map(|error| error.recovery()), Some(Recovery::Forget));
+
+    let fresh = site.fresh(&first);
+    let challenge = authenticator::challenge(&site.add_options(&fresh));
+    let json = Registration::new(&second, RP_ID, ORIGIN, challenge).json();
+    let registration = site.finish(&json, at(13)).expect("a finish");
+    let (proposal, plan) = registration.propose(Decision::Add(&fresh, &[])).expect("a proposal");
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Conflict));
 }
 
 #[test]

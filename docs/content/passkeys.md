@@ -101,7 +101,9 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
 3. Check the request with `site.json_change`, then read the body with `Assertion::parse`.
 4. Call `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It checks the tag and the lifetime of
    the challenge before any read. Then it reads the credential record, the replay floor, and the replay record of the
-   challenge, and it checks the assertion and its signature. It gives a `SignIn`.
+   challenge, and it checks the assertion and its signature. It gives a `SignIn`. A passkey that a
+   [removal](accounts.md#remove-a-passkey) ended refuses with `Error::Removed`, whose recovery is `Forget`: the
+   `signIn` function of the browser adapter then tells the provider to forget the passkey.
 5. Call `sign_in.open(&sessions, replaces, &mut random, &mut driver)`. It adds a new [session](sessions.md) to the
    commit, and ends the family of `replaces`, the current session of the browser, if it has one. It gives the
    proposal, its plan, and a `session::Opening`.
@@ -317,7 +319,8 @@ gives its recovery, and `?` in a handler gives the `rsauthnz_http::Problem` of i
 | `CredentialId` | The ID has more than 1,023 bytes, or the response and the authenticator data have two IDs | `Refuse` |
 | `NotDiscoverable` | `credProps` reports a credential that is not discoverable | `Refuse` |
 | `Full` | The account has `CREDENTIALS_MAX` (32) passkeys | `Refuse` |
-| `Credential` | The assertion has no user handle of 32 bytes, or the store has no record of its credential under this relying party and that handle | `Refuse` |
+| `Credential` | The assertion has no user handle of 32 bytes, or the store has no record of its credential under this relying party and that handle, and no removal mark | `Refuse`. A registration finish that comes late can still commit the passkey, so the provider keeps it |
+| `Removed` | The store has no record of the credential, and has its removal mark: a removal ended the passkey, and no registration writes it again | `Forget`: tell the provider to forget the passkey, and sign in with another one |
 | `Signature` | The signature of an assertion does not verify with the stored key | `Refuse` |
 | `Name` | A name is empty or has more than 256 bytes | `Refuse` |
 | `Record` | A record has no valid form | `Refuse` |
@@ -341,7 +344,9 @@ failed read, which is a crash of the binding.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
 The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `finish` makes
-one keyed read and one range read, and `sign_in` makes one signature check and three keyed reads. The cost class of `start` is `Mutate`: one range read of at most
+one keyed read and one range read, and `sign_in` makes one signature check and three keyed reads. A `sign_in` whose
+credential record is absent makes one more keyed read, of the removal mark, and then refuses. The cost class of
+`start` is `Mutate`: one range read of at most
 `CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 
 ## Support

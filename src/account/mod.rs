@@ -92,6 +92,11 @@ use crate::transition::{self, Change, Dependency, Key, OperationId, Prepared, Pr
 /// application can only make it shorter ([`Fresh::check`]).
 pub const FRESH_MAX: Duration = Duration::from_secs(300);
 
+/// The lifetime of the removal mark of a passkey: 400 days. Until it ends, a sign-in with the removed passkey answers
+/// [`Recovery::Forget`], so a provider that no Signals call reached at the removal forgets it. After it, the sign-in
+/// refuses, and the `signalAllAcceptedCredentials` call of the next sign-in hides the passkey.
+pub const REMOVAL_MARK_LIFETIME: Duration = Duration::from_secs(400 * 24 * 60 * 60);
+
 /// The longest lifetime of an invitation: 7 days.
 pub const INVITATION_LIFETIME_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -100,6 +105,9 @@ pub const INVITATION_BYTES: usize = 32;
 
 /// The record form of an invitation, and the domain of the digest of its value.
 const INVITATION_FORM: &str = "rsauthnz.invitation.1";
+
+/// The record form of a removal mark.
+const REMOVAL_FORM: &str = "rsauthnz.passkey.removal.1";
 
 /// The domain of the tag of an activation challenge, and of the operation identity of an activation.
 const ACTIVATION_FORM: &str = "rsauthnz.passkey.activation.1";
@@ -479,6 +487,9 @@ impl RelyingParty {
         proposal
             .read(Dependency::Absent(credential_key.clone()))
             .map_err(passkey::Error::from)?;
+        proposal
+            .read(Dependency::Absent(Self::removal_key(&credential_key)))
+            .map_err(passkey::Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(passkey::Error::from)?);
         proposal
             .change(Change::Write {
@@ -561,35 +572,41 @@ impl RelyingParty {
         Ok((proposal, Plan::default()))
     }
 
-    /// Proposes the removal of the passkey `id` of the account with the user handle `handle`, after a fresh user
+    /// Proposes the removal of `passkey`, a listed passkey of the account ([`Self::passkeys`]), after a fresh user
     /// verification of the account. The commit ends the credential record, and it reads another passkey of the account
     /// at its version, so the account keeps a sign-in method, also when two removals run at once. Its plan holds each
     /// passkey of the account, so the commit driver refuses the removal of the last sign-in method that the restore
     /// journal records as live. A recovery value is no sign-in method. Add the reads of the decision of the application
     /// to the proposal before the submission.
     ///
+    /// The commit also writes the removal mark of the passkey ([`Kind::Removal`]), which ends after
+    /// [`REMOVAL_MARK_LIFETIME`]. Until then, a sign-in with the passkey refuses with [`passkey::Error::Removed`], whose
+    /// recovery is [`Recovery::Forget`], and no registration writes the passkey again.
+    ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One range read of at most [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credential
     /// records.
     ///
     /// # Errors
     ///
-    /// [`passkey::Error::Credential`] if the account of `fresh` has no passkey `id` under `handle`, and [`passkey::Error::Transition`]
+    /// [`passkey::Error::Credential`] if the store holds `passkey` for no account or for another account than the one of
+    /// `fresh`, and [`passkey::Error::Transition`]
     /// with [`transition::Error::LastAnchor`] if it is the last passkey of the account. [`passkey::Error::Record`] if a record
-    /// has no valid form, and [`passkey::Error::Transition`] for the proposal. [`Failure::Store`] if the read fails.
+    /// has no valid form, [`passkey::Error::Time`] if the end of the mark overflows, [`passkey::Error::Driver`] if the
+    /// driver does not serve, and [`passkey::Error::Transition`] for the proposal. [`Failure::Store`] if the read fails.
     pub async fn remove<S: Store>(
         &self,
         store: &mut S,
         fresh: &Fresh,
-        handle: &UserHandle,
-        id: &[u8],
+        passkey: &Passkey,
         now: Reading,
         random: &mut ChaCha20Rng,
+        driver: &mut Driver,
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
-        let stored = self.stored(store, handle).await?;
+        let stored = self.stored(store, &passkey.handle).await?;
         let mut owned = stored.iter().filter(|stored| stored.passkey.account == fresh.account);
         let target = owned
             .clone()
-            .find(|stored| stored.passkey.credential.id() == id)
+            .find(|stored| stored.passkey.key == passkey.key)
             .ok_or(passkey::Error::Credential)?;
         let survivor = owned
             .find(|stored| stored.passkey.key != target.passkey.key)
@@ -607,6 +624,23 @@ impl RelyingParty {
         }
         proposal
             .change(Change::End(target.passkey.key.clone()))
+            .map_err(passkey::Error::from)?;
+        let mark = Self::removal_key(&target.passkey.key);
+        let end = now
+            .estimate()
+            .checked_add(REMOVAL_MARK_LIFETIME)
+            .ok_or(passkey::Error::Time(TimeError::Overflow))?;
+        proposal
+            .read(Dependency::Absent(mark.clone()))
+            .map_err(passkey::Error::from)?;
+        let version = self.version(driver.allocate(Kind::Removal).map_err(passkey::Error::from)?);
+        proposal
+            .change(Change::Write {
+                key: mark,
+                version,
+                end: Some(end),
+                data: passkey::encode(&Value::Array(vec![Value::Text(REMOVAL_FORM)])),
+            })
             .map_err(passkey::Error::from)?;
         let held = stored
             .into_iter()

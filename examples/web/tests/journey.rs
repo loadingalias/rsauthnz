@@ -255,6 +255,18 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
     assert_eq!(account.matches(r#"{"id":"#).count(), 1);
     assert!(account.contains(&base64url(&first.id)), "{account}");
 
+    // A provider that no Signals call reached still offers the removed passkey. Its sign-in answers `forget`, and
+    // the browser module then tells the provider to forget it.
+    let mut stale = Browser::default();
+    let options = site.post(&mut stale, "/sign-in/options", b"{}").await;
+    let json = Get::new(&second, RP_ID, ORIGIN, authenticator::challenge(&options), handle).json();
+    let reply = site.send(&mut stale, "POST", "/sign-in/finish", &json).await;
+    assert_eq!(
+        (reply.status, reply.body.as_str()),
+        (StatusCode::GONE, r#"{"recovery":"forget"}"#)
+    );
+    assert!(stale.cookie.is_none());
+
     // A second session, which the first one ends with a fresh verification.
     site.sign_in(&mut phone, &first, handle).await;
     let sessions = site.account(&mut laptop).await.body;

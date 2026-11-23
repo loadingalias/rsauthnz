@@ -484,7 +484,7 @@ fn a_code_is_its_32_digits_in_either_case_and_proves_only_its_own_account() {
 #[test]
 fn a_recovery_ends_the_sessions_that_fit_and_its_new_session_ends_the_others() {
     let mut site = Site::new();
-    // A relying party whose proposals hold ten reads: a recovery with no decision has room for seven sessions.
+    // A relying party whose proposals hold ten reads: a recovery with no decision has room for six sessions.
     let mut limits = Limits::default();
     limits.dependencies = 10;
     site.rp = RelyingParty::new(authority(), RP_ID, ORIGIN, "Acme", KEY, limits)
@@ -506,7 +506,7 @@ fn a_recovery_ends_the_sessions_that_fit_and_its_new_session_ends_the_others() {
     let outcome = site.node.commit(proposal, plan);
     let recovered = opening.release(&outcome).expect("the session of the recovery");
 
-    // One session of the lost passkey stays. The new session ends it with its fresh verification.
+    // Two sessions of the lost passkey stay. The new session ends them with its fresh verification.
     let sessions = site.sessions.clone();
     let page = ready(sessions.list(&mut site.node.memory, &alice(), None, at(32))).expect("a list");
     let Ok(Check::Active(access)) = site.session(recovered.session.identifier(), 32) else {
@@ -517,12 +517,14 @@ fn a_recovery_ends_the_sessions_that_fit_and_its_new_session_ends_the_others() {
         .iter()
         .filter(|session| session.key() != access.session().key())
         .collect();
-    assert_eq!((page.sessions.len(), others.len()), (2, 1));
+    assert_eq!((page.sessions.len(), others.len()), (3, 2));
     let fresh = Fresh::check(&access, FRESH_MAX, at(32)).expect("a fresh verification");
-    let (proposal, plan) = sessions
-        .revoke(others[0], Revoker::Fresh(&fresh), &[], at(32), &mut site.random)
-        .expect("a revocation");
-    assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    for other in others {
+        let (proposal, plan) = sessions
+            .revoke(other, Revoker::Fresh(&fresh), &[], at(32), &mut site.random)
+            .expect("a revocation");
+        assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    }
     let page = ready(sessions.list(&mut site.node.memory, &alice(), None, at(33))).expect("a list");
     assert_eq!(page.sessions.len(), 1);
 }

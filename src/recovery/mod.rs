@@ -497,6 +497,9 @@ impl RelyingParty {
         proposal
             .read(Dependency::Absent(credential_key.clone()))
             .map_err(Error::from)?;
+        proposal
+            .read(Dependency::Absent(Self::removal_key(&credential_key)))
+            .map_err(Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
         proposal
             .change(Change::Write {

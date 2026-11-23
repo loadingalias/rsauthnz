@@ -113,6 +113,10 @@ pub enum Kind {
     /// The registration of a workload: its identifier, its registered proof key, and its generation
     /// ([`workload::Registration`](crate::workload::Registration)).
     Workload = 24,
+    /// The removal mark of a passkey: a removal ended it, so a sign-in with it answers
+    /// [`Recovery::Forget`](crate::transition::Recovery::Forget). Its key holds the identifier of the credential key,
+    /// and it ends after [`REMOVAL_MARK_LIFETIME`](crate::account::REMOVAL_MARK_LIFETIME).
+    Removal = 25,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -127,7 +131,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -152,6 +156,7 @@ impl Kind {
         Self::Local,
         Self::Issuer,
         Self::Workload,
+        Self::Removal,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -180,7 +185,8 @@ impl Kind {
             | Self::Mark
             | Self::Local
             | Self::Issuer
-            | Self::Workload => None,
+            | Self::Workload
+            | Self::Removal => None,
         }
     }
 

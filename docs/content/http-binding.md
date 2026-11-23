@@ -161,6 +161,7 @@ A problem body holds only its recovery, never a byte of the request:
 | `Restart` | `409 Conflict` | `{"recovery":"restart"}` | Starts the ceremony again as a new operation |
 | `Lookup` | `500 Internal Server Error` | `{"recovery":"check"}` | Loads the current state, such as the account page. It never sends the request again: the first attempt can have committed |
 | `Verify` | `403 Forbidden` | `{"recovery":"verify"}` | Signs in again with a passkey, then starts the change again ([Fresh user verification](accounts.md#fresh-user-verification)) |
+| `Forget` | `410 Gone` | `{"recovery":"forget"}` | A removal ended the passkey of the sign-in. Tells the provider to forget it, then signs in with another passkey ([Remove a passkey](accounts.md#remove-a-passkey)) |
 | `Refuse` | `403 Forbidden` | `{"recovery":"refuse"}` | Stops. The same request refuses again |
 
 `Lookup` is not `503 Service Unavailable`, because a client can send a request again after a `503`.

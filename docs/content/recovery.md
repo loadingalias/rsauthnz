@@ -69,13 +69,16 @@ again.
    account and one page of the sessions of `sessions`. It gives an `Attempt`: `account()` and `credential()`.
 5. Call `attempt.propose(passkeys, &reads)` with the policy of the application for the other passkeys and the reads of
    its decision. `Passkeys::End` ends each other passkey of the account, such as the passkey of a lost device, or of
-   a thief who signed in with it. `Passkeys::Keep` keeps them, so a thief of the code cannot remove them.
+   a thief who signed in with it. `Passkeys::Keep` keeps them, so a thief of the code cannot remove them. A recovery
+   writes no [removal mark](accounts.md#remove-a-passkey), so a sign-in with an ended passkey refuses with
+   `Error::Credential`. The `signalAccepted` call after the recovery hides the ended passkeys in a synchronized
+   provider.
 6. Submit the proposal with its plan, and give the outcome to `opening.release(&outcome)`. Only the accepted commit
    releases the `Opened`: the evidence of the recovery and the new session. Send its identifier in the cookie.
 7. When `propose` gave `Ended::Part`, the proposal had no room for each session of the account. List the sessions of
    the account (`sessions.list`), and end each one other than the new session with `Revoker::Fresh` of the new session
    ([Sign out, list, and revoke](sessions.md#sign-out-list-and-revoke)). At the default `Limits`, a recovery with
-   `Passkeys::Keep` and no decision ends up to 61 sessions.
+   `Passkeys::Keep` and no decision ends up to 60 sessions.
 8. Make a new code: the account has no code after a recovery. The new session is a fresh user verification, so it can
    make the code at once.
 

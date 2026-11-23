@@ -695,6 +695,10 @@ pub enum Recovery {
     /// ([`account::Fresh`](crate::account::Fresh)): sign in with a passkey that replaces the session, then propose
     /// again as a new operation.
     Verify,
+    /// Nothing committed. A removal ended the passkey of the sign-in, so the server never accepts it again
+    /// ([`passkey::Error::Removed`](crate::passkey::Error::Removed)). Tell the provider of the passkey to forget it
+    /// (`signalUnknownCredential` of WebAuthn Level 3), and sign in with another passkey.
+    Forget,
     /// Refuse the request. The same request refuses again.
     Refuse,
 }

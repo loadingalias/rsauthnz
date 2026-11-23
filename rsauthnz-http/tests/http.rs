@@ -308,6 +308,24 @@ fn the_browser_module_imports_nothing_and_stays_under_8_kib() {
     assert_eq!(imports.count(), 0);
 }
 
+/// A provider can delete a passkey at `signalUnknownCredential`, so `signIn` calls it only after the recovery
+/// `forget`, which the server gives only for a passkey that a removal ended. The module keeps `forget` from the body.
+#[test]
+fn the_sign_in_of_the_module_tells_the_provider_to_forget_only_a_removed_passkey() {
+    let response = browser_module();
+    let module = str::from_utf8(response.body()).unwrap();
+    let (_, sign_in) = module.split_once("export async function signIn(").expect("the sign-in");
+    let (sign_in, _) = sign_in.split_once("\n}\n").expect("the end of the sign-in");
+    let calls: Vec<&str> = sign_in.lines().filter(|line| line.contains("signalDeleted(")).collect();
+    assert_eq!(
+        calls,
+        [
+            r#"      if (error.recovery === "forget") await signalDeleted({ rpId: publicKey.rpId, credentialId: credential.id });"#
+        ]
+    );
+    assert!(module.contains(r#"["restart", "check", "verify", "forget"].includes(problem.recovery)"#));
+}
+
 #[test]
 fn a_json_change_admits_only_json_within_its_bound() {
     let site = Site::new(ORIGIN).unwrap();
@@ -400,6 +418,8 @@ fn an_error_response_holds_only_its_recovery() {
         // request again after a 503, and the first attempt can have committed.
         (problem(Recovery::Lookup), 500, br#"{"recovery":"check"}"#),
         (problem(Recovery::Verify), 403, br#"{"recovery":"verify"}"#),
+        // The browser module calls `signalUnknownCredential` on this body, so the provider can delete the passkey.
+        (problem(Recovery::Forget), 410, br#"{"recovery":"forget"}"#),
         (problem(Recovery::Refuse), 403, refuse),
     ];
     for (response, status, body) in cases {

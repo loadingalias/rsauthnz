@@ -4,13 +4,18 @@ import { signIn, register, change, signalDeleted, signalAccepted, signalRenamed,
 const $ = (id) => document.getElementById(id);
 const show = (text) => { $("status").textContent = text; };
 
+const told = {
+  verify: "Sign in again to confirm this change, then try again.",
+  forget: "This passkey was removed from the account. Sign in with another passkey.",
+};
+
 /** Runs `action`, and shows the recovery of a problem. `verify` asks for a new sign-in, which replaces the session. */
 async function run(action) {
   try {
     await action();
   } catch (error) {
     if (!(error instanceof Problem)) throw error;
-    show(error.recovery === "verify" ? "Sign in again to confirm this change, then try again." : `Refused: ${error.recovery}`);
+    show(told[error.recovery] ?? `Refused: ${error.recovery}`);
   }
   await load();
 }

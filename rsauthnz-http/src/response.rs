@@ -89,6 +89,7 @@ pub fn redirect(path: &str) -> Result<Response<Vec<u8>>, Refusal> {
 /// | [`Recovery::Restart`] | `409 Conflict` | `{"recovery":"restart"}` |
 /// | [`Recovery::Lookup`] | `500 Internal Server Error` | `{"recovery":"check"}` |
 /// | [`Recovery::Verify`] | `403 Forbidden` | `{"recovery":"verify"}` |
+/// | [`Recovery::Forget`] | `410 Gone` | `{"recovery":"forget"}` |
 /// | [`Recovery::Refuse`] | `403 Forbidden` | `{"recovery":"refuse"}` |
 ///
 /// Only the server holds the operation of an unknown outcome, so the server looks it up first. Send
@@ -100,6 +101,7 @@ pub fn problem(recovery: Recovery) -> Response<Vec<u8>> {
         Recovery::Restart => (StatusCode::CONFLICT, br#"{"recovery":"restart"}"#),
         Recovery::Lookup => (StatusCode::INTERNAL_SERVER_ERROR, br#"{"recovery":"check"}"#),
         Recovery::Verify => (StatusCode::FORBIDDEN, br#"{"recovery":"verify"}"#),
+        Recovery::Forget => (StatusCode::GONE, br#"{"recovery":"forget"}"#),
         Recovery::Refuse => (StatusCode::FORBIDDEN, br#"{"recovery":"refuse"}"#),
     };
     response(status, PROBLEM, body.to_vec())
