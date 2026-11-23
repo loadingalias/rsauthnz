@@ -127,7 +127,7 @@ Before the first run:
 1. Install Chrome and Firefox in `/Applications`. The command starts them headless with a temporary profile, with no
    driver.
 2. Run `sudo safaridriver --enable` once. Safari has no headless mode, so the command opens one session of the system
-   `safaridriver`, and Safari shows one automation window. Unlock the Mac before the Safari check.
+   `safaridriver`, and Safari shows one automation window.
 3. Give the pinned toolchain the targets `wasm32-unknown-unknown`, `aarch64-apple-ios`, and `aarch64-linux-android`.
 
 The command:
@@ -143,7 +143,8 @@ The command:
 A run prints each step with its time, the version of each browser, and its user agent. A browser cell passes only on
 a report that equals the expected text: a build alone passes no cell. A failed cell prints each line that differs, and
 the command fails. A trap in the Worker gives `trap: <error>` as the report. A browser that gives no report in 180
-seconds fails its cell. The command stops each browser and `safaridriver`, and deletes each temporary profile.
+seconds fails its cell. Each run owns its temporary profiles. The command stops its browser processes before it removes those profiles.
+A Safari error at `POST /session` occurs before the Worker starts. Check the Safari automation settings on that Mac.
 
 ## The cases
 

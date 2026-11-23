@@ -52,6 +52,7 @@ const REPORT_TIMEOUT: Duration = Duration::from_secs(180);
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The time for the browser to stop its helpers and close its temporary profile.
+#[cfg(unix)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most bytes of a request to the server: the report of a browser has some hundred.
@@ -164,7 +165,11 @@ impl Repo {
         let reports: Reports = Arc::default();
         let served = Arc::clone(&reports);
         thread::spawn(move || serve(&listener, &wasm, &served));
-        let profiles = self.root.join("target/portable");
+        let profiles = self
+            .root
+            .join("target")
+            .join(format!("portable-{}", std::process::id()));
+        fs::create_dir(&profiles).map_err(|error| Failure::new(format!("{}: {error}", profiles.display())))?;
         let mut failed = Vec::new();
         for browser in [Browser::Chrome, Browser::Firefox, Browser::Safari] {
             let name = browser.name();
@@ -175,17 +180,18 @@ impl Repo {
             let result = browser
                 .run(&url, &profile, &reports)
                 .and_then(|(report, version)| compare(name, &report).map(|agent| format!("{version}; {agent}")));
-            if let Err(error) = fs::remove_dir_all(&profile)
-                && error.kind() != io::ErrorKind::NotFound
-            {
-                return Err(Failure::new(format!("{}: {error}", profile.display())));
-            }
             match result {
                 Ok(agent) => eprintln!("   ok in {:.2}s: {agent}", started.elapsed().as_secs_f64()),
                 Err(failure) => {
                     eprintln!("   FAIL: {}", failure.message);
                     failed.push(name);
                 }
+            }
+            if let Err(error) = fs::remove_dir_all(&profile)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!("   FAIL: cleanup of {}: {error}", profile.display());
+                failed.push("profile cleanup");
             }
         }
         // The parent of the profiles is empty after the last browser.
@@ -197,10 +203,7 @@ impl Repo {
         if failed.is_empty() {
             Ok(())
         } else {
-            Err(Failure::new(format!(
-                "portable: {} did not give the expected report",
-                failed.join(", ")
-            )))
+            Err(Failure::new(format!("portable failed: {}", failed.join(", "))))
         }
     }
 }
@@ -406,6 +409,8 @@ fn dir_arg(prefix: &str, dir: &Path) -> std::ffi::OsString {
 /// Starts `command` with no output, runs `work`, and then stops the process and waits for it.
 fn with_child<T>(mut command: Command, work: impl FnOnce(&mut Child) -> Result<T, Failure>) -> Result<T, Failure> {
     let program = PathBuf::from(command.get_program());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -419,26 +424,36 @@ fn with_child<T>(mut command: Command, work: impl FnOnce(&mut Child) -> Result<T
     Ok(result)
 }
 
-/// Ask the macOS browser to stop its helpers before the caller removes its profile.
+/// Stop the process group that owns the temporary profile, including helpers that outlive the launcher.
+#[cfg(unix)]
 fn stop_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    let signal = Command::new("/bin/kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
-    if signal.is_ok_and(|status| status.success()) {
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        while Instant::now() < deadline {
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(25));
+    let group = format!("-{}", child.id());
+    let signal = |name: &str| {
+        Command::new("/bin/kill")
+            .args([name, "--", &group])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+    };
+    signal("-TERM")?;
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() && !signal("-0")? {
+            return Ok(());
         }
+        thread::sleep(Duration::from_millis(25));
     }
-    child.kill()?;
+    signal("-KILL")?;
     child.wait()?;
-    Err(io::Error::other("the browser did not shut down on request"))
+    Err(io::Error::other(
+        "the browser process group did not stop before its deadline",
+    ))
+}
+
+#[cfg(not(unix))]
+fn stop_child(child: &mut Child) -> io::Result<()> {
+    child.kill()?;
+    child.wait().map(|_| ())
 }
 
 /// Waits until the server has the report of `browser`, or the timeout.
