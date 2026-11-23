@@ -54,9 +54,10 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
    signed-in account that adds a passkey. Call
    `rp.start(&mut store, &user, decision, now, &mut random, &mut driver).await`. `user` names the account, its user
    handle, and the name and the display name that the authenticator shows. The options hold the names, and no record
-   does. `decision` is a `passkey::Decision`. `Decision::SignUp(&reads)` is the first passkey of an account, and it
-   refuses with `Error::Fresh` for an account that has a passkey. `Decision::Add(&fresh, &reads)` adds a passkey with
-   a fresh user verification of the account ([Add a passkey](accounts.md#add-a-passkey)). `reads` is a slice of
+   does ([Rename an account](accounts.md#rename-an-account)). `decision` is a `passkey::Decision`.
+   `Decision::SignUp(&reads)` is the first passkey of an account, and it refuses with `Error::Fresh` for an account
+   that has a passkey. `Decision::Add(&fresh, &reads)` adds a passkey with a fresh user verification of the account
+   ([Add a passkey](accounts.md#add-a-passkey)). `reads` is a slice of
    `transition::Dependency`: each record and policy that the decision read, such as the state of the sign-up and the
    policy version. The proposal reads each one. The start reads each passkey of the account and lists it in
    `excludeCredentials`. Thus an authenticator that holds one of them makes no second passkey, which would

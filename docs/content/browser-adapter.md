@@ -79,13 +79,15 @@ that commits nothing, such as the options of a conditional sign-in, stays an `Ab
 ## Keep the password manager in step
 
 The Signals API of WebAuthn Level 3 tells the password manager what the server holds. Each function gives `false` in
-a browser with no Signals API, and `true` after the call. Give each ID as base64url text.
+a browser with no Signals API, and `true` after the call. Give each ID as base64url text. A call reaches only the
+provider of its browser. So call `signalAccepted` and `signalRenamed` at each sign-in too: a provider on another
+device then learns a change at the next sign-in there.
 
 | Function | When | Signals API call |
 | --- | --- | --- |
 | `signalDeleted({ rpId, credentialId })` | After the deletion of a passkey | `signalUnknownCredential` |
-| `signalAccepted({ rpId, userId, credentialIds })` | After a change of the passkeys of an account. `userId` is the user handle | `signalAllAcceptedCredentials` |
-| `signalRenamed({ rpId, userId, name, displayName })` | After a rename of the account | `signalCurrentUserDetails` |
+| `signalAccepted({ rpId, userId, credentialIds })` | After a change of the passkeys of an account, and at each sign-in. `userId` is the user handle. `credentialIds` holds each passkey of the account: the provider hides each other one | `signalAllAcceptedCredentials` |
+| `signalRenamed({ rpId, userId, name, displayName })` | After a rename of the account ([Rename an account](accounts.md#rename-an-account)), and at each sign-in | `signalCurrentUserDetails` |
 
 `capabilities()` gives the client capabilities of the browser, such as `conditionalGet` and `conditionalCreate`.
 

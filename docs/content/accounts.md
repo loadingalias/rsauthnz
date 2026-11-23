@@ -3,7 +3,8 @@
 `rsauthnz::account` adds the account journeys to [passkeys](passkeys.md) and [sessions](sessions.md): an invitation
 that activates a new account, an additional passkey, the list, the rename, and the removal of passkeys, and the
 fresh user verification that each sensitive change needs. Each operation proposes one commit, and the storage binding
-of the application accepts it ([Propose a transition](transitions.md)).
+of the application accepts it ([Propose a transition](transitions.md)). The rename of an account is a change of the
+records of the application ([Rename an account](#rename-an-account)).
 
 ## The model
 
@@ -21,7 +22,8 @@ of the application accepts it ([Propose a transition](transitions.md)).
 - A **fresh user verification** (`Fresh`) is a session whose evidence has user verification and is at most
   `FRESH_MAX` (300 seconds) old. A **sensitive change** needs one: an additional passkey, the removal of a passkey,
   a new recovery code ([Recover an account](recovery.md#make-a-recovery-code)), and the end of another session of the
-  account. A rename and a sign-out need none.
+  account. A new account name that finds the account also needs one ([Rename an account](#rename-an-account)). The
+  rename of a passkey, a new display name, and a sign-out need none.
 
 ## Issue an invitation
 
@@ -117,6 +119,22 @@ revoke](sessions.md#sign-out-list-and-revoke)).
 
 Add the reads of the decision of the application to a removal or a rename with `proposal.read` before the submission.
 
+## Rename an account
+
+The application owns the name and the display name of an account. No record of rsauthnz holds them. Give them in
+the `User` or the `Invitee` of each ceremony, so the next options give the new names to the authenticator. Thus a
+rename changes only the records of the application:
+
+1. Check each new name: 1 to `passkey::NAME_BYTES_MAX` (256) bytes. A longer name makes the next start refuse with
+   `Error::Name`, so refuse it at the rename.
+2. Check the session of the request (`sessions.check`). A new display name needs only the session.
+3. When the name finds the account, such as at a [recovery](recovery.md#recover), also call `Fresh::check`. Without
+   it, a stolen session can rename the account and hide it from the recovery of its owner.
+4. Refuse a name that another account holds. Write the new names in one change of the records of the application.
+5. On the page, call `signalRenamed({ rpId, userId, name, displayName })` of the [browser
+   adapter](browser-adapter.md#keep-the-password-manager-in-step). `userId` is the user handle as base64url. Also call
+   it at each sign-in, so a provider on another device learns the new names.
+
 ## Example
 
 This example is also the example of the `rsauthnz::account` module documentation, and `cargo xtask test` runs it. It
@@ -190,5 +208,5 @@ The tests on this Mac (macOS aarch64) run on the memory binding with the test au
 cover one activation of an invitation, two concurrent activations, another recipient, a policy that no longer permits
 the issuer, an activation in doubt at a restore, and a dump of the store with no invitation value. They also cover
 an old and an unverified assertion, the deadline of a verification, the last passkey with a recovery value, two
-concurrent removals, a rename, and the end of another session. No real browser or authenticator has run an activation
-yet.
+concurrent removals, a rename, and the end of another session. The [web example](web-example.md) tests the rename of
+an account through its HTTP API. No real browser or authenticator has run an activation or a Signals call yet.

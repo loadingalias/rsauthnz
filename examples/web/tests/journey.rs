@@ -1,7 +1,7 @@
 //! The journeys of the web example through its HTTP API, with the responses of the A202 test authenticator: a sign-up,
 //! a sign-in, the rename, the addition, and the removal of a passkey, a second session and its end, an invitation and
-//! its activation, a recovery with a code, and a sign-out. Also a lost response, a request of another site, a stale
-//! verification, and the same API over HTTP/1.1 and HTTP/2.
+//! its activation, a recovery with a code, and a sign-out. Also the rename of an account, a lost response, a request
+//! of another site, a stale verification, and the same API over HTTP/1.1 and HTTP/2.
 
 // `cfg(test)` marks the shared test authenticator as test code for Clippy.
 #[cfg(test)]
@@ -228,35 +228,32 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
         .await;
     assert!(laptop.cookie.is_none(), "a sign-up opens no session");
     site.sign_in(&mut laptop, &first, handle).await;
+    // The account page gives the data of `signalRenamed` and `signalAccepted`.
     let account = site.account(&mut laptop).await;
     assert_eq!(account.status, StatusCode::OK);
-    assert!(
-        account.body.starts_with(r#"{"name":"alice","passkeys":[{"id":"#),
-        "{}",
-        account.body
+    let expected = format!(
+        r#"{{"rpId":"localhost","userId":"{}","name":"alice","displayName":"alice","passkeys":[{{"id":"{}""#,
+        base64url(&handle),
+        base64url(&first.id)
     );
+    assert!(account.body.starts_with(&expected), "{}", account.body);
 
     // A rename needs no verification.
     let rename = format!(r#"{{"id":"{}","name":"laptop"}}"#, base64url(&first.id));
     site.post(&mut laptop, "/passkeys/rename", rename.as_bytes()).await;
     assert!(site.account(&mut laptop).await.body.contains(r#""name":"laptop""#));
 
-    // An added passkey, with the fresh verification of the sign-in, then its removal, which gives the data of the
-    // Signals calls.
+    // An added passkey, with the fresh verification of the sign-in, then its removal. The account page then gives only
+    // the first passkey to `signalAccepted`.
     let second = Passkey::new(Algorithm::Es256, -7, 2);
     let ceremony = ("/passkeys/add/options", "/passkeys/add/finish");
     site.register(&mut laptop, ceremony, b"{}", &second).await;
     assert_eq!(site.account(&mut laptop).await.body.matches(r#"{"id":"#).count(), 2);
     let remove = format!(r#"{{"id":"{}"}}"#, base64url(&second.id));
-    let removed = site.post(&mut laptop, "/passkeys/remove", remove.as_bytes()).await;
-    let expected = format!(
-        r#"{{"rpId":"localhost","userId":"{}","credentialId":"{}","credentialIds":["{}"]}}"#,
-        base64url(&handle),
-        base64url(&second.id),
-        base64url(&first.id)
-    );
-    assert_eq!(String::from_utf8(removed).expect("text"), expected);
-    assert_eq!(site.account(&mut laptop).await.body.matches(r#"{"id":"#).count(), 1);
+    site.post(&mut laptop, "/passkeys/remove", remove.as_bytes()).await;
+    let account = site.account(&mut laptop).await.body;
+    assert_eq!(account.matches(r#"{"id":"#).count(), 1);
+    assert!(account.contains(&base64url(&first.id)), "{account}");
 
     // A second session, which the first one ends with a fresh verification.
     site.sign_in(&mut phone, &first, handle).await;
@@ -291,7 +288,7 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
         site.account(&mut bob_browser)
             .await
             .body
-            .starts_with(r#"{"name":"bob""#)
+            .contains(r#""name":"bob","displayName":"bob""#)
     );
 
     // Alice loses her passkey and recovers with the code: the recovery ends her other passkey and her sessions.
@@ -377,14 +374,80 @@ async fn a_sensitive_change_after_the_verification_window_asks_for_a_new_sign_in
     site.post(&mut browser, "/recovery-code", b"{}").await;
 }
 
-#[test]
-fn the_page_calls_the_signals_api_after_the_removal_of_a_passkey() {
-    let page = include_str!("../www/app.js");
-    let (_, after) = page.split_once(r#"change("/passkeys/remove""#).expect("the removal");
-    let (handler, _) = after.split_once("item.append").expect("the end of the handler");
+#[tokio::test]
+async fn a_new_account_name_needs_a_fresh_verification_and_the_next_options_give_the_new_names() {
+    let site = Site::new();
+    let mut browser = Browser::default();
+    let passkey = Passkey::new(Algorithm::Ed25519, -8, 1);
+    let ceremony = ("/sign-up/options", "/sign-up/finish");
+    let handle = site
+        .register(&mut browser, ceremony, br#"{"name":"alice"}"#, &passkey)
+        .await;
+    let bob = Passkey::new(Algorithm::Ed25519, -8, 2);
+    site.register(&mut Browser::default(), ceremony, br#"{"name":"bob"}"#, &bob)
+        .await;
+    site.sign_in(&mut browser, &passkey, handle).await;
+    let code = member(&site.post(&mut browser, "/recovery-code", b"{}").await, "code");
+    let rename = async |browser: &mut Browser, body: &[u8]| {
+        let reply = site.send(browser, "POST", "/account/rename", body).await;
+        (reply.status, reply.body)
+    };
+    let refused = |recovery: &str| (StatusCode::FORBIDDEN, format!(r#"{{"recovery":"{recovery}"}}"#));
+
+    // After the verification window, a new display name needs only the session, and a new name asks for a new sign-in.
+    site.advance(301);
+    let body = br#"{"name":"alice","displayName":"Alice Liddell"}"#;
+    assert_eq!(rename(&mut browser, body).await, (StatusCode::OK, "{}".to_owned()));
     assert!(
-        handler.contains("signalDeleted(") && handler.contains("signalAccepted("),
-        "{handler}"
+        site.account(&mut browser)
+            .await
+            .body
+            .contains(r#""displayName":"Alice Liddell""#)
+    );
+    let body = br#"{"name":"ally","displayName":"Ally"}"#;
+    assert_eq!(rename(&mut browser, body).await, refused("verify"));
+
+    // With a fresh verification, a name of another account and a display name over its bound refuse.
+    site.sign_in(&mut browser, &passkey, handle).await;
+    let long = format!(r#"{{"name":"ally","displayName":"{}"}}"#, "x".repeat(257));
+    for wrong in [br#"{"name":"bob","displayName":"Ally"}"#.as_slice(), long.as_bytes()] {
+        assert_eq!(rename(&mut browser, wrong).await, refused("refuse"));
+    }
+    assert_eq!(rename(&mut browser, body).await, (StatusCode::OK, "{}".to_owned()));
+
+    // The account page gives the new names to `signalRenamed`, and the recovery options of the new name give them to
+    // the authenticator. The old name finds no account.
+    let account = site.account(&mut browser).await.body;
+    let expected = format!(
+        r#"{{"rpId":"localhost","userId":"{}","name":"ally","displayName":"Ally","#,
+        base64url(&handle)
+    );
+    assert!(account.starts_with(&expected), "{account}");
+    let old = format!(r#"{{"name":"alice","code":"{code}"}}"#);
+    let reply = site
+        .send(&mut Browser::default(), "POST", "/recover/options", old.as_bytes())
+        .await;
+    assert_eq!((reply.status, reply.body), refused("refuse"));
+    let new = format!(r#"{{"name":"ally","code":"{code}"}}"#);
+    let options = site
+        .post(&mut Browser::default(), "/recover/options", new.as_bytes())
+        .await;
+    let options = String::from_utf8(options).expect("text");
+    assert!(options.contains(r#""name":"ally","displayName":"Ally""#), "{options}");
+}
+
+#[test]
+fn the_page_calls_the_signals_api_at_each_load_and_after_the_removal_of_a_passkey() {
+    let page = include_str!("../www/app.js");
+    let (_, load) = page.split_once("async function load()").expect("the load");
+    let (load, _) = load.split_once("\n}\n").expect("the end of the load");
+    let (_, after) = load.split_once(r#"change("/passkeys/remove""#).expect("the removal");
+    let (handler, _) = after.split_once("item.append").expect("the end of the handler");
+    assert!(handler.contains("signalDeleted("), "{handler}");
+    let (_, tail) = load.rsplit_once("}));").expect("the lists of the account");
+    assert!(
+        tail.contains("signalRenamed(account)") && tail.contains("signalAccepted("),
+        "{tail}"
     );
 }
 

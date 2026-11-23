@@ -1,5 +1,5 @@
 // The page of the web example: each action calls the server through the browser adapter of rsauthnz-http.
-import { signIn, register, change, signalDeleted, signalAccepted, Problem } from "/rsauthnz.js";
+import { signIn, register, change, signalDeleted, signalAccepted, signalRenamed, Problem } from "/rsauthnz.js";
 
 const $ = (id) => document.getElementById(id);
 const show = (text) => { $("status").textContent = text; };
@@ -15,7 +15,10 @@ async function run(action) {
   await load();
 }
 
-/** Shows the account of the session, or the signed-out page. */
+/**
+ * Shows the account of the session, or the signed-out page. Each load also gives the passkey provider the names and
+ * the passkeys of the account, so a provider learns a rename or a removal at the next sign-in on its device.
+ */
 async function load() {
   const response = await fetch("/account");
   const signedIn = response.ok;
@@ -23,7 +26,9 @@ async function load() {
   $("signed-out").hidden = signedIn;
   if (!signedIn) return;
   const account = await response.json();
-  $("account").textContent = account.name;
+  $("account").textContent = `${account.displayName} (${account.name})`;
+  $("rename").elements.namedItem("name").value = account.name;
+  $("rename").elements.namedItem("displayName").value = account.displayName;
   $("passkeys").replaceChildren(...account.passkeys.map((passkey) => {
     const item = document.createElement("li");
     item.textContent = passkey.name || "(no name)";
@@ -36,9 +41,8 @@ async function load() {
     const remove = document.createElement("button");
     remove.textContent = "Remove";
     remove.onclick = () => run(async () => {
-      const removed = await change("/passkeys/remove", { id: passkey.id });
-      await signalDeleted({ rpId: removed.rpId, credentialId: removed.credentialId });
-      await signalAccepted({ rpId: removed.rpId, userId: removed.userId, credentialIds: removed.credentialIds });
+      await change("/passkeys/remove", { id: passkey.id });
+      await signalDeleted({ rpId: account.rpId, credentialId: passkey.id });
     });
     item.append(" ", rename, " ", remove);
     return item;
@@ -52,6 +56,8 @@ async function load() {
     item.append(end);
     return item;
   }));
+  await signalRenamed(account);
+  await signalAccepted({ ...account, credentialIds: account.passkeys.map((passkey) => passkey.id) });
 }
 
 const form = (id, action) => {
@@ -78,6 +84,7 @@ form("invite", async ({ name }) => {
   const { invitation } = await change("/invitations", { name });
   show(`Send this invitation to ${name}: ${invitation}`);
 });
+form("rename", (names) => change("/account/rename", names));
 $("add").onclick = () => run(() => register({ options: "/passkeys/add/options", finish: "/passkeys/add/finish" }));
 $("code").onclick = () => run(async () => {
   const { code } = await change("/recovery-code");

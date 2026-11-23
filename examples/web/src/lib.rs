@@ -1,6 +1,6 @@
-//! A web application on axum that mounts `rsauthnz-http`: a sign-up with a passkey, the sign-in, the passkeys and the
-//! sessions of an account, an invitation of a new account, and recovery with a code. It keeps each record in the memory
-//! binding of `rsauthnz-conformance`, so a restart loses each account.
+//! A web application on axum that mounts `rsauthnz-http`: a sign-up with a passkey, the sign-in, the names, the
+//! passkeys, and the sessions of an account, an invitation of a new account, and recovery with a code. It keeps each
+//! record in the memory binding of `rsauthnz-conformance`, so a restart loses each account.
 //!
 //! [`router`] gives the routes. Each route reads the body within [`BODY_BYTES_MAX`] and gives an `http` request to its
 //! handler, which runs the operations of rsauthnz under one lock of the [`App`]. `docs/content/web-example.md` gives
@@ -138,8 +138,9 @@ type Handler = fn(&mut State, &Request<Bytes>, Reading) -> Result<Response<Vec<u
 
 /// The routes of the application.
 pub fn router(app: Arc<App>) -> Router {
-    let routes: [(&str, Handler); 18] = [
+    let routes: [(&str, Handler); 19] = [
         ("/account", State::account),
+        ("/account/rename", State::rename_account),
         ("/sign-up/options", State::sign_up_options),
         ("/sign-up/finish", State::sign_up_finish),
         ("/sign-in/options", State::sign_in_options),
@@ -201,12 +202,14 @@ fn id<K: rsauthnz::id::Kind>(value: &str) -> Id<K> {
     Id::new("web", value).expect("an identifier of the example")
 }
 
-/// An account of the directory of the application: its identifier, its user handle, and its name.
+/// An account of the directory of the application: its identifier, its user handle, its name, and its display name.
+/// The application owns the names, and it gives them to each ceremony, so the next options give a new name.
 #[derive(Clone)]
 struct Account {
     id: Id<Human>,
     handle: UserHandle,
     name: String,
+    display_name: String,
 }
 
 /// The policy of the example: each account that signed in with user verification may invite on the site.
@@ -439,30 +442,36 @@ impl State {
             account: &account.id,
             handle: account.handle,
             name: &account.name,
-            display_name: &account.name,
+            display_name: &account.display_name,
         }
     }
 
-    /// A new account of the directory, with the name `name`.
+    /// A new account of the directory, with the name `name`, which is also its first display name.
     fn new_account(&mut self, name: &str) -> Result<Account, Problem> {
         (!self.accounts.contains_key(name)).ok_or(Problem::Recovery(Recovery::Refuse))?;
         let account = Account {
             id: id(&format!("u-{}", self.accounts.len())),
             handle: UserHandle::random(&mut self.random),
             name: name.to_owned(),
+            display_name: name.to_owned(),
         };
         self.accounts.insert(name.to_owned(), account.clone());
         Ok(account)
     }
 
-    /// The account, its passkeys, and its sessions. The current session is the one of the request.
+    /// The account, its passkeys, and its sessions. The current session is the one of the request. The relying party
+    /// ID, the user handle, the names, and the IDs of the passkeys are the data of `signalRenamed` and
+    /// `signalAccepted`, which the page calls at each load.
     fn account(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let (access, account) = self.access(request, now)?;
         let passkeys = ready(self.rp.passkeys(&mut self.memory, &account.handle))?;
         let page = ready(self.sessions.list(&mut self.memory, &account.id, None, now))?;
         reply(|place| {
             place.object(|object| {
+                object.member("rpId").str(&self.rp_id)?;
+                object.member("userId").base64url(&account.handle.to_bytes())?;
                 object.member("name").str(&account.name)?;
+                object.member("displayName").str(&account.display_name)?;
                 object.member("passkeys").array(|items| {
                     for passkey in &passkeys {
                         items.item().object(|item| {
@@ -550,16 +559,14 @@ impl State {
         Ok(response)
     }
 
-    /// The passkey `id` (base64url) of the account of the request, and the account.
-    fn passkey(&mut self, account: &Account, id: &str) -> Result<(account::Passkey, Vec<account::Passkey>), Problem> {
+    /// The passkey `id` (base64url) of `account`.
+    fn passkey(&mut self, account: &Account, id: &str) -> Result<account::Passkey, Problem> {
         let id = base64url(id)?;
         let passkeys = ready(self.rp.passkeys(&mut self.memory, &account.handle))?;
-        let passkey = passkeys
-            .iter()
+        passkeys
+            .into_iter()
             .find(|passkey| passkey.credential().id() == id)
-            .cloned()
-            .ok_or(Problem::Recovery(Recovery::Refuse))?;
-        Ok((passkey, passkeys))
+            .ok_or(Problem::Recovery(Recovery::Refuse))
     }
 
     /// A new name of a passkey of the account. A rename needs no fresh user verification, and the page makes no
@@ -567,7 +574,7 @@ impl State {
     fn rename(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let [id, text] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["id", "name"])?;
         let (access, account) = self.access(request, now)?;
-        let (passkey, _) = self.passkey(&account, &id)?;
+        let passkey = self.passkey(&account, &id)?;
         let proposal = self
             .rp
             .rename(&access, &passkey, &text, now, &mut self.random, &mut self.driver)?;
@@ -575,12 +582,12 @@ impl State {
         Ok(json_reply(b"{}".to_vec()))
     }
 
-    /// The removal of a passkey of the account, with a fresh user verification. The response gives the data of the
-    /// Signals calls of the page: `signalDeleted` and `signalAccepted`.
+    /// The removal of a passkey of the account, with a fresh user verification. The page then calls `signalDeleted`
+    /// with the ID of the passkey, and its next load calls `signalAccepted`.
     fn remove(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let [id] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["id"])?;
         let (_, fresh, account) = self.fresh(request, now)?;
-        let (removed, passkeys) = self.passkey(&account, &id)?;
+        let removed = self.passkey(&account, &id)?;
         let proposal = ready(self.rp.remove(
             &mut self.memory,
             &fresh,
@@ -590,19 +597,31 @@ impl State {
             &mut self.random,
         ))?;
         self.commit(proposal, now)?;
-        reply(|place| {
-            place.object(|object| {
-                object.member("rpId").str(&self.rp_id)?;
-                object.member("userId").base64url(&account.handle.to_bytes())?;
-                object.member("credentialId").base64url(removed.credential().id())?;
-                object.member("credentialIds").array(|items| {
-                    for passkey in passkeys.iter().filter(|passkey| passkey.key() != removed.key()) {
-                        items.item().base64url(passkey.credential().id())?;
-                    }
-                    Ok(())
-                })
-            })
-        })
+        Ok(json_reply(b"{}".to_vec()))
+    }
+
+    /// A new name and a new display name of the account of the session. A new name needs a fresh user verification,
+    /// because the name finds the account at a recovery. A new display name needs only the session. The next load of
+    /// the page gives the new names to `signalRenamed`.
+    fn rename_account(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
+        let [text, display_name] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["name", "displayName"])?;
+        let new = name(&text)?;
+        (1..=passkey::NAME_BYTES_MAX)
+            .contains(&display_name.len())
+            .ok_or(Problem::Recovery(Recovery::Refuse))?;
+        let (access, account) = self.access(request, now)?;
+        if new != account.name {
+            Fresh::check(&access, FRESH_MAX, now)?;
+            (!self.accounts.contains_key(new)).ok_or(Problem::Recovery(Recovery::Refuse))?;
+        }
+        self.accounts.remove(&account.name);
+        let renamed = Account {
+            name: new.to_owned(),
+            display_name,
+            ..account
+        };
+        self.accounts.insert(renamed.name.clone(), renamed);
+        Ok(json_reply(b"{}".to_vec()))
     }
 
     /// The options of an additional passkey of the account, with a fresh user verification.
@@ -694,7 +713,7 @@ impl State {
         let invitee = Invitee {
             account: &account.id,
             name: &account.name,
-            display_name: &account.name,
+            display_name: &account.display_name,
         };
         let options = ready(
             self.rp
