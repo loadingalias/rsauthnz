@@ -722,8 +722,8 @@ impl RelyingParty {
     /// new, so the same assertion again is a new operation that finds the replay record. [`SignIn::open`] adds the
     /// session and gives the proposal: only its accepted commit releases the evidence and the session.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check, and three keyed reads. A credential
-    /// read that finds no record makes one more keyed read, of the removal mark, and then refuses.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check and three keyed lookups in two
+    /// store calls. An absent credential needs one more lookup for its removal mark, then the sign-in refuses.
     ///
     /// # Errors
     ///
@@ -770,14 +770,14 @@ impl RelyingParty {
             }));
         };
         let floor_key = record::floor_key();
-        let floor = read(store, &floor_key).await?;
-        if let Some(floor) = &floor {
-            (created > record::floor_end(&floor.data, self.limits).ok_or(Error::Record)?).ok_or(Error::Challenge)?;
-        }
         let replay = Kind::Replay
             .key(&crypto::sha256(&[SIGN_IN_FORM.as_bytes(), challenge].concat()))
             .expect("a key of 33 bytes is valid");
-        read(store, &replay).await?.is_none().ok_or(Error::Challenge)?;
+        let [floor, used] = store.read_pair([&floor_key, &replay]).await.map_err(Failure::Store)?;
+        if let Some(floor) = &floor {
+            (created > record::floor_end(&floor.data, self.limits).ok_or(Error::Record)?).ok_or(Error::Challenge)?;
+        }
+        used.is_none().ok_or(Error::Challenge)?;
 
         // The key binds the user handle, so the record is of the account of the assertion.
         let (account, _, stored) = credential_form(&record.data, self.limits)?;

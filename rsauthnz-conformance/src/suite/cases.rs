@@ -49,26 +49,40 @@ pub(super) async fn commit<S: Subject>(mut binding: S) -> Checked {
         "a commit whose dependencies hold refused",
     )?;
     let second = Build::new("w-2").ends(&ended, 1).writes(&written, 1).intends().done();
+    let mut reader = binding.clone();
+    let (pair, commit) = both(
+        reader.read_pair([&ended, &written]),
+        committed(&mut binding, &second, instance),
+    )
+    .await;
+    let [old, new] = pair.map_err(failed("read_pair"))?;
     ensure(
-        committed(&mut binding, &second, instance).await? == Commit::Accepted,
-        "a commit whose dependencies hold refused",
+        old.is_some() != new.is_some(),
+        "a paired read saw records from two sides of one commit",
     )?;
-    let record = Store::read(&mut binding, &written).await.map_err(failed("read"))?;
+    ensure(commit? == Commit::Accepted, "a commit whose dependencies hold refused")?;
+    let [record, removed] = binding
+        .read_pair([&written, &ended])
+        .await
+        .map_err(failed("read_pair"))?;
     ensure(
         record.is_some_and(|record| record.version == version(1) && *record.data == *DATA),
         "a commit did not write its record",
     )?;
-    ensure(!holds(&mut binding, &ended).await?, "a commit did not end its record")?;
+    ensure(removed.is_none(), "a commit did not end its record")?;
     let outcome = binding.outcome(&second.operation().id).await.map_err(failed("read"))?;
     ensure(
         outcome.as_ref() == Some(second.operation()),
         "a commit has no outcome record",
     )?;
     let (audit_key, audit) = audit_record(&second);
-    let stored = Store::read(&mut binding, &audit_key).await.map_err(failed("read"))?;
+    let copies = binding
+        .read_pair([&audit_key, &audit_key])
+        .await
+        .map_err(failed("read_pair"))?;
     ensure(
-        same(stored.as_ref(), &audit),
-        "a read of the audit record does not give the audit of the commit",
+        copies.iter().all(|record| same(record.as_ref(), &audit)),
+        "a paired read of one audit key did not give the committed audit twice",
     )?;
     for (intent_key, intent) in intent_records(&second).map_err(|error| error.to_string())? {
         let stored = Store::read(&mut binding, &intent_key).await.map_err(failed("read"))?;

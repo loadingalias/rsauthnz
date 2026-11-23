@@ -51,6 +51,9 @@ const REPORT_TIMEOUT: Duration = Duration::from_secs(180);
 /// The time from the start of `safaridriver` to its port.
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The time for the browser to stop its helpers and close its temporary profile.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The most bytes of a request to the server: the report of a browser has some hundred.
 const REQUEST_BYTES_MAX: usize = 64 * 1024;
 
@@ -410,10 +413,32 @@ fn with_child<T>(mut command: Command, work: impl FnOnce(&mut Child) -> Result<T
         .spawn()
         .map_err(|error| Failure::new(format!("cannot start {}: {error}", program.display())))?;
     let result = work(&mut child);
-    let stopped = child.kill().and_then(|()| child.wait());
+    let stopped = stop_child(&mut child);
     let result = result?;
     stopped.map_err(|error| Failure::new(format!("cannot stop {}: {error}", program.display())))?;
     Ok(result)
+}
+
+/// Ask the macOS browser to stop its helpers before the caller removes its profile.
+fn stop_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    let signal = Command::new("/bin/kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    if signal.is_ok_and(|status| status.success()) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    child.kill()?;
+    child.wait()?;
+    Err(io::Error::other("the browser did not shut down on request"))
 }
 
 /// Waits until the server has the report of `browser`, or the timeout.

@@ -512,6 +512,11 @@ impl Store for Files {
         self.lock()?.serve(|open| Ok(open.records.by_key.get(key).cloned()))
     }
 
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
+        self.lock()?
+            .serve(|open| Ok(keys.map(|key| open.records.by_key.get(key).cloned())))
+    }
+
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
         let retention = self.declaration.outcome_retention;
         let mut inner = self.lock()?;

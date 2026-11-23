@@ -344,8 +344,9 @@ failed read, which is a crash of the binding.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
 The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `finish` makes
-one keyed read and one range read, and `sign_in` makes one signature check and three keyed reads. A `sign_in` whose
-credential record is absent makes one more keyed read, of the removal mark, and then refuses. The cost class of
+one keyed read and one range read. A valid `sign_in` makes one signature check and three keyed lookups in two store calls.
+It reads the credential first, then reads the replay floor and challenge record together.
+For an absent credential, it checks the removal mark and refuses. The cost class of
 `start` is `Mutate`: one range read of at most
 `CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 

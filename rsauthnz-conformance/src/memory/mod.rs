@@ -490,6 +490,12 @@ impl Store for Memory {
         Ok(binding.store.records.get(key).cloned())
     }
 
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
+        let binding = self.lock();
+        binding.serving()?;
+        Ok(keys.map(|key| binding.store.records.get(key).cloned()))
+    }
+
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
         let request = Request::new(proposal);
         self.lock().commit(request, instance)

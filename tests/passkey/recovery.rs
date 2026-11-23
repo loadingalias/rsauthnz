@@ -199,6 +199,11 @@ impl Store for Counting<'_> {
         Store::read(self.memory, key).await
     }
 
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], memory::Error> {
+        self.reads += 2;
+        self.memory.read_pair(keys).await
+    }
+
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, memory::Error> {
         self.memory.commit(proposal, instance).await
     }

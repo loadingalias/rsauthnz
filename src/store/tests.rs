@@ -181,6 +181,10 @@ impl Store for Ended {
         Ok(None)
     }
 
+    async fn read_pair(&mut self, _: [&Key; 2]) -> Result<[Option<Record>; 2], !> {
+        Ok([None, None])
+    }
+
     async fn commit(&mut self, _: &Proposal, _: Instance) -> Result<Commit, !> {
         Ok(Commit::Conflict)
     }
@@ -262,6 +266,10 @@ impl Store for Records {
 
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, !> {
         Ok(self.0.get(key).cloned())
+    }
+
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], !> {
+        Ok(keys.map(|key| self.0.get(key).cloned()))
     }
 
     async fn commit(&mut self, proposal: &Proposal, _: Instance) -> Result<Commit, !> {

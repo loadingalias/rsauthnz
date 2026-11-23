@@ -118,6 +118,18 @@ impl Store for Broken {
         Store::read(&mut self.memory, key).await
     }
 
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
+        let mut pair = self.memory.read_pair(keys).await?;
+        if self.defect == Defect::LostOutcomes {
+            for (key, record) in keys.into_iter().zip(&mut pair) {
+                if Kind::of(key) == Some(Kind::Outcome) {
+                    *record = None;
+                }
+            }
+        }
+        Ok(pair)
+    }
+
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
         let mut request = Request::new(proposal);
         match self.defect {
@@ -275,6 +287,10 @@ impl Store for Measured {
 
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {
         Store::read(&mut self.memory, key).await
+    }
+
+    async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
+        self.memory.read_pair(keys).await
     }
 
     /// Measures each record that the commit stores: the record form of each write, and each intent, audit, and

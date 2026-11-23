@@ -127,7 +127,7 @@ Before the first run:
 1. Install Chrome and Firefox in `/Applications`. The command starts them headless with a temporary profile, with no
    driver.
 2. Run `sudo safaridriver --enable` once. Safari has no headless mode, so the command opens one session of the system
-   `safaridriver`, and Safari shows one automation window.
+   `safaridriver`, and Safari shows one automation window. Unlock the Mac before the Safari check.
 3. Give the pinned toolchain the targets `wasm32-unknown-unknown`, `aarch64-apple-ios`, and `aarch64-linux-android`.
 
 The command:

@@ -4,6 +4,9 @@ rsauthnz has TLA+ models of its authority and restore rules, in
 [`models/authority-restore/`](../../models/authority-restore/README.md), and of agent grants and
 operation approval, in [`models/grant-approval/`](../../models/grant-approval/README.md).
 
+The [account recovery model](../../models/account-recovery/README.md) covers online operations that cross a
+recovery commit and generation checks after restore.
+
 The authority models check that after crashes, restarts, and restores from an older snapshot,
 nothing that a committed change ended is valid again: no revoked passkey, no consumed one-use value,
 and no reused counter value. They check that a restore adds no anchor whose commit did not complete,
@@ -75,6 +78,7 @@ From the repository root:
 cargo xtask model authority-restore/Authority.TwoOps.cfg         # one profile; TwoOps is the edit-loop bound
 cargo xtask model authority-restore                              # every authority profile
 cargo xtask model grant-approval                                 # every grant profile
+cargo xtask model account-recovery                               # five recovery profiles
 cargo xtask model authority-restore/AuthorityCached.cfg          # a full TLC search
 cargo xtask model authority-restore/AuthorityInd.Step.apalache   # a complete inductive step
 ```

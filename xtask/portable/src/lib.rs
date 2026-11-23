@@ -1095,6 +1095,18 @@ impl Store for Defective {
         Store::read(&mut self.memory, key).await
     }
 
+    async fn read_pair(&mut self, keys: [&rsauthnz::transition::Key; 2]) -> Result<[Option<Record>; 2], memory::Error> {
+        let mut pair = self.memory.read_pair(keys).await?;
+        if self.defect == Defect::LostOutcomes {
+            for (key, record) in keys.into_iter().zip(&mut pair) {
+                if Kind::of(key) == Some(Kind::Outcome) {
+                    *record = None;
+                }
+            }
+        }
+        Ok(pair)
+    }
+
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, memory::Error> {
         let last = *self.instance.lock().unwrap_or_else(PoisonError::into_inner);
         let instance = match (self.defect, last) {

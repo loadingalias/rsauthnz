@@ -81,6 +81,7 @@ as a start. Each commit compares its instance number with the number in memory.
 
 At a start, the binding reads the store log into a `BTreeMap` from `Key` to `Record`. `Store::read` is a lookup in
 this map. The binding stores the records of each kind in the same way, the mark record of the driver included.
+`Store::read_pair` holds the same lock for both map lookups. A commit can land before or after the pair.
 
 ### 4. Commit a proposal
 

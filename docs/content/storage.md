@@ -38,6 +38,7 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Store::declaration()` | Gives the `Declaration` |
 | `Store::start()` | Writes the next store instance number (`Instance`) durably, before reconciliation, and gives it. Keep the number where a restore cannot lower it, for example in the failure domain of the journal. A restored lower number lets a delayed commit of the abandoned history land |
 | `Store::read(&key)` | Gives the current `Record` of the key (`version`, `end`, and `data`), or `None`. It is a keyed read: it never scans other records |
+| `Store::read_pair([&first, &second])` | Looks up both keys in one store state. Returns two results in request order. Each absent key gives `None`. A repeated key gives the same result twice |
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
 | `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
 | `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |

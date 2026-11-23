@@ -319,6 +319,10 @@ pub trait Store {
     /// never scans other records. The proposal lists the result as a dependency: a version, or an absence.
     fn read(&mut self, key: &Key) -> impl Future<Output = Result<Option<Record>, Self::Error>>;
 
+    /// Reads both keys from one store state. Each result occupies the position of its key, including an absent
+    /// or repeated key. Use one indexed query or hold one read lock across both lookups.
+    fn read_pair(&mut self, keys: [&Key; 2]) -> impl Future<Output = Result<[Option<Record>; 2], Self::Error>>;
+
     /// The conditional atomic commit of `proposal`, in one serializable step, or in one equivalent atomic step that
     /// checks the complete dependency set.
     ///

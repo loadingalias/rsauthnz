@@ -108,11 +108,16 @@ same store makes the commits of the first one refuse.
 Implement [`Store::read`]. It gives the current [`Record`] of a [`Key`]: its version, its end, and its record form.
 It gives `None` when no record has the key. It is a keyed read, and it never scans other records.
 
+Implement [`Store::read_pair`] when you upgrade an existing binding. Read both keys under one lock or in one database snapshot.
+One indexed database query can return both rows in one round trip. Map the rows back to the two requested positions.
+Return `None` at each missing position. If both keys match, return the same result twice.
+
 Store each key and each record form as opaque bytes. The first byte of a key names the [`Kind`] of its record, and
 [`Kind::of`] gives it. The binding stores the records of every kind in the same way. These include the records that
 the driver writes for itself: the mark record ([`Kind::Mark`]) and the replay floor ([`Kind::ReplayFloor`]).
 
 [`Store::read`]: rsauthnz::store::Store::read
+[`Store::read_pair`]: rsauthnz::store::Store::read_pair
 [`Record`]: rsauthnz::store::Record
 [`Key`]: rsauthnz::transition::Key
 [`Kind`]: rsauthnz::store::Kind
