@@ -15,6 +15,10 @@
 //! unlink of a binding is a call of its own ([`Authority::unlink`]). The module [`crate::cli`] gives the call of the
 //! client and its journey.
 //!
+//! A human can also approve the CLI of their own account in a browser, with a passkey ([`Authority::enroll`], the
+//! module [`enroll`]). Its CLI credential names the account, and its binding is a CLI binding of the account, which
+//! gives no administrator call: [`Admitted::holder`] says which binding a call came from.
+//!
 //! An administrator binding ends with its CLI credential, and expiry removes it ([`store::expire`](crate::store::expire)).
 //! A binding whose credential ended is no administrator: it gets no challenge, and an unlink does not count it. The
 //! owner issues a value for that administrator again.
@@ -178,6 +182,8 @@ use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
 use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal};
+
+pub mod enroll;
 
 /// The declared lifetime of a bootstrap value: the first value and each value of a re-bootstrap. A consumption at or
 /// after the end refuses, and the local owner issues a new value.
@@ -612,6 +618,25 @@ impl Authority {
         now.latest().map_err(Error::Time)?;
         let (binding, record, _) = self.bound(store, administrator, now).await?.ok_or(Error::NotEnrolled)?;
         let key = cli::key(&self.id, administrator);
+        self.offer(store, administrator, (binding, record), key, now, random, operation)
+            .await
+    }
+
+    /// The offer of the challenge record `key` of the binding `bound` of `subject` ([`Self::challenge`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the private step of `challenge` and `account_challenge`, which take one less"
+    )]
+    async fn offer<S: Store>(
+        &self,
+        store: &mut S,
+        subject: &Id<Human>,
+        (binding, record): (Key, Record),
+        key: Key,
+        now: Reading,
+        random: &mut ChaCha20Rng,
+        operation: OperationId,
+    ) -> Result<Offer, Failure<S::Error>> {
         let pending = read(store, &key).await?;
         if let Some(pending) = &pending {
             let challenge = cli::challenge(pending, self.limits).ok_or(Error::Record)?;
@@ -620,7 +645,7 @@ impl Authority {
                 return Ok(Offer::Open(challenge));
             }
         }
-        let mut proposal = self.proposal(operation, administrator, CHALLENGE, Value::Null, now)?;
+        let mut proposal = self.proposal(operation, subject, CHALLENGE, Value::Null, now)?;
         proposal
             .read(Dependency::Version(binding, record.version))
             .map_err(Error::Transition)?;
@@ -633,9 +658,10 @@ impl Authority {
 
     /// Admits the remote call `call` with the CLI credential `credential` and the proof `proof` of the possession of
     /// its `cnf` key over the request binding of `call` ([`cli::prove`]). The credential must be the credential of a
-    /// live administrator binding, and the challenge of `call` the pending challenge of that binding, before its end.
-    /// Thus a remote call refuses before an administrator enrolls, after an unlink of the binding, and with a
-    /// challenge that a call consumed or a restore ended.
+    /// live binding, an administrator binding or a CLI binding of an account ([`enroll`]), and the challenge of `call`
+    /// the pending challenge of that binding, before its end. Thus a remote call refuses before its CLI enrolls, after
+    /// an unlink of the binding, and with a challenge that a call consumed or a restore ended. [`Admitted::holder`]
+    /// names the binding: give an administrator call only to [`Holder::Administrator`].
     ///
     /// The proposal reads the binding and the challenge record at their versions, and writes the next challenge into
     /// the record, so its commit consumes the challenge of `call`. Its deadline is the end of the challenge or of the
@@ -647,7 +673,7 @@ impl Authority {
     /// own ([`Self::unlink`]).
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). Two signature checks of each composite artifact, and two
-    /// keyed reads.
+    /// keyed reads, or three for the CLI of an account.
     ///
     /// # Errors
     ///
@@ -704,6 +730,8 @@ impl Authority {
         let (mut proposal, admission, actor) = self
             .admission(store, credential, proof, &unlink.call, UNLINK, now, random)
             .await?;
+        // The CLI of an account makes no administrator call.
+        (admission.admitted.holder == Holder::Administrator).ok_or(Error::NotEnrolled)?;
         let live = self.administrators(store).await?;
         let named = |(.., held): &&(Key, Record, Binding)| held.issue.administrator == unlink.administrator;
         let (target, record, _) = live
@@ -766,18 +794,38 @@ impl Authority {
             .verify(credential, now, &mut SignatureBudget::new(&self.limits))
             .map_err(Error::Credential)?;
         let claims = verified.claims();
-        let Subject::Human(administrator) = &claims.subject else {
+        let Subject::Human(subject) = &claims.subject else {
             return Err(Error::NotEnrolled.into());
         };
-        let binding = self.binding(administrator, claims.serial);
-        let record = read(store, &binding).await?.ok_or(Error::NotEnrolled)?;
+        // Each serial names one credential, so at most one of the two bindings holds it.
+        let administrator = self.binding(subject, claims.serial);
+        let (holder, binding, record) = match read(store, &administrator).await? {
+            Some(record) => (Holder::Administrator, administrator, record),
+            None => {
+                let account = self.account_binding(subject, claims.serial);
+                let record = read(store, &account).await?.ok_or(Error::NotEnrolled)?;
+                (Holder::Account, account, record)
+            }
+        };
         (record.version == self.version(&claims.serial.0.to_be_bytes())).ok_or(Error::NotEnrolled)?;
         // The binding keeps the credential without its signature: another credential with the same serial refuses.
-        let held = self.decode(&record)?;
+        let (protected, payload) = match holder {
+            Holder::Administrator => {
+                let held = self.decode(&record)?;
+                (held.protected, held.payload)
+            }
+            Holder::Account => {
+                let held = self.decode_account(&record)?;
+                (held.protected, held.payload)
+            }
+        };
         let sign1 = Sign1::decode(credential, self.limits).map_err(|error| Error::Credential(error.into()))?;
-        (sign1.protected_bytes() == held.protected.as_slice() && sign1.payload() == held.payload.as_slice())
+        (sign1.protected_bytes() == protected.as_slice() && sign1.payload() == payload.as_slice())
             .ok_or(Error::NotEnrolled)?;
-        let key = cli::key(&self.id, administrator);
+        let key = match holder {
+            Holder::Administrator => cli::key(&self.id, subject),
+            Holder::Account => cli::binding_key(&self.id, &binding),
+        };
         let pending = read(store, &key).await?.ok_or(Error::Challenge)?;
         let challenge = cli::challenge(&pending, self.limits).ok_or(Error::Record)?;
         let end = pending.end.ok_or(Error::Record)?;
@@ -786,7 +834,7 @@ impl Authority {
             .possession(proof, call.binding(), now, &mut SignatureBudget::new(&self.limits))
             .map_err(Error::Credential)?;
         let request = Value::Bytes(call.binding());
-        let mut proposal = self.proposal(call.operation().clone(), administrator, action, request, now)?;
+        let mut proposal = self.proposal(call.operation().clone(), subject, action, request, now)?;
         proposal
             .read(Dependency::Version(binding.clone(), record.version))
             .map_err(Error::Transition)?;
@@ -796,7 +844,8 @@ impl Authority {
             .prepare(Prepared::new(next.to_bytes().to_vec(), key, version))
             .map_err(Error::Transition)?;
         let admitted = Admitted {
-            administrator: administrator.clone(),
+            subject: subject.clone(),
+            holder,
             evidence,
             next,
         };
@@ -1350,20 +1399,37 @@ impl Admission {
     }
 }
 
-/// A remote call that the commit of its admission accepted: the evidence of the possession of the key of a live
-/// administrator binding, and the challenge of the next call.
+/// A remote call that the commit of its admission accepted: the evidence of the possession of the key of a live CLI
+/// binding, and the challenge of the next call.
 #[derive(Debug)]
 pub struct Admitted {
-    administrator: Id<Human>,
+    subject: Id<Human>,
+    holder: Holder,
     evidence: Evidence,
     next: Challenge,
 }
 
+/// The binding of the CLI of a call: an administrator binding, or the binding of a CLI of an account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Holder {
+    /// The administrator binding that a bootstrap value paid for ([`Authority::bootstrap`]).
+    Administrator,
+    /// A CLI of an account, which the account approved in a browser ([`Authority::approve`]). It acts for the account
+    /// under the policy of the application, and it makes no administrator call.
+    Account,
+}
+
 impl Admitted {
-    /// The administrator.
+    /// The human of the CLI credential: the administrator, or the account.
     #[must_use]
-    pub const fn administrator(&self) -> &Id<Human> {
-        &self.administrator
+    pub const fn subject(&self) -> &Id<Human> {
+        &self.subject
+    }
+
+    /// The binding of the CLI: give an administrator call only to [`Holder::Administrator`].
+    #[must_use]
+    pub const fn holder(&self) -> Holder {
+        self.holder
     }
 
     /// The evidence of the possession.
@@ -1430,13 +1496,16 @@ pub enum Error {
     /// The authority holds no valid record of the bootstrap value: it is consumed or ended, or it is a value of
     /// another authority or issuer key. Ask the local owner to issue a new value.
     Unknown,
-    /// The end of the bootstrap value passed. Ask the local owner to issue a new value.
+    /// The end of the bootstrap value or of the enrollment request passed. Ask the local owner to issue a new value, or
+    /// make a new request.
     Expired,
     /// The administrator has a live binding. Name another administrator, or unlink the binding.
     Bound,
-    /// The store holds [`ADMINISTRATORS_MAX`] administrator bindings of the authority, or each issue of the full log
-    /// bound an administrator with a valid CLI credential. Run an expiry pass ([`store::expire`](crate::store::expire)),
-    /// which removes each binding whose credential ended, or unlink an administrator, then issue again.
+    /// The store holds [`ADMINISTRATORS_MAX`] administrator bindings of the authority, each issue of the full log
+    /// bound an administrator with a valid CLI credential, or the account has
+    /// [`ACCOUNT_CLIS_MAX`](enroll::ACCOUNT_CLIS_MAX) CLI bindings. Run an expiry pass
+    /// ([`store::expire`](crate::store::expire)), which removes each binding whose credential ended, or unlink an
+    /// administrator, then try again.
     Full,
     /// No live administrator binding holds the credential or the administrator. Refuse the call.
     NotEnrolled,
@@ -1451,6 +1520,18 @@ pub enum Error {
     Credential(credential::Error),
     /// The proposal refuses. The error gives the recovery.
     Transition(transition::Error),
+    /// The name of a CLI is empty, longer than [`CLI_NAME_BYTES_MAX`](enroll::CLI_NAME_BYTES_MAX), or holds a control
+    /// character.
+    Name,
+    /// No open enrollment request has the user code and the device code: the request ended, or a finish consumed it.
+    /// The CLI makes a new request.
+    Request,
+    /// No account approved the enrollment request yet. The CLI asks again after 5 seconds.
+    Waiting,
+    /// An account approved the enrollment request already.
+    Approved,
+    /// Another account approved the enrollment request. The CLI finishes with the account of [`Authority::poll`].
+    Account,
 }
 
 impl fmt::Display for Error {
@@ -1471,6 +1552,11 @@ impl fmt::Display for Error {
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Credential(error) => write!(f, "the credential refused: {error}"),
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),
+            Self::Name => f.write_str("the name of the CLI is not valid"),
+            Self::Request => f.write_str("no open enrollment request has the codes"),
+            Self::Waiting => f.write_str("no account approved the enrollment request yet"),
+            Self::Approved => f.write_str("an account approved the enrollment request already"),
+            Self::Account => f.write_str("another account approved the enrollment request"),
         }
     }
 }

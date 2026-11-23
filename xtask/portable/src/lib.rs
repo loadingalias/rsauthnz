@@ -865,8 +865,8 @@ fn local_journey(random: &mut ChaCha20Rng, now: Reading) -> Result<LocalJourney,
     let admitted = local
         .admit(&credential, &proof, &call)?
         .map_err(|error| format!("the call: {error}"))?;
-    expect(*admitted.administrator() == id("alice")?, || {
-        format!("the call of {:?} was admitted", admitted.administrator())
+    expect(*admitted.subject() == id("alice")?, || {
+        format!("the call of {:?} was admitted", admitted.subject())
     })?;
     Ok(LocalJourney {
         next: admitted.next(),

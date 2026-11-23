@@ -17,7 +17,8 @@
 //! A sensitive change needs a fresh user verification ([`Fresh`]): the evidence of the session has user
 //! verification, and it is at most [`FRESH_MAX`] old at the commit. The sensitive changes are an additional passkey
 //! ([`Decision::Add`](crate::passkey::Decision::Add)), the removal of a passkey ([`RelyingParty::remove`]), a new
-//! recovery code ([`RelyingParty::recovery_code`]), and the end of another session of the account
+//! recovery code ([`RelyingParty::recovery_code`]), the approval of a CLI
+//! ([`local::Authority::approve`](crate::local::Authority::approve)), and the end of another session of the account
 //! ([`Revoker::Fresh`](crate::session::Revoker::Fresh)). A rename needs only the session of the account
 //! ([`RelyingParty::rename`]).
 //!

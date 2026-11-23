@@ -6,6 +6,8 @@
 mod account;
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
+#[path = "passkey/enroll.rs"]
+mod enroll;
 #[path = "passkey/recovery.rs"]
 mod recovery;
 #[path = "passkey/session.rs"]

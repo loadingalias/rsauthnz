@@ -3,8 +3,10 @@
 `rsauthnz::local` gives an application owner an authority on one host, with no hosted account and no daemon. The
 owner issues a one-use bootstrap value. A client, such as a headless CLI, submits the value with its own public key,
 and becomes the first administrator, with a CLI credential. A remote call is admitted only for the credential of a
-live administrator, with a proof of possession of its key over a one-use challenge ([CLI credential](cli.md)). If the
-owner loses the administrator, the owner issues a new value: an owner re-bootstrap.
+live binding, with a proof of possession of its key over a one-use challenge ([CLI credential](cli.md)). If the
+owner loses the administrator, the owner issues a new value: an owner re-bootstrap. A human can also approve the CLI
+of their own account in a browser ([Enroll the CLI from a browser](cli.md#enroll-the-cli-from-a-browser)): that CLI
+makes no administrator call.
 
 ## The model
 
@@ -23,7 +25,7 @@ owner loses the administrator, the owner issues a new value: an owner re-bootstr
   `ADMINISTRATORS_MAX` (64) bindings of an authority.
 - The **CLI credential** is a [credential](credential-format.md) of the purpose `rsauthnz:cli`, valid for
   `CLI_LIFETIME` (365 days). The issuer is the authority, the audience is the origin of the grant, the subject is the
-  administrator, and the `cnf` key is the key of the client.
+  administrator or the account, and the `cnf` key is the key of the client.
 - The **report** gives each issue in the log of the authority and each live administrator binding, with the state of
   its value.
 

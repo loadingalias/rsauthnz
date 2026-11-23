@@ -199,7 +199,7 @@ fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
     let (proposal, admission) = ready(authority.admit(&mut memory, &credential, &proof, &first, now, &mut random))?;
     let outcome = commit(&mut memory, &mut driver, (proposal, Plan::default()))?;
     let admitted = admission.release(&outcome).ok_or("call 1 was not admitted")?;
-    let administrator = admitted.administrator();
+    let administrator = admitted.subject();
     println!("6. Call 1 (status) proved the possession of the CLI key. The authority admitted it for {administrator}.");
 
     // 7. A replay of the proof refuses, because the commit of call 1 consumed its challenge.

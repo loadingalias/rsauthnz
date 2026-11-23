@@ -21,9 +21,10 @@ records of the application ([Rename an account](#rename-an-account)).
   seconds).
 - A **fresh user verification** (`Fresh`) is a session whose evidence has user verification and is at most
   `FRESH_MAX` (300 seconds) old. A **sensitive change** needs one: an additional passkey, the removal of a passkey,
-  a new recovery code ([Recover an account](recovery.md#make-a-recovery-code)), and the end of another session of the
-  account. A new account name that finds the account also needs one ([Rename an account](#rename-an-account)). The
-  rename of a passkey, a new display name, and a sign-out need none.
+  a new recovery code ([Recover an account](recovery.md#make-a-recovery-code)), the approval of a CLI ([Enroll the CLI
+  from a browser](cli.md#enroll-the-cli-from-a-browser)), and the end of another session of the account. A new account
+  name that finds the account also needs one ([Rename an account](#rename-an-account)). The rename of a passkey, a new
+  display name, and a sign-out need none.
 
 ## Issue an invitation
 

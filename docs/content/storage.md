@@ -87,7 +87,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Registration` | A pending passkey registration ceremony | `Pays::Anchor` |
 | `SignIn` | A pending sign-in challenge, or the challenge of the next call of a [CLI](cli.md) | `Pays::Nothing` |
 | `Login` | A pending login transaction of an external identity provider | `Pays::Anchor` |
-| `CliEnrollment` | A pending enrollment request of a CLI | `Pays::Anchor` |
+| `CliEnrollment` | A pending enrollment request of a CLI, which a human approves in a browser ([Enroll the CLI from a browser](cli.md#enroll-the-cli-from-a-browser)) | `Pays::Anchor` |
 | `Invitation` | An invitation value | `Pays::Anchor` |
 | `Session` | A session family and its current generation ([Keep a browser session](sessions.md)) | `None` |
 | `Recovery` | A recovery value | `Pays::Anchor` |

@@ -364,7 +364,8 @@ fn journey(custody: &dyn Custody) {
         Err(Failure::Refused(Error::Credential(credential::Error::Proof)))
     );
     let admitted = world.call(&auth, &credential, &proof, &first);
-    assert_eq!(admitted.administrator().value(), "alice");
+    assert_eq!(admitted.subject().value(), "alice");
+    assert_eq!(admitted.holder(), local::Holder::Administrator);
     assert_matches!(
         world.admit(&auth, &credential, &proof, &first, now()),
         Err(Failure::Refused(Error::Challenge))

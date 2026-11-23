@@ -1,7 +1,8 @@
 # Call with a CLI credential
 
-`rsauthnz::cli` gives a headless CLI the calls of an administrator of a [local authority](local-authority.md). The CLI
-keeps its key in [custody](custody.md). Its CLI credential is no bearer secret: each call proves the possession of the
+`rsauthnz::cli` gives a CLI the calls of a [local authority](local-authority.md): the calls of an administrator after a
+headless bootstrap, or the calls of an account that a human approved in a browser. The CLI keeps its key in
+[custody](custody.md). Its CLI credential is no bearer secret: each call proves the possession of the
 key over a one-use challenge of the authority and over the request of the call. Thus a captured call cannot repeat,
 and a proof for one request refuses for another.
 
@@ -9,10 +10,12 @@ and a proof for one request refuses for another.
 
 - The **CLI key** is an ML-DSA-65 + Ed25519 key in custody. The CLI keeps only its handle: the key ID, the algorithm,
   and the public key.
-- The **CLI credential** is the credential of the administrator binding that a bootstrap value paid for. Its `cnf` key
-  is the CLI key. It is valid for `local::CLI_LIFETIME` (365 days).
+- The **CLI credential** names its human, and its `cnf` key is the CLI key. It is valid for `local::CLI_LIFETIME` (365
+  days). A **binding** holds it, without its signature. An **administrator binding** comes from a bootstrap value. An
+  **account binding** comes from the approval of a human in a browser: it acts for the account, and it makes no
+  administrator call. An account binding is an anchor of the account, and no sign-in method.
 - A **challenge** (`Challenge`) is 32 random bytes of the authority, valid for `CHALLENGE_LIFETIME` (60 seconds). Each
-  administrator binding has at most one pending challenge. A request for a challenge authenticates no caller, so it
+  binding has at most one pending challenge. A request for a challenge authenticates no caller, so it
   never replaces a challenge that is still valid: it gives that challenge. `Debug` of a challenge and of a call does
   not show the challenge.
 - A **call** (`Call`) is a challenge, an operation identity, and a request: the CBOR value of the call that the
@@ -36,6 +39,37 @@ and a proof for one request refuses for another.
 
 The CLI enrolls its key before it submits the value. Thus a bootstrap that commits binds a key that the CLI has, also
 when the CLI lost the response, or when a restore completed the bootstrap.
+
+## Enroll the CLI from a browser
+
+The CLI of an account enrolls in the shape of OAuth device authorization ([RFC
+8628](https://www.rfc-editor.org/rfc/rfc8628)): the human approves it in a browser with a passkey. The CLI needs no
+secret from the human.
+
+1. The CLI draws a key ID, and enrolls its key with `custody.enroll(id, Algorithm::MlDsa65Ed25519, random)`.
+2. The CLI sends its public key of 1,984 bytes and a name, such as `alice-laptop`. The authority calls
+   `authority.enroll(&holder, name, now, random)`, which gives the proposal, its plan, and a `UserCode`. The name has 1
+   to `CLI_NAME_BYTES_MAX` (64) bytes and no control character. The artifact of the accepted commit is the 32 bytes of
+   the `DeviceCode`. Give the CLI both codes. The request ends after `ENROLLMENT_LIFETIME` (10 minutes).
+3. The CLI shows the user code, such as `WDJB-MJHT`, the address of the approval page, and the SHA-256 digest of its
+   public key. It can open the page with the code in its address.
+4. The human signs in on the page with a passkey. The page reads the code with `UserCode::parse`, and shows the
+   request from `authority.request(store, &code, now)`: the name, the fingerprint (the SHA-256 digest of the key), and
+   the time of the request. The human compares the fingerprint with the one on the screen of the CLI.
+5. The human approves. The page checks a fresh user verification of the session (`Fresh::check`, [Fresh user
+   verification](accounts.md#fresh-user-verification)), and calls `authority.approve(store, &fresh, &code, now,
+   random)`. The commit writes the request as approved by the account of the session. The CLI cannot name the account.
+6. Every 5 seconds, the CLI asks for the state with its codes: `authority.poll(store, &code, &device, now)` gives
+   `Status::Waiting` or `Status::Approved(account)`. The CLI stores the account.
+7. The CLI submits the finish. The authority allocates a serial (`driver.allocate(Kind::Credential)`), and calls
+   `authority.finish(store, &code, &device, &account, serial, now)`. Custody signs `finish.to_be_signed()` with the
+   issuer key, and `finish.finish(signature, operation)` gives the proposal. Its commit consumes the request, and binds
+   the key of the request to the account. The artifact of the accepted commit is the CLI credential.
+8. The CLI asks for a challenge with `authority.account_challenge(store, &account, &holder, now, random, operation)`,
+   and makes each call as [Make a call](#make-a-call) says. `admitted.holder()` is `Holder::Account`.
+
+The finish binds the key that the request holds, so the approval of one request binds no other key. An account has
+at most `ACCOUNT_CLIS_MAX` (16) bindings.
 
 ## Make a call
 
@@ -81,7 +115,7 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::{Authority, Bootstrap, HostGrant, Offer};
+use rsauthnz::local::{Authority, Bootstrap, Holder, HostGrant, Offer};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{self, Kind, Store};
 use rsauthnz::time::{Reading, ReadingSource};
@@ -168,7 +202,7 @@ for (operation, target) in [(&b"call-1"[..], "status"), (b"call-2", "deploy")] {
     let (proposal, admission) = ready(authority.admit(&mut memory, &credential, &proof, &call, now, &mut random))?;
     let outcome = commit(&mut memory, &mut driver, (proposal, Plan::default()))?;
     let admitted = admission.release(&outcome).ok_or("the call was not admitted")?;
-    assert_eq!(admitted.administrator(), &alice);
+    assert_eq!((admitted.subject(), admitted.holder()), (&alice, Holder::Administrator));
     // The next call uses the challenge that this commit wrote, with no issue.
     challenge = admitted.next();
 }
@@ -200,6 +234,11 @@ zeroization, its recovery, and the isolation that the OS enforces.
   the credential of the binding whose `cnf` key is that key. The binding keeps no signed credential, so each recovery
   costs one issuer signature. `local::Error::Unknown` shows that the bootstrap did not commit. A bootstrap that a
   restore completed gives its credential in the same way.
+- **A lost response of a request, a poll, or a finish.** After a lost request, the CLI makes a new request. After a
+  lost poll, it polls again. After a lost finish, it gives its account and its public key: the authority calls
+  `authority.account_credential(store, &account, &holder, now)`, and custody signs `reissue.to_be_signed()` again. A
+  finish that a restore completed gives its credential in the same way. `local::Error::NotEnrolled` shows that the
+  finish did not commit: poll again.
 - **A lost response of an issue of a challenge.** Ask for a challenge again. While the challenge of the lost commit is
   valid, the request gives it with `Offer::Open`. If that commit did not land, the request gives a new proposal.
 - **A lost response of a call.** The outcome is unknown, and the call can have committed. The authority looks up the
@@ -213,19 +252,29 @@ zeroization, its recovery, and the isolation that the OS enforces.
 
 | Operation | Side | Result |
 | --- | --- | --- |
+| `authority.enroll(&holder, name, now, random)` | Authority | `(Proposal, Plan, UserCode)`. The receipt gives the 32 bytes of the `DeviceCode` |
+| `UserCode::parse(text)`, `code.text()`, `DeviceCode::from_bytes(bytes)`, `device.as_bytes()` | Both | The codes of a request, and their text and bytes |
+| `authority.request(store, &code, now)` | Authority | The `Request` of the approval page: `name`, `fingerprint`, `created`, `ends`, and `approved` |
+| `authority.approve(store, &fresh, &code, now, random)` | Authority | `(Proposal, Plan)`: the approval by the account of `fresh` |
+| `authority.poll(store, &code, &device, now)` | Authority | `Status::Waiting`, or `Status::Approved(account)` |
+| `authority.finish(store, &code, &device, &account, serial, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
+| `authority.account_credential(store, &account, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential of the account binding whose `cnf` key is `holder`, which custody signs again |
+| `authority.account_challenge(store, &account, &holder, now, random, operation)` | Authority | An `Offer` for the account binding whose `cnf` key is `holder` |
 | `authority.challenge(store, &administrator, now, random, operation)` | Authority | `Offer::Open(challenge)` while the binding holds a valid challenge, with no commit. Else `Offer::New(proposal, plan)`: the receipt gives the 32 bytes of the new challenge |
 | `Challenge::from_bytes(bytes)`, `challenge.to_bytes()` | Both | The challenge, and its bytes |
 | `Call::new(challenge, operation, &request, limits)` | Both | `Call` |
 | `cli::prove(custody, &handle, &credential, &audience, &call, now, random)` | CLI | The bytes of the proof |
 | `authority.admit(store, &credential, &proof, &call, now, random)` | Authority | `(Proposal, Admission)` |
 | `admission.release(&outcome)` | Authority | `Some(Admitted)` for the accepted commit of the proposal, else `None` |
-| `admitted.administrator()`, `admitted.evidence()`, `admitted.next()` | Authority | The administrator, the evidence of the possession, and the challenge of the next call |
+| `admitted.subject()`, `admitted.holder()`, `admitted.evidence()`, `admitted.next()` | Authority | The human of the credential, its `local::Holder` (`Administrator` or `Account`), the evidence of the possession, and the challenge of the next call. Give an administrator call only to `Holder::Administrator` |
 | `authority.credential(store, &administrator, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential whose `cnf` key is `holder`, which custody signs again |
 | `local::Unlink::new(challenge, operation, administrator, limits)`, `unlink.call()` | Both | The unlink, and the call that the CLI proves |
 
-`authority.admit` reads the administrator binding of the serial of the credential and its challenge record, with keyed
-reads. `authority.challenge` reads the bindings of the administrator with one range read, and the challenge record
-with a keyed read.
+`authority.admit` reads the binding of the serial of the credential and its challenge record, with keyed reads: the
+administrator binding, then the account binding. `authority.challenge` reads the bindings of the administrator with one
+range read, and the challenge record with a keyed read. `authority.account_challenge` reads at most 16 bindings of the
+account with one range read, and the challenge record with a keyed read. `authority.request`, `approve`, `poll`, and
+`finish` each make one keyed read of the request, and `finish` one range read of the bindings of the account.
 
 ## Errors
 
@@ -235,7 +284,14 @@ with a keyed read.
 | `cli::Error::Custody` | Custody refused to sign | Follow the recovery of the `custody::Error` |
 | `cli::Error::Credential` | The proof can be longer than its bound, or the signature of custody does not verify with the key of the handle | A refused signature shows a fault of custody or another key |
 | `local::Error::Challenge` | The binding holds no pending challenge, another one, or one whose end passed | Refuse the call. The CLI asks for a new challenge, and makes a new call |
-| `local::Error::NotEnrolled` | No administrator binding with a valid CLI credential holds the credential or the administrator, or the binding of its serial holds another credential | Refuse the call |
+| `local::Error::NotEnrolled` | No binding with a valid CLI credential holds the credential, the administrator, or the account and key, or the binding of its serial holds another credential. Also an unlink by the CLI of an account | Refuse the call |
+| `local::Error::Name` | The name of the CLI is empty, longer than 64 bytes, or holds a control character | Give another name |
+| `local::Error::Request` | No open request has the user code and the device code: it ended, a finish consumed it, or the codes differ | Make a new request |
+| `local::Error::Expired` | The end of the request passed | Make a new request |
+| `local::Error::Waiting` | No account approved the request yet | Poll again after 5 seconds |
+| `local::Error::Approved` | An account approved the request already | Show the approval |
+| `local::Error::Account` | Another account approved the request | Finish with the account of the poll |
+| `local::Error::Full` | The account has 16 bindings | Wait for the end of a credential |
 | `local::Error::Credential` | The credential or the proof refuses: another request or operation, another key, or a credential after its end or of another authority | Refuse the call |
 
 [Open a local authority](local-authority.md#errors) gives each other `local::Error`.
@@ -251,8 +307,16 @@ with a keyed read.
   refuses with `local::Error::Challenge` or a conflict. Make the calls of one CLI one at a time.
 - The proposal of an admission carries the next challenge as its prepared artifact. Thus a call that releases its
   own artifact commits it in a second transition.
-- The scope of a CLI credential is its issuer, its audience, its purpose `rsauthnz:cli`, and its validity. It names no
-  resource action.
+- The scope of a CLI credential is its issuer, its audience, its purpose `rsauthnz:cli`, its human, its binding, and
+  its validity. It names no resource action. The binding tells an administrator from an account
+  (`admitted.holder()`).
+- A request authenticates no caller, and its audit names the local owner. Limit the rate of requests and polls of one
+  client. Show a request only to a signed-in human: it names the CLI.
+- A user code finds a request, and it proves nothing. Anyone can send a human the code of a request of their own CLI.
+  So the page shows the name and the fingerprint, and asks the human to approve only a CLI on their own screen. The CLI
+  shows the account of the approval.
+- No operation lists or ends the account bindings yet, and a recovery of the account does not end them. Each one ends
+  with its credential.
 
 ## Support
 
@@ -261,3 +325,7 @@ with a keyed read.
 | macOS aarch64 | The tests pass | The tests pass, in the session of a user with an unlocked login keychain |
 | Linux x86_64 and aarch64, glibc and musl | The test runs are pending | Not available |
 | Windows x86_64 | The test run is pending | Not available |
+
+The enrollment from a browser runs in the tests on this Mac (macOS aarch64), on the memory binding, with rscrypto in
+place of custody and the test authenticator of the passkey tests. They cover the journey, the approval of one request
+and the finish of another, an ended request, a lost finish response, and a restore. No real browser has run it yet.

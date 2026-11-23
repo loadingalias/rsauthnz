@@ -37,7 +37,7 @@
 //! use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 //! use rsauthnz::id::Id;
 //! use rsauthnz::limits::Limits;
-//! use rsauthnz::local::{Authority, Bootstrap, HostGrant, Offer};
+//! use rsauthnz::local::{Authority, Bootstrap, Holder, HostGrant, Offer};
 //! use rsauthnz::store::driver::{Answer, Driver, Plan};
 //! use rsauthnz::store::{self, Kind, Store};
 //! use rsauthnz::time::{Reading, ReadingSource};
@@ -124,7 +124,7 @@
 //!     let (proposal, admission) = ready(authority.admit(&mut memory, &credential, &proof, &call, now, &mut random))?;
 //!     let outcome = commit(&mut memory, &mut driver, (proposal, Plan::default()))?;
 //!     let admitted = admission.release(&outcome).ok_or("the call was not admitted")?;
-//!     assert_eq!(admitted.administrator(), &alice);
+//!     assert_eq!((admitted.subject(), admitted.holder()), (&alice, Holder::Administrator));
 //!     // The next call uses the challenge that this commit wrote, with no issue.
 //!     challenge = admitted.next();
 //! }
@@ -310,6 +310,21 @@ pub fn prove(
 /// kind, so a challenge from before a restore refuses after it.
 pub(crate) fn key(issuer: &Id<Authority>, subject: &Id<Human>) -> Key {
     let form = Value::Array(vec![Value::Text(CHALLENGE_FORM), issuer.to_cbor(), subject.to_cbor()]);
+    let form = cbor::encode(&form, Limits::FORM).expect("the form has no map and no simple value");
+    Kind::SignIn
+        .key(&crypto::sha256(&form))
+        .expect("a key of 33 bytes is valid")
+}
+
+/// The key of the challenge record of the CLI binding `binding` of an account from `issuer`: [`Kind::SignIn`] with the
+/// SHA-256 digest of the canonical CBOR form `["rsauthnz.cli.challenge.1", issuer, binding]`. An account can have
+/// several CLIs, so each binding has its own record.
+pub(crate) fn binding_key(issuer: &Id<Authority>, binding: &Key) -> Key {
+    let form = Value::Array(vec![
+        Value::Text(CHALLENGE_FORM),
+        issuer.to_cbor(),
+        Value::Bytes(binding.as_bytes()),
+    ]);
     let form = cbor::encode(&form, Limits::FORM).expect("the form has no map and no simple value");
     Kind::SignIn
         .key(&crypto::sha256(&form))
