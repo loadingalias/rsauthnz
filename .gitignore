@@ -19,3 +19,4 @@ localhost.pem
 /web-issuer/
 /provider-issuer/
 /laptop-cli/
+.claude/
