@@ -618,8 +618,16 @@ impl Authority {
         now.latest().map_err(Error::Time)?;
         let (binding, record, _) = self.bound(store, administrator, now).await?.ok_or(Error::NotEnrolled)?;
         let key = cli::key(&self.id, administrator);
-        self.offer(store, administrator, (binding, record), key, now, random, operation)
-            .await
+        self.offer(
+            store,
+            administrator,
+            (binding, record, None),
+            key,
+            now,
+            random,
+            operation,
+        )
+        .await
     }
 
     /// The offer of the challenge record `key` of the binding `bound` of `subject` ([`Self::challenge`]).
@@ -631,7 +639,7 @@ impl Authority {
         &self,
         store: &mut S,
         subject: &Id<Human>,
-        (binding, record): (Key, Record),
+        (binding, record, epoch): (Key, Record, Option<Dependency>),
         key: Key,
         now: Reading,
         random: &mut ChaCha20Rng,
@@ -646,6 +654,9 @@ impl Authority {
             }
         }
         let mut proposal = self.proposal(operation, subject, CHALLENGE, Value::Null, now)?;
+        if let Some(epoch) = epoch {
+            proposal.read(epoch).map_err(Error::Transition)?;
+        }
         proposal
             .read(Dependency::Version(binding, record.version))
             .map_err(Error::Transition)?;
@@ -809,14 +820,15 @@ impl Authority {
         };
         (record.version == self.version(&claims.serial.0.to_be_bytes())).ok_or(Error::NotEnrolled)?;
         // The binding keeps the credential without its signature: another credential with the same serial refuses.
-        let (protected, payload) = match holder {
+        let (protected, payload, epoch) = match holder {
             Holder::Administrator => {
                 let held = self.decode(&record)?;
-                (held.protected, held.payload)
+                (held.protected, held.payload, None)
             }
             Holder::Account => {
                 let held = self.decode_account(&record)?;
-                (held.protected, held.payload)
+                Self::check_epoch(store, &held.epoch).await?;
+                (held.protected, held.payload, Some(held.epoch.dependency()))
             }
         };
         let sign1 = Sign1::decode(credential, self.limits).map_err(|error| Error::Credential(error.into()))?;
@@ -835,6 +847,9 @@ impl Authority {
             .map_err(Error::Credential)?;
         let request = Value::Bytes(call.binding());
         let mut proposal = self.proposal(call.operation().clone(), subject, action, request, now)?;
+        if let Some(epoch) = epoch {
+            proposal.read(epoch).map_err(Error::Transition)?;
+        }
         proposal
             .read(Dependency::Version(binding.clone(), record.version))
             .map_err(Error::Transition)?;
@@ -1546,7 +1561,7 @@ impl fmt::Display for Error {
             Self::Full => {
                 f.write_str("the authority has the most live administrators, or each issue of its log bound one")
             }
-            Self::NotEnrolled => f.write_str("no live administrator binding holds the credential"),
+            Self::NotEnrolled => f.write_str("no live CLI binding holds the credential"),
             Self::Challenge => f.write_str("the binding holds no pending challenge of the call"),
             Self::Record => f.write_str("a record of the authority has no valid form"),
             Self::Time(error) => write!(f, "the time refused: {error}"),

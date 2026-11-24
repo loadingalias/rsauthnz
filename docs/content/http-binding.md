@@ -127,7 +127,7 @@ the request twice refuses with `Refusal::Cookie`.
 
 ### The session cookie
 
-`site.set_session(headers, name, identifier, max_age)` writes a session identifier as 86 base64url characters, with
+`site.set_session(headers, name, identifier, max_age)` writes a session identifier as 139 base64url characters, with
 the attributes above. `name.session(headers)` reads it back as an `Identifier`, or `None` when the request has no
 such cookie. Both encode with the base64url kernels of rscodec that have data-independent timing, because the
 identifier is a bearer value. A value that is not the base64url text of 64 bytes refuses with `Refusal::Cookie`.

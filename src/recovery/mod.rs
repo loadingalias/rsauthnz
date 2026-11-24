@@ -22,7 +22,7 @@
 //!    HMAC-SHA256 tag of the key of the relying party.
 //! 3. [`RelyingParty::recover`] checks the registration response and gives an [`Attempt`]. [`Attempt::propose`] gives
 //!    one commit with the decision of the application. The commit consumes the code, writes the new passkey, ends the
-//!    sessions of the account, and with [`Passkeys::End`] ends each other passkey of the account. It opens a new
+//!    earlier sessions, CLI bindings, and CLI approvals at this site. [`Passkeys::End`] also ends all earlier passkeys. It opens a new
 //!    session, which only the accepted commit releases. The plan names the new passkey as a sign-in method, so a
 //!    restore completes a recovery that a crash left in doubt.
 //!
@@ -94,9 +94,9 @@ use crate::account::{Fresh, Stored};
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::evidence::{Evidence, Method};
-use crate::id::{AuthorityVersion, Human, Id, Principal};
+use crate::id::{Human, Id, Principal};
 use crate::passkey::{self, CREDENTIALS_MAX, Credential, Error, Failure, RelyingParty, Response, User, UserHandle};
-use crate::session::{self, Opening, Session, Sessions};
+use crate::session::{Opening, Sessions};
 use crate::store::driver::{Driver, Plan};
 use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Store};
@@ -172,30 +172,11 @@ pub enum Passkeys {
     End,
 }
 
-/// Whether the commit of a recovery ends each session of the account.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Ended {
-    /// The commit ends each session of the account that did not end.
-    All,
-    /// The proposal has no room for each session of the account: more sessions than [`Limits::dependencies`] permits
-    /// with the other reads. After the commit, list the sessions of the account ([`Sessions::list`]), and end each one
-    /// other than the new session with [`Revoker::Fresh`](crate::session::Revoker::Fresh) of the new session.
-    ///
-    /// [`Limits::dependencies`]: crate::limits::Limits::dependencies
-    Part,
-}
-
 /// A checked recovery that waits for the decision of the application: the account, its new passkey, and the commit that
 /// [`RelyingParty::recover`] made.
 pub struct Attempt {
     account: Id<Human>,
     credential: Credential,
-    /// The key and the version of each other passkey of the account.
-    passkeys: Vec<(Key, AuthorityVersion)>,
-    /// The sessions of the account that the list read, and whether the list read each one.
-    sessions: Vec<Session>,
-    listed: bool,
-    dependencies_max: usize,
     proposal: Proposal,
     plan: Plan,
     opening: Opening,
@@ -214,49 +195,18 @@ impl Attempt {
         &self.credential
     }
 
-    /// The commit of the recovery, with `passkeys`, the policy for the other passkeys of the account, and `decision`,
-    /// the reads of the decision of the application, such as the state of the account in its records. The commit reads
-    /// each passkey that it ends and each session at its version, so a change of one makes it conflict: recover again
-    /// with the same response while its challenge serves. It ends each session that fits after the other reads, and
-    /// [`Ended`] tells whether a session stays.
-    ///
-    /// Submit the proposal with the plan, and give its outcome to [`Opening::release`]. After a lost response, keep the
-    /// opening, and look up the operation of the proposal: no second recovery runs by itself.
+    /// Adds the current decision of the application to the recovery commit.
+    /// Submit the proposal with the plan. After a lost response, look up the original operation.
+    /// Only an accepted outcome releases the new session through [`Opening::release`].
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     ///
     /// # Errors
     ///
-    /// [`Error::Full`] for [`Passkeys::Keep`] when the account has [`CREDENTIALS_MAX`] passkeys. [`Error::Transition`] if
-    /// `decision` reads a record of the recovery with another result, or the reads of the decision and of the passkeys
-    /// are more than the limits permit.
-    pub fn propose(
-        mut self,
-        passkeys: Passkeys,
-        decision: &[Dependency],
-    ) -> Result<(Proposal, Plan, Opening, Ended), Error> {
+    /// [`Error::Transition`] if a decision conflicts with the recovery or exceeds the dependency limit.
+    pub fn propose(mut self, decision: &[Dependency]) -> Result<(Proposal, Plan, Opening), Error> {
         passkey::decide(&mut self.proposal, decision)?;
-        match passkeys {
-            Passkeys::Keep => (self.passkeys.len() < CREDENTIALS_MAX).ok_or(Error::Full)?,
-            Passkeys::End => {
-                for (key, version) in self.passkeys {
-                    self.proposal.read(Dependency::Version(key.clone(), version))?;
-                    self.proposal.change(Change::End(key))?;
-                }
-            }
-        }
-        let mut ended = if self.listed { Ended::All } else { Ended::Part };
-        for session in &self.sessions {
-            // Each change has its own read, so the room for reads is also room for changes.
-            if self.proposal.dependencies().len() == self.dependencies_max {
-                ended = Ended::Part;
-                break;
-            }
-            self.proposal
-                .read(Dependency::Version(session.key().clone(), session.version().clone()))?;
-            self.proposal.change(Change::End(session.key().clone()))?;
-        }
-        Ok((self.proposal, self.plan, self.opening, ended))
+        Ok((self.proposal, self.plan, self.opening))
     }
 }
 
@@ -311,7 +261,8 @@ impl RelyingParty {
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
         let secret = self.recovery.as_ref().ok_or(Error::RecoveryKey)?;
         let account = fresh.account();
-        let stored = self.stored(store, handle).await?;
+        (fresh.epoch.scope == self.scope(handle)).ok_or(Error::Credential)?;
+        let stored = self.stored(store, &fresh.epoch).await?;
         let owned: Vec<&Stored> = stored
             .iter()
             .filter(|stored| stored.passkey.account() == account)
@@ -436,16 +387,15 @@ impl RelyingParty {
     /// the key of the relying party did not make, or that is older than
     /// [`REGISTRATION_LIFETIME`](crate::passkey::REGISTRATION_LIFETIME), before any read. Then it reads the record of the
     /// code of the challenge, checks that it is at the version of the challenge, and checks the response as
-    /// [`Self::verify`] does. It reads the other passkeys of the account and one page of its sessions of `sessions`.
+    /// [`Self::verify`] does. Both policies advance the account recovery number. Only [`Passkeys::Keep`] reads the current passkeys.
     ///
     /// The commit consumes the code, writes the credential record of the new passkey, and opens a new session of
     /// `sessions` whose evidence is a recovery. Its plan names the passkey as a sign-in method, so a restore completes a
     /// recovery that a crash left in doubt. The operation identity is new, and the read of the code orders two
     /// recoveries with one code: one commits, and the other conflicts. The deadline is the end of the challenge.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`], one keyed read, one range
-    /// read of at most [`CREDENTIALS_MAX`] credential records, and one range read of at most
-    /// [`PAGE_MAX`](crate::session::PAGE_MAX) sessions.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One code read and one range lookup for the newest account revision.
+    /// [`Passkeys::Keep`] also reads the enrollment revision and up to [`CREDENTIALS_MAX`] passkeys. It returns [`Error::Full`] at the limit.
     ///
     /// # Errors
     ///
@@ -454,11 +404,16 @@ impl RelyingParty {
     /// ended it. [`Error::Record`] if a record has no valid form, [`Error::Time`] if `now` has no bound,
     /// [`Error::Session`] for the new session, [`Error::Driver`] if the driver does not serve, and
     /// [`Error::Transition`] for the proposal. [`Failure::Store`] if a read fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the store, registration, session issuer, recovery policy, time, entropy and commit driver have distinct roles"
+    )]
     pub async fn recover<S: Store>(
         &self,
         store: &mut S,
         response: &Response,
         sessions: &Sessions,
+        passkeys: Passkeys,
         now: Reading,
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
@@ -471,25 +426,24 @@ impl RelyingParty {
         (record.version.coordinate() == version).ok_or(Error::Code)?;
         let (account, handle, _) = self.code_form(&record.data)?;
         let credential = self.verify(response, challenge)?;
-        let passkeys = self
-            .stored(store, &handle)
-            .await?
-            .into_iter()
-            .filter(|stored| *stored.passkey.account() == account)
-            .map(|stored| (stored.passkey.key().clone(), stored.record.version))
-            .collect();
-        let page = sessions
-            .list(store, &account, None, now)
-            .await
-            .map_err(|failure| match failure {
-                session::Failure::Refused(error) => Failure::Refused(Error::Session(error)),
-                session::Failure::Store(error) => Failure::Store(error),
-            })?;
-
-        let credential_key = self.credential_key(&handle, credential.id());
+        let epoch = self.epoch(store, &handle).await?;
+        let enrollment_guard = if passkeys == Passkeys::Keep {
+            let enrollments = epoch.enrollments(store).await?;
+            let stored = self.stored(store, &epoch).await?;
+            (stored.len() < CREDENTIALS_MAX).ok_or(Error::Full)?;
+            Some(enrollments.guard())
+        } else {
+            None
+        };
         let data = credential.record(&account, &handle);
         let request = Value::Array(vec![Value::Bytes(key.as_bytes()), Value::Bytes(&data)]);
         let mut proposal = self.proposal(passkey::operation(random), &account, RECOVER, &request, now)?;
+        let mut plan = Plan::default();
+        if let Some(guard) = enrollment_guard {
+            proposal.read(guard).map_err(Error::from)?;
+        }
+        let next = epoch.advance(self, &account, passkeys, &mut proposal, &mut plan, driver)?;
+        let credential_key = next.credential(credential.id());
         proposal
             .read(Dependency::Version(key.clone(), record.version))
             .map_err(Error::from)?;
@@ -498,7 +452,7 @@ impl RelyingParty {
             .read(Dependency::Absent(credential_key.clone()))
             .map_err(Error::from)?;
         proposal
-            .read(Dependency::Absent(Self::removal_key(&credential_key)))
+            .read(Dependency::Absent(self.removal_key(&handle, credential.id())))
             .map_err(Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
         proposal
@@ -522,19 +476,12 @@ impl RelyingParty {
             None,
         );
         let opening = sessions
-            .open(&mut proposal, evidence, None, random, driver)
+            .open(&mut proposal, evidence, &next, None, random, driver)
             .map_err(Error::Session)?;
-        let plan = Plan {
-            anchors: vec![(credential_key, Role::SignIn(account.clone()))],
-            ..Plan::default()
-        };
+        plan.anchors.push((credential_key, Role::SignIn(account.clone())));
         Ok(Attempt {
             account,
             credential,
-            passkeys,
-            sessions: page.sessions,
-            listed: page.next.is_none(),
-            dependencies_max: self.limits.dependencies,
             proposal,
             plan,
             opening,

@@ -1,8 +1,8 @@
 # Recover an account
 
 `rsauthnz::recovery` gives each account one recovery code. A user who lost each passkey gives the name of the account
-and the code, and registers a new passkey. One commit consumes the code, writes the new passkey, ends the sessions of
-the account, and opens a new session. A recovery is weaker evidence than a passkey sign-in: it is never phishing
+and the code, and registers a new passkey. One commit consumes the code and opens a session with the new passkey.
+It ends all previous sessions, connected account CLIs, and unfinished approvals for this account at this passkey site. A recovery is weaker evidence than a passkey sign-in: it is never phishing
 resistant.
 
 Each operation proposes one commit, and the storage binding of the application accepts it ([Propose a
@@ -63,30 +63,16 @@ again.
    name and the code in `body`.
 3. The browser sends `credential.toJSON()`. Check the request with `site.json_change`, and read the body with
    `Response::parse`.
-4. Call `rp.recover(&mut store, &response, &sessions, now, &mut random, &mut driver)`. It checks the tag and the
-   lifetime of the challenge before any read. Then it reads the record of the code, checks that the record is at the
-   version of the challenge, and checks the response as a registration does. It reads the other passkeys of the
-   account and one page of the sessions of `sessions`. It gives an `Attempt`: `account()` and `credential()`.
-5. Call `attempt.propose(passkeys, &reads)` with the policy of the application for the other passkeys and the reads of
-   its decision. `Passkeys::End` ends each other passkey of the account, such as the passkey of a lost device, or of
-   a thief who signed in with it. `Passkeys::Keep` keeps them, so a thief of the code cannot remove them. A recovery
-   writes no [removal mark](accounts.md#remove-a-passkey), so a sign-in with an ended passkey refuses with
-   `Error::Credential`. The `signalAccepted` call after the recovery hides the ended passkeys in a synchronized
-   provider.
-6. Submit the proposal with its plan, and give the outcome to `opening.release(&outcome)`. Only the accepted commit
-   releases the `Opened`: the evidence of the recovery and the new session. Send its identifier in the cookie.
-7. When `propose` gave `Ended::Part`, the proposal had no room for each session of the account. List the sessions of
-   the account (`sessions.list`), and end each one other than the new session with `Revoker::Fresh` of the new session
-   ([Sign out, list, and revoke](sessions.md#sign-out-list-and-revoke)). At the default `Limits`, a recovery with
-   `Passkeys::Keep` and no decision ends up to 60 sessions.
-8. Make a new code: the account has no code after a recovery. The new session is a fresh user verification, so it can
-   make the code at once.
+4. Call `rp.recover(&mut store, &response, &sessions, passkeys, now, &mut random, &mut driver)`.
+   Use `Passkeys::End` to replace all previous passkeys. Use `Passkeys::Keep` to retain them.
+   With 32 current passkeys, `Keep` returns `Error::Full`. Both policies end earlier sessions, account CLIs, and approvals.
+5. Call `attempt.propose(&reads)` with the dependencies of the application decision. Submit the proposal and its plan together.
+6. Call `opening.release(&outcome)` and send the accepted session identifier in the cookie.
+   Show the user the new passkey. After full recovery, use `signalAccepted` to hide retired passkeys in a synchronized provider.
+7. Make a new recovery code from the new session.
 
-The commit reads the code at its version and ends it, so a code serves one recovery. Two recoveries with one code are
-two operations: one commits, and the read of the code makes the other conflict. After the commit, each check of the
-code refuses with `Error::Code`. The commit also reads each session and each passkey that it ends at its version, so a
-renewal or a sign-in that changed one makes it conflict: call `recover` again with the same response while its
-challenge serves.
+Recovery advances a durable number for this account and passkey site. A renewal, CLI call, or enrollment finish prepared
+under the old number conflicts if recovery commits first. A stream stops at its next confirmation. Other accounts keep their access.
 
 After a lost response, keep the opening, and look up the operation of the proposal (`proposal.operation()`) when the
 driver serves again. Give the receipt of the lookup to `opening.release` as `Outcome::Accepted`. Never send the
@@ -177,10 +163,14 @@ that read the store return `passkey::Failure`.
 
 The cost class of `Code::parse` and `Attempt::propose` is `Parse`. The cost class of `recovery_options` is `Verify`
 ([Admit rsauthnz work](admission.md)): one keyed hash and one keyed read, which a flood of guesses pays for each
-attempt. The cost class of `recover` is `Verify` too: the checks of a registration, one keyed read, one range read of at
-most `CREDENTIALS_MAX` credential records, and one range read of at most `PAGE_MAX` (64) sessions. The cost class of
-`recovery_code` is `Mutate`: one range read of at most `CREDENTIALS_MAX` records, one keyed read, one keyed hash, and
-its commit.
+attempt. Full recovery reads the code and the newest account revision. Its commit has fixed size for any number of sessions or CLIs.
+Keeping previous passkeys also reads their enrollment revision and one page of at most `CREDENTIALS_MAX` records. Issuing a code reads the current passkeys and the code record. The commit checks the revision of the fresh session.
+
+## Upgrade existing accounts
+
+Keep the passkey authority, relying party ID, challenge key, and recovery key. Existing passkeys and recovery codes still work.
+Clear an old session cookie on the next request and ask the user to sign in once. Ask each account CLI to enroll again.
+Restart pending registration and enrollment requests. Their earlier records did not bind the request to an account recovery number.
 
 ## Support
 

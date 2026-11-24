@@ -227,6 +227,13 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
         .register(&mut laptop, ceremony, br#"{"name":"alice"}"#, &first)
         .await;
     assert!(laptop.cookie.is_none(), "a sign-up opens no session");
+    // An upgrade clears the earlier cookie. The user signs in once with the passkey already registered.
+    laptop.cookie = include_str!("../../../tests/passkey/upgrade.txt")
+        .lines()
+        .last()
+        .map(str::to_owned);
+    assert_eq!(site.account(&mut laptop).await.status, StatusCode::FORBIDDEN);
+    assert!(laptop.cookie.is_none());
     site.sign_in(&mut laptop, &first, handle).await;
     // The account page gives the data of `signalRenamed` and `signalAccepted`.
     let account = site.account(&mut laptop).await;

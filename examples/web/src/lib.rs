@@ -465,7 +465,7 @@ impl State {
     fn account(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let (access, account) = self.access(request, now)?;
         let passkeys = ready(self.rp.passkeys(&mut self.memory, &account.handle))?;
-        let page = ready(self.sessions.list(&mut self.memory, &account.id, None, now))?;
+        let page = ready(self.sessions.list(&mut self.memory, &access, None, now))?;
         reply(|place| {
             place.object(|object| {
                 object.member("rpId").str(&self.rp_id)?;
@@ -655,8 +655,8 @@ impl State {
     fn revoke(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let [key] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["key"])?;
         let key = base64url(&key)?;
-        let (access, account) = self.access(request, now)?;
-        let page = ready(self.sessions.list(&mut self.memory, &account.id, None, now))?;
+        let (access, _account) = self.access(request, now)?;
+        let page = ready(self.sessions.list(&mut self.memory, &access, None, now))?;
         let session = page
             .sessions
             .iter()
@@ -791,46 +791,21 @@ impl State {
             &mut self.memory,
             &response,
             &self.sessions,
+            Passkeys::End,
             now,
             &mut self.random,
             &mut self.driver,
         );
         let attempt = ready(recover)?;
-        let (proposal, plan, opening, ended) = attempt.propose(Passkeys::End, &[])?;
+        let (proposal, plan, opening) = attempt.propose(&[])?;
         let receipt = self.commit((proposal, plan), now)?;
         let opened = opening
             .release(&Outcome::Accepted(receipt))
             .ok_or(Problem::Recovery(Recovery::Lookup))?;
-        if ended == rsauthnz::recovery::Ended::Part {
-            self.end_others(&opened, now)?;
-        }
         let mut response = json_reply(b"{}".to_vec());
         let identifier = opened.session.identifier();
         self.site
             .set_session(response.headers_mut(), SESSION, identifier, opened.session.max_age(now))?;
         Ok(response)
-    }
-
-    /// Ends each session of the account of `opened` other than its own, with the fresh verification of the new
-    /// session: the sessions that the commit of a recovery had no room for.
-    fn end_others(&mut self, opened: &session::Opened, now: Reading) -> Result<(), Problem> {
-        let access = match ready(self.sessions.check(&mut self.memory, opened.session.identifier(), now))? {
-            Check::Active(access) => access,
-            Check::Reused(..) => return Err(Problem::Recovery(Recovery::Lookup)),
-        };
-        let fresh = Fresh::check(&access, FRESH_MAX, now)?;
-        let account = access.session().account().clone();
-        let page = ready(self.sessions.list(&mut self.memory, &account, None, now))?;
-        for session in page
-            .sessions
-            .iter()
-            .filter(|session| session.key() != access.session().key())
-        {
-            let proposal = self
-                .sessions
-                .revoke(session, Revoker::Fresh(&fresh), &[], now, &mut self.random)?;
-            self.commit(proposal, now)?;
-        }
-        Ok(())
     }
 }

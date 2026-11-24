@@ -238,11 +238,11 @@ fn a_cookie_that_is_in_the_request_twice_or_not_valid_refuses() {
 }
 
 #[test]
-fn a_session_cookie_holds_86_base64url_characters_and_reads_back_as_its_identifier() {
+fn a_session_cookie_round_trips_139_base64url_characters_and_refuses_an_earlier_cookie() {
     let site = Site::new(ORIGIN).unwrap();
-    // Each character of the alphabet kinds. The last one carries 2 bits of the identifier and 4 zero bits.
-    let mut text: Vec<u8> = (0..86).map(|at| b"AZaz09-_"[at % 8]).collect();
-    text[85] = b'A';
+    // The last character carries four identifier bits and two zero bits.
+    let mut text: Vec<u8> = (0..139).map(|at| b"AZaz09-_"[at % 8]).collect();
+    *text.last_mut().unwrap() = b'8';
     let identifier = Identifier::parse(&text).unwrap();
     let mut headers = HeaderMap::new();
     site.set_session(&mut headers, SESSION, &identifier, Duration::from_secs(600))
@@ -261,8 +261,8 @@ fn a_session_cookie_holds_86_base64url_characters_and_reads_back_as_its_identifi
     let mut standard = text.clone();
     standard[3] = b'+';
     let mut trailing = text.clone();
-    trailing[85] = b'B';
-    for value in [&text[..43], &standard[..], &trailing[..]] {
+    *trailing.last_mut().unwrap() = b'9';
+    for value in [&text[..43], &[b'A'; 86], &standard[..], &trailing[..]] {
         let request = cookies(&[&[b"__Host-session=", value].concat()]);
         assert_eq!(SESSION.session(&request).err(), Some(Refusal::Cookie));
     }

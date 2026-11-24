@@ -251,6 +251,8 @@ pub enum Role {
     Cli(Id<Human>),
     /// A recovery value of the account. It is no sign-in method.
     Recovery(Id<Human>),
+    /// Account recovery or enrollment state. A restore keeps its current revision and device records.
+    AccountState(Id<Human>),
     /// An administrator binding of the authority.
     Administrator(Id<Authority>),
 }
@@ -265,7 +267,9 @@ enum Owner<'a> {
 impl Role {
     const fn owner(&self) -> Owner<'_> {
         match self {
-            Self::SignIn(account) | Self::Cli(account) | Self::Recovery(account) => Owner::Account(account),
+            Self::SignIn(account) | Self::Cli(account) | Self::Recovery(account) | Self::AccountState(account) => {
+                Owner::Account(account)
+            }
             Self::Administrator(authority) => Owner::Authority(authority),
         }
     }

@@ -24,13 +24,14 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
   same handle, so an authenticator keeps one passkey for each account. Draw it once for a new account
   (`UserHandle::random`), and keep it with the account.
 - The **pending registration** is a record of the kind `Kind::Registration`. It holds the account and the user
-  handle. Its key is the SHA-256 digest of the CBOR form `["rsauthnz.passkey.registration.1", authority, relying
+  handle and the account revision at the start. Its key is the SHA-256 digest of the CBOR form `["rsauthnz.passkey.registration.2", authority, relying
   party ID, challenge]`, with a challenge of 32 random bytes. It ends after `REGISTRATION_LIFETIME` (300 seconds). The
   record never holds the challenge. The response is not signed, so the challenge is the only proof that the response
   comes from the ceremony of the account.
-- The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(&handle, id)`. Its key
-  is the kind, the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID,
-  user handle]`, and the SHA-256 digest of the credential ID. It holds the account, the user handle, the credential
+- The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(&mut store, &handle, id).await?`.
+  Its key combines the kind, the current passkey prefix, and the SHA-256 digest of the credential ID.
+  The initial prefix is the digest of `["rsauthnz.passkey.credential.2", authority, relying party ID, user handle]`.
+  Full recovery changes this prefix. The record holds the account, the user handle, the credential
   ID, the public key of the passkey, its algorithm, its signature counter, its backup flags, its transports, and its
   name. A new passkey has the empty name ([Rename a passkey](accounts.md#list-and-rename-passkeys)). It has no end. The
   public key is the deterministic CBOR of a `COSE_Key` with only `kty`, `alg`, and the checked public parameters: no
@@ -38,7 +39,7 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
 - Each key names the authority and the relying party ID. Thus two relying parties can share one store: neither one
   finds a pending registration or a credential of the other. The first 33 bytes of a credential key are the same for
   each passkey of an account, so one range read gives them all. An account has at most `CREDENTIALS_MAX` (32)
-  passkeys.
+  passkeys. A registration claims its place in the commit. If account recovery or another enrollment wins the race, registration conflicts.
 - A **sign-in challenge** is 72 bytes: 32 random bytes, the time of its creation, and an HMAC-SHA256 tag of both
   under the key of the relying party. The time of creation is the earliest time of the reading, so it is never later
   than the true time. No record holds the challenge until it serves a sign-in. Then the commit writes its **replay
@@ -344,10 +345,11 @@ failed read, which is a crash of the binding.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
 The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `finish` makes
-one keyed read and one range read. A valid `sign_in` makes one signature check and three keyed lookups in two store calls.
+one pending-record read, the recovery and enrollment revisions, and one passkey page. A valid `sign_in` reads the account revision,
+checks one signature, and makes three further keyed lookups in two store calls.
 It reads the credential first, then reads the replay floor and challenge record together.
 For an absent credential, it checks the removal mark and refuses. The cost class of
-`start` is `Mutate`: one range read of at most
+`start` is `Mutate`. It looks up the account revision and reads one page of at most
 `CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 
 ## Support

@@ -6,11 +6,9 @@
 //! ([`Opening::release`]). A sign-in that presents the current session of the browser ends that family in the same
 //! commit, so the identifier changes at each sign-in and at each fresh user verification, and the old one refuses.
 //!
-//! An identifier is [`IDENTIFIER_BYTES`] bytes: a locator of the account, the number of the family, and a secret of 32
-//! random bytes. The cookie holds it as [`IDENTIFIER_CHARS`] base64url characters, with no signed claim. The record
-//! key holds the locator and a digest of the family number under the authority and the audience, and the record holds
-//! the HMAC-SHA256 tag of the key under the secret. Thus the store keeps no usable identifier, and [`Sessions::check`]
-//! finds the record with one keyed read and compares the tag in constant time.
+//! The identifier carries the account locator, family number, passkey scope, recovery number, and 32 secret bytes.
+//! The cookie holds [`IDENTIFIER_CHARS`] base64url characters. The record stores an HMAC-SHA256 tag of the family key.
+//! [`Sessions::check`] reads the family and recovery records together and compares the tag in constant time.
 //!
 //! A [`Policy`] gives three times. A family ends at its lifetime after its sign-in, and no renewal extends it. Each
 //! generation ends after the idle time, and a renewal is due after half of it ([`Access::renewal_due`]).
@@ -67,8 +65,8 @@
 //!     driver.give(output)?;
 //! }
 //!
-//! // An identifier of no session refuses after one keyed read.
-//! let stranger = Identifier::parse(&[b'A'; 86])?;
+//! // An identifier of no session refuses after one paired read.
+//! let stranger = Identifier::parse(&[b'A'; rsauthnz::session::IDENTIFIER_CHARS])?;
 //! let refused = ready(sessions.check(&mut memory, &stranger, now)).unwrap_err();
 //! assert_eq!(refused, Failure::Refused(Error::Unknown));
 //! # Ok::<(), Box<dyn core::error::Error>>(())
@@ -85,6 +83,7 @@ use rscodec::base64::Profile::Url;
 use rscrypto::{ChaCha20Rng, SecretBytes};
 
 use crate::account::Fresh;
+use crate::account::generation::{self, Epoch};
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::evidence::Evidence;
@@ -95,11 +94,11 @@ use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
 use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Proposal, Recover, Recovery};
 
-/// The bytes of an identifier: a locator of 16 bytes, a family number of 16 bytes, and a secret of 32 bytes.
-pub const IDENTIFIER_BYTES: usize = 64;
+/// The bytes for the locator, family, account scope, recovery revision, and bearer secret.
+pub const IDENTIFIER_BYTES: usize = 104;
 
 /// The base64url characters of an identifier, with no padding.
-pub const IDENTIFIER_CHARS: usize = 86;
+pub const IDENTIFIER_CHARS: usize = 139;
 
 /// The most records of one page of [`Sessions::list`].
 pub const PAGE_MAX: usize = 64;
@@ -108,7 +107,7 @@ pub const PAGE_MAX: usize = 64;
 const PAGE: NonZeroUsize = NonZeroUsize::new(PAGE_MAX).expect("the bound is not zero");
 
 /// The name of the record form, the domain of each digest, and the domain of the tags.
-const FORM: &str = "rsauthnz.session.1";
+const FORM: &str = "rsauthnz.session.2";
 
 /// The audit actions.
 const RENEW: &str = "session.renew";
@@ -133,6 +132,7 @@ pub struct Policy {
 pub struct Sessions {
     authority: Id<Authority>,
     audience: Id<Audience>,
+    namespace: [u8; 32],
     policy: Policy,
     limits: Limits,
 }
@@ -158,25 +158,28 @@ impl Sessions {
         let valid = !policy.idle.is_zero() && policy.idle <= policy.lifetime && policy.grace < policy.idle;
         valid.ok_or(Error::Policy)?;
         rscodec::with_dit(|_| ()).map_err(|_| Error::Dit)?;
+        let form = Value::Array(vec![Value::Text(FORM), authority.to_cbor(), audience.to_cbor()]);
+        let namespace = crypto::sha256(&cbor::encode(&form, Limits::FORM).map_err(|_| Error::Record)?);
         Ok(Self {
             authority,
             audience,
+            namespace,
             policy,
             limits,
         })
     }
 
-    /// The session of `identifier` at `now`, after one keyed read of `store`: [`Check::Active`] for the current
+    /// The session of `identifier` at `now`, after one paired read of `store`: [`Check::Active`] for the current
     /// generation, and for the replaced generation within the grace time. [`Check::Reused`] for the replaced generation
     /// after the grace time: submit its proposal, which ends the family, and clear the cookie.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read, one SHA-256 digest, and at most two
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). Two keyed lookups in one store call, one SHA-256 digest, and at most two
     /// HMAC-SHA256 tags.
     ///
     /// # Errors
     ///
     /// [`Error::Unknown`] if no session of this audience has the identifier, also after a revocation or a sign-in that
-    /// replaced the family. [`Error::Ended`] if the idle time or the lifetime of the session passed. [`Error::Record`] if
+    /// replaced the family. [`Error::Ended`] after recovery, idle expiry, or lifetime expiry. [`Error::Record`] if
     /// the record has no valid form, and [`Error::Time`] if `now` has no bound.
     /// [`Failure::Store`] if the read fails.
     pub async fn check<S: Store>(
@@ -187,25 +190,35 @@ impl Sessions {
     ) -> Result<Check, Failure<S::Error>> {
         let latest = now.latest().map_err(Error::Time)?;
         let key = self.key(identifier.locator(), identifier.family());
-        let record = store.read(&key).await.map_err(Failure::Store)?.ok_or(Error::Unknown)?;
+        let (scope, number) = identifier.recovery();
+        let [record, generation] = store
+            .read_pair([&key, &generation::key(scope, number)])
+            .await
+            .map_err(Failure::Store)?;
+        let record = record.ok_or(Error::Unknown)?;
         let (session, previous) = self.session(key, &record)?;
+        (session.epoch.scope == *scope && session.epoch.number == number && session.epoch.holds(generation.as_ref()))
+            .ok_or(Error::Ended)?;
         let signed = tagged(&session.key);
         let current = crypto::hmac_sha256_verify(identifier.secret(), &signed, &session.tag);
         let replaced =
             !current && previous.is_some_and(|tag| crypto::hmac_sha256_verify(identifier.secret(), &signed, &tag));
         (current || replaced).ok_or(Error::Unknown)?;
         (latest < session.end).ok_or(Error::Ended)?;
-        let generation = if current {
-            Generation::Current
-        } else if latest < add(session.issued, self.policy.grace)? {
-            Generation::Replaced
+        let (generation, deadline) = if current {
+            (Generation::Current, session.end)
         } else {
-            let (proposal, plan) = self.reused(&session, now)?;
-            return Ok(Check::Reused(proposal, plan));
+            let grace_end = add(session.issued, self.policy.grace)?.min(session.end);
+            if latest >= grace_end {
+                let (proposal, plan) = self.reused(&session, now)?;
+                return Ok(Check::Reused(proposal, plan));
+            }
+            (Generation::Replaced, grace_end)
         };
         Ok(Check::Active(Access {
             session,
             generation,
+            deadline,
             family: *identifier.family(),
         }))
     }
@@ -231,15 +244,17 @@ impl Sessions {
     ) -> Result<(Proposal, Plan, Renewal), Error> {
         (access.generation == Generation::Current).ok_or(Error::Replaced)?;
         let session = &access.session;
+        (*session.locator() == self.locator(&session.epoch)).ok_or(Error::Unknown)?;
         let earliest = now.earliest().map_err(Error::Time)?;
         (now.latest().map_err(Error::Time)? < session.end).ok_or(Error::Ended)?;
-        let (identifier, tag) = Identifier::draw(session.locator(), &access.family, &session.key, random);
+        let (identifier, tag) =
+            Identifier::draw(session.locator(), &access.family, &session.epoch, &session.key, random);
         let mut proposal = self.proposal(operation(random), &session.account, RENEW, &session.key, now)?;
-        proposal.read(Dependency::Version(session.key.clone(), session.version.clone()))?;
+        access.gate(&mut proposal)?;
         let end = add(earliest, self.policy.idle)?.min(session.expires);
         let data = self.record(
-            &session.account,
             &session.evidence,
+            &session.epoch,
             session.started,
             earliest,
             &tag,
@@ -252,7 +267,6 @@ impl Sessions {
             end: Some(end),
             data,
         })?;
-        proposal.until(session.end);
         let plan = Plan {
             replaced: vec![session.key.clone()],
             ..Plan::default()
@@ -285,6 +299,7 @@ impl Sessions {
         now: Reading,
         random: &mut ChaCha20Rng,
     ) -> Result<(Proposal, Plan), Error> {
+        (*session.locator() == self.locator(&session.epoch)).ok_or(Error::Unknown)?;
         let account = Principal::Human(session.account.clone());
         let (actor, fresh) = match by {
             Revoker::Own(access) => {
@@ -292,7 +307,7 @@ impl Sessions {
                 (account, None)
             }
             Revoker::Fresh(fresh) => {
-                (*fresh.account() == session.account).ok_or(Error::Fresh)?;
+                (*fresh.account() == session.account && fresh.epoch == session.epoch).ok_or(Error::Fresh)?;
                 (account, Some(fresh))
             }
             Revoker::Other(actor) => {
@@ -315,10 +330,9 @@ impl Sessions {
         Ok((proposal, Plan::default()))
     }
 
-    /// The sessions of `account` at `now`: one page of the range read of `store` after the key `after`, or from the
-    /// first key. A session that ended at `now` is not in the page.
+    /// Lists live sessions of the account and passkey site of `access`. The page starts after `after`, or at the first key.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One range read of at most [`PAGE_MAX`] records.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One paired read and one range read of at most [`PAGE_MAX`] records.
     ///
     /// # Errors
     ///
@@ -327,13 +341,15 @@ impl Sessions {
     pub async fn list<S: Store>(
         &self,
         store: &mut S,
-        account: &Id<Human>,
+        access: &Access,
         after: Option<&Key>,
         now: Reading,
     ) -> Result<Page, Failure<S::Error>> {
         let latest = now.latest().map_err(Error::Time)?;
+        self.confirm(store, access.session(), now).await?;
+        let owner = access.session();
         let prefix = Kind::Session
-            .key(&self.locator(account))
+            .key(&self.locator(&owner.epoch))
             .expect("a key of 17 bytes is valid");
         let records = store.range(&prefix, after, PAGE).await.map_err(Failure::Store)?;
         let next = if records.len() == PAGE_MAX {
@@ -345,7 +361,7 @@ impl Sessions {
         for (key, record) in &records {
             let (session, _) = self.session(key.clone(), record)?;
             // Two accounts can share a locator only by a collision of 128 bits: the record names its account.
-            if session.account == *account && latest < session.end {
+            if session.account == owner.account && session.epoch == owner.epoch && latest < session.end {
                 sessions.push(session);
             }
         }
@@ -356,11 +372,11 @@ impl Sessions {
     /// keeps the family, so a stream that started before it continues. Call it before each part of a stream and before
     /// queued output.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One paired read of the family and its account recovery number.
     ///
     /// # Errors
     ///
-    /// [`Error::Ended`] if the family ended: a revocation, a sign-in that replaced it, the idle time, or the lifetime.
+    /// [`Error::Ended`] after account recovery, revocation, a sign-in that replaced the family, idle expiry, or lifetime expiry.
     /// [`Error::Record`] if the record has no valid form, and [`Error::Time`] if `now` has no bound. [`Failure::Store`]
     /// if the read fails.
     pub async fn confirm<S: Store>(
@@ -370,11 +386,13 @@ impl Sessions {
         now: Reading,
     ) -> Result<(), Failure<S::Error>> {
         let latest = now.latest().map_err(Error::Time)?;
-        let record = store
-            .read(&session.key)
+        (*session.locator() == self.locator(&session.epoch)).ok_or(Error::Ended)?;
+        let [record, guard] = store
+            .read_pair([&session.key, &session.epoch.key()])
             .await
-            .map_err(Failure::Store)?
-            .ok_or(Error::Ended)?;
+            .map_err(Failure::Store)?;
+        let record = record.ok_or(Error::Ended)?;
+        session.epoch.holds(guard.as_ref()).ok_or(Error::Ended)?;
         let (current, _) = self.session(session.key.clone(), &record)?;
         (current.account == session.account && latest < current.end).ok_or(Error::Ended)?;
         Ok(())
@@ -386,28 +404,25 @@ impl Sessions {
         &self,
         proposal: &mut Proposal,
         evidence: Evidence,
+        epoch: &Epoch,
         replaces: Option<&Access>,
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
     ) -> Result<Opening, Error> {
-        let Principal::Human(account) = evidence.subject() else {
-            return Err(Error::Principal);
-        };
-        let account = account.clone();
+        matches!(evidence.subject(), Principal::Human(_)).ok_or(Error::Principal)?;
         if let Some(replaced) = replaces {
             let session = &replaced.session;
-            (*session.locator() == self.locator(&session.account)).ok_or(Error::Unknown)?;
-            proposal.read(Dependency::Version(session.key.clone(), session.version.clone()))?;
-            proposal.change(Change::End(session.key.clone()))?;
+            (*session.locator() == self.locator(&session.epoch)).ok_or(Error::Unknown)?;
+            end(proposal, session)?;
         }
         let started = proposal.audit().time.earliest().map_err(Error::Time)?;
         let mut family = [0; 16];
         random.fill_bytes(&mut family);
-        let locator = self.locator(&account);
+        let locator = self.locator(epoch);
         let key = self.key(&locator, &family);
-        let (identifier, tag) = Identifier::draw(&locator, &family, &key, random);
+        let (identifier, tag) = Identifier::draw(&locator, &family, epoch, &key, random);
         let end = add(started, self.policy.idle)?;
-        let data = self.record(&account, &evidence, started, started, &tag, None)?;
+        let data = self.record(&evidence, epoch, started, started, &tag, None)?;
         proposal.read(Dependency::Absent(key.clone()))?;
         let version = self.version(driver.allocate(Kind::Session)?);
         proposal.change(Change::Write {
@@ -460,12 +475,12 @@ impl Sessions {
         ])
     }
 
-    /// The record form `["rsauthnz.session.1", account, evidence, started, issued, tag, previous tag or null]`, with each
+    /// The record form `["rsauthnz.session.2", evidence, epoch, started, issued, tag, previous tag or null]`, with each
     /// time in nanoseconds since the Unix epoch.
     fn record(
         &self,
-        account: &Id<Human>,
         evidence: &Evidence,
+        epoch: &Epoch,
         started: Duration,
         issued: Duration,
         tag: &[u8; 32],
@@ -474,8 +489,8 @@ impl Sessions {
         let nanos = |time: Duration| u64::try_from(time.as_nanos()).map_err(|_| Error::Time(TimeError::Overflow));
         let form = Value::Array(vec![
             Value::Text(FORM),
-            account.to_cbor(),
             evidence.to_cbor(),
+            epoch.form(),
             Value::Unsigned(nanos(started)?),
             Value::Unsigned(nanos(issued)?),
             Value::Bytes(tag),
@@ -494,8 +509,8 @@ impl Sessions {
         };
         let [
             Value::Text(FORM),
-            account,
             evidence,
+            epoch,
             Value::Unsigned(started),
             Value::Unsigned(issued),
             Value::Bytes(tag),
@@ -511,11 +526,16 @@ impl Sessions {
         };
         let (started, issued) = (Duration::from_nanos(*started), Duration::from_nanos(*issued));
         let expires = add(started, self.policy.lifetime)?;
+        let evidence = Evidence::from_cbor(evidence).map_err(|_| Error::Record)?;
+        let Principal::Human(account) = evidence.subject() else {
+            return Err(Error::Record);
+        };
         let session = Session {
+            epoch: Epoch::parse(epoch).ok_or(Error::Record)?,
             key,
             version: record.version.clone(),
-            account: Id::from_cbor(account).map_err(|_| Error::Record)?,
-            evidence: Evidence::from_cbor(evidence).map_err(|_| Error::Record)?,
+            account: account.clone(),
+            evidence,
             started,
             issued,
             end: add(issued, self.policy.idle)?.min(expires),
@@ -526,32 +546,19 @@ impl Sessions {
         Ok((session, previous))
     }
 
-    /// The locator of `account`: the first 16 bytes of the digest of `account` ([`Self::digest`]). The keys of the
-    /// sessions of an account start with it.
-    fn locator(&self, account: &Id<Human>) -> [u8; 16] {
-        self.digest(account.to_cbor())
+    /// The account scope and recovery number select one page prefix within the session issuer and audience.
+    fn locator(&self, epoch: &Epoch) -> [u8; 16] {
+        let hash = crypto::sha256_parts(&[&self.namespace, &epoch.scope, &epoch.number.to_be_bytes()]);
+        *hash.first_chunk().expect("a digest has 32 bytes")
     }
 
-    /// The key of a family: [`Kind::Session`], the locator, and the first 16 bytes of the digest of the family number.
-    /// The check computes the digest with its own authority and audience, so an identifier of another audience finds
-    /// no record, also with the locator that it holds.
+    /// One issuer and audience can look up only their own families.
     fn key(&self, locator: &[u8; 16], family: &[u8; 16]) -> Key {
-        let family = self.digest(Value::Bytes(family));
-        Kind::Session
-            .key(&[&locator[..], &family].concat())
-            .expect("a key of 33 bytes is valid")
-    }
-
-    /// The first 16 bytes of the SHA-256 digest of the CBOR form `["rsauthnz.session.1", authority, audience, value]`.
-    fn digest(&self, value: Value<'_>) -> [u8; 16] {
-        let form = Value::Array(vec![
-            Value::Text(FORM),
-            self.authority.to_cbor(),
-            self.audience.to_cbor(),
-            value,
-        ]);
-        let form = cbor::encode(&form, Limits::FORM).expect("the form of identifiers has no map and no simple value");
-        *crypto::sha256(&form).first_chunk().expect("a digest has 32 bytes")
+        let digest = crypto::sha256_parts(&[&self.namespace, family]);
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(locator);
+        bytes[16..].copy_from_slice(&digest[..16]);
+        Kind::Session.key(&bytes).expect("a session key has 33 bytes")
     }
 
     /// The version of a write: the authority and `value`, a new value of the session counter of the driver.
@@ -562,6 +569,7 @@ impl Sessions {
 
 /// Reads `session` at its version and ends it.
 fn end(proposal: &mut Proposal, session: &Session) -> Result<(), Error> {
+    proposal.read(session.epoch.dependency())?;
     proposal.read(Dependency::Version(session.key.clone(), session.version.clone()))?;
     proposal.change(Change::End(session.key.clone()))?;
     Ok(())
@@ -630,7 +638,7 @@ impl Identifier {
             rscodec::with_dit(|dit| {
                 Url.encode_secret(dit, self.0.as_bytes(), text)
                     .map(|_| ())
-                    .expect("86 characters hold the base64url text of 64 bytes");
+                    .expect("the output has IDENTIFIER_CHARS bytes");
             })
             .map_err(|_| Error::Dit)
         })
@@ -638,11 +646,19 @@ impl Identifier {
 
     /// A new identifier of the family `family` of the locator `locator`, with a secret from `random`, and the tag of
     /// the key `key` under the secret.
-    fn draw(locator: &[u8; 16], family: &[u8; 16], key: &Key, random: &mut ChaCha20Rng) -> (Self, [u8; 32]) {
+    fn draw(
+        locator: &[u8; 16],
+        family: &[u8; 16],
+        epoch: &Epoch,
+        key: &Key,
+        random: &mut ChaCha20Rng,
+    ) -> (Self, [u8; 32]) {
         let Ok(bytes) = SecretBytes::try_fill_with(|bytes: &mut [u8; IDENTIFIER_BYTES]| -> Result<(), !> {
             bytes[..16].copy_from_slice(locator);
             bytes[16..32].copy_from_slice(family);
-            random.fill_bytes(&mut bytes[32..]);
+            bytes[32..64].copy_from_slice(&epoch.scope);
+            bytes[64..72].copy_from_slice(&epoch.number.to_be_bytes());
+            random.fill_bytes(&mut bytes[72..]);
             Ok(())
         });
         let identifier = Self(bytes);
@@ -651,17 +667,31 @@ impl Identifier {
     }
 
     fn locator(&self) -> &[u8; 16] {
-        self.0.as_bytes().first_chunk().expect("an identifier has 64 bytes")
+        self.0
+            .as_bytes()
+            .first_chunk()
+            .expect("an identifier has IDENTIFIER_BYTES bytes")
     }
 
     fn family(&self) -> &[u8; 16] {
         self.0.as_bytes()[16..32]
             .try_into()
-            .expect("an identifier has 64 bytes")
+            .expect("an identifier has IDENTIFIER_BYTES bytes")
+    }
+
+    fn recovery(&self) -> (&[u8; 32], u64) {
+        let bytes = self.0.as_bytes();
+        (
+            bytes[32..64].try_into().expect("the identifier holds the scope"),
+            u64::from_be_bytes(bytes[64..72].try_into().expect("the identifier holds a revision")),
+        )
     }
 
     fn secret(&self) -> &[u8; 32] {
-        self.0.as_bytes().last_chunk().expect("an identifier has 64 bytes")
+        self.0
+            .as_bytes()
+            .last_chunk()
+            .expect("an identifier has IDENTIFIER_BYTES bytes")
     }
 }
 
@@ -674,6 +704,7 @@ impl fmt::Debug for Identifier {
 /// A session family as its record holds it: its account, the evidence of its sign-in, and its times.
 #[derive(Clone, Debug)]
 pub struct Session {
+    pub(crate) epoch: Epoch,
     key: Key,
     version: AuthorityVersion,
     account: Id<Human>,
@@ -759,6 +790,7 @@ pub enum Generation {
 pub struct Access {
     session: Session,
     generation: Generation,
+    deadline: Duration,
     /// The family number of the identifier, which the identifier of a renewal keeps. It is part of a bearer value, so
     /// `Debug` does not show it.
     family: [u8; 16],
@@ -774,6 +806,23 @@ impl fmt::Debug for Access {
 }
 
 impl Access {
+    /// Requires this session and its account revision at commit. The proposal expires when this identifier stops serving.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`transition::Error`] if the dependencies exceed the proposal limits or conflict.
+    pub fn gate(&self, proposal: &mut Proposal) -> Result<(), transition::Error> {
+        proposal.read(self.session.epoch.dependency())?;
+        proposal.read(Dependency::Version(
+            self.session.key.clone(),
+            self.session.version.clone(),
+        ))?;
+        proposal.until(self.deadline);
+        Ok(())
+    }
+
     /// The session.
     #[must_use]
     pub const fn session(&self) -> &Session {
@@ -949,8 +998,7 @@ pub enum Error {
     Identifier,
     /// No session of this audience has the identifier. Treat the request as signed out, and clear the cookie.
     Unknown,
-    /// The session ended: its idle time or its lifetime passed, or, for [`Sessions::confirm`], a revocation or a sign-in
-    /// ended its family. Treat the request as signed out, and clear the cookie.
+    /// The session expired or account recovery ended it. A revocation or a new sign-in also ends its family. Treat the request as signed out, and clear the cookie.
     Ended,
     /// The identifier holds the replaced generation, so it cannot renew. Serve the request with no renewal.
     Replaced,

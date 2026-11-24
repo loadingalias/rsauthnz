@@ -53,11 +53,11 @@ const RECOVERY_KEY: [u8; 32] = [4; 32];
 const HANDLE: [u8; 32] = [9; 32];
 
 /// The key of the pending record of the registration challenge `challenge` of [`rp`]: the documented digest of
-/// `["rsauthnz.passkey.registration.1", authority, relying party ID, challenge]`.
+/// `["rsauthnz.passkey.registration.2", authority, relying party ID, challenge]`.
 fn ceremony(challenge: &[u8]) -> Key {
     let authority = authority();
     let form = Value::Array(vec![
-        Value::Text("rsauthnz.passkey.registration.1"),
+        Value::Text("rsauthnz.passkey.registration.2"),
         authority.to_cbor(),
         Value::Text(RP_ID),
         Value::Bytes(challenge),
@@ -358,14 +358,23 @@ impl Site {
     }
 
     /// The key of the credential record of the passkey `passkey` of alice.
-    fn key(&self, passkey: &Passkey) -> Key {
-        self.rp.credential_key(&UserHandle::from_bytes(HANDLE), &passkey.id)
+    fn key(&mut self, passkey: &Passkey) -> Key {
+        ready(
+            self.rp
+                .credential_key(&mut self.node.memory, &UserHandle::from_bytes(HANDLE), &passkey.id),
+        )
+        .expect("the current passkey key")
+    }
+
+    fn credential(&mut self, passkey: &Passkey) -> Option<Record> {
+        let key = self.key(passkey);
+        self.node.read(&key)
     }
 
     /// The stored counter and backup state (BS) of `passkey`: the seventh and the ninth item of the documented form of
     /// the credential record.
     fn stored(&mut self, passkey: &Passkey) -> (u64, bool) {
-        let record = self.node.read(&self.key(passkey)).expect("the credential record");
+        let record = self.credential(passkey).expect("the credential record");
         let Ok(Value::Array(items)) = cbor::decode(&record.data, Limits::default()) else {
             panic!("a record form");
         };
@@ -556,7 +565,7 @@ fn each_algorithm_of_the_profile_registers_through_the_ceremony() {
         );
         // One commit consumed the ceremony and wrote the credential.
         assert_eq!(site.node.read(&ceremony), None, "{alg}");
-        let record = site.node.read(&site.key(&passkey)).expect("the credential record");
+        let record = site.credential(&passkey).expect("the credential record");
         assert_eq!(record.end, None, "{alg}");
     }
 }
@@ -735,8 +744,8 @@ fn a_ceremony_commits_once_and_its_challenge_refuses_after_it() {
         );
     }
     assert!(matches!(outcomes[3], Outcome::Accepted(_)));
-    assert!(site.node.read(&site.key(&first)).is_some());
-    assert_eq!(site.node.read(&site.key(&second)), None);
+    assert!(site.credential(&first).is_some());
+    assert_eq!(site.credential(&second), None);
     // The commit consumed the challenge, so no later finish finds its ceremony.
     assert_eq!(site.node.read(&ceremony), None);
     assert_eq!(site.finish(&second_json, at(2)).err(), Some(Error::Challenge));
@@ -771,7 +780,7 @@ fn a_registration_in_doubt_completes_once_at_restore() {
     site.node.run();
 
     // The restored store holds the passkey of alice, and the ceremony is consumed.
-    assert!(site.node.read(&site.key(&passkey)).is_some());
+    assert!(site.credential(&passkey).is_some());
     let ceremony = ceremony(&challenge);
     assert_eq!(site.node.read(&ceremony), None);
     let ticket = site.node.driver.lookup(operation).expect("a lookup");
@@ -926,7 +935,7 @@ fn the_credential_record_holds_only_the_checked_public_key() {
     let (proposal, plan) = site.propose(&Registration::new(&passkey, RP_ID, ORIGIN, challenge).json(), at(1));
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
 
-    let record = site.node.read(&site.key(&passkey)).expect("the credential record");
+    let record = site.credential(&passkey).expect("the credential record");
     let Ok(Value::Array(items)) = cbor::decode(&record.data, Limits::default()) else {
         panic!("a record form");
     };

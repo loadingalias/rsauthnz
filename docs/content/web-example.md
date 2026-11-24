@@ -48,7 +48,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Invite | `/invitations` | `rp.invite` under the policy of the example: each account that signed in with user verification may invite ([Issue an invitation](accounts.md#issue-an-invitation)) |
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
 | Make a recovery code | `/recovery-code` | `rp.recovery_code` with a `Fresh`. Only the accepted commit gives the code, and the page shows it once |
-| Recover | `/recover/options`, `/recover/finish` | `rp.recovery_options`, `rp.recover`, and `attempt.propose` with `Passkeys::End` ([Recover](recovery.md#recover)) |
+| Recover | `/recover/options`, `/recover/finish` | `rp.recovery_options`, `rp.recover` with `Passkeys::End`, and one `attempt.propose` ([Recover](recovery.md#recover)) |
 | Sign out | `/sign-out` | `sessions.revoke` with `Revoker::Own`, and `site.clear_cookie` |
 
 A sensitive change, such as a removal, a new code, a new account name, or the end of another session, needs a fresh

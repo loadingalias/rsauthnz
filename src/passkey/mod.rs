@@ -156,7 +156,7 @@ use rscodec::base64::Profile::Url;
 use rscodec::json::{self, Profile::Rfc8259, Slot, Str};
 use rscrypto::{ChaCha20Rng, SecretBytes};
 
-use crate::account::Fresh;
+use crate::account::{Fresh, generation::Epoch};
 use crate::authz;
 use crate::cbor::{self, Value};
 use crate::cose::{self, Key, TrustedKey};
@@ -256,9 +256,9 @@ const ATTESTED: u8 = 0x40;
 const EXTENSIONS: u8 = 0x80;
 
 /// The record forms.
-const PENDING_FORM: &str = "rsauthnz.passkey.registration.1";
+const PENDING_FORM: &str = "rsauthnz.passkey.registration.2";
 const SIGN_IN_FORM: &str = "rsauthnz.passkey.sign-in.1";
-const CREDENTIAL_FORM: &str = "rsauthnz.passkey.credential.2";
+pub(crate) const CREDENTIAL_FORM: &str = "rsauthnz.passkey.credential.2";
 
 /// The audit actions.
 const START: &str = "passkey.start";
@@ -375,7 +375,7 @@ impl RelyingParty {
     /// for an additional passkey. The proposal reads each read of the decision, so the start commits only while the
     /// decision holds. The finish does not keep it: decide again there ([`Registration::propose`]).
     ///
-    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One range read of at most [`CREDENTIALS_MAX`] credential
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One account revision lookup and one range read of at most [`CREDENTIALS_MAX`] credential
     /// records.
     ///
     /// # Errors
@@ -398,8 +398,9 @@ impl RelyingParty {
         let (account, handle) = (user.account, &user.handle);
         name_valid(user.name)?;
         name_valid(user.display_name)?;
+        let epoch = self.epoch(store, handle).await?;
         let records = store
-            .range(&self.account_prefix(handle), None, CREDENTIALS)
+            .range(&epoch.passkey_prefix(), None, CREDENTIALS)
             .await
             .map_err(Failure::Store)?;
         (records.len() < CREDENTIALS_MAX).ok_or(Error::Full)?;
@@ -418,12 +419,14 @@ impl RelyingParty {
         let request = Value::Array(vec![account.to_cbor(), Value::Bytes(&handle.0)]);
         let mut proposal = self.proposal(operation(random), account, START, &request, now)?;
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
-        decision.apply(&mut proposal, account, !records.is_empty())?;
+        proposal.read(epoch.dependency()).map_err(Error::from)?;
+        decision.apply(&mut proposal, account, &epoch, !records.is_empty())?;
         let version = self.version(driver.allocate(Kind::Registration).map_err(Error::from)?);
         let form = Value::Array(vec![
             Value::Text(PENDING_FORM),
             account.to_cbor(),
             Value::Bytes(&handle.0),
+            epoch.form(),
         ]);
         proposal
             .change(Change::Write {
@@ -608,8 +611,8 @@ impl RelyingParty {
     /// up the operation of the proposal. A finish after the commit refuses with [`Error::Challenge`]: the commit
     /// consumed the pending record. The deadline of the proposal is the end of the pending record.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`], and one range read of at
-    /// most [`CREDENTIALS_MAX`] credential records.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). Registration verification, the pending record, both account revisions,
+    /// and one page of at most [`CREDENTIALS_MAX`] credentials.
     ///
     /// # Errors
     ///
@@ -628,44 +631,52 @@ impl RelyingParty {
         let pending = read(store, &ceremony).await?.ok_or(Error::Challenge)?;
         let end = pending.end.ok_or(Error::Record)?;
         (now.latest().map_err(Error::Time)? < end).ok_or(Error::Challenge)?;
-        let (account, handle) = pending_form(&pending.data, self.limits)?;
+        let (account, handle, epoch) = pending_form(&pending.data, self.limits)?;
         let credential = self.verify(response, &response.client_data.challenge)?;
-        let existing = !store
-            .range(&self.account_prefix(&handle), None, CREDENTIALS)
+        (self.epoch(store, &handle).await? == epoch).ok_or(Error::Challenge)?;
+        let enrollments = epoch.enrollments(store).await?;
+        let records = store
+            .range(&epoch.passkey_prefix(), None, CREDENTIALS)
             .await
-            .map_err(Failure::Store)?
-            .is_empty();
-        let key = self.credential_key(&handle, &credential.id);
+            .map_err(Failure::Store)?;
+        (records.len() < CREDENTIALS_MAX).ok_or(Error::Full)?;
+        let existing = !records.is_empty();
+        let key = epoch.credential(&credential.id);
         let data = credential.record(&account, &handle);
         let request = Value::Array(vec![Value::Bytes(ceremony.as_bytes()), Value::Bytes(&data)]);
         let operation = OperationId::new(ceremony.as_bytes()).map_err(Error::from)?;
         let mut proposal = self.proposal(operation, &account, REGISTER, &request, now)?;
+        proposal.read(epoch.dependency()).map_err(Error::from)?;
         proposal
             .read(Dependency::Version(ceremony.clone(), pending.version))
             .map_err(Error::from)?;
         proposal.change(Change::End(ceremony)).map_err(Error::from)?;
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
         proposal
-            .read(Dependency::Absent(Self::removal_key(&key)))
+            .read(Dependency::Absent(self.removal_key(&handle, &credential.id)))
             .map_err(Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
         proposal
             .change(Change::Write {
                 key: key.clone(),
-                version,
+                version: version.clone(),
                 end: None,
                 data,
             })
             .map_err(Error::from)?;
         proposal.until(end);
-        let plan = Plan {
+        let mut plan = Plan {
             anchors: vec![(key, Role::SignIn(account.clone()))],
             ..Plan::default()
         };
+        enrollments
+            .write(&account, version, Box::default(), &mut proposal, &mut plan)
+            .map_err(Error::from)?;
         Ok(Registration {
             account,
             credential,
             existing,
+            epoch,
             proposal,
             plan,
         })
@@ -722,7 +733,7 @@ impl RelyingParty {
     /// new, so the same assertion again is a new operation that finds the replay record. [`SignIn::open`] adds the
     /// session and gives the proposal: only its accepted commit releases the evidence and the session.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check and three keyed lookups in two
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One account revision lookup, one signature check, and three keyed lookups in two
     /// store calls. An absent credential needs one more lookup for its removal mark, then the sign-in refuses.
     ///
     /// # Errors
@@ -758,11 +769,12 @@ impl RelyingParty {
 
         let handle = assertion.user_handle.as_deref().ok_or(Error::Credential)?;
         let handle = UserHandle(<[u8; 32]>::try_from(handle).map_err(|_| Error::Credential)?);
-        let key = self.credential_key(&handle, &assertion.id);
+        let epoch = self.epoch(store, &handle).await?;
+        let key = epoch.credential(&assertion.id);
         let Some(record) = read(store, &key).await? else {
             // Only a removal mark proves that the server never accepts the passkey: a registration finish that comes
             // late can still commit a passkey that the store never held, and a provider can delete it at `Forget`.
-            let removed = read(store, &Self::removal_key(&key)).await?.is_some();
+            let removed = read(store, &self.removal_key(&handle, &assertion.id)).await?.is_some();
             return Err(Failure::Refused(if removed {
                 Error::Removed
             } else {
@@ -801,6 +813,7 @@ impl RelyingParty {
         let request = Value::Array(vec![Value::Bytes(&assertion.id), Value::Bytes(challenge)]);
         let action = if possible_clone { SIGN_IN_CLONE } else { SIGN_IN };
         let mut proposal = self.proposal(operation(random), &account, action, &request, now)?;
+        proposal.read(epoch.dependency()).map_err(Error::from)?;
         proposal
             .read(Dependency::Version(key.clone(), record.version))
             .map_err(Error::from)?;
@@ -859,7 +872,11 @@ impl RelyingParty {
             })
             .map_err(Error::from)?;
         proposal.until(expires);
-        Ok(SignIn { proposal, evidence })
+        Ok(SignIn {
+            proposal,
+            evidence,
+            epoch,
+        })
     }
 
     /// A registration challenge of `form` that writes nothing and serves the ceremony that consumes one record: 32 random
@@ -961,38 +978,31 @@ impl RelyingParty {
         AuthorityVersion::new(self.authority.clone(), &value.to_be_bytes()).expect("an 8-byte coordinate is valid")
     }
 
-    /// The key of the record of the credential `id` of the account with the user handle `handle`: [`Kind::Credential`],
-    /// the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID, user
-    /// handle]`, and the SHA-256 digest of `id`. Thus each relying party of a store has its own credentials, and the
-    /// first 33 bytes are the prefix of each passkey of the account. No key of a credential of this crate (an 8-byte
-    /// serial) has this length.
+    /// Finds the storage key of `id` in the account's current passkey generation.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    #[must_use]
-    pub fn credential_key(&self, handle: &UserHandle, id: &[u8]) -> transition::Key {
-        let account = self.digest(CREDENTIAL_FORM, &handle.0);
-        Kind::Credential
-            .key(&[account, crypto::sha256(id)].concat())
-            .expect("a key of 65 bytes is valid")
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One bounded generation read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Record`] for an invalid generation, or [`Failure::Store`] for a failed read.
+    pub async fn credential_key<S: Store>(
+        &self,
+        store: &mut S,
+        handle: &UserHandle,
+        id: &[u8],
+    ) -> Result<transition::Key, Failure<S::Error>> {
+        Ok(self.epoch(store, handle).await?.credential(id))
     }
 
-    /// The key of the removal mark of the credential record `credential`: [`Kind::Removal`], then the identifier of
-    /// `credential`.
-    pub(crate) fn removal_key(credential: &transition::Key) -> transition::Key {
+    /// A removal mark keeps its identity across recoveries.
+    pub(crate) fn removal_key(&self, handle: &UserHandle, id: &[u8]) -> transition::Key {
         Kind::Removal
-            .key(&credential.as_bytes()[1..])
-            .expect("the identifier of a key fits under another kind")
-    }
-
-    /// The prefix of the keys of the passkeys of the account with the user handle `handle` ([`Self::credential_key`]).
-    pub(crate) fn account_prefix(&self, handle: &UserHandle) -> transition::Key {
-        Kind::Credential
-            .key(&self.digest(CREDENTIAL_FORM, &handle.0))
-            .expect("a key of 33 bytes is valid")
+            .key(&[self.scope(handle), crypto::sha256(id)].concat())
+            .expect("a removal key has 65 bytes")
     }
 
     /// The key of the pending record of the registration challenge `challenge`: [`Kind::Registration`] with the
-    /// SHA-256 digest of the CBOR form `["rsauthnz.passkey.registration.1", authority, relying party ID, challenge]`.
+    /// SHA-256 digest of the CBOR form `["rsauthnz.passkey.registration.2", authority, relying party ID, challenge]`.
     fn pending_key(&self, challenge: &[u8]) -> transition::Key {
         Kind::Registration
             .key(&self.digest(PENDING_FORM, challenge))
@@ -1390,6 +1400,7 @@ pub struct Registration {
     credential: Credential,
     /// Whether the account had a passkey at the finish.
     existing: bool,
+    epoch: Epoch,
     proposal: Proposal,
     plan: Plan,
 }
@@ -1426,7 +1437,7 @@ impl Registration {
     /// verification is of another account. [`Error::Transition`] if `decision` reads a record of the registration with
     /// another result, or reads more records than the limits permit.
     pub fn propose(mut self, decision: Decision<'_>) -> Result<(Proposal, Plan), Error> {
-        decision.apply(&mut self.proposal, &self.account, self.existing)?;
+        decision.apply(&mut self.proposal, &self.account, &self.epoch, self.existing)?;
         Ok((self.proposal, self.plan))
     }
 }
@@ -1453,14 +1464,14 @@ pub enum Decision<'a> {
 
 impl Decision<'_> {
     /// Adds the decision for `account` to `proposal`. `existing` tells whether the account has a passkey.
-    fn apply(self, proposal: &mut Proposal, account: &Id<Human>, existing: bool) -> Result<(), Error> {
+    fn apply(self, proposal: &mut Proposal, account: &Id<Human>, epoch: &Epoch, existing: bool) -> Result<(), Error> {
         let reads = match self {
             Self::SignUp(reads) => {
                 (!existing).ok_or(Error::Fresh)?;
                 reads
             }
             Self::Add(fresh, reads) => {
-                (fresh.account() == account).ok_or(Error::Fresh)?;
+                (fresh.account() == account && &fresh.epoch == epoch).ok_or(Error::Fresh)?;
                 fresh.gate(proposal)?;
                 reads
             }
@@ -1473,6 +1484,7 @@ impl Decision<'_> {
 /// A checked sign-in that waits for its session: the evidence, and the commit that [`RelyingParty::sign_in`] made.
 #[derive(Debug)]
 pub struct SignIn {
+    epoch: Epoch,
     proposal: Proposal,
     evidence: Evidence,
 }
@@ -1501,7 +1513,7 @@ impl SignIn {
         driver: &mut Driver,
     ) -> Result<(Proposal, Plan, Opening), Error> {
         let opening = sessions
-            .open(&mut self.proposal, self.evidence, replaces, random, driver)
+            .open(&mut self.proposal, self.evidence, &self.epoch, replaces, random, driver)
             .map_err(Error::Session)?;
         Ok((self.proposal, Plan::default(), opening))
     }
@@ -1554,17 +1566,17 @@ pub(crate) async fn read<S: Store>(store: &mut S, key: &transition::Key) -> Resu
 }
 
 /// The account and the user handle of the pending record form `data`.
-fn pending_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle), Error> {
+fn pending_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle, Epoch), Error> {
     let form = cbor::decode(data, limits).map_err(|_| Error::Record)?;
     let Value::Array(items) = &form else {
         return Err(Error::Record);
     };
-    let [Value::Text(PENDING_FORM), account, Value::Bytes(handle)] = items.as_slice() else {
+    let [Value::Text(PENDING_FORM), account, Value::Bytes(handle), epoch] = items.as_slice() else {
         return Err(Error::Record);
     };
     let account = Id::from_cbor(account).map_err(|_| Error::Record)?;
     let handle = <[u8; 32]>::try_from(*handle).map_err(|_| Error::Record)?;
-    Ok((account, UserHandle(handle)))
+    Ok((account, UserHandle(handle), Epoch::parse(epoch).ok_or(Error::Record)?))
 }
 
 /// A new operation identity: 32 bytes from `random`.

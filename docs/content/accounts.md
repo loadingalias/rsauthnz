@@ -79,7 +79,8 @@ in](passkeys.md#sign-in)).
    `Fresh::check(&access, max_age, now)`. `max_age` is at most `FRESH_MAX`: an application can make the window
    shorter, never longer. The check refuses with `account::Error::Stale` when the evidence has no user verification,
    or when its earliest time is `max_age` or more before the latest time of `now`.
-3. Give the `Fresh` to the sensitive change. The commit reads the session at its version, so a revocation or a
+3. Give the `Fresh` to the sensitive change. For an application proposal, call `fresh.gate(&mut proposal)?`.
+   The commit checks the account revision and session version. Account recovery, revocation, or a
    renewal of the session makes it conflict. Its deadline is `fresh.deadline()`: the time of the verification plus
    `max_age`, or the end of the session when that is earlier. A commit after the deadline refuses with
    `transition::Error::Expired`.
@@ -207,9 +208,9 @@ read the store return `passkey::Failure`. `Fresh::check` refuses with an `accoun
 | `Time` | A reading has no bound, or a time overflows | `Refuse`: give a reading with a known bound |
 
 The cost class of `invite`, `rename`, `Fresh::check`, and `Activation::propose` is `Parse`. The cost class of
-`activation_options`, `activate`, `passkeys`, and `remove` is `Verify` ([Admit rsauthnz work](admission.md)): one
-keyed read and one range read for the activation, and one range read for the list and the removal. The call of the
-policy is the cost of the application.
+`activation_options`, `activate`, `passkeys`, and `remove` is `Verify`. Activation reads the invitation, recovery revision, and current passkey page.
+Its finish also reads the enrollment revision. Listing reads the recovery revision and one passkey page. Removal reads one passkey page using fresh verification.
+The application supplies the policy check. [Admit rsauthnz work](admission.md)
 
 ## Support
 

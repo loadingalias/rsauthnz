@@ -13,8 +13,9 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::{Human, Id};
 use rsauthnz::limits::{Limits, SignatureBudget};
-use rsauthnz::local::enroll::{DeviceCode, ENROLLMENT_LIFETIME, Request, Status, UserCode};
-use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Holder, HostGrant, Offer, Unlink};
+use rsauthnz::local::enroll::{CliId, DeviceCode, ENROLLMENT_LIFETIME, Request, Status, UserCode};
+use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Holder, HostGrant, Offer, Unlink};
+use rsauthnz::recovery::Passkeys;
 use rsauthnz::store::Kind;
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
@@ -60,6 +61,7 @@ struct World {
 
 /// A CLI that asked for an enrollment: its key, and the codes of its request.
 struct Cli {
+    serial: Serial,
     key: Pair,
     code: UserCode,
     device: DeviceCode,
@@ -110,7 +112,13 @@ impl World {
             .expect("a request");
         let device = self.artifact((proposal, plan));
         let device = DeviceCode::from_bytes(device.try_into().expect("32 bytes"));
-        Cli { key, code, device }
+        let serial = Serial(self.site.node.driver.allocate(Kind::Credential).expect("a serial"));
+        Cli {
+            key,
+            code,
+            device,
+            serial,
+        }
     }
 
     /// A fresh user verification of alice: a passkey sign-in at 11, checked at 12.
@@ -124,6 +132,7 @@ impl World {
             &mut self.site.node.memory,
             fresh,
             &cli.code,
+            cli.serial,
             at(seconds),
             &mut self.site.random,
         );
@@ -134,15 +143,9 @@ impl World {
 
     /// The proposal of the finish of the request of `cli` for `account` at `seconds`, which the issuer key signs.
     fn finish(&mut self, cli: &Cli, account: &Id<Human>, seconds: u64) -> Result<(Proposal, Plan), local::Error> {
-        let serial = Serial(self.site.node.driver.allocate(Kind::Credential).expect("a serial"));
-        let finish = self.authority.finish(
-            &mut self.site.node.memory,
-            &cli.code,
-            &cli.device,
-            account,
-            serial,
-            at(seconds),
-        );
+        let finish = self
+            .authority
+            .finish(&mut self.site.node.memory, &cli.code, &cli.device, account, at(seconds));
         let finish = ready(finish).map_err(refused_local)?;
         let signature = self.issuer.sign(&finish.to_be_signed());
         finish.finish(
@@ -153,15 +156,40 @@ impl World {
 
     /// The admitted call `status` of the CLI with the key `key` and the credential `credential` of alice at `seconds`,
     /// after a challenge of its binding.
-    fn call(&mut self, key: &Pair, credential: &[u8], seconds: u64) -> Result<Admitted, local::Error> {
-        let offer = ready(self.authority.account_challenge(
-            &mut self.site.node.memory,
-            &alice(),
-            &key.public,
-            at(seconds),
-            &mut self.site.random,
-            OperationId::new(b"challenge").expect("an operation"),
-        ));
+    fn call(&mut self, cli: &Cli, credential: &[u8], seconds: u64) -> Result<Admitted, local::Error> {
+        let (proposal, admission) = self.prepare_call(cli, credential, seconds)?;
+        let outcome = self.site.node.commit(proposal, Plan::default());
+        Ok(admission.release(&outcome).expect("the admitted call"))
+    }
+
+    fn prepare_call(
+        &mut self,
+        cli: &Cli,
+        credential: &[u8],
+        seconds: u64,
+    ) -> Result<(Proposal, Admission), local::Error> {
+        let key = &cli.key;
+        let offer = ready(
+            self.authority.account_challenge(
+                &mut self.site.node.memory,
+                &CliId {
+                    account: alice(),
+                    serial: cli.serial,
+                },
+                &key.public,
+                at(seconds),
+                &mut self.site.random,
+                OperationId::new(
+                    &[
+                        b"challenge".as_slice(),
+                        &cli.serial.0.to_be_bytes(),
+                        &seconds.to_be_bytes(),
+                    ]
+                    .concat(),
+                )
+                .expect("an operation"),
+            ),
+        );
         let challenge = match offer.map_err(refused_local)? {
             Offer::Open(challenge) => challenge,
             Offer::New(proposal, plan) => {
@@ -170,7 +198,15 @@ impl World {
         };
         let call = Call::new(
             challenge,
-            OperationId::new(b"status").expect("an operation"),
+            OperationId::new(
+                &[
+                    b"status".as_slice(),
+                    &cli.serial.0.to_be_bytes(),
+                    &seconds.to_be_bytes(),
+                ]
+                .concat(),
+            )
+            .expect("an operation"),
             &Value::Text("status"),
             Limits::default(),
         )
@@ -184,9 +220,7 @@ impl World {
             at(seconds),
             &mut self.site.random,
         );
-        let (proposal, admission) = ready(admit).map_err(refused_local)?;
-        let outcome = self.site.node.commit(proposal, Plan::default());
-        Ok(admission.release(&outcome).expect("the admitted call"))
+        ready(admit).map_err(refused_local)
     }
 
     /// The proof of `call` with `key` over `credential`.
@@ -206,12 +240,16 @@ impl World {
     }
 
     /// The credential of the binding of alice with the key `key`, which the issuer key signs again.
-    fn reissue(&mut self, key: &Pair, seconds: u64) -> Result<Vec<u8>, local::Error> {
-        let reissue =
-            ready(
-                self.authority
-                    .account_credential(&mut self.site.node.memory, &alice(), &key.public, at(seconds)),
-            );
+    fn reissue(&mut self, cli: &Cli, seconds: u64) -> Result<Vec<u8>, local::Error> {
+        let reissue = ready(self.authority.account_credential(
+            &mut self.site.node.memory,
+            &CliId {
+                account: alice(),
+                serial: cli.serial,
+            },
+            &cli.key.public,
+            at(seconds),
+        ));
         let reissue = reissue.map_err(refused_local)?;
         let signature = self.issuer.sign(&reissue.to_be_signed());
         reissue.finish(&signature)
@@ -223,6 +261,235 @@ impl World {
             .poll(&mut self.site.node.memory, &cli.code, &cli.device, at(seconds));
         ready(poll).map_err(refused_local)
     }
+}
+
+#[test]
+fn either_recovery_cuts_off_a_connected_cli_and_its_unfinished_approvals() {
+    for policy in [Passkeys::Keep, Passkeys::End] {
+        let mut world = World::new();
+        let other_rp = super::RelyingParty::new(
+            Id::new("acme", "other-site").unwrap(),
+            super::RP_ID,
+            super::ORIGIN,
+            "Other",
+            super::KEY,
+            Limits::default(),
+        )
+        .unwrap();
+        let first_rp = core::mem::replace(&mut world.site.rp, other_rp);
+        let other_key = world.site.register(Algorithm::Ed25519, -8, 10, 0);
+        let other_session = world.site.signed_in_with(&other_key, 14);
+        let other_fresh = world.site.fresh(&other_key);
+        let other_cli = world.request(4, 20);
+        world.approve(&other_cli, &other_fresh, 21).unwrap();
+        let finish = world.finish(&other_cli, &alice(), 22).unwrap();
+        let other_credential = world.artifact(finish);
+        world.site.rp = first_rp;
+        let connected = world.request(2, 20);
+        let waiting = world.request(3, 20);
+        let fresh = world.fresh();
+        let code = world.site.new_code(&fresh, 13);
+        world.approve(&connected, &fresh, 21).unwrap();
+        world.approve(&waiting, &fresh, 21).unwrap();
+        let finished = world.finish(&connected, &alice(), 22).unwrap();
+        let credential = world.artifact(finished);
+        let (call, admission) = world.prepare_call(&connected, &credential, 24).unwrap();
+        let (finish, plan) = world.finish(&waiting, &alice(), 24).unwrap();
+        let challenge = world.site.recovery_challenge(&alice(), &code, 25).unwrap();
+        let new = Passkey::new(Algorithm::Ed25519, -8, 9);
+        let attempt = world.site.attempt(&new, challenge, 26, policy).unwrap();
+        let (recovery, recovery_plan, opening) = attempt.propose(&[]).unwrap();
+        let opened = opening
+            .release(&world.site.node.commit(recovery, recovery_plan))
+            .unwrap();
+        let access = world.site.active(opened.session.identifier(), at(27));
+        assert!(
+            ready(
+                world
+                    .authority
+                    .account_clis(&mut world.site.node.memory, &access, at(27))
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let outcome = world.site.node.commit(call, Plan::default());
+        assert!(matches!(outcome, Outcome::Conflict));
+        assert!(admission.release(&outcome).is_none());
+        assert!(matches!(world.site.node.commit(finish, plan), Outcome::Conflict));
+        assert_eq!(world.poll(&waiting, 27).err(), Some(local::Error::NotEnrolled));
+        assert_eq!(
+            world.finish(&waiting, &alice(), 27).err(),
+            Some(local::Error::NotEnrolled)
+        );
+        assert_eq!(world.reissue(&connected, 27).err(), Some(local::Error::NotEnrolled));
+        assert_eq!(
+            world.call(&connected, &credential, 27).err(),
+            Some(local::Error::NotEnrolled)
+        );
+        let access = world.site.active(other_session.session.identifier(), at(28));
+        let other_devices = ready(
+            world
+                .authority
+                .account_clis(&mut world.site.node.memory, &access, at(28)),
+        )
+        .unwrap();
+        assert_eq!(
+            other_devices.iter().map(|device| device.serial).collect::<Vec<_>>(),
+            [other_cli.serial]
+        );
+        assert_eq!(
+            world.call(&other_cli, &other_credential, 28).unwrap().holder(),
+            Holder::Account
+        );
+    }
+}
+
+#[test]
+fn full_recovery_reads_one_code_and_one_revision_at_any_cli_count() {
+    let mut size = None;
+    for count in [0, local::enroll::ACCOUNT_CLIS_MAX] {
+        let mut world = World::new();
+        let fresh = world.fresh();
+        let code = world.site.new_code(&fresh, 13);
+        for index in 0..count {
+            let cli = world.request(u8::try_from(10 + index).unwrap(), 20);
+            world.approve(&cli, &fresh, 21).unwrap();
+            let finish = world.finish(&cli, &alice(), 22).unwrap();
+            world.artifact(finish);
+        }
+        let site = &mut world.site;
+        let challenge = site.recovery_challenge(&alice(), &code, 24).unwrap();
+        let new = Passkey::new(Algorithm::Ed25519, -8, 9);
+        let registration = super::Registration::new(&new, super::RP_ID, super::ORIGIN, challenge);
+        let response = super::Response::parse(&registration.json()).unwrap();
+        let mut store = super::recovery::Counting::new(&mut site.node.memory);
+        let attempt = ready(site.rp.recover(
+            &mut store,
+            &response,
+            &site.sessions,
+            Passkeys::End,
+            at(25),
+            &mut site.random,
+            &mut site.node.driver,
+        ))
+        .unwrap();
+        assert_eq!((store.reads, store.ranges), (1, 1));
+        let (proposal, plan, opening) = attempt.propose(&[]).unwrap();
+        let work = (proposal.dependencies().len(), proposal.changes().len());
+        assert_eq!(*size.get_or_insert(work), work);
+        let recovered = opening.release(&site.node.commit(proposal, plan)).unwrap();
+        let access = site.active(recovered.session.identifier(), at(26));
+        assert!(
+            ready(world.authority.account_clis(&mut site.node.memory, &access, at(26)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn disconnect_needs_fresh_verification_and_ends_only_the_selected_cli() {
+    let mut world = World::new();
+    let first = world.request(2, 20);
+    let other = world.request(3, 20);
+    let fresh = world.fresh();
+    world.approve(&first, &fresh, 21).unwrap();
+    world.approve(&other, &fresh, 21).unwrap();
+    let finish = world.finish(&first, &alice(), 22).unwrap();
+    let credential = world.artifact(finish);
+    let finish = world.finish(&other, &alice(), 22).unwrap();
+    let kept = world.artifact(finish);
+    let opened = world.site.signed_in_with(&world.passkey, 24);
+    let access = world.site.active(opened.session.identifier(), at(25));
+    let mut store = super::recovery::Counting::new(&mut world.site.node.memory);
+    let devices = ready(world.authority.account_clis(&mut store, &access, at(25))).unwrap();
+    assert_eq!((store.reads, store.ranges), (2, 1));
+    assert_eq!(devices.len(), 2);
+    let listed = devices.iter().find(|device| device.serial == first.serial).unwrap();
+    assert_eq!(listed.name, "alice-laptop");
+    assert_eq!(listed.fingerprint, rscrypto::Sha256::digest(&first.key.public));
+    assert_eq!(listed.expires, at(22).estimate() + local::CLI_LIFETIME);
+    let op = OperationId::new(b"disconnect").unwrap();
+    assert_eq!(
+        ready(
+            world
+                .authority
+                .disconnect(&mut world.site.node.memory, &fresh, first.serial, at(400), op.clone())
+        )
+        .map_err(refused_local)
+        .err(),
+        Some(local::Error::Expired)
+    );
+    let (call, _) = world.prepare_call(&first, &credential, 25).unwrap();
+    let (proposal, plan) =
+        ready(
+            world
+                .authority
+                .disconnect(&mut world.site.node.memory, &fresh, first.serial, at(26), op),
+        )
+        .unwrap();
+    assert!(matches!(world.site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    assert!(matches!(
+        world.site.node.commit(call, Plan::default()),
+        Outcome::Conflict
+    ));
+    assert_eq!(
+        world.call(&first, &credential, 27).err(),
+        Some(local::Error::NotEnrolled)
+    );
+    assert_eq!(world.reissue(&first, 27).err(), Some(local::Error::NotEnrolled));
+    assert_eq!(
+        ready(
+            world
+                .authority
+                .account_clis(&mut world.site.node.memory, &access, at(27))
+        )
+        .unwrap()
+        .iter()
+        .map(|device| device.serial)
+        .collect::<Vec<_>>(),
+        [other.serial]
+    );
+    assert_eq!(world.call(&other, &kept, 27).unwrap().holder(), Holder::Account);
+}
+
+#[test]
+fn two_finishes_cannot_claim_the_last_place_and_a_disconnect_frees_it() {
+    let mut world = World::new();
+    let fresh = world.fresh();
+    let early = world.request(30, 20);
+    world.approve(&early, &fresh, 21).unwrap();
+    let early_finish = world.finish(&early, &alice(), 22).unwrap();
+    for seed in 2..17 {
+        let cli = world.request(seed, 20);
+        world.approve(&cli, &fresh, 21).unwrap();
+        let finish = world.finish(&cli, &alice(), 22).unwrap();
+        world.artifact(finish);
+    }
+    let last = world.request(31, 24);
+    let other = world.request(32, 24);
+    world.approve(&last, &fresh, 25).unwrap();
+    world.approve(&other, &fresh, 25).unwrap();
+    let one = world.finish(&last, &alice(), 26).unwrap();
+    let (two, plan) = world.finish(&other, &alice(), 26).unwrap();
+    world.artifact(one);
+    assert!(matches!(world.site.node.commit(two, plan), Outcome::Conflict));
+    assert!(matches!(
+        world.site.node.commit(early_finish.0, early_finish.1),
+        Outcome::Conflict
+    ));
+    assert_eq!(world.finish(&other, &alice(), 27).err(), Some(local::Error::Full));
+    let (proposal, plan) = ready(world.authority.disconnect(
+        &mut world.site.node.memory,
+        &fresh,
+        last.serial,
+        at(27),
+        OperationId::new(b"free").unwrap(),
+    ))
+    .unwrap();
+    assert!(matches!(world.site.node.commit(proposal, plan), Outcome::Accepted(_)));
+    let next = world.finish(&other, &alice(), 28).unwrap();
+    world.artifact(next);
 }
 
 /// The refusal of a local authority, from a store that does not fail.
@@ -254,12 +521,18 @@ fn a_cli_that_alice_approves_calls_for_her_account_and_makes_no_administrator_ca
     let fresh = world.fresh();
     assert_eq!(world.approve(&cli, &fresh, 23), Ok(()));
     assert_eq!(world.approve(&cli, &fresh, 24).err(), Some(local::Error::Approved));
-    assert_eq!(world.poll(&cli, 25), Ok(Status::Approved(alice())));
+    assert_eq!(
+        world.poll(&cli, 25),
+        Ok(Status::Approved(CliId {
+            account: alice(),
+            serial: cli.serial
+        }))
+    );
     let finish = world.finish(&cli, &alice(), 26).expect("a finish");
     let credential = world.artifact(finish);
     assert_eq!(world.poll(&cli, 27).err(), Some(local::Error::Request));
 
-    let admitted = world.call(&cli.key, &credential, 28).expect("an admitted call");
+    let admitted = world.call(&cli, &credential, 28).expect("an admitted call");
     assert_eq!((admitted.subject(), admitted.holder()), (&alice(), Holder::Account));
 
     // The CLI of an account makes no administrator call, also when the authority has an administrator.
@@ -324,6 +597,7 @@ fn an_approval_binds_only_the_key_of_its_request_for_its_account() {
     // The other request has no approval, and its device code finishes no other request.
     assert_eq!(world.finish(&other, &alice(), 22).err(), Some(local::Error::Waiting));
     let crossed = Cli {
+        serial: approved.serial,
         key: Pair::new(3),
         code: approved.code,
         device: DeviceCode::from_bytes(*other.device.as_bytes()),
@@ -334,8 +608,8 @@ fn an_approval_binds_only_the_key_of_its_request_for_its_account() {
 
     let finish = world.finish(&approved, &alice(), 23).expect("a finish");
     let credential = world.artifact(finish);
-    world.call(&approved.key, &credential, 24).unwrap();
-    assert_eq!(world.reissue(&other.key, 25).err(), Some(local::Error::NotEnrolled));
+    world.call(&approved, &credential, 24).unwrap();
+    assert_eq!(world.reissue(&other, 25).err(), Some(local::Error::NotEnrolled));
 }
 
 #[test]
@@ -371,8 +645,8 @@ fn a_cli_whose_finish_response_was_lost_reads_its_credential_and_proves_possessi
     world.site.node.start();
 
     assert_eq!(world.poll(&cli, 23).err(), Some(local::Error::Request));
-    let credential = world.reissue(&cli.key, 24).expect("the credential");
-    let admitted = world.call(&cli.key, &credential, 25).expect("an admitted call");
+    let credential = world.reissue(&cli, 24).expect("the credential");
+    let admitted = world.call(&cli, &credential, 25).expect("an admitted call");
     assert_eq!(admitted.holder(), Holder::Account);
 }
 
@@ -398,10 +672,10 @@ fn a_restore_completes_a_finish_in_doubt_once_and_keeps_an_acknowledged_one() {
     world.site.node.driver.restore(at(0)).expect("a restore");
     world.site.node.run();
 
-    assert_eq!(world.reissue(&kept.key, 30), Ok(acknowledged));
+    assert_eq!(world.reissue(&kept, 30), Ok(acknowledged));
     assert_eq!(world.poll(&doubt, 30).err(), Some(local::Error::Request));
-    let credential = world.reissue(&doubt.key, 30).expect("the credential");
-    world.call(&doubt.key, &credential, 31).unwrap();
+    let credential = world.reissue(&doubt, 30).expect("the credential");
+    world.call(&doubt, &credential, 31).unwrap();
     let ticket = world.site.node.driver.lookup(operation).expect("a lookup");
     world.site.node.run();
     assert!(matches!(

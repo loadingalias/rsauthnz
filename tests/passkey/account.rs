@@ -172,7 +172,12 @@ impl Invited {
 
     /// Whether carol has the passkey `passkey`.
     fn holds(&mut self, passkey: &Passkey) -> bool {
-        let key = self.site.rp.credential_key(&UserHandle::from_bytes(CAROL), &passkey.id);
+        let key = ready(self.site.rp.credential_key(
+            &mut self.site.node.memory,
+            &UserHandle::from_bytes(CAROL),
+            &passkey.id,
+        ))
+        .expect("the current passkey key");
         self.site.node.read(&key).is_some()
     }
 }
@@ -407,7 +412,7 @@ fn a_sensitive_change_with_an_old_or_unverified_assertion_refuses_and_with_a_fre
     site.node.memory.set_clock(at(33));
     let (proposal, plan) = site.remove(&fresh, &second, at(33)).expect("a removal");
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
-    assert_eq!(site.node.read(&site.key(&second)), None);
+    assert_eq!(site.credential(&second), None);
 }
 
 /// A recovery value is no sign-in method, so the account keeps its last passkey also when it has one.
@@ -423,7 +428,7 @@ fn the_removal_of_the_last_passkey_refuses_also_when_a_recovery_value_is_set() {
         site.remove(&fresh, &passkey, at(23)).err(),
         Some(Error::Transition(transition::Error::LastAnchor))
     );
-    assert!(site.node.read(&site.key(&passkey)).is_some());
+    assert!(site.credential(&passkey).is_some());
     site.recovery_challenge(&alice(), &code, 24).unwrap();
 }
 
@@ -456,8 +461,8 @@ fn two_concurrent_removals_keep_one_passkey() {
         ),
         "{outcomes:?}"
     );
-    assert_eq!(site.node.read(&site.key(&first)), None);
-    assert!(site.node.read(&site.key(&second)).is_some());
+    assert_eq!(site.credential(&first), None);
+    assert!(site.credential(&second).is_some());
 }
 
 /// A provider that no Signals call reached at a removal still offers the passkey. The removal mark makes a sign-in

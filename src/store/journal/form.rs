@@ -166,6 +166,7 @@ fn anchor(anchor: &Anchor) -> Value<'_> {
         Role::Cli(account) => (2, account.to_cbor()),
         Role::Recovery(account) => (3, account.to_cbor()),
         Role::Administrator(authority) => (4, authority.to_cbor()),
+        Role::AccountState(account) => (5, account.to_cbor()),
     };
     let end = anchor.end.map_or(Value::Null, |end| {
         Value::Array(vec![
@@ -194,6 +195,7 @@ fn read_anchor(value: &Value<'_>) -> Option<Anchor> {
         [Value::Unsigned(2), owner] => Role::Cli(Id::from_cbor(owner).ok()?),
         [Value::Unsigned(3), owner] => Role::Recovery(Id::from_cbor(owner).ok()?),
         [Value::Unsigned(4), owner] => Role::Administrator(Id::from_cbor(owner).ok()?),
+        [Value::Unsigned(5), owner] => Role::AccountState(Id::from_cbor(owner).ok()?),
         _ => return None,
     };
     let end = match end {

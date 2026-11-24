@@ -3,7 +3,7 @@
 `rsauthnz::session` keeps the session of a signed-in browser. The browser holds an opaque identifier in a `__Host-`
 cookie. The store holds one record for each session family. A [passkey sign-in](passkeys.md#sign-in) or a
 [recovery](recovery.md#recover) opens a family.
-Each request checks the identifier with one keyed read, and a renewal rotates the identifier in the same family.
+Each request checks the family and the account recovery number in one store call. A renewal rotates the identifier within its family.
 
 The core proposes each change, and the storage binding of the application commits it ([Propose a
 transition](transitions.md)). The HTTP binding writes and reads the cookie ([Mount the HTTP binding](http-binding.md)).
@@ -15,24 +15,21 @@ transition](transitions.md)). The HTTP binding writes and reads the cookie ([Mou
   and two tags.
 - A **generation** is one identifier of the family. A renewal consumes the current generation and writes the next
   one. The family keeps its sign-in and its evidence.
-- The **identifier** (`Identifier`) is 64 bytes: a locator of the account (16 bytes), the family number (16 random
-  bytes), and a secret (32 random bytes from rscrypto). The cookie holds it as 86 base64url characters
-  (`IDENTIFIER_CHARS`), with no signed claim. It is a bearer value: `Debug` shows nothing of it, and its memory is
-  cleared when it drops.
-- The **key** of a family is the kind, the locator, and the first 16 bytes of the SHA-256 digest of the CBOR form
-  `["rsauthnz.session.1", authority, audience, family number]`. The locator is the first 16 bytes of the same digest
-  of the account. Thus the sessions of an account share one key prefix, and an identifier of another audience finds
-  no record.
-- The **tag** of a generation is the HMAC-SHA256 tag of `"rsauthnz.session.1"` and the key, under the secret. The
+- The **identifier** holds 104 bytes. It carries a 16-byte locator, a 16-byte random family number, a 32-byte account scope,
+  an eight-byte recovery number, and a 32-byte random secret. The cookie encodes these as 139 base64url characters.
+- The **key** starts with `Kind::Session` and the locator. It ends with the first 16 bytes of SHA-256 over the namespace and family number.
+  The namespace is the SHA-256 digest of the CBOR array `["rsauthnz.session.2", authority, audience]`.
+  The locator takes the first 16 bytes of SHA-256 over the namespace, account scope, and big-endian recovery number.
+- The **tag** of a generation is the HMAC-SHA256 tag of `"rsauthnz.session.2"` and the key, under the secret. The
   record holds the tag of the current generation and of the generation that the last renewal replaced. It holds no
   secret and no identifier, so a read or a dump of the store gives no usable session. The check compares the tag in
   constant time.
 - The **audience** (`Id<Audience>`) is the service that accepts the sessions, such as `acme:app`. A session of one
   audience never serves another audience of the same store.
 
-The record form is the canonical CBOR array `["rsauthnz.session.1", account, evidence, started, issued, tag,
+The record form is the canonical CBOR array `["rsauthnz.session.2", evidence, epoch, started, issued, tag,
 previous tag or null]`. `started` and `issued` are nanoseconds since the Unix epoch. The evidence is the form of
-`Evidence::to_cbor` ([Vocabulary](vocabulary.md)).
+`Evidence::to_cbor`. `epoch` records the account scope, recovery number, record version, and passkey generation. [Vocabulary](vocabulary.md)
 
 ## Choose the times
 
@@ -123,7 +120,7 @@ Thus a restore from a snapshot before a renewal ends that family, and no generat
 
 - **Sign out:** call `sessions.revoke(access.session(), Revoker::Own(&access), &[], now, &mut random)`, submit the
   proposal, and clear the cookie. A sign-out needs no fresh user verification.
-- **List:** `sessions.list(&mut store, &account, after, now)` gives one `Page` from one range read of at most
+- **List:** `sessions.list(&mut store, &access, after, now)` confirms the session, then reads one `Page` of at most
   `PAGE_MAX` (64) records: each session of the account that did not end. `page.next` is the key after which the next
   page starts, or `None`. Each `Session` gives its `key()`, its `evidence()`, `started()`, `issued()`, `end()`, and
   `expires()`.
@@ -135,10 +132,13 @@ Thus a restore from a snapshot before a renewal ends that family, and no generat
   the decision of the application that the revoker can end the session, and the commit reads each one. A revocation
   of a session that renewed after its read conflicts: list again.
 
+For an application change that uses this session, call `access.gate(&mut proposal)?` before submission.
+The same commit checks the family version, the account revision, and the identifier deadline.
+
 ## Streams and queued output
 
 Before each part of a stream, and before queued output, call `sessions.confirm(&mut store, access.session(), now)`. It
-reads the record of the family. A renewal keeps the family, so a stream continues after it. A revocation, a sign-in
+reads the family and account revision together. Either recovery policy ends the stream. A renewal keeps the family, so a stream continues after it. A revocation, a sign-in
 that replaced the family, the idle time, and the lifetime each end it: `confirm` refuses with `Error::Ended`, and the
 stream stops.
 
@@ -190,8 +190,8 @@ while let Some(effect) = driver.effect() {
     driver.give(output)?;
 }
 
-// An identifier of no session refuses after one keyed read.
-let stranger = Identifier::parse(&[b'A'; 86])?;
+// An identifier of no session refuses after one paired read.
+let stranger = Identifier::parse(&[b'A'; rsauthnz::session::IDENTIFIER_CHARS])?;
 let refused = ready(sessions.check(&mut memory, &stranger, now)).unwrap_err();
 assert_eq!(refused, Failure::Refused(Error::Unknown));
 ```
@@ -207,7 +207,7 @@ gives `Refuse`, `Verify` for `Fresh`, or the recovery of the proposal for `Trans
 | `Dit` | This build on this CPU cannot encode or decode with data-independent timing | Build with `-C target-feature=+dit` on Windows aarch64 |
 | `Identifier` | The cookie value is not the base64url text of 64 bytes | Clear the cookie, and treat the request as signed out |
 | `Unknown` | No session of this audience has the identifier, also after a revocation or a sign-in that replaced the family | Clear the cookie, and treat the request as signed out |
-| `Ended` | The idle time or the lifetime passed. For `confirm`, also a revocation or a sign-in that ended the family | Clear the cookie, and treat the request as signed out |
+| `Ended` | Account recovery, idle expiry, or lifetime expiry. `confirm` also detects revocation and replacement at sign-in | Clear the cookie, and treat the request as signed out |
 | `Replaced` | A renewal of a replaced identifier | Serve the request with no renewal |
 | `Principal` | The subject of the evidence of a sign-in is not a human | Refuse |
 | `Record` | A record has no valid form | Refuse |
@@ -220,8 +220,8 @@ gives `Refuse`, `Verify` for `Fresh`, or the recovery of the proposal for `Trans
 `Store(error)` for a failed read, which is a crash of the binding. A sign-in gives a refusal of its session as
 `passkey::Error::Session(error)`.
 
-The cost class of `check`, `list`, and `confirm` is `Verify` ([Admit rsauthnz work](admission.md)). `check` makes one
-keyed read, one SHA-256 digest, and at most two HMAC-SHA256 tags. `list` makes one range read of at most 64 records.
+The cost class of `check`, `list`, and `confirm` is `Verify` ([Admit rsauthnz work](admission.md)). `check` makes two keyed lookups in one round trip and writes nothing for a valid session.
+`confirm` uses the same paired read. `list` also reads one page of up to 64 families.
 The cost class of `renew`, `revoke`, `Identifier::parse`, and `Identifier::encode` is `Parse`.
 
 ## Support

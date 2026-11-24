@@ -69,6 +69,9 @@
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
 
+pub(crate) mod generation;
+
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -126,6 +129,7 @@ const REMOVE: &str = "passkey.remove";
 /// end of the verification.
 #[derive(Clone, Debug)]
 pub struct Fresh {
+    pub(crate) epoch: generation::Epoch,
     session: Key,
     version: AuthorityVersion,
     account: Id<Human>,
@@ -157,6 +161,7 @@ impl Fresh {
             .min(session.end());
         (now.latest().map_err(Error::Time)? < deadline).ok_or(Error::Stale)?;
         Ok(Self {
+            epoch: session.epoch.clone(),
             session: session.key().clone(),
             version: session.version().clone(),
             account: session.account().clone(),
@@ -177,8 +182,15 @@ impl Fresh {
         self.deadline
     }
 
-    /// Adds the gate to `proposal`: the read of the session at its version, and the deadline.
-    pub(crate) fn gate(&self, proposal: &mut Proposal) -> Result<(), transition::Error> {
+    /// Requires the session, its account revision, and the verification deadline in the commit of `proposal`.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`transition::Error`] if the dependencies exceed the proposal limits or conflict.
+    pub fn gate(&self, proposal: &mut Proposal) -> Result<(), transition::Error> {
+        proposal.read(self.epoch.dependency())?;
         proposal.read(Dependency::Version(self.session.clone(), self.version.clone()))?;
         proposal.until(self.deadline);
         Ok(())
@@ -382,7 +394,7 @@ impl RelyingParty {
     /// relying party. It serves for [`REGISTRATION_LIFETIME`](crate::passkey::REGISTRATION_LIFETIME) from that time,
     /// and the activation consumes the invitation, so it serves one activation.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read, and one range read of at most
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One invitation lookup, one account revision lookup, and one page of up to
     /// [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credential records.
     ///
     /// # Errors
@@ -406,7 +418,8 @@ impl RelyingParty {
         let key = self.invitation_key(value);
         let (_, invitation) = self.invitation(store, &key, now).await?;
         (invitation.recipient == *invitee.account).ok_or(passkey::Error::Recipient)?;
-        self.unregistered(store, &invitation.handle).await?;
+        let epoch = self.epoch(store, &invitation.handle).await?;
+        self.unregistered(store, &epoch).await?;
         let challenge = self.bound_challenge(ACTIVATION_FORM, &key.as_bytes()[1..], now, random)?;
         let user = User {
             account: invitee.account,
@@ -431,9 +444,8 @@ impl RelyingParty {
     /// invitation orders: one commits, and the other conflicts. The deadline is the earliest of the end of the
     /// challenge, of the invitation, and of the permit of the issuer.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`], one keyed read, and one
-    /// range read of at most [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credential records. The call of `policy` is the cost of the
-    /// application.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). Registration verification, the invitation, both revisions, and one passkey page.
+    /// The application supplies `policy`.
     ///
     /// # Errors
     ///
@@ -458,7 +470,9 @@ impl RelyingParty {
         let (record, invitation) = self.invitation(store, &key, now).await?;
         let end = record.end.ok_or(passkey::Error::Record)?;
         (invitation.recipient == *recipient).ok_or(passkey::Error::Recipient)?;
-        self.unregistered(store, &invitation.handle).await?;
+        let epoch = self.epoch(store, &invitation.handle).await?;
+        let enrollments = epoch.enrollments(store).await?;
+        self.unregistered(store, &epoch).await?;
         let credential = self.verify(response, challenge)?;
         let request = authz::Request {
             principal: &invitation.issuer,
@@ -472,12 +486,13 @@ impl RelyingParty {
             && now.latest().map_err(passkey::Error::Time)? < permit.expires;
         current.ok_or(passkey::Error::Issuer)?;
 
-        let credential_key = self.credential_key(&invitation.handle, credential.id());
+        let credential_key = epoch.credential(credential.id());
         let data = credential.record(recipient, &invitation.handle);
         let id = crypto::sha256_parts(&[ACTIVATION_FORM.as_bytes(), key.as_bytes(), credential_key.as_bytes()]);
         let operation = OperationId::new(&id).expect("32 bytes are a valid operation identity");
         let request = Value::Array(vec![Value::Bytes(key.as_bytes()), Value::Bytes(&data)]);
         let mut proposal = self.proposal(operation, recipient, ACTIVATE, &request, now)?;
+        proposal.read(epoch.dependency()).map_err(passkey::Error::from)?;
         proposal
             .read(Dependency::Version(key.clone(), record.version))
             .map_err(passkey::Error::from)?;
@@ -489,22 +504,27 @@ impl RelyingParty {
             .read(Dependency::Absent(credential_key.clone()))
             .map_err(passkey::Error::from)?;
         proposal
-            .read(Dependency::Absent(Self::removal_key(&credential_key)))
+            .read(Dependency::Absent(
+                self.removal_key(&invitation.handle, credential.id()),
+            ))
             .map_err(passkey::Error::from)?;
         let version = self.version(driver.allocate(Kind::Credential).map_err(passkey::Error::from)?);
         proposal
             .change(Change::Write {
                 key: credential_key.clone(),
-                version,
+                version: version.clone(),
                 end: None,
                 data,
             })
             .map_err(passkey::Error::from)?;
         proposal.until(expires.min(end).min(permit.expires));
-        let plan = Plan {
+        let mut plan = Plan {
             anchors: vec![(credential_key, Role::SignIn(recipient.clone()))],
             ..Plan::default()
         };
+        enrollments
+            .write(recipient, version, Box::default(), &mut proposal, &mut plan)
+            .map_err(passkey::Error::from)?;
         Ok(Activation {
             account: invitation.recipient,
             credential,
@@ -515,11 +535,9 @@ impl RelyingParty {
         })
     }
 
-    /// The passkeys of the account with the user handle `handle`, from one range read of `store`, in the order of their
-    /// keys.
+    /// Lists the current passkeys of the account with user handle `handle`, in key order.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One range read of at most [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credential
-    /// records.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One recovery revision and one page of up to [`CREDENTIALS_MAX`](crate::passkey::CREDENTIALS_MAX) credentials.
     ///
     /// # Errors
     ///
@@ -529,7 +547,8 @@ impl RelyingParty {
         store: &mut S,
         handle: &UserHandle,
     ) -> Result<Vec<Passkey>, Failure<S::Error>> {
-        let stored = self.stored(store, handle).await?;
+        let epoch = self.epoch(store, handle).await?;
+        let stored = self.stored(store, &epoch).await?;
         Ok(stored.into_iter().map(|stored| stored.passkey).collect())
     }
 
@@ -556,10 +575,13 @@ impl RelyingParty {
     ) -> Result<(Proposal, Plan), passkey::Error> {
         passkey::name_valid(name)?;
         let session = access.session();
-        (*session.account() == passkey.account).ok_or(passkey::Error::Credential)?;
+        (*session.account() == passkey.account
+            && session.epoch.scope == self.scope(&passkey.handle)
+            && session.epoch.credential(passkey.credential.id()) == passkey.key)
+            .ok_or(passkey::Error::Credential)?;
         let request = Value::Array(vec![Value::Bytes(passkey.key.as_bytes()), Value::Text(name)]);
         let mut proposal = self.proposal(passkey::operation(random), &passkey.account, RENAME, &request, now)?;
-        proposal.read(Dependency::Version(session.key().clone(), session.version().clone()))?;
+        access.gate(&mut proposal)?;
         proposal.read(Dependency::Version(passkey.key.clone(), passkey.version.clone()))?;
         let mut credential = passkey.credential.clone();
         credential.name = name.into();
@@ -603,7 +625,8 @@ impl RelyingParty {
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
     ) -> Result<(Proposal, Plan), Failure<S::Error>> {
-        let stored = self.stored(store, &passkey.handle).await?;
+        (fresh.epoch.scope == self.scope(&passkey.handle)).ok_or(passkey::Error::Credential)?;
+        let stored = self.stored(store, &fresh.epoch).await?;
         let mut owned = stored.iter().filter(|stored| stored.passkey.account == fresh.account);
         let target = owned
             .clone()
@@ -626,7 +649,7 @@ impl RelyingParty {
         proposal
             .change(Change::End(target.passkey.key.clone()))
             .map_err(passkey::Error::from)?;
-        let mark = Self::removal_key(&target.passkey.key);
+        let mark = self.removal_key(&passkey.handle, target.passkey.credential.id());
         let end = now
             .estimate()
             .checked_add(REMOVAL_MARK_LIFETIME)
@@ -665,10 +688,10 @@ impl RelyingParty {
     pub(crate) async fn stored<S: Store>(
         &self,
         store: &mut S,
-        handle: &UserHandle,
+        epoch: &generation::Epoch,
     ) -> Result<Vec<Stored>, Failure<S::Error>> {
         let records = store
-            .range(&self.account_prefix(handle), None, passkey::CREDENTIALS)
+            .range(&epoch.passkey_prefix(), None, passkey::CREDENTIALS)
             .await
             .map_err(Failure::Store)?;
         let mut stored = Vec::with_capacity(records.len());
@@ -689,12 +712,12 @@ impl RelyingParty {
     }
 
     /// Refuses an activation of the account with the user handle `handle` when the account has a passkey.
-    async fn unregistered<S: Store>(&self, store: &mut S, handle: &UserHandle) -> Result<(), Failure<S::Error>> {
+    async fn unregistered<S: Store>(&self, store: &mut S, epoch: &generation::Epoch) -> Result<(), Failure<S::Error>> {
         let records = store
-            .range(&self.account_prefix(handle), None, passkey::CREDENTIALS)
+            .range(&epoch.passkey_prefix(), None, passkey::CREDENTIALS)
             .await
             .map_err(Failure::Store)?;
-        records.is_empty().ok_or(passkey::Error::Activated)?;
+        (records.is_empty() && epoch.number == 0).ok_or(passkey::Error::Activated)?;
         Ok(())
     }
 

@@ -105,7 +105,10 @@ pub fn entries(proposal: &Proposal, replaced: &[Key], anchors: &[(Key, Role)]) -
                         data: data.clone(),
                     }),
                     None => {
-                        let anchor_kind = matches!(kind, Kind::ProviderLink | Kind::Recovery | Kind::Administrator);
+                        let anchor_kind = matches!(
+                            kind,
+                            Kind::ProviderLink | Kind::Recovery | Kind::Administrator | Kind::AccountState
+                        );
                         (!anchor_kind || read(key).is_some()).ok_or(Error::Proposal)?;
                     }
                 }

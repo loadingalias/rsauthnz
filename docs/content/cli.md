@@ -56,20 +56,23 @@ secret from the human.
 4. The human signs in on the page with a passkey. The page reads the code with `UserCode::parse`, and shows the
    request from `authority.request(store, &code, now)`: the name, the fingerprint (the SHA-256 digest of the key), and
    the time of the request. The human compares the fingerprint with the one on the screen of the CLI.
-5. The human approves. The page checks a fresh user verification of the session (`Fresh::check`, [Fresh user
-   verification](accounts.md#fresh-user-verification)), and calls `authority.approve(store, &fresh, &code, now,
-   random)`. The commit writes the request as approved by the account of the session. The CLI cannot name the account.
-6. Every 5 seconds, the CLI asks for the state with its codes: `authority.poll(store, &code, &device, now)` gives
-   `Status::Waiting` or `Status::Approved(account)`. The CLI stores the account.
-7. The CLI submits the finish. The authority allocates a serial (`driver.allocate(Kind::Credential)`), and calls
-   `authority.finish(store, &code, &device, &account, serial, now)`. Custody signs `finish.to_be_signed()` with the
-   issuer key, and `finish.finish(signature, operation)` gives the proposal. Its commit consumes the request, and binds
-   the key of the request to the account. The artifact of the accepted commit is the CLI credential.
-8. The CLI asks for a challenge with `authority.account_challenge(store, &account, &holder, now, random, operation)`,
+5. Get fresh verification from the browser session. Allocate `serial` with `driver.allocate(Kind::Credential)`.
+   Submit the proposal from `authority.approve(store, &fresh, &code, Serial(serial), now, random)`.
+6. The CLI polls with `authority.poll(store, &code, &device, now)`. On `Status::Approved(id)`, save the account and serial in `id` before sending the finish.
+7. Submit `authority.finish(store, &code, &device, &id.account, now)`. Custody signs `finish.to_be_signed()`.
+   Submit the proposal and plan from `finish.finish(signature, operation)`. The accepted receipt carries the CLI credential.
+8. The CLI asks for a challenge with `authority.account_challenge(store, &id, &holder, now, random, operation)`,
    and makes each call as [Make a call](#make-a-call) says. `admitted.holder()` is `Holder::Account`.
 
 The finish binds the key that the request holds, so the approval of one request binds no other key. An account has
-at most `ACCOUNT_CLIS_MAX` (16) bindings.
+at most `ACCOUNT_CLIS_MAX` (16) active bindings per issuer and passkey site. Two finishes for the last place can commit only once.
+
+### List and disconnect a CLI
+
+Call `authority.account_clis(store, &access, now)` to list the signed-in account's CLIs. Show each name, public-key fingerprint, and expiry.
+To disconnect one, get fresh user verification. Submit the proposal and plan from `authority.disconnect(store, &fresh, serial, now, operation)`.
+After it commits, the selected CLI cannot receive a challenge, reissue its credential, or complete a pending call.
+Either account recovery policy disconnects all earlier CLIs and ends their unfinished approvals. Each CLI needs a new browser approval after an upgrade from A208.
 
 ## Make a call
 
@@ -235,10 +238,10 @@ zeroization, its recovery, and the isolation that the OS enforces.
   costs one issuer signature. `local::Error::Unknown` shows that the bootstrap did not commit. A bootstrap that a
   restore completed gives its credential in the same way.
 - **A lost response of a request, a poll, or a finish.** After a lost request, the CLI makes a new request. After a
-  lost poll, it polls again. After a lost finish, it gives its account and its public key: the authority calls
-  `authority.account_credential(store, &account, &holder, now)`, and custody signs `reissue.to_be_signed()` again. A
-  finish that a restore completed gives its credential in the same way. `local::Error::NotEnrolled` shows that the
-  finish did not commit: poll again.
+  lost poll, it polls again. After a lost finish, it gives its saved `CliId` and public key. The authority calls
+  `authority.account_credential(store, &id, &holder, now)`, and custody signs `reissue.to_be_signed()` again. A
+  finish completed during restore gives its credential the same way. On `local::Error::NotEnrolled`, check the original operation outcome.
+  A disconnected CLI or one from an earlier recovery requires fresh enrollment.
 - **A lost response of an issue of a challenge.** Ask for a challenge again. While the challenge of the lost commit is
   valid, the request gives it with `Offer::Open`. If that commit did not land, the request gives a new proposal.
 - **A lost response of a call.** The outcome is unknown, and the call can have committed. The authority looks up the
@@ -255,11 +258,11 @@ zeroization, its recovery, and the isolation that the OS enforces.
 | `authority.enroll(&holder, name, now, random)` | Authority | `(Proposal, Plan, UserCode)`. The receipt gives the 32 bytes of the `DeviceCode` |
 | `UserCode::parse(text)`, `code.text()`, `DeviceCode::from_bytes(bytes)`, `device.as_bytes()` | Both | The codes of a request, and their text and bytes |
 | `authority.request(store, &code, now)` | Authority | The `Request` of the approval page: `name`, `fingerprint`, `created`, `ends`, and `approved` |
-| `authority.approve(store, &fresh, &code, now, random)` | Authority | `(Proposal, Plan)`: the approval by the account of `fresh` |
-| `authority.poll(store, &code, &device, now)` | Authority | `Status::Waiting`, or `Status::Approved(account)` |
-| `authority.finish(store, &code, &device, &account, serial, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
-| `authority.account_credential(store, &account, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential of the account binding whose `cnf` key is `holder`, which custody signs again |
-| `authority.account_challenge(store, &account, &holder, now, random, operation)` | Authority | An `Offer` for the account binding whose `cnf` key is `holder` |
+| `authority.approve(store, &fresh, &code, serial, now, random)` | Authority | `(Proposal, Plan)`: the approval by the account of `fresh` |
+| `authority.poll(store, &code, &device, now)` | Authority | `Status::Waiting`, or `Status::Approved(id)` |
+| `authority.finish(store, &code, &device, &id.account, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
+| `authority.account_credential(store, &id, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential of the account binding whose `cnf` key is `holder`, which custody signs again |
+| `authority.account_challenge(store, &id, &holder, now, random, operation)` | Authority | An `Offer` for the account binding whose `cnf` key is `holder` |
 | `authority.challenge(store, &administrator, now, random, operation)` | Authority | `Offer::Open(challenge)` while the binding holds a valid challenge, with no commit. Else `Offer::New(proposal, plan)`: the receipt gives the 32 bytes of the new challenge |
 | `Challenge::from_bytes(bytes)`, `challenge.to_bytes()` | Both | The challenge, and its bytes |
 | `Call::new(challenge, operation, &request, limits)` | Both | `Call` |
@@ -270,11 +273,10 @@ zeroization, its recovery, and the isolation that the OS enforces.
 | `authority.credential(store, &administrator, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential whose `cnf` key is `holder`, which custody signs again |
 | `local::Unlink::new(challenge, operation, administrator, limits)`, `unlink.call()` | Both | The unlink, and the call that the CLI proves |
 
-`authority.admit` reads the binding of the serial of the credential and its challenge record, with keyed reads: the
-administrator binding, then the account binding. `authority.challenge` reads the bindings of the administrator with one
-range read, and the challenge record with a keyed read. `authority.account_challenge` reads at most 16 bindings of the
-account with one range read, and the challenge record with a keyed read. `authority.request`, `approve`, `poll`, and
-`finish` each make one keyed read of the request, and `finish` one range read of the bindings of the account.
+Account challenge and credential reissue look up the binding by account and serial, then check its recovery number.
+A new challenge also reads the CLI challenge record. Admission checks the binding and recovery number again in the commit.
+An approved enrollment request requires one keyed lookup for its request and one for its recovery number.
+Finish reads the capacity revision and one device page. Listing uses one paired session read and one device page.
 
 ## Errors
 

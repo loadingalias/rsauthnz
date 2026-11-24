@@ -18,7 +18,8 @@ use rsauthnz_conformance::suite::{Fault, Subject as _};
 use rscodec::base64::Profile::Url;
 
 use super::authenticator::{self, Get, Passkey, Registration};
-use super::{HANDLE, ORIGIN, POLICY, RP_ID, START, Site, alice, at, authority, ready};
+use super::{HANDLE, ORIGIN, POLICY, RP_ID, START, Site, at, authority, ready};
+use std::assert_matches;
 
 /// The user handle of bob.
 pub(super) const BOB: [u8; 32] = [8; 32];
@@ -39,7 +40,13 @@ const fn time(seconds: u64) -> core::time::Duration {
 impl Site {
     /// The session of the sign-in of `passkey` of the account with the user handle `handle` at `seconds`, which ends
     /// the family of `replaces`.
-    fn session_of(&mut self, passkey: &Passkey, handle: [u8; 32], seconds: u64, replaces: Option<&Access>) -> Opened {
+    pub(super) fn session_of(
+        &mut self,
+        passkey: &Passkey,
+        handle: [u8; 32],
+        seconds: u64,
+        replaces: Option<&Access>,
+    ) -> Opened {
         let json = Get::new(passkey, RP_ID, ORIGIN, self.options(at(seconds - 1)), handle).json();
         self.opened(&json, at(seconds), replaces)
     }
@@ -49,7 +56,7 @@ impl Site {
     }
 
     /// The session of `identifier` at `now`, which must serve.
-    fn active(&mut self, identifier: &Identifier, now: Reading) -> Access {
+    pub(super) fn active(&mut self, identifier: &Identifier, now: Reading) -> Access {
         match self.check(identifier, now) {
             Ok(Check::Active(access)) => access,
             other => panic!("the session does not serve: {other:?}"),
@@ -79,10 +86,10 @@ impl Site {
     }
 }
 
-/// The 64 bytes of an identifier, from its cookie value.
-fn bytes(identifier: &Identifier) -> [u8; 64] {
+/// The bytes of an identifier, from its cookie value.
+fn bytes(identifier: &Identifier) -> [u8; session::IDENTIFIER_BYTES] {
     let text = identifier.encode().expect("the cookie value");
-    let mut bytes = [0; 64];
+    let mut bytes = [0; session::IDENTIFIER_BYTES];
     Url.decode(text.as_bytes(), &mut bytes).expect("base64url");
     bytes
 }
@@ -187,7 +194,7 @@ fn a_dump_of_the_store_holds_no_usable_session_identifier() {
         let text = identifier.encode().expect("the cookie value");
         // The positive control: the search reads the keys, which start with the locator.
         assert!(holds(&bytes[..16]));
-        for needle in [&bytes[..], &bytes[16..32], &bytes[32..], text.as_bytes()] {
+        for needle in [&bytes[..], &bytes[16..32], &bytes[72..], text.as_bytes()] {
             assert!(!holds(needle));
         }
     }
@@ -267,8 +274,8 @@ fn the_listing_gives_each_session_of_the_account_that_did_not_end() {
     let laptop = site.session_of(&passkey, HANDLE, 11, None).session;
     let phone = site.session_of(&passkey, HANDLE, 31, None).session;
     site.session_of(&bob, BOB, 41, None);
-    let list = |site: &mut Site, now| {
-        let page = ready(site.sessions.list(&mut site.node.memory, &alice(), None, now));
+    let list = |site: &mut Site, access: &Access, now| {
+        let page = ready(site.sessions.list(&mut site.node.memory, access, None, now));
         let page = page.map_err(refused).expect("a page");
         assert_eq!(page.next, None);
         let mut keys: Vec<_> = page.sessions.iter().map(|session| session.key().clone()).collect();
@@ -279,7 +286,7 @@ fn the_listing_gives_each_session_of_the_account_that_did_not_end() {
     let phone = site.active(phone.identifier(), at(50));
     let mut both = vec![laptop.session().key().clone(), phone.session().key().clone()];
     both.sort();
-    assert_eq!(list(&mut site, at(50)), both);
+    assert_eq!(list(&mut site, &phone, at(50)), both);
 
     // The account ends the session of the laptop from the listing on the phone, with the fresh verification of its
     // sign-in at 31.
@@ -289,9 +296,12 @@ fn the_listing_gives_each_session_of_the_account_that_did_not_end() {
         .revoke(laptop.session(), Revoker::Fresh(&fresh), &[], at(51), &mut site.random)
         .expect("a revocation");
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Accepted(_)));
-    assert_eq!(list(&mut site, at(52)), vec![phone.session().key().clone()]);
+    assert_eq!(list(&mut site, &phone, at(52)), vec![phone.session().key().clone()]);
     // The session of the phone, from the sign-in at 31, ends at 130 with no renewal.
-    assert_eq!(list(&mut site, at(130)), Vec::new());
+    assert_matches!(
+        ready(site.sessions.list(&mut site.node.memory, &phone, None, at(130))),
+        Err(session::Failure::Refused(Error::Ended))
+    );
 }
 
 #[test]

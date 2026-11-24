@@ -23,12 +23,10 @@ becomes durable. The source of a request can survive each recovery and restore.
 
 The model assumes a single eligible recovery for each code. The authority-restore model owns selection between
 competing consumers, voids, and store instance numbers. This model assumes that the journal retains the generation
-with the new passkey of the selected recovery. The Rust restore journey must show that its stored forms implement
-that assumption. Ordinary online checks, account isolation, and the keep-passkeys policy also need Rust evidence.
-
-The current journal checks that each new anchor key is absent before it completes a consumption in doubt.
-A snapshot after a first recovery can already contain the generation record at a fixed account key. A second
-recovery must preserve both its generation and its passkey in that case. See [restore](../../src/store/journal/rules.rs).
+with the new passkey of the selected recovery. Rust uses a new revision key for each accepted recovery.
+The restore journey checks two successive recoveries against snapshots from before and after the first one.
+Product tests also check online revocation, separate accounts and passkey sites, and both passkey policies.
+See the [recovery journeys](../../tests/passkey/recovery.rs) and [CLI journeys](../../tests/passkey/enroll.rs).
 
 ## Profiles
 

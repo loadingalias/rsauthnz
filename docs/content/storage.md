@@ -171,8 +171,15 @@ index serves it without a scan of other records. The core reads these prefixes:
 | `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each start, and a worker after a crash |
 | The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md), and its open after a restore lost its record |
 | That prefix and the SHA-256 digest of the authority and an administrator: 65 bytes | The bindings of the administrator | The bootstrap, the challenge, and the recovery of a credential of a [local authority](local-authority.md) |
-| The kind byte of `Kind::Credential` and the SHA-256 digest of the CBOR form `["rsauthnz.passkey.credential.2", authority, relying party ID, user handle]`: 33 bytes | The passkeys of an account | The start of a registration, the list and the removal of [passkeys](accounts.md), and a new recovery code and a [recovery](recovery.md) |
-| The kind byte of `Kind::Session` and the locator of an account: the first 16 bytes of the SHA-256 digest of the CBOR form `["rsauthnz.session.1", authority, audience, account]`, 17 bytes in all | The sessions of an account | The list of [sessions](sessions.md#sign-out-list-and-revoke) and a [recovery](recovery.md) |
+| `Kind::Credential` and the current passkey prefix (33 bytes) | Current passkeys of one account and passkey site | [Manage passkeys](accounts.md) |
+| `Kind::Credential` and the device prefix for the issuer, account, and recovery number (33 bytes) | Connected account CLIs | [List and disconnect a CLI](cli.md#list-and-disconnect-a-cli) |
+| `Kind::AccountState` and the 32-byte scope | Newest account recovery revision or newest passkey or CLI enrollment revision | [Recover](recovery.md#recover) and [enroll a CLI](cli.md) |
+| `Kind::Session` and the 16-byte locator | Browser sessions of the current account revision | [List sessions](sessions.md#sign-out-list-and-revoke) |
+
+Recovery keys end with the bitwise complement of the big-endian revision number. A range of one record gives the newest revision.
+The first recovery also writes a permanent marker for revision zero. Each later recovery replaces the previous revision with a new key.
+Restore can therefore complete a second recovery from a snapshot before either one. Old session and CLI records keep their expiry.
+Full recovery selects a new passkey prefix. Stored public keys under an earlier prefix cannot authenticate.
 
 A store that partitions its keys can use the first 33 bytes of a key as its partition key. A shorter key is its own
 partition key. Then each range read of the core reads one partition, except the read of the sessions of an account:
