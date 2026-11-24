@@ -90,3 +90,24 @@ openssl req -x509 -new -key es.key -config ext.cnf -extensions self -subj "/O=rs
 `openssl verify -check_ss_sig -x509_strict -CAfile root.pem -untrusted issuer.pem leaf.pem` gave `OK` for the chain.
 
 The composite certificates are the `x5c` of `tests/composite-sigs/vectors.json` ([its README](../composite-sigs/README.md)).
+
+## Sigstore fixtures
+
+These files come from the Sigstore public-good instance. Each one is public data, under Apache-2.0 at its source.
+
+| File | What it is | Source |
+| --- | --- | --- |
+| `sigstore-root.der` | The Sigstore root (`O=sigstore.dev, CN=sigstore`, P-384), the trust anchor | The `certChain` of the CA from 2022-04-13 in `targets/trusted_root.json` of `sigstore/root-signing`, commit `c9bda74ad2221f938f7d2e0295ca3aad2da710a8` |
+| `sigstore-intermediate.der` | The Fulcio intermediate (`CN=sigstore-intermediate`, P-384, path length 0, `codeSigning`) | The same `certChain` |
+| `ctfe-2022.der` | The `SubjectPublicKeyInfo` of the CT log `https://ctfe.sigstore.dev/2022` (P-256). Its SHA-256 digest is its log ID | The `ctlogs` of the same file |
+| `fulcio-leaf.der` | The Fulcio leaf of the GitHub Actions release `trailofbits/rfc8785.py` v0.1.2 (P-256, signed with P-384), valid from 2024-03-19 22:41:15 to 22:51:15 UTC | The first certificate of `test/assets/bundle_v3_github.whl.sigstore` of `sigstore/sigstore-python`, commit `300b502ae99ebfaace124f1f4e422a6a669369cf`. The `integratedTime` of its Rekor entry is 1710888076 |
+
+OpenSSL 3 (`openssl x509 -text`) printed the fields, the claims, and the timestamp (2024-03-19 22:41:15.966 UTC) that
+`tests/x509.rs` expects. Python `hashlib` computed the log ID.
+
+```text
+3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1  sigstore-root.der
+15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47  sigstore-intermediate.der
+dd3d306ac6c7113263191e1c99673702a24a5eb8de3cadff878a72802f29ee8e  ctfe-2022.der
+3bdbfb9fe7a9377878b538dfb2ec6af283d51e243629fa667e360a06b62f63c2  fulcio-leaf.der
+```

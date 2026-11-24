@@ -109,7 +109,8 @@ const PRIVATE: [&str; 9] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"]
 /// The slots of the reader: each open container, and each key of each open object.
 const SLOTS: usize = 8 * (64 + 1);
 
-/// The JOSE `alg` of `algorithm`, which a signature writes, or `None` for SLH-DSA, which has no JOSE name.
+/// The JOSE `alg` of `algorithm`, which a signature writes, or `None` for SLH-DSA, which has no JOSE name, and for
+/// ES384, which this crate verifies only in X.509.
 ///
 /// Cost class: [`Parse`](crate::limits::Class::Parse).
 #[must_use]
@@ -122,7 +123,7 @@ pub const fn alg(algorithm: Algorithm) -> Option<&'static str> {
         Algorithm::MlDsa65 => Some("ML-DSA-65"),
         Algorithm::MlDsa65Ed25519 => Some(ML_DSA_65_ED25519),
         Algorithm::MlDsa65EcdsaP256 => Some(ML_DSA_65_ES256),
-        Algorithm::SlhDsaSha2_128s => None,
+        Algorithm::Es384 | Algorithm::SlhDsaSha2_128s => None,
     }
 }
 
@@ -412,7 +413,7 @@ impl Jwk<'_> {
             Algorithm::MlDsa65 | Algorithm::MlDsa65Ed25519 | Algorithm::MlDsa65EcdsaP256 => {
                 kty == "AKP" && self.alg.is_some_and(|alg| names(algorithm, alg))
             }
-            Algorithm::SlhDsaSha2_128s => false,
+            Algorithm::Es384 | Algorithm::SlhDsaSha2_128s => false,
         });
         let restricted = self.unreadable
             || self.verify == Some(false)

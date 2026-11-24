@@ -36,9 +36,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use rscrypto::auth::{
-    EcdsaP256PublicKey, EcdsaP256Signature, Ed25519PublicKey, Ed25519Signature, MlDsa65EcdsaP256PublicKey,
-    MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature, MlDsa65PublicKey, MlDsa65Signature,
-    SlhDsaSha2_128s, SlhDsaSha2_128sPublicKey,
+    EcdsaP256PublicKey, EcdsaP256Signature, EcdsaP384PublicKey, EcdsaP384Signature, Ed25519PublicKey, Ed25519Signature,
+    MlDsa65EcdsaP256PublicKey, MlDsa65EcdsaP256Signature, MlDsa65Ed25519PublicKey, MlDsa65Ed25519Signature,
+    MlDsa65PublicKey, MlDsa65Signature, SlhDsaSha2_128s, SlhDsaSha2_128sPublicKey,
 };
 use rscrypto::{HmacSha256, HmacSha256Tag, RsaPkcs1v15Profile, RsaPssProfile, RsaPublicKey, RsaPublicKeyPolicy};
 
@@ -65,6 +65,10 @@ pub enum Algorithm {
     /// [RFC 9864](https://www.rfc-editor.org/rfc/rfc9864), which assigns ESP256 (-9). This profile keeps -7, because it
     /// serves a verifier that supports nothing else.
     Es256,
+    /// ECDSA with P-384 and SHA-384 (X.509 `ecdsa-with-SHA384`, [RFC 5758](https://www.rfc-editor.org/rfc/rfc5758)).
+    /// A classical profile that only verifies the certificates of other issuers, such as the Sigstore certificate
+    /// authority. No credential of this crate, no custody key, and no COSE or JOSE form has it.
+    Es384,
     /// RSASSA-PKCS1-v1_5 with SHA-256 (COSE algorithm -257), with a modulus of 2,048 to 4,096 bits and the exponent
     /// 65,537. A classical profile that only verifies: the passkeys of some authenticators, such as Windows Hello, use
     /// it. No credential of this crate and no custody key has it.
@@ -91,9 +95,10 @@ pub enum Algorithm {
 
 impl Algorithm {
     /// Each algorithm of the registry.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Ed25519,
         Self::Es256,
+        Self::Es384,
         Self::Rs256,
         Self::Ps256,
         Self::MlDsa65,
@@ -108,6 +113,8 @@ impl Algorithm {
         let (cose, registration, authentication) = match self {
             Self::Ed25519 => (Some(-19), Registration::Assigned, Authentication::Classical),
             Self::Es256 => (Some(-7), Registration::Assigned, Authentication::Classical),
+            // IANA assigned -35, but this crate verifies ES384 only in X.509. Thus COSE names no identifier for it.
+            Self::Es384 => (None, Registration::Assigned, Authentication::Classical),
             Self::Rs256 => (Some(-257), Registration::Assigned, Authentication::Classical),
             Self::Ps256 => (Some(-37), Registration::Assigned, Authentication::Classical),
             Self::MlDsa65 => (Some(-49), Registration::Assigned, Authentication::PostQuantum),
@@ -135,7 +142,13 @@ impl Algorithm {
     /// The signature checks of one signature: one for each component.
     const fn checks(self) -> usize {
         match self {
-            Self::Ed25519 | Self::Es256 | Self::Rs256 | Self::Ps256 | Self::MlDsa65 | Self::SlhDsaSha2_128s => 1,
+            Self::Ed25519
+            | Self::Es256
+            | Self::Es384
+            | Self::Rs256
+            | Self::Ps256
+            | Self::MlDsa65
+            | Self::SlhDsaSha2_128s => 1,
             Self::MlDsa65Ed25519 | Self::MlDsa65EcdsaP256 => 2,
         }
     }
@@ -145,6 +158,7 @@ impl Algorithm {
         match self {
             Self::Ed25519 => Ed25519Signature::LENGTH,
             Self::Es256 => EcdsaP256Signature::LENGTH,
+            Self::Es384 => EcdsaP384Signature::LENGTH,
             Self::Rs256 | Self::Ps256 => RSA_MODULUS_BITS_MAX / 8,
             Self::MlDsa65 => MlDsa65Signature::LENGTH,
             Self::MlDsa65Ed25519 => MlDsa65Ed25519Signature::LENGTH,
@@ -197,6 +211,7 @@ pub enum Authentication {
 pub(crate) enum Verifier {
     Ed25519(Ed25519PublicKey),
     Es256(Box<EcdsaP256PublicKey>),
+    Es384(Box<EcdsaP384PublicKey>),
     Rs256(Box<RsaPublicKey>),
     Ps256(Box<RsaPublicKey>),
     MlDsa65(Box<MlDsa65PublicKey>),
@@ -265,6 +280,12 @@ impl Verifier {
                 let (x, y) = point.split_first_chunk::<32>()?;
                 Self::es256(x, y.try_into().ok()?)
             }
+            Algorithm::Es384 => {
+                // Only the uncompressed point, so that `to_bytes` gives the same bytes. rscrypto checks the curve.
+                (public.len() == EcdsaP384PublicKey::SEC1_LENGTH && public.first() == Some(&0x04)).then_some(())?;
+                let key = EcdsaP384PublicKey::from_sec1_bytes(public).ok()?;
+                Some(Self::Es384(Box::new(key)))
+            }
             Algorithm::MlDsa65 => public.try_into().ok().map(Self::ml_dsa_65),
             Algorithm::MlDsa65Ed25519 => public.try_into().ok().and_then(Self::ml_dsa_65_ed25519),
             Algorithm::MlDsa65EcdsaP256 => public.try_into().ok().and_then(Self::ml_dsa_65_ecdsa_p256),
@@ -273,13 +294,14 @@ impl Verifier {
         }
     }
 
-    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 key, the
-    /// `RSAPublicKey` DER of an RSA key, the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or composite
-    /// key, and PK.seed then PK.root for an SLH-DSA key.
+    /// The encoding of the key: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point of a P-256 or P-384 key,
+    /// the `RSAPublicKey` DER of an RSA key, the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or
+    /// composite key, and PK.seed then PK.root for an SLH-DSA key.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(key) => key.as_bytes().to_vec(),
             Self::Es256(key) => key.to_sec1_bytes().to_vec(),
+            Self::Es384(key) => key.to_sec1_bytes().to_vec(),
             Self::Rs256(key) | Self::Ps256(key) => key.to_pkcs1_der(),
             Self::MlDsa65(key) => key.as_bytes().to_vec(),
             Self::MlDsa65Ed25519(key) => key.to_bytes().to_vec(),
@@ -293,6 +315,7 @@ impl Verifier {
         match self {
             Self::Ed25519(_) => Algorithm::Ed25519,
             Self::Es256(_) => Algorithm::Es256,
+            Self::Es384(_) => Algorithm::Es384,
             Self::Rs256(_) => Algorithm::Rs256,
             Self::Ps256(_) => Algorithm::Ps256,
             Self::MlDsa65(_) => Algorithm::MlDsa65,
@@ -303,19 +326,27 @@ impl Verifier {
     }
 
     /// Whether `signature` is a valid signature over `message` in the form of WebAuthn and X.509: as [`Self::verify`],
-    /// but an ES256 signature is the DER `Ecdsa-Sig-Value`, and not `r || s`.
+    /// but an ECDSA signature is the DER `Ecdsa-Sig-Value`, and not `r || s`.
     pub(crate) fn verify_der(
         &self,
         message: &[u8],
         signature: &[u8],
         budget: &mut SignatureBudget,
     ) -> Result<bool, Limit> {
-        let Self::Es256(_) = self else {
-            return self.verify(message, signature, budget);
+        let mut raw = [0; EcdsaP384Signature::LENGTH];
+        let len = match self {
+            Self::Es256(_) => EcdsaP256Signature::from_der(signature).map(|signature| {
+                raw[..EcdsaP256Signature::LENGTH].copy_from_slice(signature.as_bytes());
+                EcdsaP256Signature::LENGTH
+            }),
+            Self::Es384(_) => EcdsaP384Signature::from_der(signature).map(|signature| {
+                raw.copy_from_slice(signature.as_bytes());
+                EcdsaP384Signature::LENGTH
+            }),
+            _ => return self.verify(message, signature, budget),
         };
         // A signature that is not canonical DER becomes no signature, which the check refuses after its charge.
-        let raw = EcdsaP256Signature::from_der(signature).map(EcdsaP256Signature::to_bytes);
-        self.verify(message, raw.as_ref().map_or(&[][..], |raw| raw), budget)
+        self.verify(message, len.map_or(&[][..], |len| &raw[..len]), budget)
     }
 
     /// Whether `signature` is a valid signature over `message`. ML-DSA-65, the composites, and SLH-DSA use the empty
@@ -331,6 +362,10 @@ impl Verifier {
             Self::Es256(key) => <[u8; 64]>::try_from(signature)
                 .ok()
                 .and_then(|signature| EcdsaP256Signature::from_bytes(signature).ok())
+                .is_some_and(|signature| key.verify(message, &signature).is_ok()),
+            Self::Es384(key) => <[u8; 96]>::try_from(signature)
+                .ok()
+                .and_then(|signature| EcdsaP384Signature::from_bytes(signature).ok())
                 .is_some_and(|signature| key.verify(message, &signature).is_ok()),
             Self::Rs256(key) => key
                 .verify_pkcs1v15(RsaPkcs1v15Profile::Sha256, message, signature)
@@ -407,6 +442,7 @@ impl PartialEq for Verifier {
         match (self, other) {
             (Self::Ed25519(a), Self::Ed25519(b)) => a.as_bytes() == b.as_bytes(),
             (Self::Es256(a), Self::Es256(b)) => a.to_sec1_bytes() == b.to_sec1_bytes(),
+            (Self::Es384(a), Self::Es384(b)) => a.to_sec1_bytes() == b.to_sec1_bytes(),
             (Self::Rs256(a), Self::Rs256(b)) | (Self::Ps256(a), Self::Ps256(b)) => a.modulus() == b.modulus(),
             (Self::MlDsa65(a), Self::MlDsa65(b)) => a == b,
             (Self::MlDsa65Ed25519(a), Self::MlDsa65Ed25519(b)) => a == b,

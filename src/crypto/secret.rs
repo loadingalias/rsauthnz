@@ -69,9 +69,12 @@ impl SecretKey {
             )
             .map(|(public, key)| (Self::SlhDsaSha2_128s(key), Verifier::SlhDsaSha2_128s(public)))
             .map_err(|_| Error::Crypto),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::MlDsa65 => {
-                Err(Error::Algorithm)
-            }
+            Algorithm::Ed25519
+            | Algorithm::Es256
+            | Algorithm::Es384
+            | Algorithm::Rs256
+            | Algorithm::Ps256
+            | Algorithm::MlDsa65 => Err(Error::Algorithm),
         }
     }
 
@@ -82,7 +85,12 @@ impl SecretKey {
             Algorithm::MlDsa65Ed25519 => Some(MlDsa65Ed25519SecretKey::PKCS8_DER_LENGTH),
             Algorithm::MlDsa65EcdsaP256 => Some(MlDsa65EcdsaP256SecretKey::PKCS8_DER_LENGTH),
             Algorithm::SlhDsaSha2_128s => Some(SlhDsaSha2_128sSecretKey::PKCS8_DER_LENGTH),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::MlDsa65 => None,
+            Algorithm::Ed25519
+            | Algorithm::Es256
+            | Algorithm::Es384
+            | Algorithm::Rs256
+            | Algorithm::Ps256
+            | Algorithm::MlDsa65 => None,
         }
     }
 
@@ -119,7 +127,12 @@ impl SecretKey {
             Algorithm::SlhDsaSha2_128s => SlhDsaSha2_128sSecretKey::from_pkcs8_der_in(der, Global)
                 .map(Self::SlhDsaSha2_128s)
                 .ok(),
-            Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::MlDsa65 => {
+            Algorithm::Ed25519
+            | Algorithm::Es256
+            | Algorithm::Es384
+            | Algorithm::Rs256
+            | Algorithm::Ps256
+            | Algorithm::MlDsa65 => {
                 return Err(Error::Algorithm);
             }
         };

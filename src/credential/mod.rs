@@ -1063,7 +1063,7 @@ const fn class(algorithm: Algorithm) -> Result<Authentication, Error> {
         | Algorithm::MlDsa65
         | Algorithm::MlDsa65Ed25519
         | Algorithm::MlDsa65EcdsaP256 => Ok(algorithm.report().authentication),
-        Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::SlhDsaSha2_128s => Err(Error::Profile),
+        Algorithm::Es384 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::SlhDsaSha2_128s => Err(Error::Profile),
     }
 }
 

@@ -127,7 +127,7 @@ impl<'a> Key<'a> {
                     Algorithm::MlDsa65 => PublicKey::MlDsa65(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65Ed25519 => PublicKey::MlDsa65Ed25519(fixed(bytes(-1)?)?),
                     Algorithm::MlDsa65EcdsaP256 => PublicKey::MlDsa65EcdsaP256(fixed(bytes(-1)?)?),
-                    Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 => {
+                    Algorithm::Ed25519 | Algorithm::Es256 | Algorithm::Rs256 | Algorithm::Ps256 | Algorithm::Es384 => {
                         return Err(Error::KeyAlgorithm);
                     }
                     // SLH-DSA has no COSE identifier yet, so no `alg` names it.

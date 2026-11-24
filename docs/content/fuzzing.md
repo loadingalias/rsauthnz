@@ -13,7 +13,7 @@ lock file. libFuzzer holds C++, so it stays out of each library closure.
 | `credential` | `credential::Profile::verify` | With drawn limits: an artifact over `credential::MAX_BYTES` refuses with `Error::Size`, an artifact over `Limits::bytes` refuses, and a decode or a limit that refuses does no signature work |
 | `passkey` | `passkey::Response::parse`, `RelyingParty::verify`, `passkey::Assertion::parse` | A response over 64 KiB refuses |
 | `jose` | `jose::Profile::verify_jwt`, `jose::Profile::with_key_set` | A token over `jose::TOKEN_BYTES_MAX` refuses with `Error::Limit` |
-| `x509` | `x509::Certificate::parse`, `Certificate::verify` | An input over `CERTIFICATE_BYTES_MAX` refuses with `Error::Bytes`. A signature check runs only for a certificate that parses |
+| `x509` | `x509::Certificate::parse`, `Certificate::verify`, `Certificate::timestamps` | An input over `CERTIFICATE_BYTES_MAX` refuses with `Error::Bytes`. A signature check runs only for a certificate that parses. A timestamp list with no trusted log gives no timestamp and does no signature work |
 | `session` | `session::Identifier::parse` | A cookie value of another length than `IDENTIFIER_CHARS` refuses |
 | `bootstrap` | `local::Bootstrap::parse` | No input panics |
 | `recovery` | `recovery::Code::parse` | A text of more than 64 bytes, or with another number of digits than 32 outside the hyphens and spaces, refuses |
@@ -98,7 +98,7 @@ approval of the owner.
 | `cose`, `credential` | A credential of the credential format, from `credential::Draft` and its commit, and a `COSE_Key`. The Ed25519 key of the secret `[1; 32]` signed the credential; `fuzz/src/lib.rs` holds its public key |
 | `jose` | A JWT from `jose::signing_input` and `jose::compact`, signed by the same key, and a JWK set of the key |
 | `passkey` | The registration of the ES256 case of WebAuthn Level 3, section 16.2, and an assertion of the same credential |
-| `x509` | The five certificates of `tests/x509/`, and the two composite certificates of the LAMPS draft |
+| `x509` | The five OpenSSL certificates and the three Sigstore certificates of `tests/x509/`, and the two composite certificates of the LAMPS draft |
 | `session`, `bootstrap` | One identifier and one bootstrap value in their forms |
 | `recovery` | One recovery code in its text form |
 

@@ -1,5 +1,6 @@
-//! X.509: `Certificate::parse` of untrusted DER, and the signature check of a certificate that parses. An input over
-//! `CERTIFICATE_BYTES_MAX` refuses before a read, and only a check after a parse does signature work.
+//! X.509: `Certificate::parse` of untrusted DER, the signature check of a certificate that parses, and the read of its
+//! Certificate Transparency timestamps. An input over `CERTIFICATE_BYTES_MAX` refuses before a read, only a check after
+//! a parse does signature work, and a timestamp list with no trusted log does none.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -19,6 +20,15 @@ fuzz_target!(|input: &[u8]| {
     if let Ok(certificate) = parsed {
         let limits = Limits::default();
         let mut budget = SignatureBudget::new(&limits);
+        let stamps = certificate.timestamps(&certificate, &[], &mut budget);
+        assert!(
+            untouched(&budget, &limits),
+            "a timestamp of no trusted log did signature work"
+        );
+        assert!(
+            !matches!(stamps, Ok(found) if !found.is_empty()),
+            "a timestamp of no trusted log"
+        );
         let checked = certificate.verify(certificate.key(), &mut budget);
         assert!(untouched(&budget, &limits) || matches!(checked, Ok(()) | Err(Error::Signature)));
     }

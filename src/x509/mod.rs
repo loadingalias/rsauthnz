@@ -1,4 +1,5 @@
-//! X.509 certificates for TLS identities ([RFC 5280]): issuance and bounded parsing of the forms of this crate.
+//! X.509 certificates ([RFC 5280]): the issuance of certificates for TLS identities, a bounded reader, and the checks of
+//! a certificate of another issuer, such as the Fulcio certificate of a Sigstore build.
 //!
 //! A [`Draft`] builds the DER `TBSCertificate` of [`Fields`]: the serial, the issuer and the subject names, the
 //! validity, the subject key, and the [`Usage`]. The issuer key gives the signature algorithm:
@@ -17,8 +18,14 @@
 //! the issuance record of the serial to the transition. Thus only the accepted commit releases the certificate, and one
 //! serial of an issuer gives one certificate.
 //!
-//! [`Certificate::parse`] reads the same forms, after a bound on the bytes, with no allocation past the declared
-//! lengths. [`Certificate::verify`] checks the signature with the key of the issuer.
+//! [`Certificate::parse`] reads these forms and a strict profile of other issuers, after a bound on the bytes, with no
+//! allocation past the declared lengths. [`Certificate::verify`] checks the signature with the key of the issuer. The
+//! profile adds ECDSA P-384 with SHA-384 (`ecdsa-with-SHA384`, 1.2.840.10045.4.3.3), which only verifies.
+//!
+//! [`Certificate::verify_path`] checks the path of a certificate to a trust anchor at a time that the caller gives.
+//! [`Certificate::fulcio`] gives the claims of a Fulcio certificate, and [`Certificate::timestamps`] checks the
+//! Certificate Transparency timestamps ([RFC 6962]) that a certificate embeds. The caller owns the policy: its anchors
+//! and logs, the windows of their trust, and the claims that it accepts.
 //!
 //! The example drafts the certificate of a TLS identity whose Ed25519 key signs its own certificate. A custody key gives
 //! its encoding with [`Handle::public_key`](crate::custody::Handle::public_key).
@@ -61,6 +68,7 @@
 //!
 //! [RFC 5280]: https://www.rfc-editor.org/rfc/rfc5280
 //! [RFC 5758]: https://www.rfc-editor.org/rfc/rfc5758
+//! [RFC 6962]: https://www.rfc-editor.org/rfc/rfc6962
 //! [RFC 8410]: https://www.rfc-editor.org/rfc/rfc8410
 //! [RFC 9881]: https://www.rfc-editor.org/rfc/rfc9881
 //! [RFC 9909]: https://www.rfc-editor.org/rfc/rfc9909
@@ -69,14 +77,14 @@ mod der;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt;
 use core::time::Duration;
+use core::{fmt, iter};
 
 use rscrypto::ChaCha20Rng;
 
 use self::der::{
-    BIT_STRING, BOOLEAN, DNS_NAME, EXTENSIONS, INTEGER, OBJECT, OCTET_STRING, Reader, SEQUENCE, SET, URI, UTF8_STRING,
-    VERSION, element,
+    BIT_STRING, BOOLEAN, DNS_NAME, EXTENSIONS, INTEGER, OBJECT, OCTET_STRING, PRINTABLE_STRING, Reader, SEQUENCE, SET,
+    URI, UTF8_STRING, VERSION, element,
 };
 use crate::cbor::{self, Value};
 use crate::crypto::{self, Algorithm, Authentication, Verifier};
@@ -98,11 +106,17 @@ pub const NAME_VALUE_BYTES_MAX: usize = 64;
 /// The most subject alternative names of a certificate.
 pub const ALT_NAMES_MAX: usize = 16;
 
-/// The most bytes of a URI name.
-pub const URI_BYTES_MAX: usize = 256;
+/// The most bytes of a URI name. A GitHub Actions identity names the repository, the path of the workflow, and the ref.
+pub const URI_BYTES_MAX: usize = 1024;
 
-/// The most extensions of a certificate that [`Certificate::parse`] reads.
-const EXTENSIONS_MAX: usize = 8;
+/// The most issuer certificates between a certificate and its trust anchor in [`Certificate::verify_path`].
+pub const PATH_ISSUERS_MAX: usize = 4;
+
+/// The most Certificate Transparency timestamps that [`Certificate::timestamps`] reads in one certificate.
+pub const TIMESTAMPS_MAX: usize = 8;
+
+/// The most extensions of a certificate that [`Certificate::parse`] reads. A Fulcio certificate has 27.
+const EXTENSIONS_MAX: usize = 64;
 
 /// The most bytes of a serial number: RFC 5280 section 4.1.2.2.
 const SERIAL_BYTES_MAX: usize = 20;
@@ -121,15 +135,20 @@ const SLHDSA_SHA2_128S: &[u8] = &[
 ];
 const ED25519: &[u8] = &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
 const ECDSA_SHA256: &[u8] = &[0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const ECDSA_SHA384: &[u8] = &[0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 /// `id-ecPublicKey` with the named curve `prime256v1`.
 const EC_P256: &[u8] = &[
     0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03,
     0x01, 0x07,
 ];
+/// `id-ecPublicKey` with the named curve `secp384r1`.
+const EC_P384: &[u8] = &[
+    0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22,
+];
 
 /// The algorithms of certificates, with the identifiers of their signatures and of their keys, and the most bytes of
 /// a signature in its X.509 form.
-const ALGORITHMS: [(Algorithm, &[u8], &[u8], usize); 6] = [
+const ALGORITHMS: [(Algorithm, &[u8], &[u8], usize); 7] = [
     (Algorithm::MlDsa65Ed25519, MLDSA65_ED25519, MLDSA65_ED25519, 3_373),
     (
         Algorithm::MlDsa65EcdsaP256,
@@ -141,6 +160,7 @@ const ALGORITHMS: [(Algorithm, &[u8], &[u8], usize); 6] = [
     (Algorithm::SlhDsaSha2_128s, SLHDSA_SHA2_128S, SLHDSA_SHA2_128S, 7_856),
     (Algorithm::Ed25519, ED25519, ED25519, 64),
     (Algorithm::Es256, ECDSA_SHA256, EC_P256, 72),
+    (Algorithm::Es384, ECDSA_SHA384, EC_P384, 104),
 ];
 
 /// The OIDs of the extensions, of the attributes, and of the extended key usages.
@@ -152,10 +172,17 @@ const SUBJECT_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x0e];
 const AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x23];
 const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+const CODE_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+/// 1.3.6.1.4.1.11129.2.4.2: the `SignedCertificateTimestampList` of RFC 6962 section 3.3.
+const TIMESTAMP_LIST: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x02];
+/// 1.3.6.1.4.1.57264.1: the arc of the Fulcio claims. One more arc names each claim.
+const FULCIO: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01];
 
-/// The `KeyUsage` bit strings: `digitalSignature` of an identity, and `keyCertSign` of an issuer.
-const DIGITAL_SIGNATURE: &[u8] = &[0x03, 0x02, 0x07, 0x80];
-const KEY_CERT_SIGN: &[u8] = &[0x03, 0x02, 0x02, 0x04];
+/// The `KeyUsage` bits of RFC 5280 section 4.2.1.3, in the first byte of the bit string: `digitalSignature` of an
+/// identity, and `keyCertSign` of an issuer, which can also have `cRLSign` and `digitalSignature`.
+const DIGITAL_SIGNATURE: u8 = 0x80;
+const KEY_CERT_SIGN: u8 = 0x04;
+const CRL_SIGN: u8 = 0x02;
 
 /// The public key of a certificate: its algorithm and its key.
 #[derive(Clone, PartialEq, Eq)]
@@ -163,11 +190,11 @@ pub struct PublicKey(Verifier);
 
 impl PublicKey {
     /// The key of `algorithm` with the encoding `public`: the 32 bytes of an Ed25519 key, the uncompressed SEC1 point
-    /// of 65 bytes of a P-256 key, the encoding of FIPS 204 or of the LAMPS draft for an ML-DSA-65 or a composite key,
-    /// and PK.seed then PK.root for an SLH-DSA key. A custody handle gives this encoding
+    /// of 65 bytes of a P-256 key or of 97 bytes of a P-384 key, the encoding of FIPS 204 or of the LAMPS draft for an
+    /// ML-DSA-65 or a composite key, and PK.seed then PK.root for an SLH-DSA key. A custody handle gives this encoding
     /// ([`Handle::public_key`](crate::custody::Handle::public_key)).
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). A P-256 key checks its point.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). An ECDSA key checks its point.
     ///
     /// # Errors
     ///
@@ -175,6 +202,23 @@ impl PublicKey {
     pub fn new(algorithm: Algorithm, public: &[u8]) -> Result<Self, Error> {
         identifiers(algorithm).ok_or(Error::Unsupported)?;
         Verifier::from_bytes(algorithm, public).map(Self).ok_or(Error::Key)
+    }
+
+    /// The key of `algorithm` in the DER `SubjectPublicKeyInfo` `der`, such as the key of a Certificate Transparency
+    /// log in a trusted root. The caller fixes the algorithm, so the input never selects one.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). An ECDSA key checks its point.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bytes`] for more than [`CERTIFICATE_BYTES_MAX`] bytes, [`Error::Malformed`] for DER outside the form,
+    /// [`Error::Unsupported`] for a key outside the profile, and [`Error::Key`] for a key of another algorithm or a key
+    /// that is not valid.
+    pub fn from_spki(algorithm: Algorithm, der: &[u8]) -> Result<Self, Error> {
+        (der.len() <= CERTIFICATE_BYTES_MAX).ok_or(Error::Bytes)?;
+        let key = read_key(der)?;
+        (key.algorithm() == algorithm).ok_or(Error::Key)?;
+        Ok(key)
     }
 
     /// The algorithm of the key.
@@ -304,29 +348,35 @@ pub enum AltName<'a> {
     Uri(&'a str),
 }
 
-/// An extended key usage of a TLS identity.
+/// An extended key usage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Purpose {
     /// `id-kp-serverAuth`: a TLS server.
     Server,
     /// `id-kp-clientAuth`: a TLS client.
     Client,
+    /// `id-kp-codeSigning`: the signer of code, such as a Sigstore build.
+    CodeSigning,
 }
 
 impl Purpose {
+    const ALL: [Self; 3] = [Self::Server, Self::Client, Self::CodeSigning];
+
     const fn object(self) -> &'static [u8] {
         match self {
             Self::Server => SERVER_AUTH,
             Self::Client => CLIENT_AUTH,
+            Self::CodeSigning => CODE_SIGNING,
         }
     }
 }
 
-/// What the key of a certificate does.
+/// What the key of a certificate does. Each purpose is in its list at most once, and an empty list gives no
+/// `extKeyUsage`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Usage<'a> {
-    /// A TLS identity: the critical `keyUsage` `digitalSignature`, the `extKeyUsage` of `purposes`, and the
-    /// `subjectAltName` of `names`. An empty list gives no extension. Each purpose is in the list at most once.
+    /// An identity, such as a TLS server or a code signer: the critical `keyUsage` `digitalSignature`, the
+    /// `extKeyUsage` of `purposes`, and the `subjectAltName` of `names`. An empty list gives no extension.
     Identity {
         /// The subject alternative names: at most [`ALT_NAMES_MAX`].
         names: &'a [AltName<'a>],
@@ -334,11 +384,83 @@ pub enum Usage<'a> {
         purposes: &'a [Purpose],
     },
     /// An issuer of certificates, such as an issuer key under a trust root: the critical `basicConstraints` with `cA`
-    /// and the path length, and the critical `keyUsage` `keyCertSign`.
+    /// and the path length, the critical `keyUsage` `keyCertSign`, and the `extKeyUsage` of `purposes`.
     Issuer {
         /// The most issuer certificates under this one in a path, or `None` for no bound.
         path_length: Option<u8>,
+        /// The extended key usages that each certificate under this one serves, or an empty list for no bound.
+        purposes: &'a [Purpose],
     },
+}
+
+/// The claims of a Fulcio certificate: the identity that an OpenID Connect token proved to the Sigstore certificate
+/// authority. Each claim is the `UTF8String` of the extension 1.3.6.1.4.1.57264.1.*n* that its field names (Fulcio
+/// `docs/oid-info.md`), or `None` if the certificate does not have it. The deprecated claims 1 to 6 have no effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Fulcio<'a> {
+    /// 8: the issuer of the token, such as `https://token.actions.githubusercontent.com`.
+    pub issuer: Option<&'a str>,
+    /// 9: the URI of the build signer, such as the workflow of a GitHub Actions build at its ref.
+    pub build_signer_uri: Option<&'a str>,
+    /// 10: the digest of the build signer, such as the commit of the workflow.
+    pub build_signer_digest: Option<&'a str>,
+    /// 11: the runner environment, such as `github-hosted`.
+    pub runner_environment: Option<&'a str>,
+    /// 12: the URI of the source repository.
+    pub source_repository_uri: Option<&'a str>,
+    /// 13: the digest of the source, such as a commit.
+    pub source_repository_digest: Option<&'a str>,
+    /// 14: the ref of the source, such as `refs/heads/main`.
+    pub source_repository_ref: Option<&'a str>,
+    /// 15: the stable identifier of the source repository.
+    pub source_repository_identifier: Option<&'a str>,
+    /// 16: the URI of the owner of the source repository.
+    pub source_repository_owner_uri: Option<&'a str>,
+    /// 17: the stable identifier of the owner of the source repository.
+    pub source_repository_owner_identifier: Option<&'a str>,
+    /// 18: the URI of the build configuration.
+    pub build_config_uri: Option<&'a str>,
+    /// 19: the digest of the build configuration.
+    pub build_config_digest: Option<&'a str>,
+    /// 20: the event that started the build, such as `push`.
+    pub build_trigger: Option<&'a str>,
+    /// 21: the URI of the run of the build.
+    pub run_invocation_uri: Option<&'a str>,
+    /// 22: the visibility of the source repository at the time of signing, such as `public`.
+    pub source_repository_visibility: Option<&'a str>,
+}
+
+impl<'a> Fulcio<'a> {
+    /// The field of the claim with the last arc `arc`, or `None` for another arc.
+    const fn claim(&mut self, arc: u8) -> Option<&mut Option<&'a str>> {
+        Some(match arc {
+            8 => &mut self.issuer,
+            9 => &mut self.build_signer_uri,
+            10 => &mut self.build_signer_digest,
+            11 => &mut self.runner_environment,
+            12 => &mut self.source_repository_uri,
+            13 => &mut self.source_repository_digest,
+            14 => &mut self.source_repository_ref,
+            15 => &mut self.source_repository_identifier,
+            16 => &mut self.source_repository_owner_uri,
+            17 => &mut self.source_repository_owner_identifier,
+            18 => &mut self.build_config_uri,
+            19 => &mut self.build_config_digest,
+            20 => &mut self.build_trigger,
+            21 => &mut self.run_invocation_uri,
+            22 => &mut self.source_repository_visibility,
+            _ => return None,
+        })
+    }
+}
+
+/// A Certificate Transparency timestamp that a trusted log signed for a certificate (RFC 6962 section 3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Timestamp {
+    /// The index of the log in the list of the check.
+    pub log: usize,
+    /// The time at which the log saw the certificate, since the Unix epoch, in milliseconds.
+    pub time: Duration,
 }
 
 /// The validity of a certificate, as the times since the Unix epoch. Each time encodes its whole seconds.
@@ -390,16 +512,19 @@ impl Draft {
     ///   empty or longer than [`NAME_VALUE_BYTES_MAX`] bytes, for more than [`ALT_NAMES_MAX`] alternative names or an
     ///   alternative name outside its form, and for a purpose that is in the list twice.
     /// - [`Error::Validity`] if `not_after` is not after `not_before`, or a time is after the year 9999.
-    /// - [`Error::Profile`] if an SLH-DSA key signs or holds a certificate that is no issuer certificate, or if one of
-    ///   the two keys is classical and the other one is not.
+    /// - [`Error::Profile`] if an SLH-DSA key signs or holds a certificate that is no issuer certificate, if one of
+    ///   the two keys is classical and the other one is not, or if a key is ES384, which this crate only verifies.
     /// - [`Error::Bytes`] if the certificate can have more than [`CERTIFICATE_BYTES_MAX`] bytes.
     pub fn new(fields: &Fields<'_>, issuer: &PublicKey, authority: &Id<Authority>) -> Result<Self, Error> {
         let issued = issuer.algorithm();
         let held = fields.key.algorithm();
-        let root_only =
-            |algorithm| algorithm != Algorithm::SlhDsaSha2_128s || matches!(fields.usage, Usage::Issuer { .. });
+        let fits = |algorithm| match algorithm {
+            Algorithm::SlhDsaSha2_128s => matches!(fields.usage, Usage::Issuer { .. }),
+            Algorithm::Es384 => false,
+            _ => true,
+        };
         let classical = |algorithm: Algorithm| algorithm.report().authentication == Authentication::Classical;
-        (root_only(issued) && root_only(held) && classical(issued) == classical(held)).ok_or(Error::Profile)?;
+        (fits(issued) && fits(held) && classical(issued) == classical(held)).ok_or(Error::Profile)?;
         let not_before = fields.validity.not_before.as_secs();
         let not_after = fields.validity.not_after.as_secs();
         (not_before < not_after).ok_or(Error::Validity)?;
@@ -569,20 +694,8 @@ fn extensions(usage: &Usage<'_>, subject: &PublicKey, issuer: &PublicKey) -> Res
     let mut out = Vec::new();
     match usage {
         Usage::Identity { names, purposes } => {
-            out.extend(extension(KEY_USAGE, true, DIGITAL_SIGNATURE));
-            if !purposes.is_empty() {
-                let unique = purposes
-                    .iter()
-                    .enumerate()
-                    .all(|(at, purpose)| !purposes[..at].contains(purpose));
-                unique.ok_or(Error::Name)?;
-                let objects: Vec<Vec<u8>> = purposes
-                    .iter()
-                    .map(|purpose| element(OBJECT, &[purpose.object()]))
-                    .collect();
-                let objects: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
-                out.extend(extension(EXTENDED_KEY_USAGE, false, &element(SEQUENCE, &objects)));
-            }
+            out.extend(extension(KEY_USAGE, true, &key_usage(DIGITAL_SIGNATURE)));
+            out.extend(purposes_extension(purposes)?);
             if !names.is_empty() {
                 (names.len() <= ALT_NAMES_MAX).ok_or(Error::Name)?;
                 let mut general = Vec::new();
@@ -597,11 +710,12 @@ fn extensions(usage: &Usage<'_>, subject: &PublicKey, issuer: &PublicKey) -> Res
                 out.extend(extension(SUBJECT_ALT_NAME, false, &element(SEQUENCE, &[&general])));
             }
         }
-        Usage::Issuer { path_length } => {
+        Usage::Issuer { path_length, purposes } => {
             let length = path_length.map(|length| element(INTEGER, &[&integer(length)]));
             let constraints = element(SEQUENCE, &[&[BOOLEAN, 1, 0xff], length.as_deref().unwrap_or_default()]);
             out.extend(extension(BASIC_CONSTRAINTS, true, &constraints));
-            out.extend(extension(KEY_USAGE, true, KEY_CERT_SIGN));
+            out.extend(extension(KEY_USAGE, true, &key_usage(KEY_CERT_SIGN)));
+            out.extend(purposes_extension(purposes)?);
             out.extend(extension(SUBJECT_KEY_IDENTIFIER, false, &key_identifier(subject)));
         }
     }
@@ -616,6 +730,30 @@ fn extensions(usage: &Usage<'_>, subject: &PublicKey, issuer: &PublicKey) -> Res
         ));
     }
     Ok(out)
+}
+
+/// The DER `KeyUsage` of `bits`, in the first byte. DER drops the trailing zero bits.
+fn key_usage(bits: u8) -> Vec<u8> {
+    let unused = u8::try_from(bits.trailing_zeros()).expect("a byte has at most 8 zero bits");
+    element(BIT_STRING, &[&[unused, bits]])
+}
+
+/// The `extKeyUsage` extension of `purposes`, or no bytes for an empty list.
+fn purposes_extension(purposes: &[Purpose]) -> Result<Vec<u8>, Error> {
+    if purposes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unique = purposes
+        .iter()
+        .enumerate()
+        .all(|(at, purpose)| !purposes[..at].contains(purpose));
+    unique.ok_or(Error::Name)?;
+    let objects: Vec<Vec<u8>> = purposes
+        .iter()
+        .map(|purpose| element(OBJECT, &[purpose.object()]))
+        .collect();
+    let objects: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+    Ok(extension(EXTENDED_KEY_USAGE, false, &element(SEQUENCE, &objects)))
 }
 
 /// The DER integer content of `value`.
@@ -651,7 +789,7 @@ fn alt_valid(alt: &AltName<'_>) -> bool {
     }
 }
 
-/// A certificate in the forms of this crate, as [`Certificate::parse`] read it. It borrows the DER.
+/// A certificate as [`Certificate::parse`] read it. It borrows the DER.
 #[derive(Clone, Debug)]
 pub struct Certificate<'a> {
     tbs: &'a [u8],
@@ -660,23 +798,33 @@ pub struct Certificate<'a> {
     serial: Serial,
     issuer: Vec<(Attribute, &'a str)>,
     subject: Vec<(Attribute, &'a str)>,
+    /// The DER contents of the names, which a path compares.
+    issuer_name: &'a [u8],
+    subject_name: &'a [u8],
     validity: Validity,
     key: PublicKey,
+    /// The DER `SubjectPublicKeyInfo`, whose digest a Certificate Transparency log signs for the certificates under it.
+    key_info: &'a [u8],
     names: Vec<AltName<'a>>,
     purposes: Vec<Purpose>,
     /// The path length of an issuer certificate, or `None` for a TLS identity.
     issuer_path: Option<Option<u8>>,
+    fulcio: Option<Fulcio<'a>>,
+    /// The content of the `SignedCertificateTimestampList` extension.
+    timestamps: Option<&'a [u8]>,
 }
 
 impl<'a> Certificate<'a> {
     /// Reads the DER certificate `der`: version 3, a serial of 1 to 20 bytes, a signature algorithm of the profile of
-    /// this module and the same one in the `TBSCertificate`, names of the attributes of [`Attribute`] in `UTF8String`,
-    /// the times of RFC 5280, a key of the profile, and the extensions of a [`Usage`]. It refuses each other form: a
-    /// critical extension that it does not read, a unique identifier, and bytes after the certificate. It reads no
-    /// signature: [`Self::verify`] checks it.
+    /// this module and the same one in the `TBSCertificate`, names of the attributes of [`Attribute`] in `UTF8String`
+    /// or `PrintableString`, the times of RFC 5280, a key of the profile, and the extensions of a [`Usage`]. An empty
+    /// subject needs a critical `subjectAltName`, as RFC 5280 section 4.1.2.6 asks. It also reads the Fulcio claims
+    /// ([`Self::fulcio`]) and the Certificate Transparency timestamps ([`Self::timestamps`]). It refuses each other
+    /// form: a critical extension that it does not read, a unique identifier, and bytes after the certificate. It
+    /// reads no signature: [`Self::verify`] checks it.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse). The reader allocates nothing for the DER: each length is in
-    /// its shortest form and fits in the input, which has at most [`CERTIFICATE_BYTES_MAX`] bytes. A P-256 key checks
+    /// its shortest form and fits in the input, which has at most [`CERTIFICATE_BYTES_MAX`] bytes. An ECDSA key checks
     /// its point.
     ///
     /// # Errors
@@ -707,18 +855,23 @@ impl<'a> Certificate<'a> {
         (fields.read(VERSION)? == [INTEGER, 1, 2]).ok_or(Error::Malformed)?;
         let serial = Serial::from_bytes(fields.read(INTEGER)?)?;
         (fields.element(SEQUENCE)? == identifier).ok_or(Error::Malformed)?;
-        let issuer = read_name(fields.read(SEQUENCE)?)?;
+        let issuer_name = fields.read(SEQUENCE)?;
+        let issuer = read_name(issuer_name)?;
+        (!issuer.is_empty()).ok_or(Error::Name)?;
         let mut times = Reader::new(fields.read(SEQUENCE)?);
         let (not_before, not_after) = (times.time()?, times.time()?);
         times.end()?;
         (not_before < not_after).ok_or(Error::Validity)?;
-        let subject = read_name(fields.read(SEQUENCE)?)?;
-        let key = read_key(fields.read(SEQUENCE)?)?;
+        let subject_name = fields.read(SEQUENCE)?;
+        let subject = read_name(subject_name)?;
+        let key_info = fields.element(SEQUENCE)?;
+        let key = read_key(key_info)?;
         let mut extensions = Reader::new(fields.read(EXTENSIONS)?);
         let list = extensions.read(SEQUENCE)?;
         extensions.end()?;
         fields.end()?;
         let usage = read_extensions(list)?;
+        (!subject.is_empty() || usage.names_critical).ok_or(Error::Name)?;
         Ok(Self {
             tbs,
             algorithm,
@@ -726,14 +879,19 @@ impl<'a> Certificate<'a> {
             serial,
             issuer,
             subject,
+            issuer_name,
+            subject_name,
             validity: Validity {
                 not_before: Duration::from_secs(not_before),
                 not_after: Duration::from_secs(not_after),
             },
             key,
+            key_info,
             names: usage.names,
             purposes: usage.purposes,
             issuer_path: usage.issuer_path,
+            fulcio: usage.fulcio,
+            timestamps: usage.timestamps,
         })
     }
 
@@ -748,6 +906,192 @@ impl<'a> Certificate<'a> {
     pub fn verify(&self, issuer: &PublicKey, budget: &mut SignatureBudget) -> Result<(), Error> {
         (issuer.algorithm() == self.algorithm).ok_or(Error::Signature)?;
         verify(issuer, self.tbs, self.signature, budget)
+    }
+
+    /// Verifies the path of this certificate to the trust anchor `anchor` at the time `at`, for `purpose`. `issuers`
+    /// holds the issuer certificates in order: the issuer of this certificate first, and the certificate that `anchor`
+    /// signed last. The checks:
+    ///
+    /// 1. This certificate is an identity ([`Usage::Identity`]), and its purposes include `purpose`.
+    /// 2. The issuer name of each certificate is the subject name of the next one, byte for byte.
+    /// 3. Each next certificate is an issuer certificate. Its path length bounds the issuer certificates under it, and
+    ///    its purposes, if it names some, include `purpose`.
+    /// 4. `at` is in the validity of each certificate, `anchor` included, from its first second to its last second.
+    /// 5. Each signature verifies with the key of the next certificate. The caller trusts `anchor`, so the check does
+    ///    not verify the signature of `anchor`.
+    ///
+    /// The first check that fails gives its error.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify): one signature check for each certificate under `anchor`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Path`] for more than [`PATH_ISSUERS_MAX`] issuers, a name that does not chain, an issuer that is no
+    /// issuer certificate, or a path past the length of an issuer. [`Error::Purpose`] if a certificate does not serve
+    /// `purpose`. [`Error::Time`] if `at` is outside the validity of a certificate. [`Error::Signature`] and
+    /// [`Error::Limit`] as [`Self::verify`] gives them.
+    ///
+    /// # Example
+    ///
+    /// The Fulcio certificate of a GitHub Actions release, along the Sigstore chain, at the time of its log entry.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    ///
+    /// use rsauthnz::crypto::Algorithm;
+    /// use rsauthnz::limits::{Limits, SignatureBudget};
+    /// use rsauthnz::x509::{Certificate, Error, PublicKey, Purpose};
+    ///
+    /// # let leaf: &[u8] = include_bytes!("../../tests/x509/fulcio-leaf.der");
+    /// # let intermediate: &[u8] = include_bytes!("../../tests/x509/sigstore-intermediate.der");
+    /// # let root: &[u8] = include_bytes!("../../tests/x509/sigstore-root.der");
+    /// # let ct_log: &[u8] = include_bytes!("../../tests/x509/ctfe-2022.der");
+    /// // The path is two signature checks, and each timestamp of a trusted log is one more.
+    /// let mut limits = Limits::default();
+    /// limits.signature_checks = 3;
+    /// let mut budget = SignatureBudget::new(&limits);
+    /// // The root and the intermediate of the trusted root of the host, and the leaf of the bundle.
+    /// let anchor = Certificate::parse(root)?;
+    /// let issuers = [Certificate::parse(intermediate)?];
+    /// let leaf = Certificate::parse(leaf)?;
+    /// // The `integratedTime` of the Rekor entry of the bundle: the leaf is valid for 10 minutes.
+    /// let logged = Duration::from_secs(1_710_888_076);
+    /// leaf.verify_path(&issuers, &anchor, logged, Purpose::CodeSigning, &mut budget)?;
+    /// // The CT log of the trusted root signed one timestamp of the leaf.
+    /// let log = PublicKey::from_spki(Algorithm::Es256, ct_log)?;
+    /// assert_eq!(leaf.timestamps(&issuers[0], &[log], &mut budget)?.len(), 1);
+    /// // The policy of the host compares the claims.
+    /// let claims = leaf.fulcio().ok_or(Error::Unsupported)?;
+    /// assert_eq!(claims.source_repository_uri, Some("https://github.com/trailofbits/rfc8785.py"));
+    /// assert_eq!(claims.source_repository_ref, Some("refs/tags/v0.1.2"));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn verify_path(
+        &self,
+        issuers: &[Self],
+        anchor: &Self,
+        at: Duration,
+        purpose: Purpose,
+        budget: &mut SignatureBudget,
+    ) -> Result<(), Error> {
+        (issuers.len() <= PATH_ISSUERS_MAX).ok_or(Error::Path)?;
+        (self.issuer_path.is_none() && self.purposes.contains(&purpose)).ok_or(Error::Purpose)?;
+        let path = || iter::once(self).chain(issuers).chain(iter::once(anchor));
+        // `below` counts the issuer certificates between `parent` and this certificate.
+        for (below, (child, parent)) in path().zip(path().skip(1)).enumerate() {
+            (child.issuer_name == parent.subject_name).ok_or(Error::Path)?;
+            let length = parent.issuer_path.ok_or(Error::Path)?;
+            length
+                .is_none_or(|length| below <= usize::from(length))
+                .ok_or(Error::Path)?;
+            (parent.purposes.is_empty() || parent.purposes.contains(&purpose)).ok_or(Error::Purpose)?;
+        }
+        for certificate in path() {
+            let Validity { not_before, not_after } = certificate.validity;
+            (not_before <= at && at <= not_after).ok_or(Error::Time)?;
+        }
+        for (child, parent) in path().zip(path().skip(1)) {
+            child.verify(&parent.key, budget)?;
+        }
+        Ok(())
+    }
+
+    /// The Certificate Transparency timestamps of this certificate that a log of `logs` signed (RFC 6962 sections 3.2
+    /// and 3.3), in the order of the certificate. `issuer` is the certificate of the issuer: the log signs the digest
+    /// of its key with the certificate. Each log key is ES256, and the ID of a log is the SHA-256 digest of its
+    /// `SubjectPublicKeyInfo`. A timestamp of another log has no effect, and a certificate with no timestamp gives an
+    /// empty list. The caller decides which logs it trusts at the time of each timestamp, and how many it needs.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify): one signature check for each timestamp of a log of
+    /// `logs`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a log key that is not ES256, or a timestamp of a version other than 1.
+    /// [`Error::Malformed`] for a list outside the form of RFC 6962 or with more than [`TIMESTAMPS_MAX`] timestamps.
+    /// [`Error::Timestamp`] if a timestamp of a log of `logs` does not verify. [`Error::Limit`] if the checks cost
+    /// more than `budget` has.
+    pub fn timestamps(
+        &self,
+        issuer: &Self,
+        logs: &[PublicKey],
+        budget: &mut SignatureBudget,
+    ) -> Result<Vec<Timestamp>, Error> {
+        logs.iter()
+            .all(|log| log.algorithm() == Algorithm::Es256)
+            .ok_or(Error::Unsupported)?;
+        let Some(value) = self.timestamps else {
+            return Ok(Vec::new());
+        };
+        let mut outer = Reader::new(value);
+        let mut input = outer.read(OCTET_STRING)?;
+        outer.end()?;
+        let mut list = vector(&mut input)?;
+        (input.is_empty() && !list.is_empty()).ok_or(Error::Malformed)?;
+        let ids: Vec<[u8; 32]> = logs.iter().map(|log| crypto::sha256(&log.info())).collect();
+        let (mut precertificate, mut found, mut count) = (None::<Vec<u8>>, Vec::new(), 0);
+        while !list.is_empty() {
+            count += 1;
+            (count <= TIMESTAMPS_MAX).ok_or(Error::Malformed)?;
+            let mut sct = vector(&mut list)?;
+            let [version] = take(&mut sct)?;
+            (version == 0).ok_or(Error::Unsupported)?;
+            let id: [u8; 32] = take(&mut sct)?;
+            let time: [u8; 8] = take(&mut sct)?;
+            let extensions_len: [u8; 2] = take(&mut sct)?;
+            let extensions = take_len(&mut sct, extensions_len)?;
+            let algorithms: [u8; 2] = take(&mut sct)?;
+            let signature = vector(&mut sct)?;
+            sct.is_empty().ok_or(Error::Malformed)?;
+            let Some(log) = ids.iter().position(|known| *known == id) else {
+                continue;
+            };
+            // SHA-256 (4) with ECDSA (3): the algorithm of the log key.
+            (algorithms == [4, 3]).ok_or(Error::Timestamp)?;
+            let entry: &[u8] = match precertificate {
+                Some(ref entry) => entry,
+                None => precertificate.insert(self.precertificate(issuer)?),
+            };
+            // The `digitally-signed` struct: the version 1, the type `certificate_timestamp`, the time, the entry, and
+            // the extensions of the timestamp.
+            let message = [&[0, 0][..], &time, entry, &extensions_len, extensions].concat();
+            verify(&logs[log], &message, signature, budget).map_err(|error| match error {
+                Error::Signature => Error::Timestamp,
+                other => other,
+            })?;
+            found.push(Timestamp {
+                log,
+                time: Duration::from_millis(u64::from_be_bytes(time)),
+            });
+        }
+        Ok(found)
+    }
+
+    /// The `entry_type` `precert_entry` and the `PreCert` of RFC 6962 section 3.2 for this certificate under `issuer`:
+    /// the SHA-256 digest of the key of the issuer, and the `TBSCertificate` with no timestamp list.
+    fn precertificate(&self, issuer: &Self) -> Result<Vec<u8>, Error> {
+        let mut fields = Reader::new(Reader::new(self.tbs).read(SEQUENCE)?);
+        let all = fields.rest();
+        // The version, the serial, the signature algorithm, the issuer, the validity, the subject, and the key.
+        for tag in [VERSION, INTEGER, SEQUENCE, SEQUENCE, SEQUENCE, SEQUENCE, SEQUENCE] {
+            fields.element(tag)?;
+        }
+        let head = &all[..all.len() - fields.rest().len()];
+        let mut wrapper = Reader::new(fields.read(EXTENSIONS)?);
+        let mut list = Reader::new(wrapper.read(SEQUENCE)?);
+        let mut kept = Vec::new();
+        while !list.is_empty() {
+            let extension = list.element(SEQUENCE)?;
+            let object = Reader::new(Reader::new(extension).read(SEQUENCE)?).read(OBJECT)?;
+            if object != TIMESTAMP_LIST {
+                kept.push(extension);
+            }
+        }
+        let tbs = element(SEQUENCE, &[head, &element(EXTENSIONS, &[&element(SEQUENCE, &kept)])]);
+        let len = u32::try_from(tbs.len())
+            .expect("a certificate has at most 16 KiB")
+            .to_be_bytes();
+        Ok([&[0, 1][..], &crypto::sha256(issuer.key_info), &len[1..], &tbs].concat())
     }
 
     /// The signature algorithm.
@@ -790,16 +1134,49 @@ impl<'a> Certificate<'a> {
     #[must_use]
     pub fn usage(&self) -> Usage<'_> {
         match self.issuer_path {
-            Some(path_length) => Usage::Issuer { path_length },
+            Some(path_length) => Usage::Issuer {
+                path_length,
+                purposes: &self.purposes,
+            },
             None => Usage::Identity {
                 names: &self.names,
                 purposes: &self.purposes,
             },
         }
     }
+
+    /// The claims of a Fulcio certificate, or `None` if the certificate has no Fulcio claim. The claims are evidence
+    /// only after [`Self::verify_path`] to the Sigstore anchor. The caller decides which values it accepts.
+    #[must_use]
+    pub const fn fulcio(&self) -> Option<&Fulcio<'a>> {
+        self.fulcio.as_ref()
+    }
 }
 
-/// The attributes of the DER `Name` content `content`.
+/// The first `N` bytes of `input`, which moves past them.
+fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], Error> {
+    let (head, rest) = input.split_first_chunk::<N>().ok_or(Error::Malformed)?;
+    *input = rest;
+    Ok(*head)
+}
+
+/// The `len` bytes after the big-endian length `len` in `input`, which moves past them.
+fn take_len<'a>(input: &mut &'a [u8], len: [u8; 2]) -> Result<&'a [u8], Error> {
+    let (head, rest) = input
+        .split_at_checked(usize::from(u16::from_be_bytes(len)))
+        .ok_or(Error::Malformed)?;
+    *input = rest;
+    Ok(head)
+}
+
+/// The TLS vector with a length of two bytes at the start of `input`, which moves past it.
+fn vector<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], Error> {
+    let len = take(input)?;
+    take_len(input, len)
+}
+
+/// The attributes of the DER `Name` content `content`, which can have no attribute. A value is a `UTF8String`, or a
+/// `PrintableString` of the characters of X.680 section 41.4.
 fn read_name(content: &[u8]) -> Result<Vec<(Attribute, &str)>, Error> {
     let mut reader = Reader::new(content);
     let mut attributes = Vec::new();
@@ -813,18 +1190,27 @@ fn read_name(content: &[u8]) -> Result<Vec<(Attribute, &str)>, Error> {
             .into_iter()
             .find(|attribute| attribute.object() == object)
             .ok_or(Error::Unsupported)?;
-        let value = str::from_utf8(pair.read(UTF8_STRING)?).map_err(|_| Error::Name)?;
+        let value = match pair.optional(PRINTABLE_STRING)? {
+            Some(text) => {
+                let printable = |byte: &u8| byte.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(byte);
+                text.iter().all(printable).ok_or(Error::Name)?;
+                text
+            }
+            None => pair.read(UTF8_STRING)?,
+        };
+        let value = str::from_utf8(value).map_err(|_| Error::Name)?;
         pair.end()?;
         (1..=NAME_VALUE_BYTES_MAX).contains(&value.len()).ok_or(Error::Name)?;
         attributes.push((attribute, value));
     }
-    (!attributes.is_empty()).ok_or(Error::Name)?;
     Ok(attributes)
 }
 
-/// The key of the DER `SubjectPublicKeyInfo` content `content`.
-fn read_key(content: &[u8]) -> Result<PublicKey, Error> {
-    let mut reader = Reader::new(content);
+/// The key of the DER `SubjectPublicKeyInfo` `der`.
+fn read_key(der: &[u8]) -> Result<PublicKey, Error> {
+    let mut outer = Reader::new(der);
+    let mut reader = Reader::new(outer.read(SEQUENCE)?);
+    outer.end()?;
     let identifier = reader.element(SEQUENCE)?;
     let algorithm = ALGORITHMS
         .iter()
@@ -842,19 +1228,24 @@ fn read_key(content: &[u8]) -> Result<PublicKey, Error> {
 /// The extensions of a certificate, as [`read_extensions`] read them.
 struct Extensions<'a> {
     names: Vec<AltName<'a>>,
+    /// Whether the certificate has a critical `subjectAltName`.
+    names_critical: bool,
     purposes: Vec<Purpose>,
     issuer_path: Option<Option<u8>>,
+    fulcio: Option<Fulcio<'a>>,
+    timestamps: Option<&'a [u8]>,
 }
 
-/// The usage of the DER `Extensions` content `content`: an issuer has the critical `basicConstraints` with `cA` and
-/// the critical `keyUsage` `keyCertSign`, and no `extKeyUsage` or `subjectAltName`. A TLS identity has the critical
-/// `keyUsage` `digitalSignature`, an `extKeyUsage` of [`Purpose`] and a `subjectAltName` of [`AltName`] that are not
-/// critical, and no `basicConstraints`. An extension that is not critical and that this module does not read, such as
-/// a key identifier, has no effect.
+/// The extensions of the DER `Extensions` content `content`. An issuer has the critical `basicConstraints` with `cA`,
+/// the critical `keyUsage` `keyCertSign` with `cRLSign` or `digitalSignature` or both or neither, and no
+/// `subjectAltName`. A TLS identity has the critical `keyUsage` `digitalSignature`, and no `basicConstraints`. Each
+/// can have an `extKeyUsage` of [`Purpose`] that is not critical. A `subjectAltName` of [`AltName`] can be critical.
+/// The Fulcio claims and the `SignedCertificateTimestampList` are not critical. An extension that is not critical and
+/// that this module does not read, such as a key identifier, has no effect.
 fn read_extensions(content: &[u8]) -> Result<Extensions<'_>, Error> {
     let mut reader = Reader::new(content);
-    let (mut constraints, mut usage, mut purposes, mut names) = (None, None, None, None);
-    let mut count = 0;
+    let (mut constraints, mut usage, mut purposes, mut names, mut timestamps) = (None, None, None, None, None);
+    let (mut names_critical, mut fulcio, mut count) = (false, Fulcio::default(), 0);
     while !reader.is_empty() {
         count += 1;
         (count <= EXTENSIONS_MAX).ok_or(Error::Malformed)?;
@@ -871,42 +1262,87 @@ fn read_extensions(content: &[u8]) -> Result<Extensions<'_>, Error> {
         let slot = match object {
             BASIC_CONSTRAINTS if critical => &mut constraints,
             KEY_USAGE if critical => &mut usage,
-            EXTENDED_KEY_USAGE if !critical => &mut purposes,
-            SUBJECT_ALT_NAME if !critical => &mut names,
-            BASIC_CONSTRAINTS | KEY_USAGE | EXTENDED_KEY_USAGE | SUBJECT_ALT_NAME => return Err(Error::Unsupported),
+            SUBJECT_ALT_NAME => {
+                names_critical = critical;
+                &mut names
+            }
+            BASIC_CONSTRAINTS | KEY_USAGE => return Err(Error::Unsupported),
+            // Each other extension that this module reads is not critical.
             _ if critical => return Err(Error::Unsupported),
-            _ => continue,
+            EXTENDED_KEY_USAGE => &mut purposes,
+            TIMESTAMP_LIST => &mut timestamps,
+            _ => {
+                let claim = match object.strip_prefix(FULCIO) {
+                    Some(&[arc]) => fulcio.claim(arc),
+                    _ => None,
+                };
+                if let Some(claim) = claim {
+                    claim.replace(read_text(value)?).is_none().ok_or(Error::Malformed)?;
+                }
+                continue;
+            }
         };
         slot.replace(value).is_none().ok_or(Error::Malformed)?;
     }
-    match (constraints, usage) {
-        (Some(constraints), Some(KEY_CERT_SIGN)) if purposes.is_none() && names.is_none() => {
-            let mut sequence = Reader::new(constraints);
-            let mut fields = Reader::new(sequence.read(SEQUENCE)?);
-            sequence.end()?;
-            (fields.read(BOOLEAN)? == [0xff]).ok_or(Error::Unsupported)?;
-            let path_length = fields
-                .optional(INTEGER)?
-                .map(|length| match length {
-                    [value] if value & 0x80 == 0 => Ok(*value),
-                    [0, value] if value & 0x80 != 0 => Ok(*value),
-                    _ => Err(Error::Unsupported),
-                })
-                .transpose()?;
-            fields.end()?;
-            Ok(Extensions {
-                names: Vec::new(),
-                purposes: Vec::new(),
-                issuer_path: Some(path_length),
-            })
+    let names = names.map(read_alt_names).transpose()?.unwrap_or_default();
+    let issuer_path = match (constraints, usage.map(read_key_usage).transpose()?) {
+        (Some(constraints), Some(bits))
+            if bits & KEY_CERT_SIGN != 0 && bits & !(KEY_CERT_SIGN | CRL_SIGN | DIGITAL_SIGNATURE) == 0 =>
+        {
+            names.is_empty().ok_or(Error::Unsupported)?;
+            Some(read_constraints(constraints)?)
         }
-        (None, Some(DIGITAL_SIGNATURE)) => Ok(Extensions {
-            names: names.map(read_alt_names).transpose()?.unwrap_or_default(),
-            purposes: purposes.map(read_purposes).transpose()?.unwrap_or_default(),
-            issuer_path: None,
-        }),
-        _ => Err(Error::Unsupported),
+        (None, Some(DIGITAL_SIGNATURE)) => None,
+        _ => return Err(Error::Unsupported),
+    };
+    Ok(Extensions {
+        names,
+        names_critical,
+        purposes: purposes.map(read_purposes).transpose()?.unwrap_or_default(),
+        issuer_path,
+        fulcio: (fulcio != Fulcio::default()).then_some(fulcio),
+        timestamps,
+    })
+}
+
+/// The text of the DER `UTF8String` `value`.
+fn read_text(value: &[u8]) -> Result<&str, Error> {
+    let mut reader = Reader::new(value);
+    let text = reader.read(UTF8_STRING)?;
+    reader.end()?;
+    str::from_utf8(text).map_err(|_| Error::Malformed)
+}
+
+/// The bits of the DER `KeyUsage` `value`, in its first byte. A usage in a second byte, `encipherOnly` or
+/// `decipherOnly`, is outside the profile.
+fn read_key_usage(value: &[u8]) -> Result<u8, Error> {
+    let mut reader = Reader::new(value);
+    let bits = reader.read(BIT_STRING)?;
+    reader.end()?;
+    match *bits {
+        // DER drops the trailing zero bits: the count of unused bits is the count of trailing zeros.
+        [unused, bits] if bits != 0 && u32::from(unused) == bits.trailing_zeros() => Ok(bits),
+        [_, _, _] => Err(Error::Unsupported),
+        _ => Err(Error::Malformed),
     }
+}
+
+/// The path length of the DER `BasicConstraints` `value` with `cA`, or `None` for no bound.
+fn read_constraints(value: &[u8]) -> Result<Option<u8>, Error> {
+    let mut sequence = Reader::new(value);
+    let mut fields = Reader::new(sequence.read(SEQUENCE)?);
+    sequence.end()?;
+    (fields.read(BOOLEAN)? == [0xff]).ok_or(Error::Unsupported)?;
+    let path_length = fields
+        .optional(INTEGER)?
+        .map(|length| match length {
+            [value] if value & 0x80 == 0 => Ok(*value),
+            [0, value] if value & 0x80 != 0 => Ok(*value),
+            _ => Err(Error::Unsupported),
+        })
+        .transpose()?;
+    fields.end()?;
+    Ok(path_length)
 }
 
 /// The purposes of the DER `ExtKeyUsageSyntax` `value`.
@@ -917,7 +1353,7 @@ fn read_purposes(value: &[u8]) -> Result<Vec<Purpose>, Error> {
     let mut purposes = Vec::new();
     while !reader.is_empty() {
         let object = reader.read(OBJECT)?;
-        let purpose = [Purpose::Server, Purpose::Client]
+        let purpose = Purpose::ALL
             .into_iter()
             .find(|purpose| purpose.object() == object)
             .ok_or(Error::Unsupported)?;
@@ -963,13 +1399,23 @@ pub enum Error {
     Serial,
     /// The validity has no time after its start, or a time is outside the years 1970 to 9999.
     Validity,
-    /// The keys do not fit the profile: an SLH-DSA key of a certificate that is no issuer certificate, or a classical
-    /// key with a key that is not classical.
+    /// The keys do not fit the profile of issuance: an SLH-DSA key of a certificate that is no issuer certificate, a
+    /// classical key with a key that is not classical, or an ES384 key.
     Profile,
     /// The public key is not a valid key of its algorithm.
     Key,
     /// The signature does not verify with the key, or the key has another algorithm than the signature.
     Signature,
+    /// The certificates are not a path to the anchor: more than [`PATH_ISSUERS_MAX`] issuers, a name that does not
+    /// chain, an issuer that is no issuer certificate, or a path past the length of an issuer. Give the issuers in
+    /// order, from the issuer of the certificate to the certificate that the anchor signed.
+    Path,
+    /// A certificate of the path does not serve the purpose of the check.
+    Purpose,
+    /// The time of the check is outside the validity of a certificate of the path.
+    Time,
+    /// A Certificate Transparency timestamp of a trusted log does not verify.
+    Timestamp,
     /// The signature check costs more than its budget has.
     Limit(Limit),
 }
@@ -986,6 +1432,10 @@ impl fmt::Display for Error {
             Self::Profile => f.write_str("the keys do not fit the profile"),
             Self::Key => f.write_str("the public key is not valid"),
             Self::Signature => f.write_str("the signature does not verify"),
+            Self::Path => f.write_str("the certificates are not a path to the anchor"),
+            Self::Purpose => f.write_str("a certificate of the path does not serve the purpose"),
+            Self::Time => f.write_str("the time is outside the validity of a certificate of the path"),
+            Self::Timestamp => f.write_str("a timestamp of a trusted log does not verify"),
             Self::Limit(limit) => write!(f, "the signature check passes a limit: {limit:?}"),
         }
     }

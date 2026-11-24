@@ -3,7 +3,7 @@
 `rsauthnz::crypto` holds the signature profiles. A profile is the algorithm of a trusted key. The application
 selects it, and an artifact cannot select it. [rscrypto](https://github.com/loadingalias/rscrypto) does each
 signature check. rsauthnz adds no cryptography. [Verify COSE and CWT artifacts](verification.md) gives the
-verification with each profile, and [Issue and read X.509 certificates](certificates.md) gives the X.509 identifier of
+verification with each profile, and [Issue, read, and check X.509 certificates](certificates.md) gives the X.509 identifier of
 each profile of a certificate.
 
 ## The profiles
@@ -17,6 +17,7 @@ each profile of a certificate.
 | `Es256` | -7 | Assigned | `Classical` | 1 | Two coordinates of 32 bytes | 64 bytes | A verifier that supports nothing else |
 | `Rs256` | -257 | Assigned | `Classical` | 1 | A modulus of 2,048 to 4,096 bits, and the exponent 65,537 | The bytes of the modulus | Verification only: a [passkey](passkeys.md) of an authenticator that has no other algorithm, such as Windows Hello. No credential and no custody key of rsauthnz has it |
 | `Ps256` | -37 | Assigned | `Classical` | 1 | The key of `Rs256` | The bytes of the modulus | Verification only: a JWT of an external issuer, such as an ID token ([Verify and sign JOSE tokens](jose.md)). No credential and no custody key of rsauthnz has it |
+| `Es384` | None | Assigned | `Classical` | 1 | Two coordinates of 48 bytes | 96 bytes | Verification only: an X.509 certificate of another issuer, such as the Sigstore certificate authority ([Check a certificate of another issuer](certificates.md#check-a-certificate-of-another-issuer)). No credential, no custody key, and no COSE or JOSE form of rsauthnz has it |
 | `SlhDsaSha2_128s` | None yet | Draft | `PostQuantum` | 1 | 32 bytes | 7,856 bytes | The trust-root profile: a root that signs issuer keys |
 
 rsauthnz never selects a classical profile for you, and it never reports a classical profile as post-quantum.
@@ -85,7 +86,7 @@ and the custody handle of the trusted root names the algorithm.
 
 Custody makes, signs with, rotates, and deletes root keys ([Hold keys in custody](custody.md)), and a custody handle
 verifies their signatures. The three NIST ACVP cases of `tests/slh-dsa/` verify through the facade, with the empty
-context. A root also signs X.509 issuer certificates ([Issue and read X.509 certificates](certificates.md)). The other
+context. A root also signs X.509 issuer certificates ([Issue, read, and check X.509 certificates](certificates.md)). The other
 formats of rsauthnz refuse the profile, because a root signs issuer keys and trust snapshots only.
 
 ## The profile report
@@ -120,6 +121,6 @@ assert_eq!(Algorithm::SlhDsaSha2_128s.report().cose, None);
 ## Cost
 
 Each signature check charges the signature budget of its artifact before its work: one check for `MlDsa65`,
-`Ed25519`, `Es256`, `Rs256`, `Ps256`, and `SlhDsaSha2_128s`, and two checks for a composite. [Verify COSE and CWT
+`Ed25519`, `Es256`, `Es384`, `Rs256`, `Ps256`, and `SlhDsaSha2_128s`, and two checks for a composite. [Verify COSE and CWT
 artifacts](verification.md#bound-the-signature-checks) gives the budget. A signature check is in the cost class
 `Verify` of [Admit rsauthnz work](admission.md).

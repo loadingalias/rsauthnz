@@ -9,7 +9,10 @@ all of them.
 
 The X.509 reader has fixed bounds of its own: at most `CERTIFICATE_BYTES_MAX` (16,384) bytes, refused before a read,
 and lengths that fit in the input, so it allocates nothing for the DER ([Read and verify a
-certificate](certificates.md#read-and-verify-a-certificate)). [Fuzz the parsers](fuzzing.md) gives hostile input to each
+certificate](certificates.md#read-and-verify-a-certificate)). It reads at most 64 extensions, `ALT_NAMES_MAX` (16)
+alternative names, and URIs of `URI_BYTES_MAX` (1,024) bytes. A path has at most `PATH_ISSUERS_MAX` (4) issuer
+certificates, and a certificate at most `TIMESTAMPS_MAX` (8) Certificate Transparency timestamps ([Check a certificate
+of another issuer](certificates.md#check-a-certificate-of-another-issuer)). [Fuzz the parsers](fuzzing.md) gives hostile input to each
 parser with these bounds.
 
 ## The limit set

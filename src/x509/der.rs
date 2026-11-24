@@ -11,6 +11,7 @@ pub(super) const BIT_STRING: u8 = 0x03;
 pub(super) const OCTET_STRING: u8 = 0x04;
 pub(super) const OBJECT: u8 = 0x06;
 pub(super) const UTF8_STRING: u8 = 0x0c;
+pub(super) const PRINTABLE_STRING: u8 = 0x13;
 const UTC_TIME: u8 = 0x17;
 const GENERALIZED_TIME: u8 = 0x18;
 pub(super) const SEQUENCE: u8 = 0x30;
@@ -158,6 +159,11 @@ impl<'a> Reader<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    /// The input that the reader did not read.
+    pub(super) const fn rest(&self) -> &'a [u8] {
+        self.input
     }
 
     /// Whether the reader read each element.
