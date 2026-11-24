@@ -46,6 +46,32 @@ fn base64url(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn an_unfinished_sign_up_leaves_the_name_available_and_only_one_finish_claims_it() {
+    let site = Site::new();
+    let mut first = Browser::default();
+    let mut second = Browser::default();
+    let name = br#"{"name":"alice"}"#;
+    let ceremony = ("/sign-up/options", "/sign-up/finish");
+    let options = site.post(&mut first, ceremony.0, name).await;
+    assert_eq!(site.account(&mut first).await.status, StatusCode::FORBIDDEN);
+
+    let accepted = Passkey::new(Algorithm::Ed25519, -8, 1);
+    let handle = site.register(&mut second, ceremony, name, &accepted).await;
+    let late = Passkey::new(Algorithm::Ed25519, -8, 2);
+    let answer = Registration::new(&late, RP_ID, ORIGIN, authenticator::challenge(&options)).json();
+    assert_eq!(
+        site.send(&mut first, "POST", ceremony.1, &answer).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert!(first.cookie.is_none());
+
+    site.sign_in(&mut second, &accepted, handle).await;
+    let account = site.account(&mut second).await;
+    assert!(account.body.contains(&base64url(&accepted.id)));
+    assert!(!account.body.contains(&base64url(&late.id)));
+}
+
+#[tokio::test]
 async fn the_first_sign_in_after_start_issues_a_challenge_the_store_accepts() {
     let site = Site::at(ORIGIN, 1_800_000_000);
     let mut browser = Browser::default();
@@ -110,6 +136,17 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
         base64url(&first.id)
     );
     assert!(account.body.starts_with(&expected), "{}", account.body);
+
+    // The renewal rotates the cookie even when the server must look up the accepted commit.
+    let previous = laptop.cookie.clone();
+    site.memory.inject(Fault::LostResponse);
+    site.post(&mut laptop, "/sessions/renew", b"{}").await;
+    assert!(laptop.cookie.is_some() && laptop.cookie != previous);
+    let account = site.account(&mut laptop).await;
+    assert_eq!(account.status, StatusCode::OK);
+    assert!(account.body.starts_with(&expected));
+    // The lookup restarts the driver. The next sign-in must start after its replay floor.
+    site.advance(4);
 
     // A rename needs no verification.
     let rename = format!(r#"{{"id":"{}","name":"laptop"}}"#, base64url(&first.id));

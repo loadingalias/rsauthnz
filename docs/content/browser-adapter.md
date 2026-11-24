@@ -113,5 +113,5 @@ browser takes the related origins of at least five registrable domains, and it c
 
 A test on this Mac checks that the module imports nothing and stays under 8 KiB. Another test checks the document of
 related origins in the format of WebAuthn Level 3. The ceremony tests on this Mac verify a registration and a
-sign-in from a related origin. No browser has run the module yet, so its behavior in Chrome, Safari, and Firefox is
-not verified.
+sign-in from a related origin. The web example records browser and provider results for each operation that ran.
+[Web example support](web-example.md#support).

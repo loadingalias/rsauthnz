@@ -68,7 +68,12 @@ form.onsubmit = (event) => {
 };
 verify.onclick = () => run(async () => {
   await signIn({ options: "/sign-in/options", finish: "/sign-in/finish" });
-  await review();
+  try {
+    await review();
+  } catch (error) {
+    if (!(error instanceof Problem) || error.recovery !== "verify" || location.protocol !== "http:") throw error;
+    message.textContent = "Your passkey was accepted. Open the approval page over HTTPS so the browser can keep its session cookie.";
+  }
 });
 approve.onclick = () => run(async () => {
   if (!reviewed) return;

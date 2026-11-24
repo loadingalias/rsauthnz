@@ -10,14 +10,25 @@ const told = {
 };
 
 /** Runs `action`, and shows the recovery of a problem. `verify` asks for a new sign-in, which replaces the session. */
-async function run(action) {
+async function run(action, formId) {
+  show("");
   try {
     await action();
+    await load();
+    if ((formId === "sign-in" || formId === "recover") && $("signed-in").hidden) {
+      show(location.protocol === "http:"
+        ? "Your passkey was accepted. Open this site over HTTPS so the browser can keep its session cookie."
+        : "Your passkey was accepted, but the session is unavailable. Check that this site can use cookies.");
+    }
   } catch (error) {
-    if (!(error instanceof Problem)) throw error;
-    show(told[error.recovery] ?? `Refused: ${error.recovery}`);
+    if (error instanceof Problem && error.recovery === "refuse" && formId === "sign-up") {
+      show("Sign-up could not finish. If you already saved a passkey, select Sign in with a passkey.");
+    } else if (error instanceof Problem) show(told[error.recovery] ?? `Refused: ${error.recovery}`);
+    else if (error.name === "NotAllowedError" || error.name === "AbortError") show("The passkey request stopped. You can try again.");
+    else if (error.name === "NotSupportedError") show("This browser or provider does not support the passkey request.");
+    else throw error;
+    await load();
   }
-  await load();
 }
 
 /**
@@ -68,7 +79,7 @@ async function load() {
 const form = (id, action) => {
   $(id).onsubmit = (event) => {
     event.preventDefault();
-    run(() => action(Object.fromEntries(new FormData(event.target))));
+    run(() => action(Object.fromEntries(new FormData(event.target))), id);
   };
 };
 
@@ -94,6 +105,10 @@ $("add").onclick = () => run(() => register({ options: "/passkeys/add/options", 
 $("code").onclick = () => run(async () => {
   const { code } = await change("/recovery-code");
   show(`Your recovery code, shown once: ${code}`);
+});
+$("renew").onclick = () => run(async () => {
+  await change("/sessions/renew");
+  show("Session renewed.");
 });
 $("sign-out").onclick = () => run(() => change("/sign-out"));
 load();

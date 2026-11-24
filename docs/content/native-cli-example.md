@@ -7,10 +7,10 @@ It also runs a headless bootstrap for the first administrator.
 
 Use the pinned Rust toolchain. Start the web example and create a passkey for your account. [Run the web example](web-example.md#run-the-example).
 
-1. Open a second terminal at the repository root. Choose a new directory for this CLI key.
+1. Open a second terminal at the repository root. Use a new directory outside the checkout for the CLI key.
 
    ```sh
-   cargo run --locked -p native-cli --features native-custody -- enroll ./laptop-cli "Laptop"
+   cargo run --locked -p native-cli --features native-custody -- enroll "$HOME/.rsauthnz-laptop-cli" "Laptop"
    ```
 
 2. Open the local address printed by the CLI. Enter the **User code** and select **Review request**.
@@ -19,7 +19,7 @@ Use the pinned Rust toolchain. Start the web example and create a passkey for yo
 5. Use the same directory for later calls.
 
    ```sh
-   cargo run --locked -p native-cli --features native-custody -- status ./laptop-cli
+   cargo run --locked -p native-cli --features native-custody -- status "$HOME/.rsauthnz-laptop-cli"
    ```
 
 The user code expires after ten minutes. While the request waits, the CLI polls every five seconds.

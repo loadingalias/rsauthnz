@@ -13,3 +13,9 @@ AGENTS.md
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+# Local example keys, CLI credentials, and the certificate for localhost.
+*.key
+localhost.pem
+/web-issuer/
+/provider-issuer/
+/laptop-cli/

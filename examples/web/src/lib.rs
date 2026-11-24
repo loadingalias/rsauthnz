@@ -48,6 +48,9 @@ pub const BODY_BYTES_MAX: usize = 16 * 1024;
 /// it is also a path segment.
 pub const NAME_BYTES_MAX: usize = 64;
 
+/// The most account drafts this local example keeps until registration expires.
+const PENDING_SIGNUPS_MAX: usize = 128;
+
 /// The session cookie.
 const SESSION: CookieName = CookieName::new("session").expect("a token");
 
@@ -139,6 +142,8 @@ impl App {
             sessions,
             random,
             accounts: BTreeMap::new(),
+            signups: BTreeMap::new(),
+            next_account: 0,
             policy: Invitations {
                 version,
                 expires: now.estimate() + Duration::from_secs(30 * 24 * 60 * 60),
@@ -210,6 +215,7 @@ pub fn router(app: Arc<App>) -> Router {
         ("/passkeys/remove", State::remove),
         ("/passkeys/add/options", State::add_options),
         ("/passkeys/add/finish", State::add_finish),
+        ("/sessions/renew", State::renew),
         ("/sessions/revoke", State::revoke),
         ("/invitations", State::invite),
         ("/invitation/options", State::activation_options),
@@ -396,6 +402,8 @@ struct State {
     sessions: Sessions,
     random: ChaCha20Rng,
     accounts: BTreeMap<String, Account>,
+    signups: BTreeMap<Id<Human>, (Account, Duration)>,
+    next_account: u64,
     policy: Invitations,
 }
 
@@ -520,17 +528,17 @@ impl State {
         }
     }
 
-    /// A new account of the directory, with the name `name`, which is also its first display name.
+    /// A draft for an available name. Only a committed registration or invitation claims the name.
     fn new_account(&mut self, name: &str) -> Result<Account, Problem> {
         (!self.accounts.contains_key(name)).ok_or(Problem::Recovery(Recovery::Refuse))?;
-        let account = Account {
-            id: id(&format!("u-{}", self.accounts.len())),
+        let serial = self.next_account;
+        self.next_account = serial.checked_add(1).ok_or(Problem::Recovery(Recovery::Refuse))?;
+        Ok(Account {
+            id: id(&format!("u-{serial}")),
             handle: UserHandle::random(&mut self.random),
             name: name.to_owned(),
             display_name: name.to_owned(),
-        };
-        self.accounts.insert(name.to_owned(), account.clone());
-        Ok(account)
+        })
     }
 
     /// The account, its passkeys, and its sessions. The current session is the one of the request. The relying party
@@ -571,6 +579,14 @@ impl State {
     /// The options of the sign-up of a new account with the name of the request.
     fn sign_up_options(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let [text] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["name"])?;
+        if self.signups.len() >= PENDING_SIGNUPS_MAX {
+            self.signups.retain(|_, (_, end)| *end > now.estimate());
+            (self.signups.len() < PENDING_SIGNUPS_MAX).ok_or(Problem::Recovery(Recovery::Restart))?;
+        }
+        let end = now
+            .estimate()
+            .checked_add(passkey::REGISTRATION_LIFETIME)
+            .ok_or(Problem::Recovery(Recovery::Refuse))?;
         let account = self.new_account(name(&text)?)?;
         let user = Self::user(&account);
         let start = self.rp.start(
@@ -582,14 +598,25 @@ impl State {
             &mut self.driver,
         );
         let proposal = ready(start)?;
-        Ok(json_reply(self.artifact(proposal, now)?))
+        let options = self.artifact(proposal, now)?;
+        self.signups.insert(account.id.clone(), (account, end));
+        Ok(json_reply(options))
     }
 
     /// The first passkey of a new account.
     fn sign_up_finish(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let response = passkey::Response::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
         let registration = ready(self.rp.finish(&mut self.memory, &response, now, &mut self.driver))?;
+        let account = self
+            .signups
+            .get(registration.account())
+            .map(|(account, _)| account)
+            .filter(|account| !self.accounts.contains_key(&account.name))
+            .cloned()
+            .ok_or(Problem::Recovery(Recovery::Refuse))?;
         self.commit(registration.propose(Decision::SignUp(&[]))?, now)?;
+        self.signups.remove(&account.id);
+        self.accounts.insert(account.name.clone(), account);
         Ok(json_reply(b"{}".to_vec()))
     }
 
@@ -613,11 +640,30 @@ impl State {
         let opened = opening
             .release(&Outcome::Accepted(receipt))
             .ok_or(Problem::Recovery(Recovery::Lookup))?;
+        self.session_response(&opened.session, now)
+    }
+
+    fn session_response(&self, issued: &session::Issued, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let mut response = json_reply(b"{}".to_vec());
-        let identifier = opened.session.identifier();
-        self.site
-            .set_session(response.headers_mut(), SESSION, identifier, opened.session.max_age(now))?;
+        self.site.set_session(
+            response.headers_mut(),
+            SESSION,
+            issued.identifier(),
+            issued.max_age(now),
+        )?;
         Ok(response)
+    }
+
+    /// Rotates the current session cookie after the renewal commits.
+    fn renew(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
+        self.site.check_change(request)?;
+        let (access, _) = self.access(request, now)?;
+        let (proposal, plan, renewal) = self.sessions.renew(&access, now, &mut self.random, &mut self.driver)?;
+        let receipt = self.commit((proposal, plan), now)?;
+        let issued = renewal
+            .release(&Outcome::Accepted(receipt))
+            .ok_or(Problem::Recovery(Recovery::Lookup))?;
+        self.session_response(&issued, now)
     }
 
     /// The end of the session of the request.
@@ -771,6 +817,7 @@ impl State {
             &mut self.driver,
         )?;
         let value = self.artifact(proposal, now)?;
+        self.accounts.insert(recipient.name.clone(), recipient);
         reply(|place| place.object(|object| object.member("invitation").base64url(&value)))
     }
 
@@ -876,10 +923,6 @@ impl State {
         let opened = opening
             .release(&Outcome::Accepted(receipt))
             .ok_or(Problem::Recovery(Recovery::Lookup))?;
-        let mut response = json_reply(b"{}".to_vec());
-        let identifier = opened.session.identifier();
-        self.site
-            .set_session(response.headers_mut(), SESSION, identifier, opened.session.max_age(now))?;
-        Ok(response)
+        self.session_response(&opened.session, now)
     }
 }

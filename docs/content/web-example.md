@@ -7,7 +7,7 @@ adapter](browser-adapter.md).
 
 The server keeps accounts, sessions, and CLI bindings in memory. A server restart ends them.
 The CLI issuer key stays in file custody. The default key directory is `.rsauthnz-web-example` in your home directory.
-To select a separate directory, run `cargo run --locked -p web -- ./web-issuer`. Give a new directory on the first run.
+To select another key directory, give its path after `--`. Use a new directory outside the checkout.
 
 ## Run the example
 
@@ -24,12 +24,36 @@ The server prints one line and serves until you stop it:
 Serving http://localhost:8080. The store is in memory: a restart of this process loses each account.
 ```
 
-Open `http://localhost:8080` in a browser with a passkey provider. The origin is `http://localhost:8080`, and the
-relying party ID is `localhost`. The session cookie is a `__Host-` cookie with `Secure`, so a browser keeps it on
-`http://localhost` when it treats `localhost` as a secure context. The server serves HTTP/1.1 and HTTP/2 with no TLS. A browser uses HTTP/2 only with TLS, so it uses HTTP/1.1 here.
+Open `http://localhost:8080` in a browser with a passkey provider. The relying party ID is `localhost`.
+The session requires a `Secure`, host-only cookie named `__Host-session`. Safari 27.2 omitted this cookie on HTTP after a successful passkey sign-in.
+Use the HTTPS setup below for Safari.
 
 After the memory store starts, the server waits until its clock can issue a usable sign-in challenge.
 Other requests can proceed during this wait.
+
+If you cancel sign-up in the passkey provider, you can use the same name again.
+The first completed registration claims the name. Sign in with that passkey to open your first session.
+
+## Use HTTPS on localhost
+
+Use a certificate for `localhost` that your browser trusts. The following commands use `socat` with OpenSSL support for local TLS.
+
+1. Keep `localhost.pem` and its private key `localhost.key` outside the checkout. Start the listener from their directory.
+
+   ```sh
+   socat 'OPENSSL-LISTEN:8443,bind=127.0.0.1,reuseaddr,fork,max-children=16,cert=localhost.pem,key=localhost.key,verify=0' 'TCP4:127.0.0.1:8081'
+   ```
+
+2. In another terminal, start the example from the repository root.
+
+   ```sh
+   cargo run --locked -p web -- --https
+   ```
+
+3. Open `https://localhost:8443`. When enrolling the native CLI, use port `8081`. Its approval link opens the HTTPS page.
+
+The browser verifies the server certificate. The listener accepts connections on loopback and does not require a client certificate.
+Stop both processes when you finish. If you created temporary trust for this run, remove it and the test key.
 
 ## Approve a CLI
 
@@ -51,6 +75,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Rename a passkey | `/passkeys/rename` | `rp.rename`. It needs no fresh user verification |
 | Add a passkey | `/passkeys/add/options`, `/passkeys/add/finish` | `rp.start` and `registration.propose` with `Decision::Add` ([Add a passkey](accounts.md#add-a-passkey)) |
 | Remove a passkey | `/passkeys/remove` | `rp.remove` with a `Fresh`. Its commit writes the removal mark of the passkey ([Remove a passkey](accounts.md#remove-a-passkey)) |
+| Renew this session | `/sessions/renew` | `sessions.renew` rotates the identifier. The browser receives its replacement cookie after the commit and stays signed in to the same account. |
 | End a session | `/sessions/revoke` | `sessions.revoke` with `Revoker::Own` for the session of the request, and `Revoker::Fresh` for another one |
 | Invite | `/invitations` | `rp.invite` under the policy of the example: each account that signed in with user verification may invite ([Issue an invitation](accounts.md#issue-an-invitation)) |
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
@@ -81,7 +106,7 @@ Browser handlers return `rsauthnz_http::Problem` when the request fails. An ende
 On the CLI approval page, an absent or ended session asks for fresh sign-in. [HTTP problem responses](http-binding.md#return-a-problem).
 
 After a commit whose response is lost (`Outcome::Unknown`), the server starts the driver again and looks up the
-operation. A sign-in or a recovery then answers the same request with its session. A start of a ceremony has no
+operation. Sign-in, renewal, and recovery can then return the session cookie for the accepted commit. A start of a ceremony has no
 options in the receipt of a lookup, so it answers `{"recovery":"restart"}`. Each other result of the lookup gives its
 recovery ([Lost responses](http-binding.md#lost-responses)).
 
@@ -107,6 +132,22 @@ journey, the rename of an account, a commit whose response is lost, a request of
 verification window.
 One test serves the router on a loopback port and sends the same request over HTTP/1.1 and HTTP/2.
 
+## Check a browser and passkey provider
+
+1. Start the TLS listener above. Use the provider example as its backend with a new issuer directory.
+
+   ```sh
+   cargo run --locked -p web --example providers -- --https "$HOME/.rsauthnz-provider-issuer"
+   ```
+
+2. Open `https://localhost:8443/run` in the browser you want to check. Use the prefilled test name.
+3. Select **Make a passkey**. Record the provider you choose and the verification method it requests.
+4. After the provider confirms, select **Sign in with a passkey**. Check the account and current session.
+
+The terminal prints the offered algorithm identifiers and the algorithm of the credential that the provider returns.
+It also shows the server result and whether each browser signal completed. Check the provider to confirm a rename or removal.
+Keep the server running across browsers to use the same accounts. Remove your test passkeys from the provider when you finish.
+
 ## Support
 
 | Profile | Evidence |
@@ -114,5 +155,6 @@ One test serves the router on a loopback port and sends the same request over HT
 | macOS aarch64, HTTP/1.1 and HTTP/2 | The tests pass, and the server serves the page and the sign-in options to `curl` over both protocols |
 | Windows x86_64 | Not run yet |
 | Chrome 158 on macOS aarch64, virtual passkey | Sign-up, passkey sign-in on the approval page, matching fingerprints, and native CLI approval passed. |
+| Safari 27.2 (22625.2.8.11.9), Apple Passwords with Touch ID on macOS 27.2.1 | Registration chose ES256 (`-7`) on HTTP and HTTPS with `-49` first. HTTP sign-in verified, but Safari omitted the `__Host-` cookie. A separate HTTPS check returned that cookie. The signed-in HTTPS account page still needs a run. |
 
-The example serves cleartext HTTP on loopback. A host with persistent accounts needs its own storage binding.
+A host with persistent accounts needs its own storage binding.
