@@ -5,6 +5,7 @@ description = "The HTTP binding of rsauthnz on `http` 1.x values: origin and CSR
 repository = "https://github.com/loadingalias/rsauthnz"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]

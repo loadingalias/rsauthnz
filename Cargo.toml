@@ -5,6 +5,7 @@ description = "Authentication and authorization: passkeys, sessions, recovery, a
 repository = "https://github.com/loadingalias/rsauthnz"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -13,7 +14,7 @@ publish.workspace = true
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # The only source of signatures, digests, and the seeded random generator. Its `alloc` gives the owners that clear a
 # secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "blake3", "chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2", "slh-dsa"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "blake3", "chacha20-rng", "ecdsa-p256", "ecdsa-p384", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2", "slh-dsa"] }
 # The JSON reader and writer and base64url of the passkey ceremonies, the base64url of session identifiers, and the
 # hex text of recovery codes. Its `std` detects DIT on aarch64, so the secret kernels run in a `with_dit` scope.
 rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "hex", "json", "std"] }
@@ -35,12 +36,14 @@ workspace = true
 resolver = "3"
 members = [".", "rsauthnz-conformance", "rsauthnz-http", "xtask", "xtask/portable", "examples/storage-binding", "examples/native-cli", "examples/web"]
 
-# No `rust-version`: development requires the nightly pinned in
-# rust-toolchain.toml, which a release number cannot express.
+# `rust-version` is the release number of the nightly that rust-toolchain.toml pins. Cargo then
+# refuses an older toolchain with one message. A crate that turns on an unstable feature also needs
+# that nightly. Set it again when the pin moves.
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-# Private during stealth. Publication is a later, separate decision.
+rust-version = "1.101"
+# No crates.io release yet. The user releases an alpha when a consumer needs one.
 publish = false
 
 [workspace.lints.cargo]

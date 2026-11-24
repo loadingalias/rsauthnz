@@ -5,6 +5,7 @@ description = "The storage conformance of rsauthnz: the memory binding of the st
 repository = "https://github.com/loadingalias/rsauthnz"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
