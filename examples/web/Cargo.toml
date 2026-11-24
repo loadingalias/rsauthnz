@@ -12,7 +12,7 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "htt
 # The request and response values that axum and rsauthnz-http share.
 http = "1.5"
 # The ceremonies, the sessions, recovery, and the commit driver.
-rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
+rsauthnz = { version = "=0.1.0-alpha.1", path = "../..", features = ["native-custody"] }
 # The memory binding of the storage contract, and the executor of the effects of the driver on it.
 rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
 # The checks and the responses of a site that serves browsers, and the browser adapter.
@@ -22,7 +22,7 @@ rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", de
 # The seeded random generator that the ceremonies take.
 rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"] }
 # The runtime of the server.
-tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "time"] }
 
 [dev-dependencies]
 # The HTTP/2 client of the check of the protocol, from the closure of axum.

@@ -52,7 +52,7 @@ secret from the human.
    to `CLI_NAME_BYTES_MAX` (64) bytes and no control character. The artifact of the accepted commit is the 32 bytes of
    the `DeviceCode`. Give the CLI both codes. The request ends after `ENROLLMENT_LIFETIME` (10 minutes).
 3. The CLI shows the user code, such as `WDJB-MJHT`, the address of the approval page, and the SHA-256 digest of its
-   public key. It can open the page with the code in its address.
+   public key. The example reads the code from a form on the approval page.
 4. The human signs in on the page with a passkey. The page reads the code with `UserCode::parse`, and shows the
    request from `authority.request(store, &code, now)`: the name, the fingerprint (the SHA-256 digest of the key), and
    the time of the request. The human compares the fingerprint with the one on the screen of the CLI.
@@ -317,8 +317,7 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 - A user code finds a request, and it proves nothing. Anyone can send a human the code of a request of their own CLI.
   So the page shows the name and the fingerprint, and asks the human to approve only a CLI on their own screen. The CLI
   shows the account of the approval.
-- No operation lists or ends the account bindings yet, and a recovery of the account does not end them. Each one ends
-  with its credential.
+- An account recovery ends prior CLI access. The owner can also disconnect one CLI. [List and disconnect a CLI](#list-and-disconnect-a-cli).
 
 ## Support
 
@@ -330,4 +329,6 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 
 The enrollment from a browser runs in the tests on this Mac (macOS aarch64), on the memory binding, with rscrypto in
 place of custody and the test authenticator of the passkey tests. They cover the journey, the approval of one request
-and the finish of another, an ended request, a lost finish response, and a restore. No real browser has run it yet.
+and the finish of another, an ended request, a lost finish response, and a restore.
+Chrome 158 on macOS aarch64 also ran the approval page with a virtual passkey and the native CLI in file custody.
+[Run the native CLI example](native-cli-example.md#connect-a-cli-to-your-account).

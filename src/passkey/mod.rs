@@ -682,6 +682,23 @@ impl RelyingParty {
         })
     }
 
+    /// The earliest challenge creation time that the current replay floor admits. An absent floor gives zero.
+    /// A host can cache this value after the store starts or restores. Wait until the earliest clock reading reaches it before issuing sign-in options.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read per start or restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Record`] for an invalid or unbounded floor and [`Failure::Store`] for a failed read.
+    pub async fn sign_in_not_before<S: Store>(&self, store: &mut S) -> Result<Duration, Failure<S::Error>> {
+        let Some(floor) = store.read(&record::floor_key()).await.map_err(Failure::Store)? else {
+            return Ok(Duration::ZERO);
+        };
+        Ok(record::floor_end(&floor.data, self.limits)
+            .and_then(|end| end.checked_add(Duration::from_nanos(1)))
+            .ok_or(Error::Record)?)
+    }
+
     /// The options of a sign-in: `PublicKeyCredentialRequestOptionsJSON` with a new challenge, for
     /// `PublicKeyCredential.parseRequestOptionsFromJSON()`. They ask for user verification when the authenticator can do
     /// it, and they name no credential, so the browser offers each passkey of the site, also in the autofill of

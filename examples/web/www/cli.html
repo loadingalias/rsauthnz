@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect a CLI</title>
+<main>
+  <h1>Connect a CLI</h1>
+  <form id="review">
+    <label>Code from your terminal <input id="code" required maxlength="16" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX"></label>
+    <button>Review request</button>
+  </form>
+  <p id="message" role="status"></p>
+  <button id="verify" hidden>Sign in with a passkey</button>
+  <section id="details" hidden>
+    <h2 id="device"></h2>
+    <p>Account <strong id="owner"></strong></p>
+    <p>Check that this key fingerprint matches your terminal.</p>
+    <code id="fingerprint" style="overflow-wrap:anywhere"></code>
+    <p><button id="approve">Approve this CLI</button></p>
+  </section>
+  <p><a href="/">Account</a></p>
+</main>
+<script type="module" src="/cli.js"></script>

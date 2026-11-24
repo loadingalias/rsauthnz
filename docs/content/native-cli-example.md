@@ -1,16 +1,36 @@
 # Run the native CLI example
 
-The native CLI example is a program that runs the journey of a headless CLI on a [local authority](local-authority.md).
-The local owner opens the authority and issues a one-use bootstrap value. The CLI enrolls its key in
-[custody](custody.md), and submits the value with its public key. Then the CLI is the first administrator, with a CLI
-credential. Each later call proves the possession of the key ([CLI credential](cli.md)). The example also shows two
-failures and its cleanup.
+The native CLI can ask a person to approve its key in a browser. It then signs a `status` call for that account.
+It also runs a headless bootstrap for the first administrator.
 
-The example is the workspace member `examples/native-cli`, in one file: `src/main.rs`. It uses only public items:
-`rsauthnz`, the memory binding and the effect executor of `rsauthnz-conformance`, and the random generator of
-`rscrypto`. It builds no claims and no transitions by hand.
+## Connect a CLI to your account
 
-## Run the example
+Use the pinned Rust toolchain. Start the web example and create a passkey for your account. [Run the web example](web-example.md#run-the-example).
+
+1. Open a second terminal at the repository root. Choose a new directory for this CLI key.
+
+   ```sh
+   cargo run --locked -p native-cli --features native-custody -- enroll ./laptop-cli "Laptop"
+   ```
+
+2. Open the local address printed by the CLI. Enter the **User code** and select **Review request**.
+3. Sign in if the page asks. Check the account and device name. Compare the fingerprint with your terminal.
+4. Select **Approve this CLI**. The terminal prints the approving account, then `Status admitted for` and its account ID.
+5. Use the same directory for later calls.
+
+   ```sh
+   cargo run --locked -p native-cli --features native-custody -- status ./laptop-cli
+   ```
+
+The user code expires after ten minutes. While the request waits, the CLI polls every five seconds.
+The default loopback port is 8080. To use another port, give it after the device name. The CLI saves the port with the binding.
+
+The directory holds the private key, the binding, and the signed credential. Keep it for later calls.
+Before sending the finish, the CLI saves the account ID and credential serial. If the response is lost, the CLI looks up the credential.
+Run `status` after an interruption. Account recovery or a server restart ends the binding. Enroll again in a new directory.
+[CLI enrollment and recovery](cli.md#enroll-the-cli-from-a-browser).
+
+## Run the headless example
 
 You need a checkout of the repository and the toolchain that `rust-toolchain.toml` pins. The example needs the
 feature `native-custody`, on Linux, macOS, or Windows. Run it from the root of the repository:
@@ -37,7 +57,7 @@ The store is the memory binding: a restart of this process loses each record.
 Without the feature, Cargo refuses the run and names the feature that the program needs. If a step fails, the program
 stops, removes its key directory, and exits with status 1 and the error.
 
-## The steps
+## Headless bootstrap steps
 
 | Step | Side | Operations | Guide |
 | --- | --- | --- | --- |
@@ -63,7 +83,7 @@ The text of the bootstrap value is a secret. The example does not print it.
 
 The example matches each refusal by its error. If an operation does not refuse with that error, the program fails.
 
-## Cleanup
+## Headless cleanup
 
 The example makes a new directory `rsauthnz-native-cli-<process ID>` under the temporary directory of the system. Its
 two key files are there. At the end, the CLI and the authority delete their keys with `custody.delete`, and the
@@ -74,16 +94,16 @@ removes the directory with no further error.
 
 ## Test the example
 
-The test runs the same journey, and passes only if each step completes, each failure refuses with its error, and the
-directory is gone:
+Run both journeys.
 
 ```sh
 cargo xtask test -p native-cli
 ```
 
-One test passes: `tests::the_journey_refuses_a_second_bootstrap_and_a_replay_and_leaves_no_key_file`.
+The browser journey starts the native binary and the web application on loopback. It checks fresh verification, credential recovery, and a later signed call.
+The headless journey checks the second bootstrap, the repeated proof, and key cleanup.
 
-## Limits of the example
+## Limits of the headless example
 
 - The store is the [memory binding](memory-binding.md). It keeps each record in the memory of the process, so a
   restart loses the authority, the administrator binding, and each challenge. A host uses a
@@ -103,6 +123,6 @@ One test passes: `tests::the_journey_refuses_a_second_bootstrap_and_a_replay_and
 
 | Target | Result |
 | --- | --- |
-| macOS aarch64 | The example and its test pass |
+| macOS aarch64 | Browser-approved enrollment and signed status over HTTP/2. The headless bootstrap also passes. |
 | Linux x86_64 and aarch64, glibc and musl | The runs are pending |
 | Windows x86_64 | The run is pending |

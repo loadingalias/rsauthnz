@@ -2,13 +2,12 @@
 
 The web example is a web application on [axum](https://docs.rs/axum/0.8.9) that mounts the [HTTP
 binding](http-binding.md). A person signs up with a passkey, signs in, names, adds, and removes passkeys, ends
-sessions, invites a new account, and recovers the account with a code. The page calls the server through the [browser
+sessions, invites a new account, and recovers the account with a code. A person can also approve a native CLI. The page calls the server through the [browser
 adapter](browser-adapter.md).
 
-The example is the workspace member `examples/web`. `src/lib.rs` holds the routes and one handler for each step,
-`src/main.rs` serves them, and `www/` holds the page. It uses only public items: `rsauthnz`, `rsauthnz-http`, the
-memory binding and the effect executor of `rsauthnz-conformance`, rscodec for the JSON of the requests, and the random
-generator of rscrypto. The store is the memory binding, so a restart of the server loses each account.
+The server keeps accounts, sessions, and CLI bindings in memory. A server restart ends them.
+The CLI issuer key stays in file custody. The default key directory is `.rsauthnz-web-example` in your home directory.
+To select a separate directory, run `cargo run --locked -p web -- ./web-issuer`. Give a new directory on the first run.
 
 ## Run the example
 
@@ -27,12 +26,20 @@ Serving http://localhost:8080. The store is in memory: a restart of this process
 
 Open `http://localhost:8080` in a browser with a passkey provider. The origin is `http://localhost:8080`, and the
 relying party ID is `localhost`. The session cookie is a `__Host-` cookie with `Secure`, so a browser keeps it on
-`http://localhost` only when it treats `localhost` as a secure context. No browser run of this example exists yet. The
-server serves HTTP/1.1 and HTTP/2 with no TLS. A browser uses HTTP/2 only with TLS, so it uses HTTP/1.1 here.
+`http://localhost` when it treats `localhost` as a secure context. The server serves HTTP/1.1 and HTTP/2 with no TLS. A browser uses HTTP/2 only with TLS, so it uses HTTP/1.1 here.
+
+After the memory store starts, the server waits until its clock can issue a usable sign-in challenge.
+Other requests can proceed during this wait.
+
+## Approve a CLI
+
+Start enrollment in the terminal. Follow the printed address to `/cli`. You can also select **Connect a CLI** on the account page.
+Review the account, device name, and key fingerprint. Approval requires passkey verification within five minutes.
+If the account changes after review, review the request again. [Connect a CLI to your account](native-cli-example.md#connect-a-cli-to-your-account).
 
 ## The steps
 
-Each state change is a same-origin `POST` with a JSON body. The router reads the body within `BODY_BYTES_MAX` (16 KiB),
+Each browser change uses a same-origin `POST` with a JSON body. The router reads the body within `BODY_BYTES_MAX` (16 KiB),
 and the handler checks it with `site.json_change` or `site.check_change` before other work.
 
 | Step | Routes | Operations |
@@ -49,6 +56,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
 | Make a recovery code | `/recovery-code` | `rp.recovery_code` with a `Fresh`. Only the accepted commit gives the code, and the page shows it once |
 | Recover | `/recover/options`, `/recover/finish` | `rp.recovery_options`, `rp.recover` with `Passkeys::End`, and one `attempt.propose` ([Recover](recovery.md#recover)) |
+| Review or approve a CLI | `/cli/request`, `/cli/approve` | `authority.request` shows the device. `authority.approve` checks fresh verification and commits the approval. |
 | Sign out | `/sign-out` | `sessions.revoke` with `Revoker::Own`, and `site.clear_cookie` |
 
 A sensitive change, such as a removal, a new code, a new account name, or the end of another session, needs a fresh
@@ -66,11 +74,11 @@ sign-in with another passkey.
 
 ## Failures and recovery
 
-Each handler returns `Result<Response<Vec<u8>>, rsauthnz_http::Problem>`, and `?` converts each refusal of the
-binding and each error of rsauthnz, so the example converts no error of its own ([Return a
-problem](http-binding.md#return-a-problem)). A request whose session does not serve, also an ended or a reused one,
-gives `Problem::SignedOut`, which clears the session cookie. The page sends each change with no ceremony with `change`
-of the browser module ([Make a change](browser-adapter.md#make-a-change)).
+The native CLI sends CBOR to `/cli/enroll`, `/cli/poll`, `/cli/finish`, `/cli/credential`, `/cli/challenge`, and `/cli/status`.
+These routes take `POST` requests on loopback. The device code stays in the request body. A signed proof admits the `status` call.
+
+Browser handlers return `rsauthnz_http::Problem` when the request fails. An ended session clears the session cookie on the account page.
+On the CLI approval page, an absent or ended session asks for fresh sign-in. [HTTP problem responses](http-binding.md#return-a-problem).
 
 After a commit whose response is lost (`Outcome::Unknown`), the server starts the driver again and looks up the
 operation. A sign-in or a recovery then answers the same request with its session. A start of a ceremony has no
@@ -79,17 +87,14 @@ recovery ([Lost responses](http-binding.md#lost-responses)).
 
 ## The mount on axum
 
-The axum code of the example is 53 lines: `router` and `page` in `src/lib.rs`, and the `axum::serve` call of
-`src/main.rs`. For each route, the router:
+The `router` function mounts the handlers on axum. The binary starts the listener with `axum::serve`. The router performs these steps.
 
-1. reads the body with `axum::body::to_bytes` within `BODY_BYTES_MAX`, and refuses a longer body with
-   `Refusal::BodyBytes.response()`;
-2. gives the handler an `http::Request<Bytes>`, which `rsauthnz-http` takes with no conversion;
-3. converts the `Response<Vec<u8>>` of the handler with `response.map(Body::from)`.
+1. Read the body with `axum::body::to_bytes`. Return `Refusal::BodyBytes` if it exceeds `BODY_BYTES_MAX`.
+2. Pass the handler an `http::Request<Bytes>`.
+3. Convert the handler response with `response.map(Body::from)`.
 
-The handlers run under one lock of the application state. Each future of the memory binding is ready at its first
-poll, so no handler waits while it holds the lock. A store that does I/O needs its own executor of the effects of the
-driver ([Write a storage binding](storage-binding.md)).
+The handlers share one application lock. The memory binding completes each storage request at its first poll.
+CLI credential issuance also reads the issuer key from file custody. A store that does I/O needs its own executor. [Write a storage binding](storage-binding.md).
 
 ## Check the example
 
@@ -108,6 +113,6 @@ One test serves the router on a loopback port and sends the same request over HT
 | --- | --- |
 | macOS aarch64, HTTP/1.1 and HTTP/2 | The tests pass, and the server serves the page and the sign-in options to `curl` over both protocols |
 | Windows x86_64 | Not run yet |
-| Real browsers and authenticators | Not run yet. The tests use the test authenticator, not a browser |
+| Chrome 158 on macOS aarch64, virtual passkey | Sign-up, passkey sign-in on the approval page, matching fingerprints, and native CLI approval passed. |
 
-The example claims no persistence, no TLS, and no HTTP/3.
+The example serves cleartext HTTP on loopback. A host with persistent accounts needs its own storage binding.

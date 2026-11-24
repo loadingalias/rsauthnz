@@ -1,7 +1,7 @@
 [package]
 name = "native-cli"
 version = "0.0.0"
-description = "A headless CLI on a local authority of rsauthnz: the first-administrator bootstrap and the possession of its key on later calls."
+description = "A native CLI with browser approval, a headless administrator bootstrap, and signed calls."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -11,17 +11,32 @@ name = "native-cli"
 required-features = ["native-custody"]
 
 [features]
-# The key files of `FileCustody`, on Linux, macOS, and Windows. The feature is off by default, so a build of the
-# workspace with its default features still builds rsauthnz with no native custody.
+# The CLI keeps its private key in file custody on Linux, macOS, and Windows.
 native-custody = ["rsauthnz/native-custody"]
 
 [dependencies]
+# The HTTP/2 client uses the same transport as the web example.
+bytes = "1.12"
+h2 = "=0.4.20"
+http = "1.5"
+tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "time"] }
+# The terminal and the approval page show the same base64url fingerprint.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64"] }
 # The local authority, the CLI credential, custody, and the commit driver.
 rsauthnz = { version = "=0.1.0-alpha.1", path = "../.." }
 # The memory binding of the storage contract, and the executor of the effects of the driver on it.
 rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-conformance" }
 # The seeded random generator that custody and the authority take.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "sha2"] }
+
+[dev-dependencies]
+# The HTTP journey runs the web example with its test authenticator.
+web = { path = "../web" }
+axum = { version = "=0.8.9", default-features = false, features = ["http2", "tokio"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["macros"] }
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["json", "std"] }
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["ecdsa-p256", "ed25519", "ml-dsa"] }
 
 [lints]
 workspace = true

@@ -181,7 +181,9 @@ use crate::store::driver::Plan;
 use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal};
+use crate::transition::{
+    self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal, Recover, Recovery,
+};
 
 pub mod enroll;
 
@@ -1549,6 +1551,19 @@ pub enum Error {
     Account,
 }
 
+impl Recover for Error {
+    /// Read the current state again when the challenge or the enrollment request changes.
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Expired | Self::Challenge | Self::Request | Self::Approved | Self::Waiting | Self::Account => {
+                Recovery::Restart
+            }
+            Self::Transition(error) => error.recovery(),
+            _ => Recovery::Refuse,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1585,6 +1600,15 @@ pub enum Failure<E> {
     Refused(Error),
     /// A read failed. It is a crash of the binding: start the driver again.
     Store(E),
+}
+
+impl<E> Recover for Failure<E> {
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Refused(error) => error.recovery(),
+            Self::Store(_) => Recovery::Restart,
+        }
+    }
 }
 
 impl<E> From<Error> for Failure<E> {

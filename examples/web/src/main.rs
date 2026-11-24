@@ -39,8 +39,21 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         SystemRng.fill_bytes(seed);
         Ok::<_, !>(())
     });
-    let app = web::App::new(ORIGIN, Memory::new(Schedule::None), Box::new(clock), random)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_io().build()?;
+    let mut args = std::env::args_os().skip(1);
+    let directory = match args.next() {
+        Some(directory) => std::path::PathBuf::from(directory),
+        None => std::env::home_dir()
+            .ok_or("no home directory for the web issuer")?
+            .join(".rsauthnz-web-example"),
+    };
+    if args.next().is_some() {
+        return Err("Use web [ISSUER_DIRECTORY].".into());
+    }
+    let app = web::App::new(ORIGIN, Memory::new(Schedule::None), Box::new(clock), random, &directory)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(ADDRESS).await?;
         println!("Serving {ORIGIN}. The store is in memory: a restart of this process loses each account.");

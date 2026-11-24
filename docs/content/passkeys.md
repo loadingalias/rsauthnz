@@ -91,6 +91,9 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
 
 ## Sign in
 
+After the store starts or restores, read `rp.sign_in_not_before(&mut store)` once. It returns the earliest creation time the replay floor accepts.
+Before issuing options, wait until `now.earliest()` reaches that time. Each subsequent sign-in still starts without a storage read.
+
 1. For each view of the login page, call `rp.sign_in_options(now, &mut random)` and send the options with
    `rsauthnz_http::json`. `now` needs a known bound: a reading with no bound refuses with
    `Error::Time(TimeError::UnknownBound)`. The call writes no record and no audit record, so a view costs no write.

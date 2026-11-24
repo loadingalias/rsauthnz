@@ -6,6 +6,10 @@
 //! handler, which runs the operations of rsauthnz under one lock of the [`App`]. `docs/content/web-example.md` gives
 //! the journey and the commands.
 
+mod cli;
+#[path = "../../shared/keys.rs"]
+mod keys;
+
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
@@ -22,6 +26,7 @@ use rsauthnz::authz::{self, Permit, Requirements};
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{Action, Authority, AuthorityVersion, Human, Id, Principal, Resource};
 use rsauthnz::limits::Limits;
+use rsauthnz::local;
 use rsauthnz::passkey::{self, Assertion, Decision, RelyingParty, User, UserHandle};
 use rsauthnz::recovery::{Code, Passkeys};
 use rsauthnz::session::{self, Access, Check, Revoker, Sessions};
@@ -74,13 +79,21 @@ impl core::fmt::Debug for App {
 }
 
 impl App {
-    /// The application of the site `origin` on the store `memory`, with the clock `clock` and the generator
-    /// `random`. It starts the commit driver and commits the policy of invitations.
+    /// The application of the site `origin` on the store `memory`, with the clock `clock` and the generator `random`.
+    /// It opens the CLI issuer key in `directory` and commits the invitation policy.
     ///
     /// # Errors
     ///
-    /// The refusal of the origin, of the driver, or of the commit of the policy.
-    pub fn new(origin: &str, memory: Memory, clock: Clock, mut random: ChaCha20Rng) -> Result<Self, String> {
+    /// Returns the cause if the site, issuer key, authority, or invitation policy cannot open.
+    pub fn new(
+        origin: &str,
+        mut memory: Memory,
+        clock: Clock,
+        mut random: ChaCha20Rng,
+        directory: &std::path::Path,
+    ) -> Result<Self, String> {
+        let issuer = keys::Keys::open(directory, "issuer", &mut random)
+            .map_err(|error| format!("the CLI issuer key: {error}"))?;
         let site = Site::new(origin).map_err(|error| format!("the origin: {error}"))?;
         let rp_id = origin
             .split_once("://")
@@ -95,13 +108,32 @@ impl App {
         let sessions = Sessions::new(authority(), id("app"), SESSION_POLICY, Limits::default())
             .map_err(|error| format!("the sessions: {error}"))?;
         let profile = Profile::new(memory.declaration()).map_err(|error| format!("the profile: {error}"))?;
-        let driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
+        let mut driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
         let now = clock();
+        driver.start(now);
+        settle(&mut memory, &mut driver, now);
+        let sign_in_not_before =
+            ready(rp.sign_in_not_before(&mut memory)).map_err(|error| format!("the replay floor: {error}"))?;
+        let grant = local::HostGrant {
+            owner: id("owner"),
+            origin: id("app"),
+        };
+        let cli = ready(local::Authority::open(
+            &mut memory,
+            &grant,
+            id("cli"),
+            issuer.handle.clone(),
+            Limits::default(),
+        ))
+        .map_err(|error| format!("the CLI authority: {error}"))?;
         let version = AuthorityVersion::new(authority(), &[1]).map_err(|error| format!("the version: {error}"))?;
         let mut state = State {
             rp_id: rp_id.to_owned(),
             memory,
             driver,
+            cli,
+            issuer,
+            sign_in_not_before,
             site,
             rp,
             sessions,
@@ -112,7 +144,6 @@ impl App {
                 expires: now.estimate() + Duration::from_secs(30 * 24 * 60 * 60),
             },
         };
-        state.start(now);
         let proposal = state
             .policy_record(now)
             .map_err(|error| format!("the policy: {error}"))?;
@@ -126,10 +157,31 @@ impl App {
     }
 
     /// The response of `handler` to `request`, at the time of the clock.
-    fn handle(&self, handler: Handler, request: &Request<Bytes>) -> Response<Vec<u8>> {
-        let now = (self.clock)();
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        handler(&mut state, request, now).unwrap_or_else(|problem| problem.response(&state.site))
+    async fn handle(&self, handler: Handler, request: &Request<Bytes>) -> Response<Vec<u8>> {
+        let respond = || {
+            let now = (self.clock)();
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if request.uri().path() == "/sign-in/options"
+                && let Ok(earliest) = now.earliest()
+            {
+                let delay = state.sign_in_not_before.saturating_sub(earliest);
+                if !delay.is_zero() {
+                    if let Err(error) = state.site.check_change(request) {
+                        return Ok(error.response());
+                    }
+                    return Err(delay);
+                }
+            }
+            Ok(handler(&mut state, request, now).unwrap_or_else(|problem| problem.response(&state.site)))
+        };
+        match respond() {
+            Ok(response) => response,
+            Err(delay) if delay <= passkey::SIGN_IN_LIFETIME => {
+                tokio::time::sleep(delay).await;
+                respond().unwrap_or_else(|_| rsauthnz_http::problem(Recovery::Restart))
+            }
+            Err(_) => rsauthnz_http::problem(Recovery::Restart),
+        }
     }
 }
 
@@ -138,7 +190,15 @@ type Handler = fn(&mut State, &Request<Bytes>, Reading) -> Result<Response<Vec<u
 
 /// The routes of the application.
 pub fn router(app: Arc<App>) -> Router {
-    let routes: [(&str, Handler); 19] = [
+    let routes: &[(&str, Handler)] = &[
+        ("/cli/request", State::cli_request),
+        ("/cli/approve", State::cli_approve),
+        ("/cli/enroll", State::cli_enroll),
+        ("/cli/poll", State::cli_poll),
+        ("/cli/finish", State::cli_finish),
+        ("/cli/credential", State::cli_credential),
+        ("/cli/challenge", State::cli_challenge),
+        ("/cli/status", State::cli_status),
         ("/account", State::account),
         ("/account/rename", State::rename_account),
         ("/sign-up/options", State::sign_up_options),
@@ -168,12 +228,21 @@ pub fn router(app: Arc<App>) -> Router {
             "/app.js",
             get(|| async { page("text/javascript; charset=utf-8", include_str!("../www/app.js")) }),
         );
-    for (path, handler) in routes {
+    router = router
+        .route(
+            "/cli",
+            get(|| async { page("text/html; charset=utf-8", include_str!("../www/cli.html")) }),
+        )
+        .route(
+            "/cli.js",
+            get(|| async { page("text/javascript; charset=utf-8", include_str!("../www/cli.js")) }),
+        );
+    for &(path, handler) in routes {
         let app = Arc::clone(&app);
         let serve = move |request: AxumRequest| async move {
             let (parts, body) = request.into_parts();
             let response = match axum::body::to_bytes(body, BODY_BYTES_MAX).await {
-                Ok(bytes) => app.handle(handler, &Request::from_parts(parts, bytes)),
+                Ok(bytes) => app.handle(handler, &Request::from_parts(parts, bytes)).await,
                 Err(_) => Refusal::BodyBytes.response(),
             };
             response.map(Body::from)
@@ -319,6 +388,9 @@ struct State {
     rp_id: String,
     memory: Memory,
     driver: Driver,
+    cli: local::Authority,
+    issuer: keys::Keys,
+    sign_in_not_before: Duration,
     site: Site,
     rp: RelyingParty,
     sessions: Sessions,
@@ -327,22 +399,24 @@ struct State {
     policy: Invitations,
 }
 
-impl State {
-    /// Gives each effect of the driver to the store, with the time `now` for its deadline checks.
-    fn settle(&mut self, now: Reading) {
-        self.memory.set_clock(now);
-        while let Some(effect) = self.driver.effect() {
-            let output = ready(suite::execute(&mut self.memory, effect));
-            if self.driver.give(output).is_err() {
-                break;
-            }
+/// Gives each driver effect to the memory binding with the time of this request.
+fn settle(memory: &mut Memory, driver: &mut Driver, now: Reading) {
+    memory.set_clock(now);
+    while let Some(effect) = driver.effect() {
+        let output = ready(suite::execute(memory, effect));
+        if driver.give(output).is_err() {
+            break;
         }
     }
+}
 
+impl State {
     /// A start of the driver on the store: after a crash, and after a response that the store lost.
-    fn start(&mut self, now: Reading) {
+    fn start(&mut self, now: Reading) -> Result<(), Problem> {
         self.driver.start(now);
-        self.settle(now);
+        settle(&mut self.memory, &mut self.driver, now);
+        self.sign_in_not_before = ready(self.rp.sign_in_not_before(&mut self.memory))?;
+        Ok(())
     }
 
     /// The receipt of the accepted commit of `proposal`. After a lost response, the driver starts again, and the
@@ -350,7 +424,7 @@ impl State {
     fn commit(&mut self, (proposal, plan): (Proposal, Plan), now: Reading) -> Result<Receipt, Problem> {
         let operation = proposal.operation().clone();
         let ticket = self.driver.submit(proposal, plan)?;
-        self.settle(now);
+        settle(&mut self.memory, &mut self.driver, now);
         match self.driver.take(ticket) {
             Some(Answer::Outcome(Outcome::Accepted(receipt))) => return Ok(receipt),
             Some(Answer::Outcome(Outcome::Unknown(_))) => {}
@@ -359,9 +433,9 @@ impl State {
             }
             _ => return Err(Problem::Recovery(Recovery::Lookup)),
         }
-        self.start(now);
+        self.start(now)?;
         let ticket = self.driver.lookup(operation)?;
-        self.settle(now);
+        settle(&mut self.memory, &mut self.driver, now);
         match self.driver.take(ticket) {
             Some(Answer::Lookup(Lookup::Committed(receipt))) => Ok(receipt),
             Some(Answer::Lookup(Lookup::Absent)) => Err(Problem::Recovery(Recovery::Restart)),

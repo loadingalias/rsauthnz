@@ -1,4 +1,7 @@
-//! A headless CLI on a local authority of rsauthnz. The local owner opens the authority and issues a one-use
+//! A native CLI signs calls with its key in file custody. The `enroll` command asks for browser approval.
+//! The `status` command signs a call for the approved account.
+//!
+//! With no arguments, the program runs a headless bootstrap. The local owner opens the authority and issues a one-use
 //! bootstrap value. The CLI enrolls its key in custody and submits the value with its public key. The CLI then is the
 //! first administrator, with a CLI credential. Each later call proves the possession of the key over a one-use
 //! challenge. The example also shows two failures: a second bootstrap with the same value, and a replayed proof.
@@ -13,6 +16,10 @@
 
 // std's OS generator. Review this gate at each move of the pinned nightly (AGENTS.md toolchain review).
 #![feature(random)]
+
+mod browser;
+#[path = "../../shared/keys.rs"]
+mod keys;
 
 use core::mem::DropGuard;
 use core::pin::pin;
@@ -48,6 +55,9 @@ fn main() -> Result<(), Failure> {
         SystemRng.fill_bytes(seed);
         Ok::<_, !>(())
     });
+    if let Some(command) = env::args_os().nth(1) {
+        return browser::run(&command, env::args_os().skip(2), random);
+    }
     let dir = env::temp_dir().join(format!("rsauthnz-native-cli-{}", process::id()));
     journey(dir, random)
 }
