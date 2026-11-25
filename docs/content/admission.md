@@ -28,6 +28,10 @@ does signature, KDF, or storage work.
    `cose::Profile::verify` does its cheap checks first. An input over a bound refuses before a signature check.
 4. Run `Mutate` and `External` work in their own pools, so that slow work in one cannot hold the other.
 
+A passkey operation, such as `rp.sign_in`, takes the store and the commit driver for its whole call. A host with one
+driver thus runs the verification and the commit of a sign-in in one queue. [Run the web example](web-example.md#limits)
+shows such a host: one bounded queue, a share for each credential, a commit budget, and an expiry pass.
+
 ## The limit set
 
 `rsauthnz::limits::Limits` is the one limit set of the crate. Each parser, each verifier, and each transition

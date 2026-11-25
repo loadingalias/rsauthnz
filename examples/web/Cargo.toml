@@ -21,8 +21,9 @@ rsauthnz-http = { version = "=0.1.0-alpha.1", path = "../../rsauthnz-http" }
 rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json", "std"] }
 # The seeded random generator that the ceremonies take.
 rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"] }
-# The runtime of the server.
-tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "time"] }
+# The runtime of the server. `signal` gives the Ctrl-C of the shutdown, and adds `signal-hook-registry` and `errno`
+# (approved 2026-11-24). `sync` gives the reply of the application thread to a request.
+tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
 # The HTTP/2 client of the check of the protocol, from the closure of axum.

@@ -21,7 +21,8 @@ async function run(action, formId) {
         : "Your passkey was accepted, but the session is unavailable. Check that this site can use cookies.");
     }
   } catch (error) {
-    if (error instanceof Problem && error.recovery === "refuse" && formId === "sign-up") {
+    if (error instanceof Problem && error.status === 503) show("The server is busy. Try again in a moment.");
+    else if (error instanceof Problem && error.recovery === "refuse" && formId === "sign-up") {
       show("Sign-up could not finish. If you already saved a passkey, select Sign in with a passkey.");
     } else if (error instanceof Problem) show(told[error.recovery] ?? `Refused: ${error.recovery}`);
     else if (error.name === "NotAllowedError" || error.name === "AbortError") show("The passkey request stopped. You can try again.");

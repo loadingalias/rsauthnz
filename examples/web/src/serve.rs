@@ -59,8 +59,9 @@ pub(crate) fn run(
         Ok::<_, !>(())
     });
     let origin = transport.origin();
-    let app = web::App::new(origin, Memory::new(Schedule::None), Box::new(clock), random, directory)?;
-    let router = web::router(Arc::new(app)).merge(routes);
+    let store = Memory::new(Schedule::None).with_retention(web::RETENTION);
+    let app = Arc::new(web::App::new(origin, store, Box::new(clock), random, directory)?);
+    let router = web::router(Arc::clone(&app)).merge(routes);
     let (port, router) = match transport {
         Transport::Http => (8080, router),
         Transport::Https => (8081, router.layer(middleware::from_fn(cli_address))),
@@ -72,7 +73,14 @@ pub(crate) fn run(
         .block_on(async {
             let listener = tokio::net::TcpListener::bind((core::net::Ipv4Addr::LOCALHOST, port)).await?;
             println!("Serving {origin}{page}. The store is in memory: a restart of this process loses each account.");
-            axum::serve(listener, router).await
+            println!("Stop the server with Ctrl-C. It first completes each request that it took.");
+            web::serve(listener, router, &app, async {
+                // With no signal handler, the server serves until the process ends.
+                if tokio::signal::ctrl_c().await.is_err() {
+                    core::future::pending::<()>().await;
+                }
+            })
+            .await
         })?;
     Ok(())
 }

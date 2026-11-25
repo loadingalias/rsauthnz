@@ -191,6 +191,7 @@ itself. On `Err(problem)`, return `problem.response(&site)`.
 | --- | --- |
 | `Refusal(refusal)` | `refusal.response()` |
 | `Recovery(recovery)` | `problem(recovery)` |
+| `Busy` | `503` with `Retry-After: 1` and the body of `problem(Recovery::Restart)`: give it when the host has no room for the request. Nothing committed, so the client can send the request again ([the limits of the web example](web-example.md#limits)) |
 | `SignedOut(name)` | `problem(Recovery::Refuse)`, and the cookie `name` cleared: give it when the session cookie is not valid, or its session is unknown, ended, or reused ([Check each request](sessions.md#check-each-request)) |
 
 The example of the `Problem` documentation, which `cargo xtask test` runs, returns a stale verification as

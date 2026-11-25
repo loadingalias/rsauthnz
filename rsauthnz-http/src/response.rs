@@ -1,6 +1,6 @@
 //! The responses of the binding. Each one has `Cache-Control: no-store`, and a problem body holds only its recovery.
 
-use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
+use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, RETRY_AFTER};
 use http::{Response, StatusCode};
 use rsauthnz::passkey::RelyingParty;
 use rsauthnz::transition::{Recover, Recovery};
@@ -168,11 +168,14 @@ pub enum Problem {
     /// The session cookie of this name serves no session: its value is not valid, or its session is unknown, ended, or
     /// reused. The client is signed out, and only the server can clear an `HttpOnly` cookie.
     SignedOut(CookieName),
+    /// The host has no room for the request now. Nothing committed, so the client can send the request again later.
+    Busy,
 }
 
 impl Problem {
     /// The response: [`Refusal::response`] of a refusal, [`problem`] of a recovery, and for [`Problem::SignedOut`] the
-    /// response of [`Recovery::Refuse`] that clears the cookie ([`Site::clear_cookie`]).
+    /// response of [`Recovery::Refuse`] that clears the cookie ([`Site::clear_cookie`]). [`Problem::Busy`] gives `503`
+    /// with `Retry-After: 1` and the body of [`Recovery::Restart`].
     #[must_use]
     pub fn response(self, site: &Site) -> Response<Vec<u8>> {
         match self {
@@ -181,6 +184,14 @@ impl Problem {
             Self::SignedOut(name) => {
                 let mut response = problem(Recovery::Refuse);
                 site.clear_cookie(response.headers_mut(), name);
+                response
+            }
+            Self::Busy => {
+                let mut response = problem(Recovery::Restart);
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static("1"));
                 response
             }
         }

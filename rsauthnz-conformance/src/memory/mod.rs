@@ -196,8 +196,8 @@ struct State {
     records: BTreeMap<Key, Record>,
 }
 
-/// The outcome retention of the declaration. Each audit and outcome record ends at the estimate of the audit time of
-/// its proposal plus the retention, which saturates at `Duration::MAX`.
+/// The outcome retention of a new binding. Each audit and outcome record ends at the estimate of the audit time of its
+/// proposal plus the retention, which saturates at `Duration::MAX`. [`Memory::with_retention`] sets another one.
 const RETENTION: Duration = Duration::MAX;
 
 impl State {
@@ -239,12 +239,13 @@ struct Request {
 }
 
 impl Request {
-    fn new(proposal: &Proposal) -> Self {
+    /// The request of `proposal`, whose audit and outcome records end after `retention`.
+    fn new(proposal: &Proposal, retention: Duration) -> Self {
         let mut records = store::intent_records(proposal)
             .expect("an intent record has a key of at most 73 bytes and an encodable CBOR form");
         let outcome = store::outcome_record(proposal);
         let key = outcome.0.clone();
-        let end = Some(proposal.audit().time.estimate().saturating_add(RETENTION));
+        let end = Some(proposal.audit().time.estimate().saturating_add(retention));
         records.extend([store::audit_record(proposal), outcome].map(|(key, record)| (key, Record { end, ..record })));
         Self {
             id: proposal.operation().id.clone(),
@@ -281,6 +282,8 @@ struct Binding {
     calls: [u64; 3],
     /// The reading of [`Subject::clock`].
     clock: Reading,
+    /// The outcome retention of the declaration.
+    retention: Duration,
 }
 
 impl Binding {
@@ -399,7 +402,17 @@ impl Memory {
             injected: None,
             calls: [0; 3],
             clock: Reading::new(Duration::ZERO, Some(Duration::ZERO), ReadingSource::Caller),
+            retention: RETENTION,
         })))
+    }
+
+    /// The binding with the outcome retention `retention`: each audit and outcome record of a later commit ends that
+    /// long after the audit time of its proposal, and an expiry pass after that end removes it. A new binding keeps
+    /// each one with no end. Set the retention before the first commit, so that the declaration holds for each record.
+    #[must_use]
+    pub fn with_retention(self, retention: Duration) -> Self {
+        self.lock().retention = retention;
+        self
     }
 
     /// Sets the reading of the clock that the binding gives for [`Effect::Clock`](rsauthnz::store::driver::Effect):
@@ -462,7 +475,7 @@ impl Store for Memory {
         Declaration {
             isolation: Isolation::Serializable,
             crash_loss: CrashLoss::Everything,
-            outcome_retention: RETENTION,
+            outcome_retention: self.lock().retention,
             crash_injection: CrashInjection::Supported,
             restore: Restore::Journal {
                 location: "the memory of the process".into(),
@@ -497,8 +510,9 @@ impl Store for Memory {
     }
 
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
-        let request = Request::new(proposal);
-        self.lock().commit(request, instance)
+        let mut binding = self.lock();
+        let request = Request::new(proposal, binding.retention);
+        binding.commit(request, instance)
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

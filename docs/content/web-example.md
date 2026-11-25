@@ -18,11 +18,15 @@ repository:
 cargo run --locked -p web
 ```
 
-The server prints one line and serves until you stop it:
+The server prints two lines and serves until you stop it:
 
 ```text
 Serving http://localhost:8080. The store is in memory: a restart of this process loses each account.
+Stop the server with Ctrl-C. It first completes each request that it took.
 ```
+
+Ctrl-C starts the shutdown. The server takes no new connection, sends the response of each request that it took, and
+joins its application thread. Then the process exits with status 0.
 
 Open `http://localhost:8080` in a browser with a passkey provider. The relying party ID is `localhost`.
 The session requires a `Secure`, host-only cookie named `__Host-session`. Safari 27.2 omitted this cookie on HTTP after a successful passkey sign-in.
@@ -97,6 +101,42 @@ A sign-in with a removed passkey, such as from a provider that no call reached, 
 `{"recovery":"forget"}`. `signIn` of the browser module then calls `signalDeleted` for it, and the page asks for a
 sign-in with another passkey.
 
+## Limits
+
+One application thread owns the state: the store, the commit driver, and the directory of accounts. A request that
+needs the state waits for that thread in one queue. The pages, the browser module, and the sign-in options need no
+state, so the request path serves them. A request over a limit gets its refusal before the application does work
+for it.
+
+| Limit | Value | Over the limit |
+| --- | --- | --- |
+| Request body (`BODY_BYTES_MAX`) | 16 KiB | `413` on the request path |
+| Requests that wait for the application (`PENDING_MAX`) | 64 | `503` on the request path |
+| Places of one credential among the waiting sign-ins (`SHARE_MAX`) | 8 | `503` on the request path |
+| Commits (`COMMIT_INTERVAL`, `COMMIT_BURST`) | 20 each second, after a burst of 100 | `503` before the store does work for the commit |
+| Accounts, with each invited account (`ACCOUNTS_MAX`) | 1,024 | `503` for a sign-up or an invitation |
+| Sign-ups that wait for their finish | 128 | `409` with `{"recovery":"restart"}` |
+| Expiry (`EXPIRY_INTERVAL`, `EXPIRY_BATCH`) | One pass each second, at most 256 ended records of each kind | The next pass continues |
+| Audit and outcome records (`RETENTION`) | 1 hour | The expiry pass removes them |
+
+An overload answer is `503` with `Retry-After: 1` and the body `{"recovery":"restart"}`. Nothing committed, so the
+client can send the request again. The page shows "The server is busy. Try again in a moment."
+
+The share of a credential keeps places free during a flood of sign-ins with one passkey. A person with many
+registered passkeys can still fill the queue.
+
+The commit budget and the account bound are for the whole site. One account that signs in faster than the budget
+delays the sign-ins of the other accounts.
+
+A store that does not answer stops the application thread. Each request that needs the state then waits, up to the
+64 places, and the next one gets `503`. The pages and the sign-in options still serve.
+
+Verification and commits wait in the same queue. Each passkey operation, such as `rp.sign_in`, holds the store and
+the commit driver while it verifies.
+
+The example sets no bound on connections or on the time to read the request headers. Put a server or a proxy with
+such bounds in front of a host that the public can reach.
+
 ## Failures and recovery
 
 The native CLI sends CBOR to `/cli/enroll`, `/cli/poll`, `/cli/finish`, `/cli/credential`, `/cli/challenge`, and `/cli/status`.
@@ -112,14 +152,18 @@ recovery ([Lost responses](http-binding.md#lost-responses)).
 
 ## The mount on axum
 
-The `router` function mounts the handlers on axum. The binary starts the listener with `axum::serve`. The router performs these steps.
+The `router` function mounts the handlers on axum. The `serve` function serves them until its shutdown future
+completes, and then joins the application thread. The router performs these steps.
 
 1. Read the body with `axum::body::to_bytes`. Return `Refusal::BodyBytes` if it exceeds `BODY_BYTES_MAX`.
-2. Pass the handler an `http::Request<Bytes>`.
-3. Convert the handler response with `response.map(Body::from)`.
+2. For a sign-in, check the request and read the assertion. Take a place of its credential (`Assertion::id`).
+3. Put the handler and its `http::Request<Bytes>` in the queue. Return `Problem::Busy` if the queue is full.
+4. Convert the handler response with `response.map(Body::from)`.
 
-The handlers share one application lock. The memory binding completes each storage request at its first poll.
-CLI credential issuance also reads the issuer key from file custody. A store that does I/O needs its own executor. [Write a storage binding](storage-binding.md).
+`App::new` takes each store that implements `rsauthnz_conformance::suite::Subject`. The binaries give it the memory
+binding, which completes each storage request at its first poll. For a store that does I/O, the application thread
+waits until the store answers. CLI credential issuance also reads the issuer key from file custody.
+[Write a storage binding](storage-binding.md).
 
 ## Check the example
 
@@ -131,6 +175,10 @@ The tests drive the routes in process with the responses of the test authenticat
 journey, the rename of an account, a commit whose response is lost, a request of another site, and a change after the
 verification window.
 One test serves the router on a loopback port and sends the same request over HTTP/1.1 and HTTP/2.
+
+The limit tests use a store that does not answer until the test releases it. They check the queue, the share of a
+credential, the commit budget, the account bound, and the expiry pass. One test stops the server with a request in
+flight: the request gets its response, and then the application thread joins.
 
 ## Check a browser and passkey provider
 

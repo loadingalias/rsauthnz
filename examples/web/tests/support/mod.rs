@@ -9,6 +9,7 @@ use axum::body::Body;
 use http::{Request, StatusCode};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz_conformance::memory::{Memory, Schedule};
+use rsauthnz_conformance::suite::Subject;
 use rscodec::base64::Profile::Url;
 use rscodec::json::{self, Slot};
 use rscrypto::ChaCha20Rng;
@@ -18,7 +19,7 @@ use crate::authenticator::{self, Get, Passkey, Registration};
 
 /// The site: its router, its store, and the clock of the host in whole seconds.
 pub(crate) struct Site {
-    origin: String,
+    pub(crate) origin: String,
     pub(crate) router: Router,
     pub(crate) memory: Memory,
     seconds: Arc<AtomicU64>,
@@ -47,6 +48,17 @@ impl Site {
     /// A new site at the start time of its memory store.
     pub(crate) fn at(origin: &str, start: u64) -> Self {
         let memory = Memory::new(Schedule::None);
+        Self::on(origin, start, memory.clone(), memory).0
+    }
+
+    /// A new site on `store`, which keeps its records in `memory`, at the start time `start`. Also the application
+    /// of the site.
+    pub(crate) fn on<S: Subject + Send + 'static>(
+        origin: &str,
+        start: u64,
+        store: S,
+        memory: Memory,
+    ) -> (Self, Arc<web::App<S>>) {
         let seconds = Arc::new(AtomicU64::new(start));
         let clock = Arc::clone(&seconds);
         let clock = Box::new(move || {
@@ -62,21 +74,16 @@ impl Site {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let app = web::App::new(
-            origin,
-            memory.clone(),
-            clock,
-            ChaCha20Rng::from_seed([5; 32]),
-            &issuer_dir,
-        )
-        .expect("the app");
-        Self {
+        let app = web::App::new(origin, store, clock, ChaCha20Rng::from_seed([5; 32]), &issuer_dir).expect("the app");
+        let app = Arc::new(app);
+        let site = Self {
             origin: origin.to_owned(),
-            router: web::router(Arc::new(app)),
+            router: web::router(Arc::clone(&app)),
             memory,
             seconds,
             issuer_dir,
-        }
+        };
+        (site, app)
     }
 
     pub(crate) fn advance(&self, seconds: u64) {

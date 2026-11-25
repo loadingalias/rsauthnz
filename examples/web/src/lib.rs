@@ -1,20 +1,27 @@
 //! A web application on axum that mounts `rsauthnz-http`: a sign-up with a passkey, the sign-in, the names, the
 //! passkeys, and the sessions of an account, an invitation of a new account, and recovery with a code. It keeps each
-//! record in the memory binding of `rsauthnz-conformance`, so a restart loses each account.
+//! record in a store of the storage contract. The binaries use the memory binding of `rsauthnz-conformance`, so a
+//! restart loses each account.
 //!
-//! [`router`] gives the routes. Each route reads the body within [`BODY_BYTES_MAX`] and gives an `http` request to its
-//! handler, which runs the operations of rsauthnz under one lock of the [`App`]. `docs/content/web-example.md` gives
-//! the journey and the commands.
+//! [`router`] gives the routes. Each route reads the body within [`BODY_BYTES_MAX`]. One thread owns the state of the
+//! [`App`], and a request that needs the state waits for that thread in a queue of [`PENDING_MAX`] places. A request
+//! over a limit gets its refusal on the request path. [`serve`] serves the routes until its shutdown, and then joins
+//! the thread. `docs/content/web-example.md` gives the journey, the limits, and the commands.
 
 mod cli;
 #[path = "../../shared/keys.rs"]
 mod keys;
 
+use core::fmt;
+use core::num::NonZeroUsize;
 use core::pin::pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::task::Wake;
+use std::thread;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -30,16 +37,16 @@ use rsauthnz::local;
 use rsauthnz::passkey::{self, Assertion, Decision, RelyingParty, User, UserHandle};
 use rsauthnz::recovery::{Code, Passkeys};
 use rsauthnz::session::{self, Access, Check, Revoker, Sessions};
-use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
-use rsauthnz::store::{self, Profile, Store};
+use rsauthnz::store::driver::{Answer, Driver, Effect, Lookup, Output, Plan};
+use rsauthnz::store::{self, Profile};
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Proposal, Receipt, Recovery};
-use rsauthnz_conformance::memory::Memory;
-use rsauthnz_conformance::suite;
+use rsauthnz_conformance::suite::{self, Subject};
 use rsauthnz_http::{CookieName, Problem, Refusal, Site, json as json_reply};
 use rscodec::base64::Profile::Url;
 use rscodec::json::{self, Profile::Rfc8259, Slot};
 use rscrypto::ChaCha20Rng;
+use tokio::sync::oneshot;
 
 /// The most bytes of a request body: a registration response with an RSA key fits.
 pub const BODY_BYTES_MAX: usize = 16 * 1024;
@@ -50,6 +57,30 @@ pub const NAME_BYTES_MAX: usize = 64;
 
 /// The most account drafts this local example keeps until registration expires.
 const PENDING_SIGNUPS_MAX: usize = 128;
+
+/// The most requests that wait for the application thread. The next one gets the overload response.
+pub const PENDING_MAX: usize = 64;
+
+/// The most waiting sign-ins of one credential. A flood with one credential thus leaves places for each other one.
+pub const SHARE_MAX: usize = 8;
+
+/// The time between two expiry passes.
+pub const EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most ended records of each kind that one expiry pass removes.
+pub const EXPIRY_BATCH: NonZeroUsize = NonZeroUsize::new(256).expect("256 is not zero");
+
+/// The commit budget: one commit in each interval, which is 20 commits in each second.
+pub const COMMIT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The most commits that the budget takes at one time.
+pub const COMMIT_BURST: u32 = 100;
+
+/// The most accounts of the directory, with each invited account.
+pub const ACCOUNTS_MAX: usize = 1024;
+
+/// The time that the store of the binaries keeps an audit record and an outcome record.
+pub const RETENTION: Duration = Duration::from_secs(60 * 60);
 
 /// The session cookie.
 const SESSION: CookieName = CookieName::new("session").expect("a token");
@@ -68,33 +99,76 @@ const INVITATION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// The clock of the host: a time reading with a known bound.
 pub type Clock = Box<dyn Fn() -> Reading + Send + Sync>;
 
-/// The application: its state under one lock, and its clock.
-pub struct App {
-    state: Mutex<State>,
-    clock: Clock,
+/// The waiting sign-ins of each credential ID. An entry lives while a sign-in of its credential waits, so the map has
+/// at most [`PENDING_MAX`] entries. The map is ordered, so an ID of a peer selects no hash.
+type Shares = Arc<Mutex<BTreeMap<Box<[u8]>, usize>>>;
+
+/// The application. One thread owns its state, and a request that needs the state waits for that thread in one
+/// bounded queue. The request path holds what a check before the queue needs.
+pub struct App<S> {
+    site: Site,
+    rp: Arc<RelyingParty>,
+    clock: Arc<dyn Fn() -> Reading + Send + Sync>,
+    /// The generator of the sign-in options, which the request path makes.
+    random: Mutex<ChaCha20Rng>,
+    /// The earliest time of a sign-in challenge that the store accepts, in nanoseconds since the Unix epoch. The
+    /// application thread writes it at each start of the driver.
+    sign_in_not_before: Arc<AtomicU64>,
+    /// The queue of the application thread, or `None` after [`App::stop`].
+    jobs: Mutex<Option<mpsc::SyncSender<Job<S>>>>,
+    shares: Shares,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
-impl core::fmt::Debug for App {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // The state holds secrets, such as the key of the relying party.
+impl<S> fmt::Debug for App<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The application holds secrets, such as the key of the relying party.
         f.debug_struct("App").finish_non_exhaustive()
     }
 }
 
-impl App {
-    /// The application of the site `origin` on the store `memory`, with the clock `clock` and the generator `random`.
-    /// It opens the CLI issuer key in `directory` and commits the invitation policy.
+/// A request in the queue of the application thread.
+struct Job<S> {
+    handler: Handler<S>,
+    request: Request<Bytes>,
+    reply: oneshot::Sender<Response<Vec<u8>>>,
+    /// The place of a sign-in among the waiting sign-ins of its credential. It ends with the job.
+    _share: Option<Share>,
+}
+
+/// One waiting sign-in of a credential. Its drop gives the place back.
+struct Share {
+    shares: Shares,
+    id: Box<[u8]>,
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut shares = self.shares.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = shares.get_mut(&self.id) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                shares.remove(&self.id);
+            }
+        }
+    }
+}
+
+impl<S: Subject + Send + 'static> App<S> {
+    /// The application of the site `origin` on `store`, with the clock `clock` and the generator `random`. It opens
+    /// the CLI issuer key in `directory`, commits the invitation policy, and starts the application thread.
     ///
     /// # Errors
     ///
-    /// Returns the cause if the site, issuer key, authority, or invitation policy cannot open.
+    /// Returns the cause if the site, issuer key, authority, invitation policy, or thread cannot start.
     pub fn new(
         origin: &str,
-        mut memory: Memory,
+        mut store: S,
         clock: Clock,
         mut random: ChaCha20Rng,
         directory: &std::path::Path,
     ) -> Result<Self, String> {
+        let clock: Arc<dyn Fn() -> Reading + Send + Sync> = Arc::from(clock);
         let issuer = keys::Keys::open(directory, "issuer", &mut random)
             .map_err(|error| format!("the CLI issuer key: {error}"))?;
         let site = Site::new(origin).map_err(|error| format!("the origin: {error}"))?;
@@ -108,21 +182,20 @@ impl App {
         let rp = RelyingParty::new(authority(), rp_id, origin, "Web example", key, Limits::default())
             .map_err(|error| format!("the relying party: {error}"))?
             .with_recovery(recovery);
+        let rp = Arc::new(rp);
         let sessions = Sessions::new(authority(), id("app"), SESSION_POLICY, Limits::default())
             .map_err(|error| format!("the sessions: {error}"))?;
-        let profile = Profile::new(memory.declaration()).map_err(|error| format!("the profile: {error}"))?;
+        let profile = Profile::new(store.declaration()).map_err(|error| format!("the profile: {error}"))?;
         let mut driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
         let now = clock();
         driver.start(now);
-        settle(&mut memory, &mut driver, now);
-        let sign_in_not_before =
-            ready(rp.sign_in_not_before(&mut memory)).map_err(|error| format!("the replay floor: {error}"))?;
+        settle(&mut store, &mut driver, now);
         let grant = local::HostGrant {
             owner: id("owner"),
             origin: id("app"),
         };
-        let cli = ready(local::Authority::open(
-            &mut memory,
+        let cli = wait(local::Authority::open(
+            &mut store,
             &grant,
             id("cli"),
             issuer.handle.clone(),
@@ -130,72 +203,175 @@ impl App {
         ))
         .map_err(|error| format!("the CLI authority: {error}"))?;
         let version = AuthorityVersion::new(authority(), &[1]).map_err(|error| format!("the version: {error}"))?;
+        let sign_in_not_before = Arc::new(AtomicU64::new(0));
+        let requests = random.child(b"requests", 0);
         let mut state = State {
             rp_id: rp_id.to_owned(),
-            memory,
+            store,
             driver,
             cli,
             issuer,
-            sign_in_not_before,
-            site,
-            rp,
+            clock: Arc::clone(&clock),
+            sign_in_not_before: Arc::clone(&sign_in_not_before),
+            site: site.clone(),
+            rp: Arc::clone(&rp),
             sessions,
             random,
             accounts: BTreeMap::new(),
             signups: BTreeMap::new(),
             next_account: 0,
+            commit_next: Duration::ZERO,
+            expiry_next: Duration::ZERO,
             policy: Invitations {
                 version,
                 expires: now.estimate() + Duration::from_secs(30 * 24 * 60 * 60),
             },
         };
+        state
+            .not_before()
+            .map_err(|problem| format!("the replay floor: {problem:?}"))?;
         let proposal = state
             .policy_record(now)
             .map_err(|error| format!("the policy: {error}"))?;
         state
             .commit(proposal, now)
             .map_err(|problem| format!("the commit of the policy: {problem:?}"))?;
+        let (jobs, queue) = mpsc::sync_channel(PENDING_MAX);
+        let thread = thread::Builder::new()
+            .name("web-application".to_owned())
+            .spawn(move || state.work(&queue))
+            .map_err(|error| format!("the application thread: {error}"))?;
         Ok(Self {
-            state: Mutex::new(state),
+            site,
+            rp,
             clock,
+            random: Mutex::new(requests),
+            sign_in_not_before,
+            jobs: Mutex::new(Some(jobs)),
+            shares: Shares::default(),
+            thread: Mutex::new(Some(thread)),
         })
     }
 
-    /// The response of `handler` to `request`, at the time of the clock.
-    async fn handle(&self, handler: Handler, request: &Request<Bytes>) -> Response<Vec<u8>> {
-        let respond = || {
-            let now = (self.clock)();
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if request.uri().path() == "/sign-in/options"
-                && let Ok(earliest) = now.earliest()
-            {
-                let delay = state.sign_in_not_before.saturating_sub(earliest);
-                if !delay.is_zero() {
-                    if let Err(error) = state.site.check_change(request) {
-                        return Ok(error.response());
-                    }
-                    return Err(delay);
-                }
-            }
-            Ok(handler(&mut state, request, now).unwrap_or_else(|problem| problem.response(&state.site)))
+    /// Closes the queue and joins the application thread, which first serves each request that waits. Each later
+    /// request gets the overload response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Stopped`] if the application thread stopped with a panic.
+    pub fn stop(&self) -> Result<(), Stopped> {
+        drop(self.jobs.lock().unwrap_or_else(PoisonError::into_inner).take());
+        let thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner).take();
+        thread.map_or(Ok(()), |thread| thread.join().map_err(|_| Stopped))
+    }
+
+    /// The response of `handler` to `request`. The request waits for the application thread, or it gets the overload
+    /// response at once if the queue or the share of its credential is full.
+    async fn handle(&self, handler: Handler<S>, mut request: Request<Bytes>) -> Response<Vec<u8>> {
+        let share = match self.share(&mut request) {
+            Ok(share) => share,
+            Err(problem) => return problem.response(&self.site),
         };
-        match respond() {
-            Ok(response) => response,
-            Err(delay) if delay <= passkey::SIGN_IN_LIFETIME => {
-                tokio::time::sleep(delay).await;
-                respond().unwrap_or_else(|_| rsauthnz_http::problem(Recovery::Restart))
-            }
-            Err(_) => rsauthnz_http::problem(Recovery::Restart),
+        let (reply, response) = oneshot::channel();
+        let job = Job {
+            handler,
+            request,
+            reply,
+            _share: share,
+        };
+        let queued = self
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|jobs| jobs.try_send(job).is_ok());
+        if !queued {
+            return Problem::Busy.response(&self.site);
         }
+        // The application thread drops a job with no response only when it stops.
+        response.await.unwrap_or_else(|_| Problem::Busy.response(&self.site))
+    }
+
+    /// The place of the sign-in `request` among the waiting sign-ins of its credential, and `None` for each other
+    /// request. The parsed assertion goes with the request, so the application thread does not parse it again.
+    fn share(&self, request: &mut Request<Bytes>) -> Result<Option<Share>, Problem> {
+        if request.uri().path() != "/sign-in/finish" {
+            return Ok(None);
+        }
+        let assertion = Assertion::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
+        let id: Box<[u8]> = assertion.id().into();
+        {
+            let mut shares = self.shares.lock().unwrap_or_else(PoisonError::into_inner);
+            let held = shares.get(&id).copied().unwrap_or(0);
+            (held < SHARE_MAX).ok_or(Problem::Busy)?;
+            shares.insert(id.clone(), held.saturating_add(1));
+        }
+        request.extensions_mut().insert(Arc::new(assertion));
+        Ok(Some(Share {
+            shares: Arc::clone(&self.shares),
+            id,
+        }))
+    }
+
+    /// The options of a sign-in. They name no passkey, so the browser offers each passkey of the site. They need no
+    /// state of the application, so the request path makes them. After a start of the store, the request first waits
+    /// until the clock can give a challenge that the store accepts.
+    async fn sign_in_options(&self, request: &Request<Bytes>) -> Response<Vec<u8>> {
+        if let Err(refusal) = self.site.check_change(request) {
+            return refusal.response();
+        }
+        let delay = self.early();
+        if !delay.is_zero() {
+            if delay > passkey::SIGN_IN_LIFETIME {
+                return rsauthnz_http::problem(Recovery::Restart);
+            }
+            tokio::time::sleep(delay).await;
+            if !self.early().is_zero() {
+                return rsauthnz_http::problem(Recovery::Restart);
+            }
+        }
+        let mut random = self.random.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.rp.sign_in_options((self.clock)(), &mut random) {
+            Ok(options) => json_reply(options),
+            Err(error) => Problem::from(error).response(&self.site),
+        }
+    }
+
+    /// The time from the earliest time of the clock to the first sign-in challenge that the store accepts.
+    fn early(&self) -> Duration {
+        let not_before = Duration::from_nanos(self.sign_in_not_before.load(Ordering::Relaxed));
+        (self.clock)()
+            .earliest()
+            .map_or(Duration::ZERO, |earliest| not_before.saturating_sub(earliest))
     }
 }
 
-/// A handler: the response to a request at a time, or the problem response of its refusal.
-type Handler = fn(&mut State, &Request<Bytes>, Reading) -> Result<Response<Vec<u8>>, Problem>;
+/// The application thread stopped with a panic, so [`App::stop`] joined no complete work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stopped;
 
-/// The routes of the application.
-pub fn router(app: Arc<App>) -> Router {
-    let routes: &[(&str, Handler)] = &[
+impl fmt::Display for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the application thread stopped with a panic")
+    }
+}
+
+impl core::error::Error for Stopped {}
+
+/// A handler: the response to a request at a time, or the problem response of its refusal.
+type Handler<S> = fn(&mut State<S>, &Request<Bytes>, Reading) -> Result<Response<Vec<u8>>, Problem>;
+
+/// The request with its body, or `None` for a body over [`BODY_BYTES_MAX`].
+async fn bounded(request: AxumRequest) -> Option<Request<Bytes>> {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, BODY_BYTES_MAX).await.ok()?;
+    Some(Request::from_parts(parts, bytes))
+}
+
+/// The routes of the application. The pages, the browser module, and the sign-in options need no state, so the
+/// request path serves them. Each other route waits for the application thread.
+pub fn router<S: Subject + Send + 'static>(app: Arc<App<S>>) -> Router {
+    let routes: &[(&str, Handler<S>)] = &[
         ("/cli/request", State::cli_request),
         ("/cli/approve", State::cli_approve),
         ("/cli/enroll", State::cli_enroll),
@@ -208,7 +384,6 @@ pub fn router(app: Arc<App>) -> Router {
         ("/account/rename", State::rename_account),
         ("/sign-up/options", State::sign_up_options),
         ("/sign-up/finish", State::sign_up_finish),
-        ("/sign-in/options", State::sign_in_options),
         ("/sign-in/finish", State::sign_in_finish),
         ("/sign-out", State::sign_out),
         ("/passkeys/rename", State::rename),
@@ -223,7 +398,6 @@ pub fn router(app: Arc<App>) -> Router {
         ("/recovery-code", State::recovery_code),
         ("/recover/options", State::recovery_options),
         ("/recover/finish", State::recover),
-        ("/rsauthnz.js", |_, _, _| Ok(rsauthnz_http::browser_module())),
     ];
     let mut router = Router::new()
         .route(
@@ -233,8 +407,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/app.js",
             get(|| async { page("text/javascript; charset=utf-8", include_str!("../www/app.js")) }),
-        );
-    router = router
+        )
         .route(
             "/cli",
             get(|| async { page("text/html; charset=utf-8", include_str!("../www/cli.html")) }),
@@ -242,20 +415,50 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/cli.js",
             get(|| async { page("text/javascript; charset=utf-8", include_str!("../www/cli.js")) }),
+        )
+        .route(
+            "/rsauthnz.js",
+            get(|| async { rsauthnz_http::browser_module().map(Body::from) }),
         );
+    let options = Arc::clone(&app);
+    router = router.route(
+        "/sign-in/options",
+        any(move |request: AxumRequest| async move {
+            match bounded(request).await {
+                Some(request) => options.sign_in_options(&request).await,
+                None => Refusal::BodyBytes.response(),
+            }
+            .map(Body::from)
+        }),
+    );
     for &(path, handler) in routes {
         let app = Arc::clone(&app);
         let serve = move |request: AxumRequest| async move {
-            let (parts, body) = request.into_parts();
-            let response = match axum::body::to_bytes(body, BODY_BYTES_MAX).await {
-                Ok(bytes) => app.handle(handler, &Request::from_parts(parts, bytes)).await,
-                Err(_) => Refusal::BodyBytes.response(),
-            };
-            response.map(Body::from)
+            match bounded(request).await {
+                Some(request) => app.handle(handler, request).await,
+                None => Refusal::BodyBytes.response(),
+            }
+            .map(Body::from)
         };
         router = router.route(path, any(serve));
     }
     router
+}
+
+/// Serves `router` on `listener` until `shutdown` completes. Then it takes no new connection, waits for the response
+/// of each request that it took, and joins the application thread of `app`.
+///
+/// # Errors
+///
+/// Returns the error of the listener, or [`Stopped`] as an error if the application thread stopped with a panic.
+pub async fn serve<S: Subject + Send + 'static>(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    app: &App<S>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
+    app.stop().map_err(std::io::Error::other)
 }
 
 /// A static page of the application.
@@ -314,15 +517,29 @@ impl authz::Policy for Invitations {
     }
 }
 
-/// The output of a future of the memory binding, which is ready at its first poll.
-#[expect(
-    clippy::unreachable,
-    reason = "the memory binding does no I/O, so each of its futures is ready at its first poll"
-)]
-fn ready<F: Future>(future: F) -> F::Output {
-    match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(output) => output,
-        Poll::Pending => unreachable!("the memory binding does no I/O"),
+/// Wakes the thread that waits for a future of the store.
+struct Unpark(thread::Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// The output of `future`. A future of the memory binding is ready at its first poll. For a store that does not
+/// answer at once, the thread parks until the store wakes it.
+fn wait<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    if let Poll::Ready(output) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        return output;
+    }
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
     }
 }
 
@@ -388,51 +605,99 @@ fn name(text: &str) -> Result<&str, Problem> {
         .ok_or(Problem::Recovery(Recovery::Refuse))
 }
 
-/// The state of the application: the relying party ID, the store and its commit driver, the site, the relying party,
-/// the sessions, the generator, the directory of accounts by name, and the policy of invitations.
-struct State {
+/// The state of the application, which its one thread owns: the relying party ID, the store and its commit driver, the
+/// site, the relying party, the sessions, the generator, the directory of accounts by name, the policy of
+/// invitations, and the times of the next commit of the budget and of the next expiry pass.
+struct State<S> {
     rp_id: String,
-    memory: Memory,
+    store: S,
     driver: Driver,
     cli: local::Authority,
     issuer: keys::Keys,
-    sign_in_not_before: Duration,
+    clock: Arc<dyn Fn() -> Reading + Send + Sync>,
+    sign_in_not_before: Arc<AtomicU64>,
     site: Site,
-    rp: RelyingParty,
+    rp: Arc<RelyingParty>,
     sessions: Sessions,
     random: ChaCha20Rng,
     accounts: BTreeMap<String, Account>,
     signups: BTreeMap<Id<Human>, (Account, Duration)>,
     next_account: u64,
+    /// The time of the next commit at the rate of the budget. The budget is empty while this time is
+    /// [`COMMIT_BURST`] intervals after the clock.
+    commit_next: Duration,
+    expiry_next: Duration,
     policy: Invitations,
 }
 
-/// Gives each driver effect to the memory binding with the time of this request.
-fn settle(memory: &mut Memory, driver: &mut Driver, now: Reading) {
-    memory.set_clock(now);
+/// Gives each effect of the driver to the store, with the time of this request as the clock.
+fn settle<S: Subject>(store: &mut S, driver: &mut Driver, now: Reading) {
     while let Some(effect) = driver.effect() {
-        let output = ready(suite::execute(memory, effect));
+        let output = match effect {
+            Effect::Clock => Output::Clock(now),
+            effect => wait(suite::execute(store, effect)),
+        };
         if driver.give(output).is_err() {
             break;
         }
     }
 }
 
-impl State {
+impl<S: Subject> State<S> {
+    /// Serves each request of `jobs`, one at a time, until the queue closes. Before each request, and at least once in
+    /// each [`EXPIRY_INTERVAL`], it makes the expiry pass that is due.
+    fn work(mut self, jobs: &mpsc::Receiver<Job<S>>) {
+        loop {
+            let job = match jobs.recv_timeout(EXPIRY_INTERVAL) {
+                Ok(job) => Some(job),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            let now = (self.clock)();
+            self.expire(now);
+            if let Some(job) = job {
+                let response =
+                    (job.handler)(&mut self, &job.request, now).unwrap_or_else(|problem| problem.response(&self.site));
+                // A client that left takes no response.
+                let _sent = job.reply.send(response);
+            }
+        }
+    }
+
+    /// One expiry pass, if one is due at `now`: it removes at most [`EXPIRY_BATCH`] ended records of each kind.
+    fn expire(&mut self, now: Reading) {
+        if now.estimate() >= self.expiry_next {
+            self.expiry_next = now.estimate().saturating_add(EXPIRY_INTERVAL);
+            // A pass that fails removes nothing, and the next pass tries again.
+            let _pass = wait(store::expire(&mut self.store, now, EXPIRY_BATCH));
+        }
+    }
+
     /// A start of the driver on the store: after a crash, and after a response that the store lost.
     fn start(&mut self, now: Reading) -> Result<(), Problem> {
         self.driver.start(now);
-        settle(&mut self.memory, &mut self.driver, now);
-        self.sign_in_not_before = ready(self.rp.sign_in_not_before(&mut self.memory))?;
+        settle(&mut self.store, &mut self.driver, now);
+        self.not_before()
+    }
+
+    /// Gives the request path the earliest time of a sign-in challenge that the store accepts.
+    fn not_before(&mut self) -> Result<(), Problem> {
+        let not_before = wait(self.rp.sign_in_not_before(&mut self.store))?;
+        let nanos = u64::try_from(not_before.as_nanos()).unwrap_or(u64::MAX);
+        self.sign_in_not_before.store(nanos, Ordering::Relaxed);
         Ok(())
     }
 
-    /// The receipt of the accepted commit of `proposal`. After a lost response, the driver starts again, and the
-    /// receipt is the one of the lookup of the operation, which has no artifact.
+    /// The receipt of the accepted commit of `proposal`. A commit over the budget gets the overload response before
+    /// the store does work for it. After a lost response, the driver starts again, and the receipt is the one of the
+    /// lookup of the operation, which has no artifact.
     fn commit(&mut self, (proposal, plan): (Proposal, Plan), now: Reading) -> Result<Receipt, Problem> {
+        let next = self.commit_next.max(now.estimate()).saturating_add(COMMIT_INTERVAL);
+        (next.saturating_sub(now.estimate()) <= COMMIT_INTERVAL.saturating_mul(COMMIT_BURST)).ok_or(Problem::Busy)?;
+        self.commit_next = next;
         let operation = proposal.operation().clone();
         let ticket = self.driver.submit(proposal, plan)?;
-        settle(&mut self.memory, &mut self.driver, now);
+        settle(&mut self.store, &mut self.driver, now);
         match self.driver.take(ticket) {
             Some(Answer::Outcome(Outcome::Accepted(receipt))) => return Ok(receipt),
             Some(Answer::Outcome(Outcome::Unknown(_))) => {}
@@ -443,7 +708,7 @@ impl State {
         }
         self.start(now)?;
         let ticket = self.driver.lookup(operation)?;
-        settle(&mut self.memory, &mut self.driver, now);
+        settle(&mut self.store, &mut self.driver, now);
         match self.driver.take(ticket) {
             Some(Answer::Lookup(Lookup::Committed(receipt))) => Ok(receipt),
             Some(Answer::Lookup(Lookup::Absent)) => Err(Problem::Recovery(Recovery::Restart)),
@@ -491,7 +756,7 @@ impl State {
             Ok(None) => return Err(Problem::Recovery(Recovery::Refuse)),
             Err(_) => return Err(Problem::SignedOut(SESSION)),
         };
-        let access = match ready(self.sessions.check(&mut self.memory, &identifier, now)) {
+        let access = match wait(self.sessions.check(&mut self.store, &identifier, now)) {
             Ok(Check::Active(access)) => access,
             Ok(Check::Reused(proposal, plan)) => {
                 self.commit((proposal, plan), now)?;
@@ -530,6 +795,7 @@ impl State {
 
     /// A draft for an available name. Only a committed registration or invitation claims the name.
     fn new_account(&mut self, name: &str) -> Result<Account, Problem> {
+        (self.accounts.len() < ACCOUNTS_MAX).ok_or(Problem::Busy)?;
         (!self.accounts.contains_key(name)).ok_or(Problem::Recovery(Recovery::Refuse))?;
         let serial = self.next_account;
         self.next_account = serial.checked_add(1).ok_or(Problem::Recovery(Recovery::Refuse))?;
@@ -546,8 +812,8 @@ impl State {
     /// `signalAccepted`, which the page calls at each load.
     fn account(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let (access, account) = self.access(request, now)?;
-        let passkeys = ready(self.rp.passkeys(&mut self.memory, &account.handle))?;
-        let page = ready(self.sessions.list(&mut self.memory, &access, None, now))?;
+        let passkeys = wait(self.rp.passkeys(&mut self.store, &account.handle))?;
+        let page = wait(self.sessions.list(&mut self.store, &access, None, now))?;
         reply(|place| {
             place.object(|object| {
                 object.member("rpId").str(&self.rp_id)?;
@@ -590,14 +856,14 @@ impl State {
         let account = self.new_account(name(&text)?)?;
         let user = Self::user(&account);
         let start = self.rp.start(
-            &mut self.memory,
+            &mut self.store,
             &user,
             Decision::SignUp(&[]),
             now,
             &mut self.random,
             &mut self.driver,
         );
-        let proposal = ready(start)?;
+        let proposal = wait(start)?;
         let options = self.artifact(proposal, now)?;
         self.signups.insert(account.id.clone(), (account, end));
         Ok(json_reply(options))
@@ -606,7 +872,7 @@ impl State {
     /// The first passkey of a new account.
     fn sign_up_finish(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let response = passkey::Response::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
-        let registration = ready(self.rp.finish(&mut self.memory, &response, now, &mut self.driver))?;
+        let registration = wait(self.rp.finish(&mut self.store, &response, now, &mut self.driver))?;
         let account = self
             .signups
             .get(registration.account())
@@ -614,25 +880,25 @@ impl State {
             .filter(|account| !self.accounts.contains_key(&account.name))
             .cloned()
             .ok_or(Problem::Recovery(Recovery::Refuse))?;
+        (self.accounts.len() < ACCOUNTS_MAX).ok_or(Problem::Busy)?;
         self.commit(registration.propose(Decision::SignUp(&[]))?, now)?;
         self.signups.remove(&account.id);
         self.accounts.insert(account.name.clone(), account);
         Ok(json_reply(b"{}".to_vec()))
     }
 
-    /// The options of a sign-in. They name no passkey, so the browser offers each passkey of the site.
-    fn sign_in_options(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
-        self.site.check_change(request)?;
-        Ok(json_reply(self.rp.sign_in_options(now, &mut self.random)?))
-    }
-
     /// A sign-in, which replaces the session of the request, and its session cookie.
     fn sign_in_finish(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
-        let assertion = Assertion::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
+        // The request path checked the request and parsed its assertion ([`App::share`]).
+        let assertion = request
+            .extensions()
+            .get::<Arc<Assertion>>()
+            .cloned()
+            .ok_or(Problem::Recovery(Recovery::Refuse))?;
         let replaces = self.access(request, now).ok().map(|(access, _)| access);
-        let sign_in = ready(
+        let sign_in = wait(
             self.rp
-                .sign_in(&mut self.memory, &assertion, now, &mut self.random, &mut self.driver),
+                .sign_in(&mut self.store, &assertion, now, &mut self.random, &mut self.driver),
         )?;
         let (proposal, plan, opening) =
             sign_in.open(&self.sessions, replaces.as_ref(), &mut self.random, &mut self.driver)?;
@@ -682,7 +948,7 @@ impl State {
     /// The passkey `id` (base64url) of `account`.
     fn passkey(&mut self, account: &Account, id: &str) -> Result<account::Passkey, Problem> {
         let id = base64url(id)?;
-        let passkeys = ready(self.rp.passkeys(&mut self.memory, &account.handle))?;
+        let passkeys = wait(self.rp.passkeys(&mut self.store, &account.handle))?;
         passkeys
             .into_iter()
             .find(|passkey| passkey.credential().id() == id)
@@ -708,8 +974,8 @@ impl State {
         let [id] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["id"])?;
         let (_, fresh, account) = self.fresh(request, now)?;
         let removed = self.passkey(&account, &id)?;
-        let proposal = ready(self.rp.remove(
-            &mut self.memory,
+        let proposal = wait(self.rp.remove(
+            &mut self.store,
             &fresh,
             &removed,
             now,
@@ -750,14 +1016,14 @@ impl State {
         let (_, fresh, account) = self.fresh(request, now)?;
         let user = Self::user(&account);
         let start = self.rp.start(
-            &mut self.memory,
+            &mut self.store,
             &user,
             Decision::Add(&fresh, &[]),
             now,
             &mut self.random,
             &mut self.driver,
         );
-        let proposal = ready(start)?;
+        let proposal = wait(start)?;
         Ok(json_reply(self.artifact(proposal, now)?))
     }
 
@@ -765,7 +1031,7 @@ impl State {
     fn add_finish(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let response = passkey::Response::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
         let (_, fresh, _) = self.fresh(request, now)?;
-        let registration = ready(self.rp.finish(&mut self.memory, &response, now, &mut self.driver))?;
+        let registration = wait(self.rp.finish(&mut self.store, &response, now, &mut self.driver))?;
         self.commit(registration.propose(Decision::Add(&fresh, &[]))?, now)?;
         Ok(json_reply(b"{}".to_vec()))
     }
@@ -776,7 +1042,7 @@ impl State {
         let [key] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["key"])?;
         let key = base64url(&key)?;
         let (access, _account) = self.access(request, now)?;
-        let page = ready(self.sessions.list(&mut self.memory, &access, None, now))?;
+        let page = wait(self.sessions.list(&mut self.store, &access, None, now))?;
         let session = page
             .sessions
             .iter()
@@ -836,9 +1102,9 @@ impl State {
             name: &account.name,
             display_name: &account.display_name,
         };
-        let options = ready(
+        let options = wait(
             self.rp
-                .activation_options(&mut self.memory, &value, &invitee, now, &mut self.random),
+                .activation_options(&mut self.store, &value, &invitee, now, &mut self.random),
         )?;
         Ok(json_reply(options))
     }
@@ -858,14 +1124,14 @@ impl State {
             .ok_or(Problem::Recovery(Recovery::Refuse))?;
         let response = passkey::Response::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
         let activate = self.rp.activate(
-            &mut self.memory,
+            &mut self.store,
             &response,
             &account.id,
             &self.policy,
             now,
             &mut self.driver,
         );
-        let activation = ready(activate)?;
+        let activation = wait(activate)?;
         self.commit(activation.propose(&[])?, now)?;
         Ok(json_reply(b"{}".to_vec()))
     }
@@ -874,8 +1140,8 @@ impl State {
     fn recovery_code(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         self.site.check_change(request)?;
         let (_, fresh, account) = self.fresh(request, now)?;
-        let code = ready(self.rp.recovery_code(
-            &mut self.memory,
+        let code = wait(self.rp.recovery_code(
+            &mut self.store,
             &fresh,
             &account.handle,
             now,
@@ -897,9 +1163,9 @@ impl State {
             .ok_or(Problem::Recovery(Recovery::Refuse))?;
         let code = Code::parse(code.as_bytes())?;
         let user = Self::user(&account);
-        let options = ready(
+        let options = wait(
             self.rp
-                .recovery_options(&mut self.memory, &user, &code, now, &mut self.random),
+                .recovery_options(&mut self.store, &user, &code, now, &mut self.random),
         )?;
         Ok(json_reply(options))
     }
@@ -909,7 +1175,7 @@ impl State {
     fn recover(&mut self, request: &Request<Bytes>, now: Reading) -> Result<Response<Vec<u8>>, Problem> {
         let response = passkey::Response::parse(self.site.json_change(request, BODY_BYTES_MAX)?)?;
         let recover = self.rp.recover(
-            &mut self.memory,
+            &mut self.store,
             &response,
             &self.sessions,
             Passkeys::End,
@@ -917,7 +1183,7 @@ impl State {
             &mut self.random,
             &mut self.driver,
         );
-        let attempt = ready(recover)?;
+        let attempt = wait(recover)?;
         let (proposal, plan, opening) = attempt.propose(&[])?;
         let receipt = self.commit((proposal, plan), now)?;
         let opened = opening

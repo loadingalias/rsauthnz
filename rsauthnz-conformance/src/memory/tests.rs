@@ -212,6 +212,42 @@ fn two_concurrent_commits_that_read_one_absence_give_one_commit_and_one_conflict
 
 /// An append is durable only after its sync returns: a read before the sync does not give it, and the crash of a
 /// failed sync loses it. The next append gets the sequence of the lost append, so the journal has no gap.
+/// Contract: [`Memory::with_retention`] ends the audit and outcome records of a commit at its audit time plus the
+/// retention. An expiry pass removes each one only after that end.
+#[test]
+fn an_expiry_pass_removes_the_audit_and_outcome_records_only_after_the_finite_retention() {
+    let hour = Duration::from_secs(3_600);
+    let mut memory = Memory::new(Schedule::None).with_retention(hour);
+    assert_eq!(memory.declaration().outcome_retention, hour);
+    let instance = ready(memory.start()).unwrap();
+    let key = Kind::Credential.key(b"c-1").unwrap();
+    let proposal = proposal(b"op-1", &key);
+    assert_eq!(ready(memory.commit(&proposal, instance)), Ok(Commit::Accepted));
+
+    // The audit time of the proposal is 1,000 s, so each record ends at 4,600 s.
+    let page = NonZeroUsize::new(16).unwrap();
+    let end = Duration::from_secs(4_600);
+    for kind in [Kind::Audit, Kind::Outcome] {
+        assert_eq!(ready(memory.expire(kind, end, page)), Ok(0), "{kind:?} at its end");
+    }
+    assert_eq!(
+        ready(memory.outcome(&proposal.operation().id)).unwrap().as_ref(),
+        Some(proposal.operation())
+    );
+    for kind in [Kind::Audit, Kind::Outcome] {
+        assert_eq!(
+            ready(memory.expire(kind, end + Duration::from_nanos(1), page)),
+            Ok(1),
+            "{kind:?} after its end"
+        );
+    }
+    assert_eq!(ready(memory.outcome(&proposal.operation().id)), Ok(None));
+    assert!(
+        ready(Store::read(&mut memory, &key)).unwrap().is_some(),
+        "the credential has no end"
+    );
+}
+
 #[test]
 fn an_append_is_durable_only_after_its_sync_returns() {
     let mut memory = Memory::new(Schedule::None);

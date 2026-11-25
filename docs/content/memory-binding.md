@@ -8,7 +8,7 @@ Use it only for tests and for conformance. Never use it as a production store:
 
 - A loss of the process loses all its state.
 - Its state grows with the commits and the appends of the caller. It has no limit of its own, other than the memory
-  of the process.
+  of the process. With `with_retention`, an expiry pass removes the audit and outcome records after their end.
 - Expiry scans the records of one kind for ended records, because the binding keeps no index of ends. A production
   binding keeps such an index.
 
@@ -73,7 +73,8 @@ assert_eq!(outcome.as_ref(), Some(proposal.operation()));
 Each future of the binding is ready at its first poll, so a test needs no executor. A test that waits for the
 futures in an executor gets the same results.
 
-1. Make the binding with `Memory::new(schedule)`. A new binding is stopped.
+1. Make the binding with `Memory::new(schedule)`. A new binding is stopped. To give each audit and outcome record an
+   end, add `.with_retention(retention)` before the first commit.
 2. Call `Store::start` to get the store instance number (`Instance`). Give it to each commit.
 3. Call the primitives. After an error, call `Store::start` again, then check the state.
 
@@ -137,7 +138,7 @@ of one key give one commit and one conflict.
 | --- | --- |
 | `isolation` | `Isolation::Serializable` |
 | `crash_loss` | `CrashLoss::Everything`: the store is in the memory of the process |
-| `outcome_retention` | `Duration::MAX`: each audit and outcome record ends at the estimate of its audit time plus the retention, which saturates at `Duration::MAX`, so no expiry removes it |
+| `outcome_retention` | `Duration::MAX`, or the value of `with_retention`. Each audit and outcome record ends at the estimate of its audit time plus the retention. The sum saturates at `Duration::MAX`, so with the default no expiry removes a record. With a finite retention, an expiry pass after the end removes it |
 | `crash_injection` | `CrashInjection::Supported` |
 | `restore` | `Restore::Journal`, in the memory of the process, in a simulated domain apart from the store and its snapshots |
 | `key_bytes_max` | 2048 (`transition::Key::BYTES_MAX`) |

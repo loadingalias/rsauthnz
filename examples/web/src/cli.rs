@@ -19,7 +19,7 @@ use rsauthnz::transition::{OperationId, Outcome, Recovery};
 use rsauthnz_http::{Problem, Refusal};
 use rscrypto::ChaCha20Rng;
 
-use super::{BODY_BYTES_MAX, State, fields, ready, reply};
+use super::{BODY_BYTES_MAX, State, Subject, fields, reply, wait};
 
 const REFUSE: Problem = Problem::Recovery(Recovery::Refuse);
 type Reply = Result<Response<Vec<u8>>, Problem>;
@@ -80,7 +80,7 @@ fn sign(issuer: &super::keys::Keys, message: &[u8], random: &mut ChaCha20Rng) ->
         .map_err(|_| REFUSE)
 }
 
-impl State {
+impl<S: Subject> State<S> {
     fn cli_access(
         &mut self,
         request: &Request<Bytes>,
@@ -96,7 +96,7 @@ impl State {
         let [code] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["code"])?;
         let code = UserCode::parse(&code)?;
         let (_, account) = self.cli_access(request, now)?;
-        let shown = ready(self.cli.request(&mut self.memory, &code, now))?;
+        let shown = wait(self.cli.request(&mut self.store, &code, now))?;
         reply(|place| {
             place.object(|out| {
                 out.member("name").str(&shown.name)?;
@@ -115,9 +115,9 @@ impl State {
         (account.id.to_string() == reviewed).ok_or(Problem::Recovery(Recovery::Restart))?;
         let fresh = Fresh::check(&access, FRESH_MAX, now)?;
         let serial = Serial(self.driver.allocate(Kind::Credential)?);
-        let proposal = ready(
+        let proposal = wait(
             self.cli
-                .approve(&mut self.memory, &fresh, &code, serial, now, &mut self.random),
+                .approve(&mut self.store, &fresh, &code, serial, now, &mut self.random),
         )?;
         self.commit(proposal, now)?;
         Ok(rsauthnz_http::json(b"{}".to_vec()))
@@ -138,9 +138,9 @@ impl State {
         let [Value::Text(code), Value::Bytes(secret)] = input(request)? else {
             return Err(REFUSE);
         };
-        let status = ready(
+        let status = wait(
             self.cli
-                .poll(&mut self.memory, &UserCode::parse(code)?, &device(secret)?, now),
+                .poll(&mut self.store, &UserCode::parse(code)?, &device(secret)?, now),
         )?;
         match status {
             Status::Waiting => output(&Value::Null),
@@ -164,8 +164,8 @@ impl State {
             return Err(REFUSE);
         };
         let account = Id::from_cbor(&account).map_err(|_| REFUSE)?;
-        let draft = ready(self.cli.finish(
-            &mut self.memory,
+        let draft = wait(self.cli.finish(
+            &mut self.store,
             &UserCode::parse(code)?,
             &device(secret)?,
             &account,
@@ -185,9 +185,9 @@ impl State {
         };
         let id = identity(&account, serial)?;
         let draft =
-            ready(
+            wait(
                 self.cli
-                    .account_credential(&mut self.memory, &id, holder.try_into().map_err(|_| REFUSE)?, now),
+                    .account_credential(&mut self.store, &id, holder.try_into().map_err(|_| REFUSE)?, now),
             )?;
         let signature = sign(&self.issuer, &draft.to_be_signed(), &mut self.random)?;
         output(&Value::Bytes(&draft.finish(&signature)?))
@@ -199,8 +199,8 @@ impl State {
         };
         let id = identity(&account, serial)?;
         let op = operation(&mut self.random)?;
-        let offer = ready(self.cli.account_challenge(
-            &mut self.memory,
+        let offer = wait(self.cli.account_challenge(
+            &mut self.store,
             &id,
             holder.try_into().map_err(|_| REFUSE)?,
             now,
@@ -232,9 +232,9 @@ impl State {
         )
         .map_err(|_| REFUSE)?;
         let (proposal, admission) =
-            ready(
+            wait(
                 self.cli
-                    .admit(&mut self.memory, credential, proof, &call, now, &mut self.random),
+                    .admit(&mut self.store, credential, proof, &call, now, &mut self.random),
             )?;
         let receipt = self.commit((proposal, Plan::default()), now)?;
         let admitted = admission.release(&Outcome::Accepted(receipt)).ok_or(REFUSE)?;

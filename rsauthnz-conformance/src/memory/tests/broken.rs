@@ -18,7 +18,7 @@ use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Recor
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 
-use super::super::{Error, Fault, Memory, Request, Schedule, Snapshot};
+use super::super::{Error, Fault, Memory, RETENTION, Request, Schedule, Snapshot};
 use super::ready;
 use crate::suite::{self, Case, Report, Subject};
 
@@ -131,7 +131,7 @@ impl Store for Broken {
     }
 
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
-        let mut request = Request::new(proposal);
+        let mut request = Request::new(proposal, RETENTION);
         match self.defect {
             Defect::NoAtomicCheck => request.dependencies.clear(),
             Defect::WriteSkew => {
@@ -296,7 +296,7 @@ impl Store for Measured {
     /// Measures each record that the commit stores: the record form of each write, and each intent, audit, and
     /// outcome record.
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
-        let request = Request::new(proposal);
+        let request = Request::new(proposal, RETENTION);
         let writes = request.changes.iter().filter_map(|change| match change {
             Change::Write { data, .. } => Some(data.len()),
             Change::End(_) => None,

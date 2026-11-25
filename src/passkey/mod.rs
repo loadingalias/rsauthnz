@@ -1176,6 +1176,13 @@ impl Assertion {
                 .map(Vec::into_boxed_slice),
         })
     }
+
+    /// The credential ID of the assertion. A host reads it before it admits the sign-in, for example to bound the
+    /// waiting sign-ins of one credential. It is input of the peer: only [`RelyingParty::sign_in`] checks it.
+    #[must_use]
+    pub fn id(&self) -> &[u8] {
+        &self.id
+    }
 }
 
 // The challenge and the signature can repeat the sign-in while the challenge is open, so the output shows only lengths.

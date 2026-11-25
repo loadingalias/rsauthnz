@@ -102,7 +102,9 @@ Before issuing options, wait until `now.earliest()` reaches that time. Each subs
 2. The browser gives the options to `PublicKeyCredential.parseRequestOptionsFromJSON()`, calls
    `navigator.credentials.get()`, and sends `credential.toJSON()` as the JSON body of a state change. The `signIn`
    function of the [browser adapter](browser-adapter.md) does this step.
-3. Check the request with `site.json_change`, then read the body with `Assertion::parse`.
+3. Check the request with `site.json_change`, then read the body with `Assertion::parse`. `assertion.id()` gives
+   the credential ID before the sign-in checks it. A host can use it to bound the waiting sign-ins of one credential
+   ([the limits of the web example](web-example.md#limits)).
 4. Call `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It checks the tag and the lifetime of
    the challenge before any read. Then it reads the credential record, the replay floor, and the replay record of the
    challenge, and it checks the assertion and its signature. It gives a `SignIn`. A passkey that a

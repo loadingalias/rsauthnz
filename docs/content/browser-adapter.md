@@ -70,7 +70,7 @@ action of the page, and its `status` is the HTTP status, or 0 when no response a
 
 | `recovery` | Cause | The page |
 | --- | --- | --- |
-| `restart` | Nothing committed, such as a conflict or a challenge that ended | Starts the ceremony again |
+| `restart` | Nothing committed, such as a conflict or a challenge that ended. With the `status` 503, the host had no room for the request | Starts the ceremony again. After a 503, it waits first |
 | `check` | The outcome is unknown: the server could not resolve it, or the finish got no response | Loads the current state, such as the account page. It never sends the request again |
 | `verify` | The change needs a fresh user verification ([Manage accounts](accounts.md#fresh-user-verification)) | Calls `signIn` again, which replaces the session, then starts the change again |
 | `forget` | A removal ended the passkey of the sign-in ([Remove a passkey](accounts.md#remove-a-passkey)). `signIn` has called `signalDeleted` for it already | Asks for a sign-in with another passkey |

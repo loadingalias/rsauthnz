@@ -11,7 +11,7 @@ use rsauthnz::passkey::RelyingParty;
 use rsauthnz::session::Identifier;
 use rsauthnz::transition::Recovery;
 use rsauthnz_http::{
-    CookieName, Error, RELATED_ORIGINS, Refusal, SameSite, Site, browser_module, json, problem, redirect,
+    CookieName, Error, Problem, RELATED_ORIGINS, Refusal, SameSite, Site, browser_module, json, problem, redirect,
     related_origins,
 };
 
@@ -421,10 +421,14 @@ fn an_error_response_holds_only_its_recovery() {
         // The browser module calls `signalUnknownCredential` on this body, so the provider can delete the passkey.
         (problem(Recovery::Forget), 410, br#"{"recovery":"forget"}"#),
         (problem(Recovery::Refuse), 403, refuse),
+        // The host had no room, and nothing committed: the client sends the request again after the time.
+        (Problem::Busy.response(&site), 503, br#"{"recovery":"restart"}"#),
     ];
     for (response, status, body) in cases {
         assert_eq!((response.status().as_u16(), response.body().as_slice()), (status, body));
         assert_eq!(response.headers()["content-type"], "application/problem+json");
         assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers().get("retry-after").is_some(), status == 503);
     }
+    assert_eq!(Problem::Busy.response(&site).headers()["retry-after"], "1");
 }
