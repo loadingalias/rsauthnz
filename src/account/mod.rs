@@ -364,7 +364,7 @@ impl RelyingParty {
             invite.action.to_cbor(),
             invite.resource.to_cbor(),
         ]);
-        let mut proposal = self.proposal_by(passkey::operation(random), issuer.clone(), INVITE, &request, now)?;
+        let mut proposal = self.proposal_by(OperationId::random(random), issuer.clone(), INVITE, &request, now)?;
         proposal.read(Dependency::Policy(checked.permit().version.clone()))?;
         proposal.until(checked.deadline());
         proposal.read(Dependency::Absent(key.clone()))?;
@@ -580,7 +580,7 @@ impl RelyingParty {
             && session.epoch.credential(passkey.credential.id()) == passkey.key)
             .ok_or(passkey::Error::Credential)?;
         let request = Value::Array(vec![Value::Bytes(passkey.key.as_bytes()), Value::Text(name)]);
-        let mut proposal = self.proposal(passkey::operation(random), &passkey.account, RENAME, &request, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), &passkey.account, RENAME, &request, now)?;
         access.gate(&mut proposal)?;
         proposal.read(Dependency::Version(passkey.key.clone(), passkey.version.clone()))?;
         let mut credential = passkey.credential.clone();
@@ -636,7 +636,7 @@ impl RelyingParty {
             .find(|stored| stored.passkey.key != target.passkey.key)
             .ok_or(passkey::Error::Transition(transition::Error::LastAnchor))?;
         let request = Value::Bytes(target.passkey.key.as_bytes());
-        let mut proposal = self.proposal(passkey::operation(random), &fresh.account, REMOVE, &request, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), &fresh.account, REMOVE, &request, now)?;
         fresh.gate(&mut proposal).map_err(passkey::Error::from)?;
         for kept in [survivor, target] {
             proposal

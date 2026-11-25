@@ -48,10 +48,47 @@ use crate::crypto;
 use crate::id::{Authority, AuthorityVersion, Id};
 use crate::limits::Limits;
 use crate::time::{Reading, ReadingSource, TimeError};
-use crate::transition::{self, Change, Key, Operation, OperationId, Proposal};
+use crate::transition::{self, Change, Key, Operation, OperationId, Proposal, Recover, Recovery};
 
 pub mod driver;
 pub mod journal;
+
+/// The failure of an operation that reads the store: a refusal `R` of the module of the operation, or a failed read with
+/// the error `S` of the binding. Each module names it `Failure<E>` with its own refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure<R, S> {
+    /// The operation refused.
+    Refused(R),
+    /// A read failed. It is a crash of the binding: start the driver again.
+    Store(S),
+}
+
+impl<R: Recover, S> Recover for Failure<R, S> {
+    /// The recovery of the refusal, and [`Recovery::Restart`] after a failed read: nothing committed.
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Refused(error) => error.recovery(),
+            Self::Store(_) => Recovery::Restart,
+        }
+    }
+}
+
+impl<R, S> From<R> for Failure<R, S> {
+    fn from(error: R) -> Self {
+        Self::Refused(error)
+    }
+}
+
+impl<R: fmt::Display, S: fmt::Display> fmt::Display for Failure<R, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(error) => error.fmt(f),
+            Self::Store(error) => write!(f, "a read of the store failed: {error}"),
+        }
+    }
+}
+
+impl<R: core::error::Error, S: core::error::Error> core::error::Error for Failure<R, S> {}
 
 /// The first item of the CBOR form of an audit record. Its number changes with the form.
 const AUDIT_FORM: &str = "rsauthnz.store.audit.1";
@@ -114,7 +151,7 @@ pub enum Kind {
     /// ([`workload::Registration`](crate::workload::Registration)).
     Workload = 24,
     /// The removal mark of a passkey: a removal ended it, so a sign-in with it answers
-    /// [`Recovery::Forget`](crate::transition::Recovery::Forget). Its key holds the identifier of the credential key,
+    /// [`Recovery::Forget`]. Its key holds the identifier of the credential key,
     /// and it ends after [`REMOVAL_MARK_LIFETIME`](crate::account::REMOVAL_MARK_LIFETIME).
     Removal = 25,
     /// A durable recovery or enrollment revision of an account.

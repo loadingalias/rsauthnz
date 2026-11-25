@@ -59,7 +59,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::time::Duration;
 
-use rscrypto::SecretVec;
+use rscrypto::{ChaCha20Rng, SecretVec};
 
 use crate::cbor::{self, Value};
 use crate::crypto;
@@ -92,6 +92,13 @@ impl OperationId {
     pub fn new(bytes: &[u8]) -> Result<Self, Error> {
         (1..=Self::BYTES_MAX).contains(&bytes.len()).ok_or(Error::OperationId)?;
         Ok(Self(bytes.into()))
+    }
+
+    /// A new operation identity: 32 bytes from `random`.
+    pub(crate) fn random(random: &mut ChaCha20Rng) -> Self {
+        let mut id = [0; 32];
+        random.fill_bytes(&mut id);
+        Self(id.into())
     }
 
     /// The bytes of the identity.

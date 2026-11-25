@@ -683,27 +683,4 @@ impl fmt::Display for Error {
 impl core::error::Error for Error {}
 
 /// The failure of an operation that reads the store: a refusal, or a failed read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Failure<E> {
-    /// The operation refused.
-    Refused(Error),
-    /// A read failed. It is a crash of the binding: start the driver again.
-    Store(E),
-}
-
-impl<E> From<Error> for Failure<E> {
-    fn from(error: Error) -> Self {
-        Self::Refused(error)
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for Failure<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Refused(error) => error.fmt(f),
-            Self::Store(error) => write!(f, "a read of the store failed: {error}"),
-        }
-    }
-}
-
-impl<E: core::error::Error> core::error::Error for Failure<E> {}
+pub type Failure<E> = crate::store::Failure<Error, E>;

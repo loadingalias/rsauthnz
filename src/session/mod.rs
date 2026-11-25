@@ -249,7 +249,7 @@ impl Sessions {
         (now.latest().map_err(Error::Time)? < session.end).ok_or(Error::Ended)?;
         let (identifier, tag) =
             Identifier::draw(session.locator(), &access.family, &session.epoch, &session.key, random);
-        let mut proposal = self.proposal(operation(random), &session.account, RENEW, &session.key, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), &session.account, RENEW, &session.key, now)?;
         access.gate(&mut proposal)?;
         let end = add(earliest, self.policy.idle)?.min(session.expires);
         let data = self.record(
@@ -321,7 +321,7 @@ impl Sessions {
             time: now,
         };
         let request = self.request(&session.key);
-        let mut proposal = Proposal::new(operation(random), audit, &request, self.limits)?;
+        let mut proposal = Proposal::new(OperationId::random(random), audit, &request, self.limits)?;
         if let Some(fresh) = fresh {
             fresh.gate(&mut proposal)?;
         }
@@ -589,13 +589,6 @@ fn add(time: Duration, duration: Duration) -> Result<Duration, Error> {
 /// The audit action `name` of this module.
 fn action(name: &str) -> Id<Action> {
     Id::new("rsauthnz", name).expect("each action of this module is a valid identifier")
-}
-
-/// A new operation identity: 32 bytes from `random`.
-fn operation(random: &mut ChaCha20Rng) -> OperationId {
-    let mut id = [0; 32];
-    random.fill_bytes(&mut id);
-    OperationId::new(&id).expect("32 bytes are a valid operation identity")
 }
 
 /// The identifier of a session: the value of its cookie. It is a bearer secret, so `Debug` shows nothing of it, and its
@@ -1063,37 +1056,4 @@ impl From<driver::Error> for Error {
 }
 
 /// The failure of an operation that reads the store: a refusal, or a failed read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Failure<E> {
-    /// The operation refused.
-    Refused(Error),
-    /// A read failed. It is a crash of the binding: start the driver again.
-    Store(E),
-}
-
-impl<E> Recover for Failure<E> {
-    /// The recovery of the refusal, and [`Recovery::Restart`] after a failed read: nothing committed.
-    fn recovery(&self) -> Recovery {
-        match self {
-            Self::Refused(error) => error.recovery(),
-            Self::Store(_) => Recovery::Restart,
-        }
-    }
-}
-
-impl<E> From<Error> for Failure<E> {
-    fn from(error: Error) -> Self {
-        Self::Refused(error)
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for Failure<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Refused(error) => error.fmt(f),
-            Self::Store(error) => write!(f, "a read of the store failed: {error}"),
-        }
-    }
-}
-
-impl<E: core::error::Error> core::error::Error for Failure<E> {}
+pub type Failure<E> = crate::store::Failure<Error, E>;

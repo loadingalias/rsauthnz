@@ -421,7 +421,7 @@ impl RelyingParty {
             .checked_add(REGISTRATION_LIFETIME)
             .ok_or(Error::Time(TimeError::Overflow))?;
         let request = Value::Array(vec![account.to_cbor(), Value::Bytes(&handle.0)]);
-        let mut proposal = self.proposal(operation(random), account, START, &request, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), account, START, &request, now)?;
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
         proposal.read(epoch.dependency()).map_err(Error::from)?;
         decision.apply(&mut proposal, account, &epoch, !records.is_empty())?;
@@ -1633,7 +1633,7 @@ impl SignIn {
         ]);
         let action = if possible_clone { SIGN_IN_CLONE } else { SIGN_IN };
         let actor = Principal::Human(account.clone());
-        let mut proposal = owner.proposal_by(operation(random), actor, action, &request, records.now)?;
+        let mut proposal = owner.proposal_by(OperationId::random(random), actor, action, &request, records.now)?;
         proposal.read(records.epoch.dependency()).map_err(Error::from)?;
         proposal
             .read(Dependency::Version(records.key.clone(), records.record.version))
@@ -1774,13 +1774,6 @@ fn pending_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle, E
     let account = Id::from_cbor(account).map_err(|_| Error::Record)?;
     let handle = <[u8; 32]>::try_from(*handle).map_err(|_| Error::Record)?;
     Ok((account, UserHandle(handle), Epoch::parse(epoch).ok_or(Error::Record)?))
-}
-
-/// A new operation identity: 32 bytes from `random`.
-pub(crate) fn operation(random: &mut ChaCha20Rng) -> OperationId {
-    let mut id = [0; 32];
-    random.fill_bytes(&mut id);
-    OperationId::new(&id).expect("32 bytes are a valid operation identity")
 }
 
 /// The reads of `decision`, the decision of the application, in `proposal`.
@@ -2025,40 +2018,7 @@ impl From<driver::Error> for Error {
 }
 
 /// The failure of an operation that reads the store: a refusal, or a failed read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Failure<E> {
-    /// The operation refused.
-    Refused(Error),
-    /// A read failed. It is a crash of the binding: start the driver again.
-    Store(E),
-}
-
-impl<E> Recover for Failure<E> {
-    /// The recovery of the refusal, and [`Recovery::Restart`] after a failed read: nothing committed.
-    fn recovery(&self) -> Recovery {
-        match self {
-            Self::Refused(error) => error.recovery(),
-            Self::Store(_) => Recovery::Restart,
-        }
-    }
-}
-
-impl<E> From<Error> for Failure<E> {
-    fn from(error: Error) -> Self {
-        Self::Refused(error)
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for Failure<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Refused(error) => error.fmt(f),
-            Self::Store(error) => write!(f, "a read of the store failed: {error}"),
-        }
-    }
-}
-
-impl<E: core::error::Error> core::error::Error for Failure<E> {}
+pub type Failure<E> = crate::store::Failure<Error, E>;
 
 #[cfg(test)]
 mod tests;

@@ -101,7 +101,7 @@ use crate::store::driver::{Driver, Plan};
 use crate::store::journal::{Anchor, Role};
 use crate::store::{Kind, Store};
 use crate::time::Reading;
-use crate::transition::{Change, Dependency, Key, Prepared, Proposal};
+use crate::transition::{Change, Dependency, Key, OperationId, Prepared, Proposal};
 
 /// The random bytes of a recovery code: 128 bits.
 pub const CODE_BYTES: usize = 16;
@@ -271,7 +271,7 @@ impl RelyingParty {
         let key = self.recovery_key(handle);
         let earlier = passkey::read(store, &key).await?;
         let request = Value::Bytes(key.as_bytes());
-        let mut proposal = self.proposal(passkey::operation(random), account, ISSUE, &request, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), account, ISSUE, &request, now)?;
         fresh.gate(&mut proposal).map_err(Error::from)?;
         proposal
             .read(Dependency::Version(
@@ -437,7 +437,7 @@ impl RelyingParty {
         };
         let data = credential.record(&account, &handle);
         let request = Value::Array(vec![Value::Bytes(key.as_bytes()), Value::Bytes(&data)]);
-        let mut proposal = self.proposal(passkey::operation(random), &account, RECOVER, &request, now)?;
+        let mut proposal = self.proposal(OperationId::random(random), &account, RECOVER, &request, now)?;
         let mut plan = Plan::default();
         if let Some(guard) = enrollment_guard {
             proposal.read(guard).map_err(Error::from)?;
