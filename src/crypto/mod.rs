@@ -7,10 +7,8 @@
 //! Each digest goes through one SHA-256 function, and each keyed digest of a recovery code through one keyed BLAKE3
 //! function.
 //!
-//! The composite profiles are those of the [LAMPS composite signatures] (draft 19, which becomes RFC 10073). Both
-//! components sign the same message, and a composite signature verifies only if both components verify. rscrypto
-//! does the construction, and this crate adds no combiner. COSE uses the empty context of the construction, as the
-//! [JOSE and COSE composite draft] requires.
+//! [RFC 10073] defines both composite signatures. Verification requires valid ML-DSA and classical components.
+//! JOSE and COSE use an empty context. The Ed25519 profile follows [draft 06]. [Draft 07] keeps the P-256 profile.
 //!
 //! ```
 //! use rsauthnz::crypto::{Algorithm, Authentication, Registration};
@@ -26,8 +24,9 @@
 //! ```
 //!
 //! [rscrypto]: https://crates.io/crates/rscrypto
-//! [LAMPS composite signatures]: https://datatracker.ietf.org/doc/draft-ietf-lamps-pq-composite-sigs/
-//! [JOSE and COSE composite draft]: https://datatracker.ietf.org/doc/draft-ietf-jose-pq-composite-sigs/
+//! [RFC 10073]: https://www.rfc-editor.org/rfc/rfc10073.html
+//! [draft 06]: https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-06
+//! [Draft 07]: https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-07
 
 #[cfg(all(feature = "native-custody", any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) mod secret;
@@ -44,12 +43,10 @@ use rscrypto::{HmacSha256, HmacSha256Tag, RsaPkcs1v15Profile, RsaPssProfile, Rsa
 
 use crate::limits::{Limit, SignatureBudget};
 
-/// The COSE identifier of composite ML-DSA-65 + Ed25519. DRAFT: draft-ietf-jose-pq-composite-sigs-06 (section
-/// 7.2.6) requests -59, and IANA has not assigned it. A change of the draft changes only this constant.
+/// Draft 06 used -59 for ML-DSA-65 + Ed25519. Draft 07 omits this profile.
 const ML_DSA_65_ED25519_DRAFT: i64 = -59;
 
-/// The COSE identifier of composite ML-DSA-65 + ECDSA P-256. DRAFT: draft-ietf-jose-pq-composite-sigs-06 (section
-/// 7.2.2) requests -55, and IANA has not assigned it. A change of the draft changes only this constant.
+/// Drafts 06 and 07 request -55 for ML-DSA-65 + ECDSA P-256. IANA lists it as unassigned.
 const ML_DSA_65_ECDSA_P256_DRAFT: i64 = -55;
 
 /// The most bits of the modulus of an RSA key of [`Algorithm::Rs256`] and [`Algorithm::Ps256`].
@@ -189,8 +186,7 @@ pub struct Report {
 pub enum Registration {
     /// IANA assigned the identifier.
     Assigned,
-    /// A draft requests the identifier, and IANA has not assigned it. A later draft can change it, and another
-    /// implementation can use another value.
+    /// The profile has no IANA assignment. An identifier from a particular draft can require peer agreement.
     Draft,
 }
 

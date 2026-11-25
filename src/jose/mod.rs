@@ -7,8 +7,7 @@
 //! carries a key (`jku`, `jwk`, `x5u`, `x5c`, `x5t`, `x5t#S256`) refuses, and so do `crit` and `b64`.
 //!
 //! The JOSE names are `Ed25519` ([RFC 9864], which also takes the `EdDSA` of [RFC 8037]), `ES256`, `RS256`, `PS256`,
-//! `ML-DSA-65` ([RFC 9964]), and the two composite names of draft 06 of the JOSE and COSE composite draft, each in one
-//! constant: [`ML_DSA_65_ED25519`] and [`ML_DSA_65_ES256`]. RS256 and PS256 only verify.
+//! `ML-DSA-65` ([RFC 9964]), [`ML_DSA_65_ED25519`], and [`ML_DSA_65_ES256`]. RS256 and PS256 only verify.
 //!
 //! [`Profile::verify`] checks a JWS and gives its payload. [`Profile::verify_jwt`] also checks the claims at a time
 //! reading with its bound: the issuer, the audience, `exp`, and `nbf`. [`signing_input`] and [`compact`] make a JWS:
@@ -60,12 +59,10 @@ pub const TOKEN_BYTES_MAX: usize = 16 * 1024;
 /// The most keys of a profile, also from a key set.
 pub const KEYS_MAX: usize = 16;
 
-/// The JOSE name of composite ML-DSA-65 + Ed25519 in draft 06 of the JOSE and COSE composite draft. IANA has not
-/// assigned it.
+/// Draft 06 names ML-DSA-65 + Ed25519. Draft 07 omits this profile. IANA lists no assignment.
 pub const ML_DSA_65_ED25519: &str = "ML-DSA-65-Ed25519";
 
-/// The JOSE name of composite ML-DSA-65 + ECDSA P-256 in draft 06 of the JOSE and COSE composite draft. IANA has not
-/// assigned it.
+/// Drafts 06 and 07 name ML-DSA-65 + ECDSA P-256. IANA lists no assignment.
 pub const ML_DSA_65_ES256: &str = "ML-DSA-65-ES256";
 
 /// The limits of a header.

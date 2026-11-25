@@ -26,17 +26,20 @@ and the kind of each JWT. A token can only match its profile:
 
 | `Algorithm` | JOSE `alg` | Key in a key set | Use |
 | --- | --- | --- | --- |
-| `MlDsa65Ed25519` | `ML-DSA-65-Ed25519` (draft) | `AKP` with `alg` and `pub` | Sign and verify |
-| `MlDsa65EcdsaP256` | `ML-DSA-65-ES256` (draft) | `AKP` with `alg` and `pub` | Sign and verify |
+| `MlDsa65Ed25519` | `ML-DSA-65-Ed25519` (draft 06 only) | `AKP` with `alg` and `pub` | Sign and verify |
+| `MlDsa65EcdsaP256` | `ML-DSA-65-ES256` (draft 07 request) | `AKP` with `alg` and `pub` | Sign and verify |
 | `MlDsa65` | `ML-DSA-65` ([RFC 9964](https://www.rfc-editor.org/rfc/rfc9964)) | `AKP` with `alg` and `pub` | Sign and verify |
 | `Ed25519` | `Ed25519` ([RFC 9864](https://www.rfc-editor.org/rfc/rfc9864)); verification also takes `EdDSA` | `OKP` with `crv` `Ed25519` | Sign and verify |
 | `Es256` | `ES256` | `EC` with `crv` `P-256` | Sign and verify |
 | `Rs256` | `RS256` | `RSA` | Verify only |
 | `Ps256` | `PS256` | `RSA` | Verify only |
 
-The composite names come from draft 06 of the [JOSE and COSE composite
-draft](https://datatracker.ietf.org/doc/draft-ietf-jose-pq-composite-sigs/), each in one constant:
-`jose::ML_DSA_65_ED25519` and `jose::ML_DSA_65_ES256`. IANA has not assigned them. An RSA key has a modulus of 2,048 to
+Draft 06 names both composites. Draft 07 keeps the P-256 profile and drops ML-DSA-65 with Ed25519.
+Existing Ed25519 credentials use the draft 06 name. Both peers must select the same profile.
+[Draft 06](https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-06#section-7), [draft 07](https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-07#section-7), and
+[IANA JOSE](https://www.iana.org/assignments/jose/jose.xhtml#web-signature-encryption-algorithms).
+
+An RSA key has a modulus of 2,048 to
 4,096 bits and the exponent 65,537 ([Signature profiles](profiles.md)).
 
 ## Verify a token

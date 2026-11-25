@@ -26,25 +26,23 @@ IANA marks ES256 (-7) deprecated since [RFC 9864](https://www.rfc-editor.org/rfc
 fully specified ESP256 (-9). `Es256` keeps -7, because the classical profile serves a verifier that supports nothing
 else, and such a verifier knows -7.
 
-The two composite profiles are the [LAMPS composite
-signatures](https://datatracker.ietf.org/doc/draft-ietf-lamps-pq-composite-sigs/) (draft 19, which becomes RFC
-10073). ML-DSA-65 and the classical algorithm sign the same message. A composite signature verifies only if both
+[RFC 10073](https://www.rfc-editor.org/rfc/rfc10073.html) defines both composite signatures. ML-DSA-65 and the classical algorithm sign the same message. A composite signature verifies only if both
 components verify. One component alone does not verify as the composite. Thus each composite signature costs two
 signature checks.
 
-COSE uses the composite with the empty context, as the [JOSE and COSE composite
-draft](https://datatracker.ietf.org/doc/draft-ietf-jose-pq-composite-sigs/) (draft 06, section 4.1) requires. A
+COSE uses the empty context for both composite profiles. A
 composite `COSE_Key` is an `AKP` key (`kty` 7) with `alg` and `pub`. `pub` is the public key in the encoding of
-the LAMPS draft: the ML-DSA-65 key, then the Ed25519 key or the uncompressed P-256 point. A composite signature is
+RFC 10073: the ML-DSA-65 key, then the Ed25519 key or the uncompressed P-256 point. A composite signature is
 the ML-DSA-65 signature, then the Ed25519 signature or the DER `Ecdsa-Sig-Value` of the ECDSA signature. The
 verifier accepts only the canonical DER. An `Es256` signature is different: it is `r || s`, 64 bytes.
 
 ### Draft identifiers
 
-IANA has not assigned the COSE identifiers of the composite profiles. Draft 06 of the JOSE and COSE composite draft
-requests -59 for `MlDsa65Ed25519` and -55 for `MlDsa65EcdsaP256`, and rsauthnz uses these values. Until IANA
-assigns them, another implementation can use other values. A later draft can change them. Each value is one
-constant in rsauthnz, so a change of the draft changes only that constant.
+rsauthnz uses -59 for ML-DSA-65 with Ed25519 and -55 for ML-DSA-65 with P-256.
+Draft 06 requests both values. Draft 07 retains only the P-256 request. IANA lists both values as unassigned.
+Verify existing credentials under their original trusted profile. Reissue credentials when changing the signature algorithm.
+[Draft 06](https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-06#section-7), [draft 07](https://datatracker.ietf.org/doc/html/draft-ietf-jose-pq-composite-sigs-07#section-7), and
+[IANA COSE](https://www.iana.org/assignments/cose/cose.xhtml#algorithms).
 
 ## The profile of an audience
 
