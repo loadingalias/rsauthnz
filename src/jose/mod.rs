@@ -271,6 +271,11 @@ impl Profile {
         Ok(self)
     }
 
+    /// Whether the profile has a key.
+    pub(crate) fn has_keys(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
     /// Checks the JWS `token` in the compact serialization, and gives its header and its payload. The token has at
     /// most [`TOKEN_BYTES_MAX`] bytes.
     ///

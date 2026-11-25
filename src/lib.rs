@@ -16,6 +16,7 @@ pub mod id;
 pub mod jose;
 pub mod limits;
 pub mod local;
+pub mod oidc;
 pub mod passkey;
 pub mod recovery;
 pub mod session;
