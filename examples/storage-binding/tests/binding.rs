@@ -1,5 +1,7 @@
 //! The file binding keeps the storage contract: it passes the conformance suite with and without a journal, and a
 //! start after a torn write serves the durable state.
+// The binding claims durability on a Unix file system only: its durable rename syncs the directory.
+#![cfg(unix)]
 
 use core::mem::DropGuard;
 use core::num::NonZeroUsize;

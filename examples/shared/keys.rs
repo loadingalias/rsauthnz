@@ -26,10 +26,12 @@ impl Keys {
     ///
     /// Returns the file or custody error. An incomplete enrollment requires a new directory.
     pub(crate) fn open(directory: &Path, record: &str, random: &mut ChaCha20Rng) -> Result<Self, Error> {
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        let created = match builder.create(directory) {
+        // On Windows, each key file of the custody has its own owner-only DACL.
+        let made = cfg_select! {
+            unix => std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(directory),
+            _ => fs::create_dir(directory),
+        };
+        let created = match made {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
             Err(error) => return Err(error.into()),

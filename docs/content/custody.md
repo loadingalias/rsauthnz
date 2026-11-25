@@ -222,8 +222,8 @@ when it drops. rscrypto builds the key in place in its allocation, and signing r
 PKCS #8 encoding in place, and an export writes it into a buffer that is cleared. Thus an import or an export holds
 the encoding and the key together for that one call. The file custody reads the key file into such a buffer. A test
 of the library reads each heap block that the file custody frees, through the OS, and it finds no key bytes. That
-test passes on macOS 27.2.1 on aarch64, and on Ubuntu 26.04 on x86_64 with glibc and with musl. It has not run on
-Windows.
+test passes on macOS 27.2.1 on aarch64, on Ubuntu 26.04 on x86_64 with glibc and with musl, and on Windows Server
+2025 (build 26100) on x86_64.
 
 The Keychain custody also gets a copy of the item in memory of macOS, and rscrypto reads the key from it in place.
 The custody releases that copy before it signs, but it cannot clear it. Enroll writes the encoding into memory that
