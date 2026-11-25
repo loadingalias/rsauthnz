@@ -41,7 +41,7 @@ async function run(action) {
     } else if (error instanceof Problem && error.recovery === "check") {
       message.textContent = "The response was lost. Check your terminal or review the request again.";
     } else if (error instanceof Problem && error.recovery === "restart") {
-      message.textContent = "Review the request again. If the code expired, start enrollment again in your terminal.";
+      message.textContent = "Check the code in your terminal, and enter it again. After 5 wrong codes, or when the code expires, start enrollment again in your terminal.";
     } else if (error instanceof Problem && error.recovery === "forget") {
       verify.hidden = false;
       message.textContent = "This passkey was removed. Sign in with another passkey.";

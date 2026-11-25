@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use authenticator::Passkey;
 use http::StatusCode;
 use rsauthnz::account::FRESH_MAX;
+use rsauthnz::agent::{ATTEMPTS_MAX, UserCode};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz::local::enroll::UserCode;
 use rsauthnz_conformance::suite::{Fault, Subject as _};
 use support::{Browser, Site, member};
 
@@ -101,10 +101,19 @@ async fn browser_approval_requires_fresh_verification_and_the_native_cli_recover
     .expect("the CLI prompt");
     UserCode::parse(&code).expect("the displayed user code");
     let review = format!(r#"{{"code":"{code}"}}"#);
-    let no_session = site
-        .send(&mut Browser::default(), "POST", "/cli/request", review.as_bytes())
-        .await;
-    assert_eq!(no_session.body, r#"{"recovery":"verify"}"#);
+    let (locator, check) = code.split_once('-').expect("two groups");
+    let other = if check.starts_with('B') { "CCCC" } else { "BBBB" };
+    let wrong = format!(r#"{{"code":"{locator}-{other}"}}"#);
+    // A human who is not signed in checks no code, so no wrong code of theirs counts against the bound.
+    for body in core::iter::repeat_n(&wrong, usize::try_from(ATTEMPTS_MAX).expect("a count")).chain([&review]) {
+        let no_session = site
+            .send(&mut Browser::default(), "POST", "/cli/request", body.as_bytes())
+            .await;
+        assert_eq!(no_session.body, r#"{"recovery":"verify"}"#);
+    }
+    // A wrong code of a signed-in human counts, and the page shows nothing of the request.
+    let counted = site.send(&mut browser, "POST", "/cli/request", wrong.as_bytes()).await;
+    assert_eq!(counted.body, r#"{"recovery":"restart"}"#);
     let shown = site.post(&mut browser, "/cli/request", review.as_bytes()).await;
     assert_eq!(member(&shown, "name"), "Alice laptop");
     assert_eq!(member(&shown, "account"), "alice");

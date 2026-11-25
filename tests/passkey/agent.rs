@@ -18,7 +18,7 @@ use rscodec::base64::Profile::Url;
 use rscrypto::auth::MlDsa65Ed25519;
 
 use super::authenticator::{Get, Passkey};
-use super::{HANDLE, ORIGIN, RP_ID, Site, alice, at, ready};
+use super::{HANDLE, ORIGIN, RP_ID, Site, alice, at, ready, wrong};
 
 /// The site of alice with her passkey, and the agent enrollment of the site.
 struct World {
@@ -26,6 +26,9 @@ struct World {
     passkey: Passkey,
     agents: Agents,
 }
+
+/// The proposal of a check of a user code, its plan, and its answer.
+type Proposed<T> = (Proposal, Plan, Checked<T>);
 
 /// An agent that asked for an enrollment: its public key, and the values of its request.
 struct Agent {
@@ -99,8 +102,8 @@ impl World {
         (access, fresh, cookie)
     }
 
-    /// The request of `code` as the approval page shows it to the human of `access` at `seconds`.
-    fn show(&mut self, access: &Access, code: &UserCode, seconds: u64) -> Result<Checked<Request>, Error> {
+    /// The proposal of the check of `code` for the approval page of the human of `access` at `seconds`, and its answer.
+    fn check(&mut self, access: &Access, code: &UserCode, seconds: u64) -> Result<Proposed<Request>, Error> {
         let request = self.agents.request(
             &mut self.site.node.memory,
             access,
@@ -111,8 +114,16 @@ impl World {
         ready(request).map_err(refused)
     }
 
-    /// The approval proposal of the request of `code` with `fresh` at `seconds`.
-    fn approval(&mut self, fresh: &Fresh, code: &UserCode, seconds: u64) -> Result<Checked<(Proposal, Plan)>, Error> {
+    /// The request of `code` as the approval page shows it to the human of `access` at `seconds`, after the commit of
+    /// its check: `None` for a wrong code.
+    fn show(&mut self, access: &Access, code: &UserCode, seconds: u64) -> Result<Option<Request>, Error> {
+        let (proposal, plan, checked) = self.check(access, code, seconds)?;
+        let outcome = self.commit((proposal, plan));
+        Ok(checked.release(&outcome))
+    }
+
+    /// The approval proposal of the request of `code` with `fresh` at `seconds`, and its answer.
+    fn approval(&mut self, fresh: &Fresh, code: &UserCode, seconds: u64) -> Result<Proposed<Option<Loopback>>, Error> {
         let approve = self.agents.approve(
             &mut self.site.node.memory,
             fresh,
@@ -120,18 +131,17 @@ impl World {
             at(seconds),
             &mut self.site.random,
         );
-        Ok(match ready(approve).map_err(refused)? {
-            Checked::Right((proposal, plan, _)) => Checked::Right((proposal, plan)),
-            Checked::Wrong(proposal, plan) => Checked::Wrong(proposal, plan),
-        })
+        ready(approve).map_err(refused)
     }
 
     /// Commits the approval of the request of `agent` with `fresh` at `seconds`, and gives the outcome.
     fn approve(&mut self, agent: &Agent, fresh: &Fresh, seconds: u64) -> Outcome {
-        let Checked::Right(proposal) = self.approval(fresh, &agent.started.code, seconds).expect("an approval") else {
-            panic!("the code is right");
-        };
-        self.commit(proposal)
+        let (proposal, plan, checked) = self.approval(fresh, &agent.started.code, seconds).expect("an approval");
+        let outcome = self.commit((proposal, plan));
+        if matches!(outcome, Outcome::Accepted(_)) {
+            assert_eq!(checked.release(&outcome), Some(None));
+        }
+        outcome
     }
 
     /// The finish of `agent` at `seconds`, with the redirect code `redirect`.
@@ -186,29 +196,14 @@ fn refused(failure: Failure<rsauthnz_conformance::memory::Error>) -> Error {
     }
 }
 
-/// The user code of `code` with the check letters `check`.
-fn with_check(code: &UserCode, check: &str) -> UserCode {
-    let text = code.text();
-    let (locator, _) = text.split_once('-').expect("two groups");
-    UserCode::parse(&format!("{locator}-{check}")).expect("a code")
-}
-
-/// A check that the right code never has: one letter of the alphabet that differs from its first check letter.
-fn wrong(code: &UserCode) -> UserCode {
-    let text = code.text();
-    let first = text.as_bytes()[5];
-    with_check(code, if first == b'B' { "CCCC" } else { "BBBB" })
-}
-
 #[test]
 fn an_agent_that_alice_approves_gets_an_identity_that_she_owns() {
     let mut world = World::new();
     let agent = world.request(2, "build-agent", None, 20);
     let (access, fresh) = world.session();
 
-    let Checked::Right(shown) = world.show(&access, &agent.started.code, 21).expect("a request") else {
-        panic!("the code is right");
-    };
+    let shown = world.show(&access, &agent.started.code, 21).expect("a request");
+    let shown = shown.expect("the code is right");
     assert_eq!(shown.name, "build-agent");
     assert_eq!(shown.fingerprint, rscrypto::Sha256::digest(&agent.key));
     assert_eq!((shown.loopback, shown.approved), (None, false));
@@ -285,9 +280,7 @@ fn an_approval_from_a_session_that_ended_refuses() {
     let mut world = World::new();
     let agent = world.request(2, "build-agent", None, 20);
     let (access, fresh) = world.session();
-    let Checked::Right(approval) = world.approval(&fresh, &agent.started.code, 21).expect("an approval") else {
-        panic!("the code is right");
-    };
+    let (proposal, plan, _) = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
     let sign_out = world
         .site
         .sessions
@@ -301,7 +294,7 @@ fn an_approval_from_a_session_that_ended_refuses() {
         .expect("a sign-out");
     assert!(matches!(world.commit(sign_out), Outcome::Accepted(_)));
 
-    assert!(matches!(world.commit(approval), Outcome::Conflict));
+    assert!(matches!(world.commit((proposal, plan)), Outcome::Conflict));
     assert!(matches!(world.finish(&agent, None, 22), Ok(Status::Waiting)));
 }
 
@@ -310,21 +303,20 @@ fn two_approvals_of_one_request_commit_once() {
     let mut world = World::new();
     let agent = world.request(2, "build-agent", None, 20);
     let (_, fresh) = world.session();
-    let first = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
-    let second = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
-    let (Checked::Right(first), Checked::Right(second)) = (first, second) else {
-        panic!("the code is right");
-    };
-    assert!(matches!(world.commit(first), Outcome::Accepted(_)));
-    assert!(matches!(world.commit(second), Outcome::Conflict));
+    let (first, first_plan, _) = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
+    let (second, second_plan, _) = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
+    assert!(matches!(world.commit((first, first_plan)), Outcome::Accepted(_)));
+    assert!(matches!(world.commit((second, second_plan)), Outcome::Conflict));
     assert_eq!(
         world.approval(&fresh, &agent.started.code, 22).err(),
         Some(Error::Approved)
     );
 }
 
-/// Each wrong check of the last 4 letters is a commit that counts it. After `ATTEMPTS_MAX` of them, the request is
-/// locked: the right code refuses too, and the agent makes a new request.
+/// Each check of a user code is a commit at the version of its request, and a wrong check counts, also in an approval.
+/// So a right check that read the version before a count conflicts and shows nothing: checks at the same time get one
+/// answer for each count. After `ATTEMPTS_MAX` wrong checks, the request is locked: the right code refuses too, and the
+/// agent makes a new request.
 #[test]
 fn wrong_user_codes_past_the_bound_lock_the_request() {
     let mut world = World::new();
@@ -332,16 +324,18 @@ fn wrong_user_codes_past_the_bound_lock_the_request() {
     let (access, fresh) = world.session();
     let wrong = wrong(&agent.started.code);
     for attempt in 1..=ATTEMPTS_MAX {
-        let Checked::Wrong(proposal, plan) = world.show(&access, &wrong, 21).expect("a check") else {
-            panic!("the code is wrong");
-        };
-        assert!(matches!(world.commit((proposal, plan)), Outcome::Accepted(_)));
-        if attempt < ATTEMPTS_MAX {
-            assert!(matches!(
-                world.show(&access, &agent.started.code, 21),
-                Ok(Checked::Right(_))
-            ));
+        let (right, plan, shown) = world.check(&access, &agent.started.code, 21).expect("a check");
+        if attempt % 2 == 0 {
+            let (proposal, plan, approved) = world.approval(&fresh, &wrong, 21).expect("a check");
+            let outcome = world.commit((proposal, plan));
+            assert!(matches!(outcome, Outcome::Accepted(_)));
+            assert_eq!(approved.release(&outcome), None);
+        } else {
+            assert_eq!(world.show(&access, &wrong, 21), Ok(None));
         }
+        let outcome = world.commit((right, plan));
+        assert!(matches!(outcome, Outcome::Conflict));
+        assert_eq!(shown.release(&outcome), None);
     }
     assert_eq!(world.show(&access, &agent.started.code, 22).err(), Some(Error::Locked));
     assert_eq!(
@@ -375,21 +369,17 @@ fn a_loopback_request_finishes_only_with_the_redirect_code_of_its_approval() {
     let loopback = Loopback::parse("http://127.0.0.1:49152/agent").expect("a loopback address");
     let agent = world.request(2, "desktop-agent", Some(&loopback), 20);
     let (access, fresh) = world.session();
-    let Checked::Right(shown) = world.show(&access, &agent.started.code, 21).expect("a request") else {
-        panic!("the code is right");
+    let shown = world.show(&access, &agent.started.code, 21).expect("a request");
+    assert_eq!(shown.expect("the code is right").loopback.as_ref(), Some(&loopback));
+    let (proposal, plan, checked) = world.approval(&fresh, &agent.started.code, 21).expect("an approval");
+    let outcome = world.commit((proposal, plan));
+    let Outcome::Accepted(receipt) = &outcome else {
+        panic!("the approval gave {outcome:?}");
     };
-    assert_eq!(shown.loopback.as_ref(), Some(&loopback));
-    let approve = world.agents.approve(
-        &mut world.site.node.memory,
-        &fresh,
-        &agent.started.code,
-        at(21),
-        &mut world.site.random,
-    );
-    let Ok(Checked::Right((proposal, plan, Some(target)))) = ready(approve) else {
+    let redirect = RedirectCode::from_bytes(receipt.artifact().expect("an artifact").try_into().expect("32 bytes"));
+    let Some(Some(target)) = checked.release(&outcome) else {
         panic!("a loopback approval");
     };
-    let redirect = RedirectCode::from_bytes(world.artifact((proposal, plan)));
     let address = target.redirect(&redirect);
     assert!(address.starts_with("http://127.0.0.1:49152/agent?code="));
 

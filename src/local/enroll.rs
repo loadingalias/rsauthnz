@@ -5,7 +5,9 @@
 //!    ([`Authority::enroll`]). The commit writes the request, and gives the CLI a [`UserCode`] and a [`DeviceCode`].
 //! 2. The CLI shows the user code and the address of the approval page. The human signs in there with a passkey, sees
 //!    the name and the key fingerprint of the CLI ([`Authority::request`]), and approves with a fresh user verification
-//!    ([`Authority::approve`]). The commit writes the request as approved by the account of the human.
+//!    ([`Authority::approve`]). The commit writes the request as approved by the account of the human. Each of the two
+//!    steps is a check of the user code under the rule of agent enrollment ([`crate::agent`]): commit its proposal, then
+//!    take its answer from the outcome ([`Checked::release`]). [`ATTEMPTS_MAX`] wrong checks lock the request.
 //! 3. The CLI asks for the state of its request with its device code ([`Authority::poll`]), and learns the account.
 //! 4. The CLI submits the finish ([`Authority::finish`]): one commit consumes the request and binds the key of the CLI
 //!    to a CLI credential of the account. Its binding is an anchor of the account, and no sign-in method.
@@ -18,16 +20,16 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::fmt;
 use core::time::Duration;
 
-use rscrypto::{ChaCha20Rng, SecretBytes};
+use rscrypto::ChaCha20Rng;
 
 use super::{Authority, CLI_LIFETIME, Error, Failure, Offer, Reissue, cli, encode, read};
 use crate::account::{
     Fresh,
     generation::{Epoch, Revision},
 };
+use crate::agent::{ATTEMPTS_MAX, Checked, DeviceCode, UserCode};
 use crate::cbor::{self, Value};
 use crate::cli as calls;
 use crate::cose::PublicKey;
@@ -53,106 +55,14 @@ pub const CLI_NAME_BYTES_MAX: usize = 64;
 pub const ACCOUNT_CLIS_MAX: usize = 16;
 
 /// The first item of each CBOR form of this module. The number changes with the form.
-const REQUEST_FORM: &str = "rsauthnz.local.enrollment.2";
+const REQUEST_FORM: &str = "rsauthnz.local.enrollment.3";
 const ACCOUNT_FORM: &str = "rsauthnz.local.cli.2";
 /// The actions of the audit records.
 const ENROLL: &str = "cli.enroll";
+const CHECK: &str = "cli.code";
 const APPROVE: &str = "cli.approve";
 const BIND: &str = "cli.bind";
 const DISCONNECT: &str = "cli.disconnect";
-
-/// The letters of a user code: the base20 alphabet of RFC 8628, section 6.1, with no vowel, so no code spells a word.
-const LETTERS: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
-
-/// The user code of an enrollment request: 8 letters of the base20 alphabet of RFC 8628, about 34 bits. The CLI shows
-/// it as `WDJB-MJHT`, and the human gives it to the approval page. It finds the request, and it proves nothing: the
-/// approval needs a fresh user verification. `Debug` does not show it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct UserCode([u8; 8]);
-
-impl UserCode {
-    /// Reads a user code: 8 letters of the alphabet in either case, with each `-` and space ignored.
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Request`] for another text: no request has it.
-    pub fn parse(text: &str) -> Result<Self, Error> {
-        let mut code = [0; 8];
-        let mut letters = text.bytes().filter(|byte| !matches!(byte, b'-' | b' '));
-        for slot in &mut code {
-            let letter = letters.next().ok_or(Error::Request)?.to_ascii_uppercase();
-            LETTERS.contains(&letter).ok_or(Error::Request)?;
-            *slot = letter;
-        }
-        letters.next().is_none().ok_or(Error::Request)?;
-        Ok(Self(code))
-    }
-
-    /// The text of the code: two groups of 4 letters, such as `WDJB-MJHT`.
-    #[must_use]
-    pub fn text(&self) -> String {
-        let (head, tail) = self.0.split_at(4);
-        [head, b"-", tail].concat().into_iter().map(char::from).collect()
-    }
-
-    /// A new code from `random`. A byte at or past 240 is drawn again, so each letter has the same chance.
-    fn random(random: &mut ChaCha20Rng) -> Self {
-        let mut code = [0; 8];
-        for slot in &mut code {
-            *slot = loop {
-                let mut byte = [0];
-                random.fill_bytes(&mut byte);
-                if byte[0] < 240 {
-                    break LETTERS[usize::from(byte[0] % 20)];
-                }
-            };
-        }
-        Self(code)
-    }
-}
-
-impl fmt::Debug for UserCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("UserCode(..)")
-    }
-}
-
-/// The device code of an enrollment request: 32 random bytes that only the CLI holds. It is a secret, so `Debug` does
-/// not show it, and its memory is cleared when it drops. The store keeps only its SHA-256 digest.
-pub struct DeviceCode(SecretBytes<32>);
-
-impl DeviceCode {
-    /// The device code of `bytes`, such as the artifact of the accepted commit of [`Authority::enroll`].
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    #[must_use]
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        let Ok(secret) = SecretBytes::try_fill_with(|secret| {
-            secret.copy_from_slice(&bytes);
-            Ok::<_, !>(())
-        });
-        Self(secret)
-    }
-
-    /// The bytes of the code, which the CLI sends with each poll and its finish.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
-    }
-
-    /// The SHA-256 digest of the code, which the request record keeps.
-    fn digest(&self) -> [u8; 32] {
-        crypto::sha256(self.0.as_bytes())
-    }
-}
-
-impl fmt::Debug for DeviceCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DeviceCode(..)")
-    }
-}
 
 /// An enrollment request, as the approval page shows it to a signed-in human ([`Authority::request`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,15 +212,38 @@ impl Finish<'_> {
     }
 }
 
-/// An enrollment request record: `["rsauthnz.local.enrollment.2", device, holder, name, created, approved]`. `device`
-/// is the SHA-256 digest of the device code, `holder` the public key of the CLI, `created` the time of the request in
-/// whole seconds, and `approved` the account, reserved serial, and account revision, or null.
+/// An enrollment request record: `["rsauthnz.local.enrollment.3", check, device, holder, name, created, attempts,
+/// approved]`. `check` is the last 4 letters of the user code, `device` the SHA-256 digest of the device code, `holder`
+/// the public key of the CLI, `created` the time of the request in whole seconds, `attempts` the number of wrong checks,
+/// and `approved` the account, reserved serial, and account revision, or null.
 struct Pending {
+    check: [u8; 4],
     device: [u8; 32],
     holder: Vec<u8>,
     name: String,
     created: u64,
+    attempts: u64,
     approved: Option<(Id<Human>, Serial, Epoch)>,
+}
+
+impl Pending {
+    /// The record form.
+    fn form(&self) -> Box<[u8]> {
+        let approved = self.approved.as_ref().map_or(Value::Null, |(account, serial, epoch)| {
+            Value::Array(vec![account.to_cbor(), Value::Unsigned(serial.0), epoch.form()])
+        });
+        encode(&[
+            Value::Text(REQUEST_FORM),
+            Value::Bytes(&self.check),
+            Value::Bytes(&self.device),
+            Value::Bytes(&self.holder),
+            Value::Text(&self.name),
+            Value::Unsigned(self.created),
+            Value::Unsigned(self.attempts),
+            approved,
+        ])
+        .into_boxed_slice()
+    }
 }
 
 /// A connected account CLI, as the owner sees it.
@@ -353,7 +286,7 @@ impl Authority {
     /// request, which ends after [`ENROLLMENT_LIFETIME`]. Give the CLI the user code at once, and the device code from
     /// the artifact of the accepted commit: [`DeviceCode::from_bytes`]. A request authenticates no caller, so its audit
     /// names the local owner. The operation identity is new: after a lost response, the CLI asks again, and the earlier
-    /// request ends unused. Two requests with one user code conflict: ask again.
+    /// request ends unused. Two open requests with the first 4 letters of one user code conflict: ask again.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse), and its commit. Limit the rate of requests of one client.
     ///
@@ -380,29 +313,28 @@ impl Authority {
             .estimate()
             .checked_add(ENROLLMENT_LIFETIME)
             .ok_or(Error::Time(TimeError::Overflow))?;
-        let mut operation = [0; 16];
-        random.fill_bytes(&mut operation);
-        let operation = OperationId::new(&operation).expect("16 bytes are a valid operation identity");
         let owner = self.grant.owner.clone();
-        let mut proposal = self.proposal(operation, &owner, ENROLL, Value::Bytes(key.as_bytes()), now)?;
+        let request = Value::Bytes(key.as_bytes());
+        let mut proposal = self.proposal(OperationId::random(random), &owner, ENROLL, request, now)?;
         proposal
             .read(Dependency::Absent(key.clone()))
             .map_err(Error::Transition)?;
         let version = self.next(None, &device.digest())?;
-        let data = encode(&[
-            Value::Text(REQUEST_FORM),
-            Value::Bytes(&device.digest()),
-            Value::Bytes(holder),
-            Value::Text(name),
-            Value::Unsigned(now.estimate().as_secs()),
-            Value::Null,
-        ]);
+        let pending = Pending {
+            check: *code.check(),
+            device: device.digest(),
+            holder: holder.to_vec(),
+            name: name.into(),
+            created: now.estimate().as_secs(),
+            attempts: 0,
+            approved: None,
+        };
         proposal
             .change(Change::Write {
                 key: key.clone(),
                 version: version.clone(),
                 end: Some(end),
-                data: data.into_boxed_slice(),
+                data: pending.form(),
             })
             .map_err(Error::Transition)?;
         proposal
@@ -411,30 +343,41 @@ impl Authority {
         Ok((proposal, Plan::default(), code))
     }
 
-    /// The request of the user code `code`, for the approval page. Show it only to a signed-in human: it names the
-    /// CLI. Show its fingerprint as the CLI shows it, so that the human approves only the CLI on their own screen.
+    /// Proposes the check of the user code `code` by the signed-in human of `access`, for the approval page. Commit the
+    /// proposal: [`Checked::release`] of its outcome gives the request for a right code. A wrong code counts against
+    /// [`ATTEMPTS_MAX`]. Show the fingerprint of the request as the CLI shows it, so that the human approves only the
+    /// CLI on their own screen.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup and, for an approved request, one account revision lookup.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, for an approved request one account
+    /// revision lookup, and its commit.
     ///
     /// # Errors
     ///
-    /// [`Error::Request`] if no request has the code: it ended, or a finish consumed it. [`Error::Expired`] after its
-    /// end, and [`Error::Time`] if `now` has no bound. [`Error::Record`] if the record has no valid form, and
-    /// [`Failure::Store`] if the read fails.
+    /// [`Error::Request`] if no request has the first 4 letters of `code`: it ended, or a finish consumed it.
+    /// [`Error::Locked`] after [`ATTEMPTS_MAX`] wrong checks, and [`Error::Expired`] after its end. [`Error::Time`] if
+    /// `now` has no bound. [`Error::Record`] if the record has no valid form, and [`Failure::Store`] if the read fails.
+    /// [`Error::Transition`] for the proposal.
     pub async fn request<S: Store>(
         &self,
         store: &mut S,
+        access: &Access,
         code: &UserCode,
         now: Reading,
-    ) -> Result<Request, Failure<S::Error>> {
-        let (_, record, pending) = self.pending(store, code, now).await?;
-        Ok(Request {
+        random: &mut ChaCha20Rng,
+    ) -> Result<(Proposal, Plan, Checked<Request>), Failure<S::Error>> {
+        let (key, record, pending) = self.pending(store, code, now).await?;
+        let right = pending.check == *code.check();
+        let ends = record.end.ok_or(Error::Record)?;
+        let request = right.then(|| Request {
             fingerprint: crypto::sha256(&pending.holder),
-            name: pending.name,
+            name: pending.name.clone(),
             created: Duration::from_secs(pending.created),
-            ends: record.end.ok_or(Error::Record)?,
+            ends,
             approved: pending.approved.is_some(),
-        })
+        });
+        let proposal = self.check(key, &record, pending, access.session().account(), right, now, random)?;
+        let checked = Checked::new(&proposal, request);
+        Ok((proposal, Plan::default(), checked))
     }
 
     /// Proposes the approval of the request of `code` by the account of `fresh`, a fresh user verification of a
@@ -443,12 +386,16 @@ impl Authority {
     /// [`ENROLLMENT_LIFETIME`] to finish. It reads the session at its version, and the request at its version, so a
     /// second approval conflicts. Its deadline is the earliest of the end of the verification and of the request.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup and, for an approved request, one account revision lookup.
+    /// The approval is also a check of `code`: for a wrong code, the proposal counts the wrong check and approves
+    /// nothing. [`Checked::release`] of the outcome tells whether the approval committed.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, for an approved request one account
+    /// revision lookup, and its commit.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::request`]. [`Error::Approved`] if an account approved the request already. [`Error::Time`]
-    /// if the end overflows, and [`Error::Transition`] for the proposal.
+    /// if the end overflows.
     pub async fn approve<S: Store>(
         &self,
         store: &mut S,
@@ -457,45 +404,27 @@ impl Authority {
         serial: Serial,
         now: Reading,
         random: &mut ChaCha20Rng,
-    ) -> Result<(Proposal, Plan), Failure<S::Error>> {
-        let (key, record, pending) = self.pending(store, code, now).await?;
-        pending.approved.is_none().ok_or(Error::Approved)?;
+    ) -> Result<(Proposal, Plan, Checked<()>), Failure<S::Error>> {
         let account = fresh.account();
-        let mut operation = [0; 16];
-        random.fill_bytes(&mut operation);
-        let operation = OperationId::new(&operation).expect("16 bytes are a valid operation identity");
-        let form = Value::Bytes(key.as_bytes());
-        let mut proposal = self.proposal(operation, account, APPROVE, form, now)?;
+        let (key, record, mut pending) = self.pending(store, code, now).await?;
+        if pending.check != *code.check() {
+            let proposal = self.check(key, &record, pending, account, false, now, random)?;
+            let checked = Checked::new(&proposal, None);
+            return Ok((proposal, Plan::default(), checked));
+        }
+        pending.approved.is_none().ok_or(Error::Approved)?;
+        let request = Value::Bytes(key.as_bytes());
+        let mut proposal = self.proposal(OperationId::random(random), account, APPROVE, request, now)?;
         fresh.gate(&mut proposal).map_err(Error::Transition)?;
         proposal.until(record.end.ok_or(Error::Record)?);
         let end = now
             .estimate()
             .checked_add(ENROLLMENT_LIFETIME)
             .ok_or(Error::Time(TimeError::Overflow))?;
-        let version = self.next(
-            Some(record.version.clone()),
-            &crypto::sha256(&encode(&[account.to_cbor()])),
-        )?;
-        proposal
-            .read(Dependency::Version(key.clone(), record.version))
-            .map_err(Error::Transition)?;
-        let data = encode(&[
-            Value::Text(REQUEST_FORM),
-            Value::Bytes(&pending.device),
-            Value::Bytes(&pending.holder),
-            Value::Text(&pending.name),
-            Value::Unsigned(pending.created),
-            Value::Array(vec![account.to_cbor(), Value::Unsigned(serial.0), fresh.epoch.form()]),
-        ]);
-        proposal
-            .change(Change::Write {
-                key,
-                version,
-                end: Some(end),
-                data: data.into_boxed_slice(),
-            })
-            .map_err(Error::Transition)?;
-        Ok((proposal, Plan::default()))
+        pending.approved = Some((account.clone(), serial, fresh.epoch.clone()));
+        self.rewrite(&mut proposal, key, &record, &pending, Some(end))?;
+        let checked = Checked::new(&proposal, Some(()));
+        Ok((proposal, Plan::default(), checked))
     }
 
     /// The state of the request of `code` for its CLI, which proves itself with its device code `device`. After
@@ -514,7 +443,7 @@ impl Authority {
         now: Reading,
     ) -> Result<Status, Failure<S::Error>> {
         let (_, _, pending) = self.pending(store, code, now).await?;
-        (pending.device == device.digest()).ok_or(Error::Request)?;
+        (pending.check == *code.check() && pending.device == device.digest()).ok_or(Error::Request)?;
         Ok(pending.approved.map_or(Status::Waiting, |(account, serial, _)| {
             Status::Approved(CliId { account, serial })
         }))
@@ -541,7 +470,7 @@ impl Authority {
         now: Reading,
     ) -> Result<Finish<'_>, Failure<S::Error>> {
         let (key, record, pending) = self.pending(store, code, now).await?;
-        (pending.device == device.digest()).ok_or(Error::Request)?;
+        (pending.check == *code.check() && pending.device == device.digest()).ok_or(Error::Request)?;
         let holder: &[u8; 1984] = pending.holder.as_slice().try_into().map_err(|_| Error::Record)?;
         let (approved, serial, epoch) = pending.approved.ok_or(Error::Waiting)?;
         (&approved == account).ok_or(Error::Account)?;
@@ -634,17 +563,70 @@ impl Authority {
     }
 
     /// The key of the request of `code`: [`Kind::CliEnrollment`] with the SHA-256 digest of the canonical CBOR form
-    /// `["rsauthnz.local.enrollment.2", authority, code]`.
+    /// `["rsauthnz.local.enrollment.3", authority, locator]`, where `locator` is the first 4 letters of the code.
     fn request_key(&self, code: &UserCode) -> Key {
         let digest = crypto::sha256(&encode(&[
             Value::Text(REQUEST_FORM),
             self.id.to_cbor(),
-            Value::Bytes(&code.0),
+            Value::Bytes(code.locator()),
         ]));
         Kind::CliEnrollment.key(&digest).expect("a key of 33 bytes is valid")
     }
 
-    /// The key, the record, and the request of `code`, while it is open at `now`.
+    /// The proposal of a check of the user code of the open request `pending` at `key` by the human `actor`, with one
+    /// more wrong check if the code is not `right`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request, its record, its state, the actor, the result, the time, and the random source are each one input of one check"
+    )]
+    fn check(
+        &self,
+        key: Key,
+        record: &Record,
+        mut pending: Pending,
+        actor: &Id<Human>,
+        right: bool,
+        now: Reading,
+        random: &mut ChaCha20Rng,
+    ) -> Result<Proposal, Error> {
+        if !right {
+            pending.attempts = pending.attempts.checked_add(1).ok_or(Error::Record)?;
+        }
+        let request = Value::Bytes(key.as_bytes());
+        let mut proposal = self.proposal(OperationId::random(random), actor, CHECK, request, now)?;
+        self.rewrite(&mut proposal, key, record, &pending, record.end)?;
+        Ok(proposal)
+    }
+
+    /// Adds to `proposal` the read of the request `key` at the version of `record`, and the write of `pending` at the
+    /// next version, which ends at `end`. The identity of the version is the digest of the form. Thus of two proposals
+    /// that read one version, one commits and the other conflicts.
+    fn rewrite(
+        &self,
+        proposal: &mut Proposal,
+        key: Key,
+        record: &Record,
+        pending: &Pending,
+        end: Option<Duration>,
+    ) -> Result<AuthorityVersion, Error> {
+        let data = pending.form();
+        let version = self.next(Some(record.version.clone()), &crypto::sha256(&data))?;
+        proposal
+            .read(Dependency::Version(key.clone(), record.version.clone()))
+            .map_err(Error::Transition)?;
+        proposal
+            .change(Change::Write {
+                key,
+                version: version.clone(),
+                end,
+                data,
+            })
+            .map_err(Error::Transition)?;
+        Ok(version)
+    }
+
+    /// The key, the record, and the request of `code`, while it is open at `now` and not locked. Only the first 4
+    /// letters of `code` find it: the caller checks the rest.
     async fn pending<S: Store>(
         &self,
         store: &mut S,
@@ -656,6 +638,7 @@ impl Authority {
         let record = read(store, &key).await?.ok_or(Error::Request)?;
         (latest < record.end.ok_or(Error::Record)?).ok_or(Error::Expired)?;
         let pending = self.decode_request(&record).ok_or(Error::Record)?;
+        (pending.attempts < ATTEMPTS_MAX).ok_or(Error::Locked)?;
         if let Some((_, _, epoch)) = &pending.approved {
             Self::check_epoch(store, epoch).await?;
         }
@@ -670,10 +653,12 @@ impl Authority {
         };
         let [
             Value::Text(REQUEST_FORM),
+            Value::Bytes(check),
             Value::Bytes(device),
             Value::Bytes(holder),
             Value::Text(name),
             Value::Unsigned(created),
+            Value::Unsigned(attempts),
             approved,
         ] = items.as_slice()
         else {
@@ -690,10 +675,12 @@ impl Authority {
             _ => return None,
         };
         Some(Pending {
+            check: (*check).try_into().ok()?,
             device: (*device).try_into().ok()?,
             holder: holder.to_vec(),
             name: (*name).into(),
             created: *created,
+            attempts: *attempts,
             approved,
         })
     }

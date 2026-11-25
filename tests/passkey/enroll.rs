@@ -5,6 +5,7 @@
 use core::time::Duration;
 
 use rsauthnz::account::Fresh;
+use rsauthnz::agent::{ATTEMPTS_MAX, Checked, DeviceCode, UserCode};
 use rsauthnz::cbor::Value;
 use rsauthnz::cli::{Call, Challenge};
 use rsauthnz::cose::{Key as CoseKey, PublicKey, TrustedKey};
@@ -13,9 +14,10 @@ use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::{Human, Id};
 use rsauthnz::limits::{Limits, SignatureBudget};
-use rsauthnz::local::enroll::{CliId, DeviceCode, ENROLLMENT_LIFETIME, Request, Status, UserCode};
+use rsauthnz::local::enroll::{CliId, ENROLLMENT_LIFETIME, Request, Status};
 use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Holder, HostGrant, Offer, Unlink};
 use rsauthnz::recovery::Passkeys;
+use rsauthnz::session::Access;
 use rsauthnz::store::Kind;
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
@@ -23,7 +25,7 @@ use rsauthnz_conformance::suite::{Fault, Subject as _};
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 use super::authenticator::Passkey;
-use super::{START, Site, alice, at, ready};
+use super::{START, Site, alice, at, ready, wrong};
 
 /// A key of the composite profile, as a CLI or the issuer holds it.
 struct Pair {
@@ -126,18 +128,56 @@ impl World {
         self.site.fresh(&self.passkey)
     }
 
-    /// The approval of the request of `cli` with `fresh` at `seconds`.
-    fn approve(&mut self, cli: &Cli, fresh: &Fresh, seconds: u64) -> Result<(), local::Error> {
+    /// The session of a passkey sign-in of alice at 11, checked at 12, and its fresh user verification.
+    fn session(&mut self) -> (Access, Fresh) {
+        self.site.verified(&self.passkey)
+    }
+
+    /// The proposal of the check of `code` for the approval page of the human of `access` at `seconds`, and its answer.
+    fn check(
+        &mut self,
+        access: &Access,
+        code: &UserCode,
+        seconds: u64,
+    ) -> Result<(Proposal, Plan, Checked<Request>), local::Error> {
+        let request = self.authority.request(
+            &mut self.site.node.memory,
+            access,
+            code,
+            at(seconds),
+            &mut self.site.random,
+        );
+        ready(request).map_err(refused_local)
+    }
+
+    /// The request of `code` as the approval page shows it to the human of `access` at `seconds`, after the commit of
+    /// its check: `None` for a wrong code.
+    fn show(&mut self, access: &Access, code: &UserCode, seconds: u64) -> Result<Option<Request>, local::Error> {
+        let (proposal, plan, checked) = self.check(access, code, seconds)?;
+        let outcome = self.site.node.commit(proposal, plan);
+        Ok(checked.release(&outcome))
+    }
+
+    /// The approval of the request of `cli` with the code `code` and `fresh` at `seconds`, which commits: whether it
+    /// approved the request.
+    fn approval(&mut self, cli: &Cli, code: &UserCode, fresh: &Fresh, seconds: u64) -> Result<bool, local::Error> {
         let approve = self.authority.approve(
             &mut self.site.node.memory,
             fresh,
-            &cli.code,
+            code,
             cli.serial,
             at(seconds),
             &mut self.site.random,
         );
-        let (proposal, plan) = ready(approve).map_err(refused_local)?;
-        assert!(matches!(self.site.node.commit(proposal, plan), Outcome::Accepted(_)));
+        let (proposal, plan, checked) = ready(approve).map_err(refused_local)?;
+        let outcome = self.site.node.commit(proposal, plan);
+        assert!(matches!(outcome, Outcome::Accepted(_)));
+        Ok(checked.release(&outcome).is_some())
+    }
+
+    /// The approval of the request of `cli` with `fresh` at `seconds`.
+    fn approve(&mut self, cli: &Cli, fresh: &Fresh, seconds: u64) -> Result<(), local::Error> {
+        assert!(self.approval(cli, &cli.code, fresh, seconds)?);
         Ok(())
     }
 
@@ -504,21 +544,20 @@ fn refused_local(failure: local::Failure<rsauthnz_conformance::memory::Error>) -
 fn a_cli_that_alice_approves_calls_for_her_account_and_makes_no_administrator_call() {
     let mut world = World::new();
     let cli = world.request(2, 20);
-    let shown = ready(world.authority.request(&mut world.site.node.memory, &cli.code, at(21))).map_err(refused_local);
+    let (access, fresh) = world.session();
     assert_eq!(
-        shown,
-        Ok(Request {
+        world.show(&access, &cli.code, 21),
+        Ok(Some(Request {
             name: "alice-laptop".into(),
             fingerprint: rscrypto::Sha256::digest(&cli.key.public),
             created: START + Duration::from_secs(20),
             ends: START + Duration::from_secs(20) + ENROLLMENT_LIFETIME,
             approved: false,
-        })
+        }))
     );
     assert_eq!(world.poll(&cli, 22), Ok(Status::Waiting));
     assert_eq!(world.finish(&cli, &alice(), 22).err(), Some(local::Error::Waiting));
 
-    let fresh = world.fresh();
     assert_eq!(world.approve(&cli, &fresh, 23), Ok(()));
     assert_eq!(world.approve(&cli, &fresh, 24).err(), Some(local::Error::Approved));
     assert_eq!(
@@ -682,4 +721,103 @@ fn a_restore_completes_a_finish_in_doubt_once_and_keeps_an_acknowledged_one() {
         world.site.node.driver.take(ticket),
         Some(Answer::Lookup(Lookup::Committed(_)))
     ));
+}
+
+/// A pending request of the A208 form, as a store holds it at an upgrade: `["rsauthnz.local.enrollment.2", device,
+/// holder, name, created, null]` at the key of the SHA-256 digest of `["rsauthnz.local.enrollment.2", authority,
+/// code]`, with all 8 letters of `code`.
+fn earlier_request(world: &mut World, code: &str, device: &DeviceCode, holder: &[u8; 1984], seconds: u64) {
+    const FORM: &str = "rsauthnz.local.enrollment.2";
+    let authority: Id<rsauthnz::id::Authority> = Id::new("acme", "cli").expect("an identifier");
+    let encode =
+        |items: Vec<Value<'_>>| rsauthnz::cbor::encode(&Value::Array(items), Limits::default()).expect("a form");
+    let letters = code.replace('-', "");
+    let digest = rscrypto::Sha256::digest(&encode(vec![
+        Value::Text(FORM),
+        authority.to_cbor(),
+        Value::Bytes(letters.as_bytes()),
+    ]));
+    let key = Kind::CliEnrollment.key(&digest).expect("a key");
+    let device = rscrypto::Sha256::digest(device.as_bytes());
+    let created = at(seconds).estimate();
+    let data = encode(vec![
+        Value::Text(FORM),
+        Value::Bytes(&device),
+        Value::Bytes(holder),
+        Value::Text("alice-laptop"),
+        Value::Unsigned(created.as_secs()),
+        Value::Null,
+    ]);
+    let audit = rsauthnz::transition::Audit {
+        actor: rsauthnz::id::Principal::Human(world.grant.owner.clone()),
+        action: Id::new("rsauthnz", "cli.enroll").expect("an identifier"),
+        time: at(seconds),
+    };
+    let mut proposal = Proposal::new(
+        OperationId::new(b"earlier").expect("an operation"),
+        audit,
+        &Value::Null,
+        Limits::default(),
+    )
+    .expect("a proposal");
+    proposal
+        .read(rsauthnz::transition::Dependency::Absent(key.clone()))
+        .expect("a read");
+    let version = [1_u64.to_be_bytes().as_slice(), &device].concat();
+    proposal
+        .change(rsauthnz::transition::Change::Write {
+            key,
+            version: rsauthnz::id::AuthorityVersion::new(authority, &version).expect("a version"),
+            end: Some(created + ENROLLMENT_LIFETIME),
+            data: data.into_boxed_slice(),
+        })
+        .expect("a write");
+    assert!(matches!(
+        world.site.node.commit(proposal, Plan::default()),
+        Outcome::Accepted(_)
+    ));
+}
+
+/// Each check of a user code is a commit at the version of its request, and a wrong check counts, also in an approval.
+/// So a right check that read the version before a count conflicts and shows nothing: checks at the same time get one
+/// answer for each count. After `ATTEMPTS_MAX` wrong checks, the request is locked: its right code refuses, and the CLI
+/// makes a new request.
+#[test]
+fn wrong_user_codes_past_the_bound_lock_a_cli_request() {
+    let mut world = World::new();
+    let cli = world.request(2, 20);
+    let (access, fresh) = world.session();
+    let wrong = wrong(&cli.code);
+    for attempt in 1..=ATTEMPTS_MAX {
+        let (right, plan, shown) = world.check(&access, &cli.code, 21).unwrap();
+        if attempt % 2 == 0 {
+            assert_eq!(world.approval(&cli, &wrong, &fresh, 21), Ok(false));
+        } else {
+            assert_eq!(world.show(&access, &wrong, 21), Ok(None));
+        }
+        let outcome = world.site.node.commit(right, plan);
+        assert!(matches!(outcome, Outcome::Conflict));
+        assert_eq!(shown.release(&outcome), None);
+    }
+    assert_eq!(world.show(&access, &cli.code, 22), Err(local::Error::Locked));
+    assert_eq!(world.approve(&cli, &fresh, 22), Err(local::Error::Locked));
+    assert_eq!(world.poll(&cli, 22), Err(local::Error::Locked));
+    assert_eq!(world.finish(&cli, &alice(), 22).err(), Some(local::Error::Locked));
+}
+
+/// The key of a request covers its form, so after an upgrade from the form of A208, a pending request of that form
+/// refuses for the human and for the CLI. The CLI makes a new request.
+#[test]
+fn a_pending_request_of_the_earlier_form_refuses() {
+    let mut world = World::new();
+    let key = Pair::new(2);
+    let device = DeviceCode::from_bytes([5; 32]);
+    earlier_request(&mut world, "WDJB-MJHT", &device, &key.public, 20);
+    let code = UserCode::parse("WDJB-MJHT").unwrap();
+    let (access, _) = world.session();
+    assert_eq!(world.show(&access, &code, 21), Err(local::Error::Request));
+    let poll = world
+        .authority
+        .poll(&mut world.site.node.memory, &code, &device, at(21));
+    assert_eq!(ready(poll).map_err(refused_local), Err(local::Error::Request));
 }

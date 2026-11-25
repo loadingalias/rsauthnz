@@ -8,12 +8,13 @@ use std::path::Path;
 
 use bytes::Bytes;
 use http::{Request, header};
+use rsauthnz::agent::{DeviceCode, UserCode};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cli::{self, Call, Challenge};
 use rsauthnz::credential::Serial;
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
-use rsauthnz::local::enroll::{CliId, DeviceCode, ENROLLMENT_LIFETIME, UserCode};
+use rsauthnz::local::enroll::{CliId, ENROLLMENT_LIFETIME};
 use rsauthnz::transition::OperationId;
 use rscodec::base64::Profile::Url;
 use rscrypto::{ChaCha20Rng, Sha256};

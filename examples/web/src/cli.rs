@@ -3,6 +3,7 @@
 use axum::body::Bytes;
 use http::{Method, Request, Response, header};
 use rsauthnz::account::{FRESH_MAX, Fresh};
+use rsauthnz::agent::{DeviceCode, UserCode};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cli::{Call, Challenge};
 use rsauthnz::credential::Serial;
@@ -11,7 +12,7 @@ use rsauthnz::id::{Human, Id};
 use rsauthnz::limits::Limits;
 use rsauthnz::local::{
     Holder, Offer,
-    enroll::{CliId, DeviceCode, Status, UserCode},
+    enroll::{CliId, Status},
 };
 use rsauthnz::store::{Kind, driver::Plan};
 use rsauthnz::time::Reading;
@@ -22,6 +23,8 @@ use rscrypto::ChaCha20Rng;
 use super::{BODY_BYTES_MAX, State, Subject, fields, reply, wait};
 
 const REFUSE: Problem = Problem::Recovery(Recovery::Refuse);
+/// The answer to a wrong user code and to a check that did not commit: the human gives the code again.
+const AGAIN: Problem = Problem::Recovery(Recovery::Restart);
 type Reply = Result<Response<Vec<u8>>, Problem>;
 
 /// The machine routes take bounded CBOR by POST. Only the browser routes use a session.
@@ -95,8 +98,10 @@ impl<S: Subject> State<S> {
     pub(super) fn cli_request(&mut self, request: &Request<Bytes>, now: Reading) -> Reply {
         let [code] = fields(self.site.json_change(request, BODY_BYTES_MAX)?, ["code"])?;
         let code = UserCode::parse(&code)?;
-        let (_, account) = self.cli_access(request, now)?;
-        let shown = wait(self.cli.request(&mut self.store, &code, now))?;
+        let (access, account) = self.cli_access(request, now)?;
+        let (proposal, plan, checked) = wait(self.cli.request(&mut self.store, &access, &code, now, &mut self.random))?;
+        let receipt = self.commit((proposal, plan), now)?;
+        let shown = checked.release(&Outcome::Accepted(receipt)).ok_or(AGAIN)?;
         reply(|place| {
             place.object(|out| {
                 out.member("name").str(&shown.name)?;
@@ -115,11 +120,13 @@ impl<S: Subject> State<S> {
         (account.id.to_string() == reviewed).ok_or(Problem::Recovery(Recovery::Restart))?;
         let fresh = Fresh::check(&access, FRESH_MAX, now)?;
         let serial = Serial(self.driver.allocate(Kind::Credential)?);
-        let proposal = wait(
-            self.cli
-                .approve(&mut self.store, &fresh, &code, serial, now, &mut self.random),
-        )?;
-        self.commit(proposal, now)?;
+        let (proposal, plan, checked) =
+            wait(
+                self.cli
+                    .approve(&mut self.store, &fresh, &code, serial, now, &mut self.random),
+            )?;
+        let receipt = self.commit((proposal, plan), now)?;
+        checked.release(&Outcome::Accepted(receipt)).ok_or(AGAIN)?;
         Ok(rsauthnz_http::json(b"{}".to_vec()))
     }
 

@@ -1543,6 +1543,9 @@ pub enum Error {
     /// No open enrollment request has the user code and the device code: the request ended, or a finish consumed it.
     /// The CLI makes a new request.
     Request,
+    /// The enrollment request had [`ATTEMPTS_MAX`](crate::agent::ATTEMPTS_MAX) wrong checks of its user code. The CLI
+    /// makes a new request.
+    Locked,
     /// No account approved the enrollment request yet. The CLI asks again after 5 seconds.
     Waiting,
     /// An account approved the enrollment request already.
@@ -1555,9 +1558,13 @@ impl Recover for Error {
     /// Read the current state again when the challenge or the enrollment request changes.
     fn recovery(&self) -> Recovery {
         match self {
-            Self::Expired | Self::Challenge | Self::Request | Self::Approved | Self::Waiting | Self::Account => {
-                Recovery::Restart
-            }
+            Self::Expired
+            | Self::Challenge
+            | Self::Request
+            | Self::Locked
+            | Self::Approved
+            | Self::Waiting
+            | Self::Account => Recovery::Restart,
             Self::Transition(error) => error.recovery(),
             _ => Recovery::Refuse,
         }
@@ -1584,6 +1591,7 @@ impl fmt::Display for Error {
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),
             Self::Name => f.write_str("the name of the CLI is not valid"),
             Self::Request => f.write_str("no open enrollment request has the codes"),
+            Self::Locked => f.write_str("the enrollment request had too many wrong checks of its user code"),
             Self::Waiting => f.write_str("no account approved the enrollment request yet"),
             Self::Approved => f.write_str("an account approved the enrollment request already"),
             Self::Account => f.write_str("another account approved the enrollment request"),

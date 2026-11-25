@@ -48,16 +48,23 @@ secret from the human.
 
 1. The CLI draws a key ID, and enrolls its key with `custody.enroll(id, Algorithm::MlDsa65Ed25519, random)`.
 2. The CLI sends its public key of 1,984 bytes and a name, such as `alice-laptop`. The authority calls
-   `authority.enroll(&holder, name, now, random)`, which gives the proposal, its plan, and a `UserCode`. The name has 1
-   to `CLI_NAME_BYTES_MAX` (64) bytes and no control character. The artifact of the accepted commit is the 32 bytes of
-   the `DeviceCode`. Give the CLI both codes. The request ends after `ENROLLMENT_LIFETIME` (10 minutes).
+   `authority.enroll(&holder, name, now, random)`, which gives the proposal, its plan, and an `agent::UserCode`. The
+   name has 1 to `CLI_NAME_BYTES_MAX` (64) bytes and no control character. The artifact of the accepted commit is the 32
+   bytes of the `agent::DeviceCode`. Give the CLI both codes. The request ends after `ENROLLMENT_LIFETIME` (10 minutes).
+   The CLI path and [agent enrollment](agent-enrollment.md) use the same codes and the same check rule.
 3. The CLI shows the user code, such as `WDJB-MJHT`, the address of the approval page, and the SHA-256 digest of its
    public key. The example reads the code from a form on the approval page.
-4. The human signs in on the page with a passkey. The page reads the code with `UserCode::parse`, and shows the
-   request from `authority.request(store, &code, now)`: the name, the fingerprint (the SHA-256 digest of the key), and
-   the time of the request. The human compares the fingerprint with the one on the screen of the CLI.
+4. The human signs in on the page with a passkey. The page reads the code with `UserCode::parse`, and calls
+   `authority.request(store, &access, &code, now, random)` with the `Access` of the session check. The call gives
+   `(proposal, plan, checked)`. Commit the proposal and its plan, then call `checked.release(&outcome)`:
+   - `Some(request)`: show the name, the fingerprint (the SHA-256 digest of the key), and the time of the request. The
+     human compares the fingerprint with the one on the screen of the CLI.
+   - `None`: the code is wrong, or the commit did not accept. Show nothing of the request, and ask the human to give
+     the code again. A wrong code counts against the bound.
 5. Get fresh verification from the browser session. Allocate `serial` with `driver.allocate(Kind::Credential)`.
-   Submit the proposal from `authority.approve(store, &fresh, &code, Serial(serial), now, random)`.
+   Commit the proposal and plan from `authority.approve(store, &fresh, &code, Serial(serial), now, random)`.
+   `checked.release(&outcome)` gives `Some(())` when the approval committed, and `None` for a wrong code or another
+   outcome.
 6. The CLI polls with `authority.poll(store, &code, &device, now)`. On `Status::Approved(id)`, save the account and serial in `id` before sending the finish.
 7. Submit `authority.finish(store, &code, &device, &id.account, now)`. Custody signs `finish.to_be_signed()`.
    Submit the proposal and plan from `finish.finish(signature, operation)`. The accepted receipt carries the CLI credential.
@@ -237,6 +244,8 @@ zeroization, its recovery, and the isolation that the OS enforces.
   the credential of the binding whose `cnf` key is that key. The binding keeps no signed credential, so each recovery
   costs one issuer signature. `local::Error::Unknown` shows that the bootstrap did not commit. A bootstrap that a
   restore completed gives its credential in the same way.
+- **A lost response of a check or an approval.** The server looks up the operation, and `checked.release` takes the
+  receipt of the lookup. If the outcome stays unknown, the human gives the code again.
 - **A lost response of a request, a poll, or a finish.** After a lost request, the CLI makes a new request. After a
   lost poll, it polls again. After a lost finish, it gives its saved `CliId` and public key. The authority calls
   `authority.account_credential(store, &id, &holder, now)`, and custody signs `reissue.to_be_signed()` again. A
@@ -256,9 +265,10 @@ zeroization, its recovery, and the isolation that the OS enforces.
 | Operation | Side | Result |
 | --- | --- | --- |
 | `authority.enroll(&holder, name, now, random)` | Authority | `(Proposal, Plan, UserCode)`. The receipt gives the 32 bytes of the `DeviceCode` |
-| `UserCode::parse(text)`, `code.text()`, `DeviceCode::from_bytes(bytes)`, `device.as_bytes()` | Both | The codes of a request, and their text and bytes |
-| `authority.request(store, &code, now)` | Authority | The `Request` of the approval page: `name`, `fingerprint`, `created`, `ends`, and `approved` |
-| `authority.approve(store, &fresh, &code, serial, now, random)` | Authority | `(Proposal, Plan)`: the approval by the account of `fresh` |
+| `agent::UserCode::parse(text)`, `code.text()`, `agent::DeviceCode::from_bytes(bytes)`, `device.as_bytes()` | Both | The codes of a request, and their text and bytes |
+| `authority.request(store, &access, &code, now, random)` | Authority | `(Proposal, Plan, Checked<Request>)`. The `Request` of the approval page has `name`, `fingerprint`, `created`, `ends`, and `approved` |
+| `authority.approve(store, &fresh, &code, serial, now, random)` | Authority | `(Proposal, Plan, Checked<()>)`: the approval by the account of `fresh` |
+| `checked.release(&outcome)` | Authority | The answer of a right code from the accepted commit of its check, also after a lookup. `None` for a wrong code and each other outcome |
 | `authority.poll(store, &code, &device, now)` | Authority | `Status::Waiting`, or `Status::Approved(id)` |
 | `authority.finish(store, &code, &device, &id.account, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
 | `authority.account_credential(store, &id, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential of the account binding whose `cnf` key is `holder`, which custody signs again |
@@ -288,8 +298,9 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 | `local::Error::Challenge` | The binding holds no pending challenge, another one, or one whose end passed | Refuse the call. The CLI asks for a new challenge, and makes a new call |
 | `local::Error::NotEnrolled` | No binding with a valid CLI credential holds the credential, the administrator, or the account and key, or the binding of its serial holds another credential. Also an unlink by the CLI of an account | Refuse the call |
 | `local::Error::Name` | The name of the CLI is empty, longer than 64 bytes, or holds a control character | Give another name |
-| `local::Error::Request` | No open request has the user code and the device code: it ended, a finish consumed it, or the codes differ | Make a new request |
+| `local::Error::Request` | No open request has the user code and the device code: it ended, a finish consumed it, the codes differ, or it has the form of an earlier version | Make a new request |
 | `local::Error::Expired` | The end of the request passed | Make a new request |
+| `local::Error::Locked` | The request had `agent::ATTEMPTS_MAX` (5) wrong checks of its user code | Make a new request |
 | `local::Error::Waiting` | No account approved the request yet | Poll again after 5 seconds |
 | `local::Error::Approved` | An account approved the request already | Show the approval |
 | `local::Error::Account` | Another account approved the request | Finish with the account of the poll |
@@ -314,9 +325,18 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
   (`admitted.holder()`).
 - A request authenticates no caller, and its audit names the local owner. Limit the rate of requests and polls of one
   client. Show a request only to a signed-in human: it names the CLI.
-- A user code finds a request, and it proves nothing. Anyone can send a human the code of a request of their own CLI.
-  So the page shows the name and the fingerprint, and asks the human to approve only a CLI on their own screen. The CLI
-  shows the account of the approval.
+- The first 4 letters of a user code find the request, and the last 4 check it. Only a signed-in human makes a check.
+  Each check is a commit at the version of the request, whose audit names the account, and a wrong check counts. Of
+  the checks that read one version, only one commits, and only its answer releases. After `agent::ATTEMPTS_MAX` (5)
+  wrong checks, the request is locked, and one request admits a guess with a chance of at most 5 in 160,000. A
+  signed-in human can lock the request of another CLI with wrong checks. That CLI makes a new request.
+- A check of an approved request writes its next version too. A finish that read the earlier version conflicts: the
+  CLI sends the finish again.
+- A user code proves nothing. Anyone can send a human the code of a request of their own CLI. So the page shows the
+  name and the fingerprint, and asks the human to approve only a CLI on their own screen. The CLI shows the account of
+  the approval.
+- A request pending at an upgrade to the form of this version refuses with `local::Error::Request`, and its CLI makes
+  a new request. A CLI that finished its enrollment keeps its binding.
 - An account recovery ends prior CLI access. The owner can also disconnect one CLI. [List and disconnect a CLI](#list-and-disconnect-a-cli).
 
 ## Support
@@ -329,6 +349,7 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 
 The enrollment from a browser runs in the tests on this Mac (macOS aarch64), on the memory binding, with rscrypto in
 place of custody and the test authenticator of the passkey tests. They cover the journey, the approval of one request
-and the finish of another, an ended request, a lost finish response, and a restore.
+and the finish of another, an ended request, the attempt bound with checks at the same time, a request of the earlier
+form, a lost finish response, and a restore.
 Chrome 158 on macOS aarch64 also ran the approval page with a virtual passkey and the native CLI in file custody.
 [Run the native CLI example](native-cli-example.md#connect-a-cli-to-your-account).

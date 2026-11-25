@@ -64,6 +64,8 @@ Stop both processes when you finish. If you created temporary trust for this run
 Start enrollment in the terminal. Follow the printed address to `/cli`. You can also select **Connect a CLI** on the account page.
 Review the account, device name, and key fingerprint. Approval requires passkey verification within five minutes.
 If the account changes after review, review the request again. [Connect a CLI to your account](native-cli-example.md#connect-a-cli-to-your-account).
+A review and an approval each commit a check of the user code. A wrong code answers `{"recovery":"restart"}` and shows
+nothing of the request. After 5 wrong codes, the request is locked, and the CLI starts again.
 
 ## The steps
 
@@ -85,7 +87,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
 | Make a recovery code | `/recovery-code` | `rp.recovery_code` with a `Fresh`. Only the accepted commit gives the code, and the page shows it once |
 | Recover | `/recover/options`, `/recover/finish` | `rp.recovery_options`, `rp.recover` with `Passkeys::End`, and one `attempt.propose` ([Recover](recovery.md#recover)) |
-| Review or approve a CLI | `/cli/request`, `/cli/approve` | `authority.request` shows the device. `authority.approve` checks fresh verification and commits the approval. |
+| Review or approve a CLI | `/cli/request`, `/cli/approve` | Each commits a check of the user code. `authority.request` shows the device after its commit. `authority.approve` checks fresh verification and commits the approval. |
 | Sign out | `/sign-out` | `sessions.revoke` with `Revoker::Own`, and `site.clear_cookie` |
 
 A sensitive change, such as a removal, a new code, a new account name, or the end of another session, needs a fresh

@@ -61,14 +61,15 @@ before an enrollment loses the identity. The agent then enrolls again.
    `ENROLLMENT_LIFETIME` (10 minutes).
 3. The agent shows the user code, the address of the approval page, and the SHA-256 digest of its public key.
 4. The human signs in on the approval page and gives the code. The page reads it with `UserCode::parse(text)`, and
-   calls `agents.request(store, &access, &code, now, random)` with the `Access` of the session check:
-   - `Checked::Right(request)`: show `request.name` as text, never as markup, and `request.fingerprint`. The human
-     compares the fingerprint with the one on the screen of the agent.
-   - `Checked::Wrong(proposal, plan)`: the last 4 letters are wrong. Commit the proposal, which counts the wrong check,
-     then tell the human that the code is wrong.
+   calls `agents.request(store, &access, &code, now, random)` with the `Access` of the session check. The call gives
+   `(proposal, plan, checked)`. Commit the proposal and its plan, then call `checked.release(&outcome)`:
+   - `Some(request)`: show `request.name` as text, never as markup, and `request.fingerprint`. The human compares the
+     fingerprint with the one on the screen of the agent.
+   - `None`: the code is wrong, or the commit did not accept. Show nothing of the request, and ask the human to give
+     the code again. A wrong code counts against the bound.
 5. To approve, get a fresh user verification with `Fresh::check(&access, max_age, now)`, and call
-   `agents.approve(store, &fresh, &code, now, random)`. Commit the proposal of `Checked::Right((proposal, plan, _))`.
-   Commit the proposal of `Checked::Wrong` as in step 4.
+   `agents.approve(store, &fresh, &code, now, random)`. Commit its proposal and plan as in step 4. `checked.release(&outcome)`
+   gives `Some(loopback)` when the approval committed, and `None` for a wrong code or another outcome.
 6. The agent sends its finish body to the finish route every `interval` seconds:
 
    ```json
@@ -94,9 +95,10 @@ A local agent also starts a listener on the loopback interface, and gives its ad
 ```
 
 1. The agent opens `verification_uri_complete` in the browser of the human, so the human does not type the code.
-2. The approval page shows `request.loopback`. After the approval of step 5 commits, the artifact of its receipt is the
-   32 bytes of the redirect code: `RedirectCode::from_bytes(bytes)`. The page sends the browser to
-   `loopback.redirect(&redirect)`, which is the loopback address with the query `code=` and the base64url of the code.
+2. The approval page shows `request.loopback`. After the approval of step 5 commits, `checked.release(&outcome)` gives
+   `Some(Some(loopback))`, and the artifact of the receipt is the 32 bytes of the redirect code:
+   `RedirectCode::from_bytes(bytes)`. The page sends the browser to `loopback.redirect(&redirect)`, which is the loopback
+   address with the query `code=` and the base64url of the code.
 3. The listener of the agent reads the code, and the agent sends the finish body with it:
 
    ```json
@@ -120,8 +122,8 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 ## Lost responses and restore
 
 - **A lost response of a request.** The agent makes a new request. The earlier request ends unused.
-- **A lost response of an approval.** The server looks up the operation. For a loopback request whose redirect code is
-  lost, the agent makes a new request.
+- **A lost response of a check or an approval.** The server looks up the operation, and `checked.release` takes the
+  receipt of the lookup. For a loopback request whose redirect code is lost, the agent makes a new request.
 - **A lost response of a finish.** The agent reads its identity: `agents.identity(store, &agent)` with the agent
   identifier of step 2. `Error::NotEnrolled` shows that the finish did not commit.
 - **A restore.** A restore ends each pending request: a finish refuses with `Error::Request`. A restore from a snapshot
@@ -134,8 +136,9 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 | --- | --- | --- |
 | `Agents::new(authority, limits)` | Server | The enrollment of agents under one authority |
 | `agents.enroll(&key, name, loopback, now, random)` | Server | `(Proposal, Plan, Started)`. `started.code` and `started.agent` at once. The receipt gives the 32 bytes of the `DeviceCode` |
-| `agents.request(store, &access, &code, now, random)` | Server | `Checked::Right(Request)` with `name`, `fingerprint`, `loopback`, `created`, `ends`, and `approved`, or `Checked::Wrong(proposal, plan)` |
-| `agents.approve(store, &fresh, &code, now, random)` | Server | `Checked::Right((proposal, plan, loopback))`, or `Checked::Wrong(proposal, plan)`. For a loopback request, the receipt gives the 32 bytes of the `RedirectCode` |
+| `agents.request(store, &access, &code, now, random)` | Server | `(Proposal, Plan, Checked<Request>)`. The `Request` has `name`, `fingerprint`, `loopback`, `created`, `ends`, and `approved` |
+| `agents.approve(store, &fresh, &code, now, random)` | Server | `(Proposal, Plan, Checked<Option<Loopback>>)`. For a loopback request, the receipt gives the 32 bytes of the `RedirectCode` |
+| `checked.release(&outcome)` | Server | The answer of a right code from the accepted commit of its check, also after a lookup. `None` for a wrong code and each other outcome |
 | `agents.finish(store, &code, &device, redirect, now, operation)` | Server | `Status::Waiting`, or `Status::Approved(proposal, plan)` |
 | `agents.identity(store, &agent)` | Server | The current `Identity` of the agent |
 | `Enrollment::parse(json)`, `Finish::parse(json)` | Server | The bodies of the agent |
@@ -145,7 +148,8 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 | `Loopback::parse(text)`, `loopback.redirect(&code)` | Both | The loopback address, and the address of the redirect |
 | `rsauthnz_http::machine_json(&request, bytes_max)`, `rsauthnz_http::waiting()` | Server | The check of a request of an agent, and the answer to a finish that waits |
 
-A request, a check, an approval, and a finish each read the request with one keyed lookup. A finish of an approved
+A request, a check, an approval, and a finish each read the request with one keyed lookup. A check and an approval
+also commit. A finish of an approved
 request also reads the account revision of the approval, so a recovery of the account between the approval and the
 finish stops the finish. An identity read is one keyed lookup.
 
@@ -170,9 +174,13 @@ Each `agent::Error` implements `transition::Recover`, so `?` gives a `rsauthnz_h
 
 ## Limits
 
-- The first 4 letters of a user code find the request, and the last 4 check it. Only a signed-in human makes a check,
-  and each wrong check is a commit whose audit names the account. After `ATTEMPTS_MAX` (5) wrong checks, the request
-  is locked. Thus one request admits a guess with a chance of at most 5 in 160,000.
+- The first 4 letters of a user code find the request, and the last 4 check it. Only a signed-in human makes a check.
+  Each check is a commit at the version of the request, whose audit names the account, and a wrong check counts. Of
+  the checks that read one version, only one commits, and only its answer releases. Thus checks at the same time get
+  no more answers than one at a time. After `ATTEMPTS_MAX` (5) wrong checks, the request is locked, and one request
+  admits a guess with a chance of at most 5 in 160,000.
+- A check of an approved request writes its next version too. A finish that read the earlier version conflicts: the
+  agent sends the finish again.
 - A signed-in human can lock the request of another agent with wrong checks. That agent makes a new request.
 - Two open requests whose user codes have the same first 4 letters conflict at the commit of the second. The agent
   asks again.

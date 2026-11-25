@@ -11,14 +11,16 @@
 //! 2. The human signs in with a passkey and gives the user code. The approval page shows the name and the key
 //!    fingerprint of the agent ([`Agents::request`]). The human approves with a fresh user verification
 //!    ([`Agents::approve`]). The commit writes the request as approved by the account of the human. For a loopback
-//!    request, the browser then goes to the loopback address with a one-use [`RedirectCode`].
+//!    request, the browser then goes to the loopback address with a one-use [`RedirectCode`]. Each of the two steps is
+//!    a check of the user code: commit its proposal, then take its answer from the outcome ([`Checked::release`]).
 //! 3. The agent asks for its finish with its device code, and for a loopback request also with the redirect code
 //!    ([`Agents::finish`]). Until the approval, the answer is [`Status::Waiting`]. Then one commit consumes the request
 //!    and writes the agent identity, bound to the account of the approval.
 //!
 //! The owner comes only from the approval: no field of a request names it. A user code finds its request by its first
-//! 4 letters and checks the last 4. Each wrong check is a commit that counts it, and [`ATTEMPTS_MAX`] wrong checks
-//! lock the request. A loopback request finishes only with the redirect code, which goes only to the browser of the
+//! 4 letters and checks the last 4. Each check is a commit at the version of the request, and a wrong check counts.
+//! Thus of the checks that read one version, only one gives an answer, and [`ATTEMPTS_MAX`] wrong checks lock the
+//! request. A loopback request finishes only with the redirect code, which goes only to the browser of the
 //! human that approved. So a human who approves the request of a remote agent by mistake binds no key: the remote
 //! agent never gets the redirect code.
 //!
@@ -46,7 +48,9 @@ use crate::session::Access;
 use crate::store::driver::Plan;
 use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Prepared, Proposal, Recover, Recovery};
+use crate::transition::{
+    self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal, Recover, Recovery,
+};
 
 /// The lifetime of an enrollment request: 10 minutes. An approval gives the agent the same time again to finish.
 pub const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(10 * 60);
@@ -95,9 +99,10 @@ const ENROLL: &str = "agent.enroll";
 /// The letters of a user code: the base20 alphabet of RFC 8628, section 6.1, with no vowel, so no code spells a word.
 const LETTERS: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
 
-/// The user code of an enrollment request: 8 letters of the base20 alphabet of RFC 8628. The agent shows it as
-/// `WDJB-MJHT`, and the human gives it to the approval page. The first 4 letters find the request, and the last 4
-/// check it: a wrong check counts against [`ATTEMPTS_MAX`]. `Debug` does not show it.
+/// The user code of an enrollment request of an agent or of a CLI ([`crate::local::enroll`]): 8 letters of the base20
+/// alphabet of RFC 8628. The agent shows it as `WDJB-MJHT`, and the human gives it to the approval page. The first 4
+/// letters find the request, and the last 4 check it: a wrong check counts against [`ATTEMPTS_MAX`]. `Debug` does not
+/// show it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UserCode([u8; 8]);
 
@@ -129,7 +134,7 @@ impl UserCode {
     }
 
     /// A new code from `random`. A byte at or past 240 is drawn again, so each letter has the same chance.
-    fn random(random: &mut ChaCha20Rng) -> Self {
+    pub(crate) fn random(random: &mut ChaCha20Rng) -> Self {
         let mut code = [0; 8];
         for slot in &mut code {
             *slot = loop {
@@ -144,12 +149,12 @@ impl UserCode {
     }
 
     /// The letters that find the request.
-    fn locator(&self) -> &[u8; 4] {
+    pub(crate) fn locator(&self) -> &[u8; 4] {
         self.0.first_chunk().expect("a code has 8 letters")
     }
 
     /// The letters that check the request.
-    fn check(&self) -> &[u8; 4] {
+    pub(crate) fn check(&self) -> &[u8; 4] {
         self.0.last_chunk().expect("a code has 8 letters")
     }
 }
@@ -187,7 +192,7 @@ macro_rules! secret {
             }
 
             /// The SHA-256 digest of the code, which the request record keeps.
-            fn digest(&self) -> [u8; 32] {
+            pub(crate) fn digest(&self) -> [u8; 32] {
                 crypto::sha256(self.0.as_bytes())
             }
         }
@@ -201,7 +206,8 @@ macro_rules! secret {
 }
 
 secret! {
-    /// The device code of an enrollment request: only the agent holds it, and it gives it with each finish.
+    /// The device code of an enrollment request of an agent or of a CLI: only the agent or the CLI holds it, and it
+    /// gives it with each poll and finish.
     DeviceCode
 }
 
@@ -431,18 +437,39 @@ pub struct Request {
     pub approved: bool,
 }
 
-/// The result of a check of a user code.
+/// The answer of a check of a user code, which the commit of its proposal releases ([`Self::release`]). The proposal
+/// reads the request at its version and writes its next version, and for a wrong code it counts the wrong check. Thus
+/// of the checks that read one version, one commits and each other conflicts, so each answer costs one commit, also
+/// for checks at the same time.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the caller matches the result at once, as it takes `(Proposal, Plan)` from each other operation; a box adds an allocation to each check"
-)]
-pub enum Checked<T> {
-    /// The code is right.
-    Right(T),
-    /// The last 4 letters of the code are wrong. Commit the proposal, which counts the wrong check, then tell the human
-    /// that the code is wrong. Only after the commit does the next check see the count.
-    Wrong(Proposal, Plan),
+pub struct Checked<T> {
+    operation: OperationId,
+    answer: Option<T>,
+}
+
+impl<T> Checked<T> {
+    /// The check of `proposal`, with `answer` for a right code, or `None` for a wrong one.
+    pub(crate) fn new(proposal: &Proposal, answer: Option<T>) -> Self {
+        Self {
+            operation: proposal.operation().id.clone(),
+            answer,
+        }
+    }
+
+    /// The answer of a right code, if `outcome` is the accepted commit of the proposal of this check, also the receipt
+    /// of a lookup of its operation after a lost response. `None` for a wrong code, and for each other outcome: show
+    /// nothing of the request, and tell the human to give the code again.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn release(self, outcome: &Outcome) -> Option<T> {
+        let Outcome::Accepted(receipt) = outcome else {
+            return None;
+        };
+        (*receipt.operation() == self.operation)
+            .then_some(self.answer)
+            .flatten()
+    }
 }
 
 /// The state of an enrollment request for its agent ([`Agents::finish`]).
@@ -678,16 +705,18 @@ impl Agents {
         Ok((proposal, Plan::default(), Started { code, agent }))
     }
 
-    /// The request of the user code `code`, for the approval page of the signed-in human of `access`. Show its
-    /// fingerprint as the agent shows it, so that the human approves only the agent on their own screen.
+    /// Proposes the check of the user code `code` by the signed-in human of `access`, for the approval page. Commit the
+    /// proposal: [`Checked::release`] of its outcome gives the request for a right code. Show its fingerprint as the
+    /// agent shows it, so that the human approves only the agent on their own screen.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, and for a wrong code its commit.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, and its commit.
     ///
     /// # Errors
     ///
     /// [`Error::Request`] if no request has the first 4 letters of `code`: it ended, or a finish consumed it.
     /// [`Error::Locked`] after [`ATTEMPTS_MAX`] wrong checks, and [`Error::Expired`] after its end. [`Error::Time`] if
     /// `now` has no bound. [`Error::Record`] if the record has no valid form, and [`Failure::Store`] if the read fails.
+    /// [`Error::Transition`] for the proposal.
     pub async fn request<S: Store>(
         &self,
         store: &mut S,
@@ -695,22 +724,21 @@ impl Agents {
         code: &UserCode,
         now: Reading,
         random: &mut ChaCha20Rng,
-    ) -> Result<Checked<Request>, Failure<S::Error>> {
-        let (_, record, pending) = match self
-            .checked(store, access.session().account(), code, now, random)
-            .await?
-        {
-            Checked::Right(found) => found,
-            Checked::Wrong(proposal, plan) => return Ok(Checked::Wrong(proposal, plan)),
-        };
-        Ok(Checked::Right(Request {
+    ) -> Result<(Proposal, Plan, Checked<Request>), Failure<S::Error>> {
+        let (key, record, pending) = self.open(store, code, now).await?;
+        let right = pending.check == *code.check();
+        let ends = record.end.ok_or(Error::Record)?;
+        let request = right.then(|| Request {
             fingerprint: crypto::sha256(&*pending.key),
-            name: pending.name,
-            loopback: pending.loopback,
+            name: pending.name.clone(),
+            loopback: pending.loopback.clone(),
             created: Duration::from_secs(pending.created),
-            ends: record.end.ok_or(Error::Record)?,
+            ends,
             approved: pending.approved.is_some(),
-        }))
+        });
+        let proposal = self.check(key, &record, pending, access.session().account(), right, now, random)?;
+        let checked = Checked::new(&proposal, request);
+        Ok((proposal, Plan::default(), checked))
     }
 
     /// Proposes the approval of the request of `code` by the account of `fresh`, a fresh user verification of a
@@ -719,16 +747,17 @@ impl Agents {
     /// versions, so a second approval conflicts. Its deadline is the earliest of the end of the verification and of the
     /// request.
     ///
-    /// For a loopback request, the proposal also gives the loopback address. Only the receipt of the accepted commit
-    /// gives the redirect code: [`RedirectCode::from_bytes`] of its artifact. Then send the browser to
-    /// [`Loopback::redirect`].
+    /// The approval is also a check of `code`: for a wrong code, the proposal counts the wrong check and approves
+    /// nothing. [`Checked::release`] of the accepted commit gives the loopback address of a loopback request, or `None`
+    /// in it for another request. Only the receipt of that commit gives the redirect code: [`RedirectCode::from_bytes`]
+    /// of its artifact. Then send the browser to [`Loopback::redirect`].
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, and its commit.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::request`]. [`Error::Approved`] if an account approved the request already. [`Error::Time`]
-    /// if the end overflows, and [`Error::Transition`] for the proposal.
+    /// if the end overflows.
     pub async fn approve<S: Store>(
         &self,
         store: &mut S,
@@ -736,12 +765,14 @@ impl Agents {
         code: &UserCode,
         now: Reading,
         random: &mut ChaCha20Rng,
-    ) -> Result<Checked<(Proposal, Plan, Option<Loopback>)>, Failure<S::Error>> {
+    ) -> Result<(Proposal, Plan, Checked<Option<Loopback>>), Failure<S::Error>> {
         let owner = fresh.account();
-        let (key, record, mut pending) = match self.checked(store, owner, code, now, random).await? {
-            Checked::Right(found) => found,
-            Checked::Wrong(proposal, plan) => return Ok(Checked::Wrong(proposal, plan)),
-        };
+        let (key, record, mut pending) = self.open(store, code, now).await?;
+        if pending.check != *code.check() {
+            let proposal = self.check(key, &record, pending, owner, false, now, random)?;
+            let checked = Checked::new(&proposal, None);
+            return Ok((proposal, Plan::default(), checked));
+        }
         pending.approved.is_none().ok_or(Error::Approved)?;
         let actor = Principal::Human(owner.clone());
         let mut proposal = self.proposal(
@@ -766,24 +797,14 @@ impl Agents {
             fresh.epoch.clone(),
             redirect.as_ref().map(RedirectCode::digest),
         ));
-        let version = self.next(&record.version, &crypto::sha256(&encode(&[owner.to_cbor()])))?;
-        proposal
-            .read(Dependency::Version(key.clone(), record.version))
-            .map_err(Error::Transition)?;
-        proposal
-            .change(Change::Write {
-                key: key.clone(),
-                version: version.clone(),
-                end: Some(end),
-                data: pending.form(),
-            })
-            .map_err(Error::Transition)?;
+        let version = self.rewrite(&mut proposal, key.clone(), &record, &pending, Some(end))?;
         if let Some(redirect) = redirect {
             proposal
                 .prepare(Prepared::new(redirect.as_bytes().to_vec(), key, version))
                 .map_err(Error::Transition)?;
         }
-        Ok(Checked::Right((proposal, Plan::default(), pending.loopback)))
+        let checked = Checked::new(&proposal, Some(pending.loopback));
+        Ok((proposal, Plan::default(), checked))
     }
 
     /// The finish of the request of `code` by its agent, which proves itself with its device code `device`, and for a
@@ -908,43 +929,57 @@ impl Agents {
         Ok((key, record, pending))
     }
 
-    /// The open request of `code` for the human `actor`, or the proposal that counts a wrong check of its last 4
-    /// letters. The proposal reads the request at its version, so of two wrong checks at one version one counts and
-    /// the other conflicts.
-    async fn checked<S: Store>(
+    /// The proposal of a check of the user code of the open request `pending` at `key` by the human `actor`, with one
+    /// more wrong check if the code is not `right`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request, its record, its state, the actor, the result, the time, and the random source are each one input of one check"
+    )]
+    fn check(
         &self,
-        store: &mut S,
+        key: Key,
+        record: &Record,
+        mut pending: Pending,
         actor: &Id<Human>,
-        code: &UserCode,
+        right: bool,
         now: Reading,
         random: &mut ChaCha20Rng,
-    ) -> Result<Checked<(Key, Record, Pending)>, Failure<S::Error>> {
-        let (key, record, mut pending) = self.open(store, code, now).await?;
-        if pending.check == *code.check() {
-            return Ok(Checked::Right((key, record, pending)));
+    ) -> Result<Proposal, Error> {
+        if !right {
+            pending.attempts = pending.attempts.checked_add(1).ok_or(Error::Record)?;
         }
-        pending.attempts = pending.attempts.checked_add(1).ok_or(Error::Record)?;
         let actor = Principal::Human(actor.clone());
-        let mut proposal = self.proposal(
-            OperationId::random(random),
-            actor,
-            CHECK,
-            Value::Bytes(key.as_bytes()),
-            now,
-        )?;
+        let request = Value::Bytes(key.as_bytes());
+        let mut proposal = self.proposal(OperationId::random(random), actor, CHECK, request, now)?;
+        self.rewrite(&mut proposal, key, record, &pending, record.end)?;
+        Ok(proposal)
+    }
+
+    /// Adds to `proposal` the read of the request `key` at the version of `record`, and the write of `pending` at the
+    /// next version, which ends at `end`. The identity of the version is the digest of the form. Thus of two proposals
+    /// that read one version, one commits and the other conflicts.
+    fn rewrite(
+        &self,
+        proposal: &mut Proposal,
+        key: Key,
+        record: &Record,
+        pending: &Pending,
+        end: Option<Duration>,
+    ) -> Result<AuthorityVersion, Error> {
+        let data = pending.form();
+        let version = self.next(&record.version, &crypto::sha256(&data))?;
         proposal
             .read(Dependency::Version(key.clone(), record.version.clone()))
             .map_err(Error::Transition)?;
-        let version = self.next(&record.version, &crypto::sha256(&pending.attempts.to_be_bytes()))?;
         proposal
             .change(Change::Write {
                 key,
-                version,
-                end: record.end,
-                data: pending.form(),
+                version: version.clone(),
+                end,
+                data,
             })
             .map_err(Error::Transition)?;
-        Ok(Checked::Wrong(proposal, Plan::default()))
+        Ok(version)
     }
 
     /// The key of the request of `code`: [`Kind::AgentEnrollment`] with the SHA-256 digest of the canonical CBOR form

@@ -23,6 +23,8 @@ Use the pinned Rust toolchain. Start the web example and create a passkey for yo
    ```
 
 The user code expires after ten minutes. While the request waits, the CLI polls every five seconds.
+A wrong user code shows nothing of the request, and the page asks for the code again. After 5 wrong codes, start
+enrollment again in the terminal.
 The default loopback port is 8080. To use another port, give it after the device name. The CLI saves the port with the binding.
 
 The directory holds the private key, the binding, and the signed credential. Keep it for later calls.

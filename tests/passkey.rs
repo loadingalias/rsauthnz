@@ -77,6 +77,15 @@ fn at(seconds: u64) -> Reading {
     )
 }
 
+/// The user code of `code` with other check letters, which the right code never has: its locator, then 4 times a letter
+/// of the alphabet that differs from its first check letter.
+fn wrong(code: &rsauthnz::agent::UserCode) -> rsauthnz::agent::UserCode {
+    let text = code.text();
+    let (locator, check) = text.split_once('-').expect("two groups");
+    let check = if check.starts_with('B') { "CCCC" } else { "BBBB" };
+    rsauthnz::agent::UserCode::parse(&format!("{locator}-{check}")).expect("a code")
+}
+
 /// The output of `future`. The futures of the memory binding are ready at their first poll.
 fn ready<F: Future>(future: F) -> F::Output {
     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
@@ -267,6 +276,11 @@ impl Site {
 
     /// A fresh user verification of alice with her passkey `with`: a sign-in at 11, checked at 12.
     fn fresh(&mut self, with: &Passkey) -> Fresh {
+        self.verified(with).1
+    }
+
+    /// The session of a sign-in with `with` at 11, checked at 12, and its fresh user verification.
+    fn verified(&mut self, with: &Passkey) -> (Access, Fresh) {
         let json = Get::new(with, RP_ID, ORIGIN, self.options(at(10)), HANDLE).json();
         let opened = self.opened(&json, at(11), None);
         let access = match ready(
@@ -276,7 +290,8 @@ impl Site {
             Ok(rsauthnz::session::Check::Active(access)) => access,
             other => panic!("the session does not serve: {other:?}"),
         };
-        Fresh::check(&access, FRESH_MAX, at(12)).expect("a fresh verification")
+        let fresh = Fresh::check(&access, FRESH_MAX, at(12)).expect("a fresh verification");
+        (access, fresh)
     }
 
     /// Commits the start of an additional passkey of alice at 12 with the verification `fresh`, and gives its options.
