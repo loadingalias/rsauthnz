@@ -3,7 +3,8 @@
 //!
 //! This test binary has its own global allocator. While a thread arms it, the allocator copies each block that the
 //! thread frees through the OS, before it releases the block, and it counts each block that holds a part of the key.
-//! The OS copy reads the bytes as the hardware holds them, so no Rust load reads memory that is not initialized,
+//! Then it clears the block. The system allocator can give a freed block to a later allocation with its bytes, as
+//! glibc does. Thus the count of a later free never holds the bytes of an earlier one. The OS copy reads the bytes as the hardware holds them, so no Rust load reads memory that is not initialized,
 //! such as the padding of a structure.
 #![cfg(all(feature = "native-custody", any(target_os = "linux", target_os = "macos", windows)))]
 
@@ -41,10 +42,10 @@ static ALLOCATOR: Scan = Scan;
 
 #[expect(
     unsafe_code,
-    reason = "a global allocator that scans each freed block before the system frees it"
+    reason = "a global allocator that scans and clears each freed block before the system frees it"
 )]
-// SAFETY: each call goes to `System` with the same arguments. `dealloc` reads the block through the OS before it
-// releases it, and the scan allocates nothing.
+// SAFETY: each call goes to `System` with the same arguments. `dealloc` reads the block through the OS and clears it
+// before it releases it, and the scan allocates nothing.
 unsafe impl GlobalAlloc for Scan {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller keeps the contract of `GlobalAlloc::alloc`.
@@ -55,6 +56,11 @@ unsafe impl GlobalAlloc for Scan {
         if ARMED.get() {
             ARMED.set(false);
             scan(block.addr(), layout.size());
+            for at in 0..layout.size() {
+                // SAFETY: the block has `layout.size()` bytes, and the caller does not use it after this call. The
+                // write is volatile, so the compiler keeps it before the free.
+                unsafe { block.add(at).write_volatile(0) };
+            }
             ARMED.set(true);
         }
         // SAFETY: the caller keeps the contract of `GlobalAlloc::dealloc`.
