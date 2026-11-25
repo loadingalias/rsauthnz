@@ -56,7 +56,8 @@ authenticator.
 
 ## Observed results
 
-Each bound held in each run of the table. The host was not quiet, so the times are no performance claim.
+Each bound held in each run of the table. The times are no performance claim: the macOS host was not quiet, and
+each run is one run.
 
 | Host | Check | Result |
 | --- | --- | --- |
@@ -66,5 +67,10 @@ Each bound held in each run of the table. The host was not quiet, so the times a
 | | A legitimate sign-in during a flood | 100 of 100 sign-ins got a session during a flood of 480,000 sign-ins. The median was 1.4 ms, the 99th percentile 2.5 ms, and the longest 2.9 ms |
 | | Retained records | At most 186,160 records with an end, constant from 3,900 seconds. None after 300 passes of the 2 hours |
 | | Shutdown with a request in flight | Pass |
-| Linux x86_64 | Each check | Not run yet |
+| Ubuntu 26.04 (Linux 7.0.0-1018-aws, glibc), Intel Xeon 6975P-C (x86_64, c8i.4xlarge), release build, 2026-11-25, the only work of the host | Malformed input | 24,000 refusals. For each kind, the median was 1.1 ms to 2.0 ms, and the 99th percentile was 2.5 ms to 2.7 ms. 11 records before and after |
+| | Flood of sign-in verifications | 120,000 sign-ins: 21,047 got `403` after the signature check (99th percentile 4.3 ms), and 98,953 got `503` (99th percentile 3.1 ms). 22 records before and after |
+| | A store that does not answer | Pass, also with musl |
+| | A legitimate sign-in during a flood | 100 of 100 sign-ins got a session during a flood of 480,000 sign-ins. The median was 1.3 ms, the 99th percentile 2.3 ms, and the longest 2.4 ms |
+| | Retained records | At most 186,160 records with an end, constant from 3,900 seconds. None after 300 passes of the 2 hours |
+| | Shutdown with a request in flight | Pass, also with musl |
 | Windows x86_64 | Each check | Not run yet |

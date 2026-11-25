@@ -204,6 +204,7 @@ Keep the server running across browsers to use the same accounts. Remove your te
 | Profile | Evidence |
 | --- | --- |
 | macOS aarch64, HTTP/1.1 and HTTP/2 | The tests pass, and the server serves the page and the sign-in options to `curl` over both protocols |
+| Linux x86_64, glibc and musl (Ubuntu 26.04) | The tests pass |
 | Windows x86_64 | Not run yet |
 | Chrome 158 on macOS aarch64, virtual passkey | Sign-up, passkey sign-in on the approval page, matching fingerprints, and native CLI approval passed. |
 | Safari 27.2 (22625.2.8.11.9), Apple Passwords with Touch ID on macOS 27.2.1 | Registration chose ES256 (`-7`) on HTTP and HTTPS with `-49` first. HTTP sign-in verified, but Safari omitted the `__Host-` cookie. A separate HTTPS check returned that cookie. The signed-in HTTPS account page still needs a run. |
