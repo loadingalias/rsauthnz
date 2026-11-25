@@ -180,6 +180,9 @@ The limit tests use a store that does not answer until the test releases it. The
 credential, the commit budget, the account bound, and the expiry pass. One test stops the server with a request in
 flight: the request gets its response, and then the application thread joins.
 
+Four more runs put a load on the example and measure it. [Check a host at its limits](host-limits.md) gives their
+commands, their bounds, and the observed results.
+
 ## Check a browser and passkey provider
 
 1. Start the TLS listener above. Use the provider example as its backend with a new issuer directory.

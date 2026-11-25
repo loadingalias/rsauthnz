@@ -160,7 +160,7 @@ impl Site {
 }
 
 /// The user handle of the creation options `options`: the `id` of its `user`.
-fn user_id(options: &[u8]) -> [u8; 32] {
+pub(crate) fn user_id(options: &[u8]) -> [u8; 32] {
     let limits = json::Limits {
         input_bytes_max: 64 * 1024,
         depth_max: 4,

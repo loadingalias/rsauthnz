@@ -287,6 +287,8 @@ async fn a_shutdown_returns_the_response_of_a_request_in_flight_and_then_joins_t
     let response = request.await.expect("the request");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     server.await.expect("the server").expect("a joined shutdown");
+    // The listener is closed, so the server takes no new connection.
+    std::net::TcpStream::connect(address).unwrap_err();
     // The queue is closed, so a later request gets the overload response.
     assert_eq!(sign_up(&site, "bob").await, StatusCode::SERVICE_UNAVAILABLE);
 }

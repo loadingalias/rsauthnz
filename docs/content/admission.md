@@ -31,6 +31,7 @@ does signature, KDF, or storage work.
 A passkey operation, such as `rp.sign_in`, takes the store and the commit driver for its whole call. A host with one
 driver thus runs the verification and the commit of a sign-in in one queue. [Run the web example](web-example.md#limits)
 shows such a host: one bounded queue, a share for each credential, a commit budget, and an expiry pass.
+[Check a host at its limits](host-limits.md) gives the runs that check it.
 
 ## The limit set
 
