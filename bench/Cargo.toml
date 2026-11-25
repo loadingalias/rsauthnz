@@ -1,0 +1,30 @@
+[package]
+name = "bench"
+version = "0.0.0"
+description = "The benchmarks of rsauthnz. They are a package of their own, so no test build compiles their harness."
+# Cargo gives each file of a `benches` directory of the root package to that package, so this directory has another name.
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The complete ES256 sign-in verification beside its rscrypto primitive:
+# `cargo bench --locked -p bench --bench sign_in`.
+[[bench]]
+name = "sign_in"
+path = "sign_in.rs"
+harness = false
+
+[dev-dependencies]
+# The harness (approved 2026-11-21). Its closure holds one C file, which the musl test lane cannot build.
+criterion = { version = "=0.8.2", default-features = false }
+# The sign-in that the benchmark measures.
+rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
+# The memory binding of the storage contract, and the executor of the effects of the driver on it.
+rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../rsauthnz-conformance" }
+# The test authenticator reads and writes JSON and base64url.
+rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "json"] }
+# The primitive of the benchmark, the keys of the test authenticator, and the seeded random generator.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng", "ecdsa-p256", "ed25519", "ml-dsa", "sha2"] }
+
+[lints]
+workspace = true

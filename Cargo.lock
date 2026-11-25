@@ -91,6 +91,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+ "rsauthnz",
+ "rsauthnz-conformance",
+ "rscodec",
+ "rscrypto",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,7 +581,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rsauthnz"
 version = "0.1.0-alpha.1"
 dependencies = [
- "criterion",
  "rsauthnz-conformance",
  "rscodec",
  "rscrypto",

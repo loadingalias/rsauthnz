@@ -28,20 +28,13 @@ native-custody = []
 # The memory binding and the effect executor commit the transitions of the tests and of the doctests: only the
 # receipt of an accepted transition gives a prepared artifact.
 rsauthnz-conformance = { path = "rsauthnz-conformance" }
-# The harness of `benches/` (approved 2026-11-21). No library crate depends on it, and its closure holds one C file.
-criterion = { version = "=0.8.2", default-features = false }
-
-# The complete ES256 sign-in verification beside its rscrypto primitive: `cargo bench --locked --bench sign_in`.
-[[bench]]
-name = "sign_in"
-harness = false
 
 [lints]
 workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "rsauthnz-conformance", "rsauthnz-http", "xtask", "xtask/portable", "examples/storage-binding", "examples/native-cli", "examples/web"]
+members = [".", "rsauthnz-conformance", "rsauthnz-http", "xtask", "xtask/portable", "bench", "examples/storage-binding", "examples/native-cli", "examples/web"]
 
 # `rust-version` is the release number of the nightly that rust-toolchain.toml pins. Cargo then
 # refuses an older toolchain with one message. A crate that turns on an unstable feature also needs
