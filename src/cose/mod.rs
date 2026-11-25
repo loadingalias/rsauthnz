@@ -67,6 +67,7 @@ use core::fmt;
 
 pub(crate) use cwt::validity;
 pub use cwt::{Claims, Confirmation, Profile, Verified};
+pub(crate) use key::verifier;
 pub use key::{Key, PublicKey, TrustedKey};
 pub(crate) use sign1::to_be_signed;
 pub use sign1::{Header, Sign1};

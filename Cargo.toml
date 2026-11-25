@@ -13,8 +13,10 @@ publish.workspace = true
 # rstypes and rscrypto come from their Git `main`.
 rstypes = { git = "https://github.com/loadingalias/rsasync", branch = "main", default-features = false }
 # The only source of signatures, digests, and the seeded random generator. Its `alloc` gives the owners that clear a
-# secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation.
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "blake3", "chacha20-rng", "ecdsa-p256", "ecdsa-p384", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2", "slh-dsa"] }
+# secret when they drop (`SecretVec`), and it builds each secret key of custody in place in its allocation. Its `std`
+# gives the run-time CPU detection of x86_64: without it, each primitive uses its compile-time backend there, such as
+# the portable SHA-256 on a CPU with SHA-NI.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["alloc", "blake3", "chacha20-rng", "ecdsa-p256", "ecdsa-p384", "ed25519", "ml-dsa", "mldsa65-ecdsa-p256", "mldsa65-ed25519", "rsa", "sha2", "slh-dsa", "std"] }
 # The JSON reader and writer and base64url of the passkey ceremonies, the base64url of session identifiers, and the
 # hex text of recovery codes. Its `std` detects DIT on aarch64, so the secret kernels run in a `with_dit` scope.
 rscodec = { git = "https://github.com/loadingalias/rscodec", branch = "main", default-features = false, features = ["base64", "hex", "json", "std"] }

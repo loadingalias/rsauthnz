@@ -22,9 +22,10 @@
 //!
 //! A sign-in has one commit. [`RelyingParty::sign_in_options`] gives the options with a challenge that holds the
 //! earliest time of its reading under an HMAC-SHA256 tag, and it writes nothing. [`Assertion::parse`] reads the
-//! response of `navigator.credentials.get()`, and [`RelyingParty::sign_in`] checks it. [`SignIn::open`] then proposes
-//! the commit: the replay record of the challenge, the counter of the credential when it advances, the new session,
-//! and the audit. Only the accepted commit releases the [`Evidence`] and the session
+//! response of `navigator.credentials.get()`. [`RelyingParty::sign_in_read`] reads its records from the store, and
+//! [`SignInRecords::verify`] checks it with no store and no driver. [`SignIn::open`] then proposes the commit: the
+//! replay record of the challenge, the counter of the credential when it advances, the new session, and the audit. Only
+//! the accepted commit releases the [`Evidence`] and the session
 //! ([`Opening::release`](crate::session::Opening::release)).
 //!
 //! The options offer ML-DSA-65 (-49), EdDSA (-8), ES256 (-7), and RS256 (-257), in this order, and the check also
@@ -271,6 +272,8 @@ const SIGN_IN_CLONE: &str = "passkey.sign-in.possible-clone";
 pub struct RelyingParty {
     pub(crate) authority: Id<Authority>,
     pub(crate) id: String,
+    /// The SHA-256 digest of `id`, which the authenticator data of each response holds.
+    id_hash: [u8; 32],
     origin: String,
     /// The other origins of the application that use the relying party ID ([`Self::with_related`]).
     related: Vec<String>,
@@ -319,6 +322,7 @@ impl RelyingParty {
         Ok(Self {
             authority,
             id: id.into(),
+            id_hash: crypto::sha256(id.as_bytes()),
             origin: origin.into(),
             related: Vec::new(),
             name: name.into(),
@@ -542,7 +546,7 @@ impl RelyingParty {
         else {
             return Err(Error::Malformed);
         };
-        let (flags, backup, sign_count, rest) = self.authenticator_data(data)?;
+        let (flags, backup, sign_count, rest) = Self::authenticator_data(&self.id_hash, data)?;
         (flags & USER_VERIFIED != 0).ok_or(Error::UserVerification)?;
         (flags & ATTESTED != 0).ok_or(Error::Malformed)?;
         let (_aaguid, rest) = rest.split_first_chunk::<16>().ok_or(Error::Malformed)?;
@@ -552,7 +556,7 @@ impl RelyingParty {
             .ok_or(Error::Malformed)?;
         (id.len() <= CREDENTIAL_ID_BYTES_MAX && *id == *response.id).ok_or(Error::CredentialId)?;
         let (key, extensions) = cbor::decode_prefix(rest, self.limits).map_err(|_| Error::Malformed)?;
-        self.extensions(flags, extensions)?;
+        Self::extensions(flags, extensions, self.limits)?;
         let key = Key::from_value(&key).map_err(|error| match error {
             cose::Error::Unsupported | cose::Error::KeyAlgorithm => Error::Algorithm,
             _ => Error::Key,
@@ -576,11 +580,11 @@ impl RelyingParty {
     }
 
     /// The flags, the backup state, and the signature counter of the authenticator data `data`, and the bytes after the
-    /// counter. It checks the hash of the relying party ID, the presence of the user, and a backup state only with
-    /// backup eligibility.
-    fn authenticator_data<'d>(&self, data: &'d [u8]) -> Result<(u8, Backup, u32, &'d [u8]), Error> {
+    /// counter. It checks the hash `id_hash` of the relying party ID, the presence of the user, and a backup state only
+    /// with backup eligibility.
+    fn authenticator_data<'d>(id_hash: &[u8; 32], data: &'d [u8]) -> Result<(u8, Backup, u32, &'d [u8]), Error> {
         let (rp_id_hash, rest) = data.split_first_chunk::<32>().ok_or(Error::Malformed)?;
-        (*rp_id_hash == crypto::sha256(self.id.as_bytes())).ok_or(Error::RelyingParty)?;
+        (rp_id_hash == id_hash).ok_or(Error::RelyingParty)?;
         let (&[flags], rest) = rest.split_first_chunk::<1>().ok_or(Error::Malformed)?;
         (flags & USER_PRESENT != 0).ok_or(Error::UserPresence)?;
         let backup = backup(flags & BACKUP_ELIGIBLE != 0, flags & BACKUP_STATE != 0).ok_or(Error::Malformed)?;
@@ -589,12 +593,13 @@ impl RelyingParty {
     }
 
     /// Checks the extension outputs `extensions` of the authenticator data with `flags`: none without the ED flag, and
-    /// a CBOR map with it. The check reads no output, so an output that nobody asked for has no effect.
-    fn extensions(&self, flags: u8, extensions: &[u8]) -> Result<(), Error> {
+    /// a CBOR map with it, within `limits`. The check reads no output, so an output that nobody asked for has no
+    /// effect.
+    fn extensions(flags: u8, extensions: &[u8], limits: Limits) -> Result<(), Error> {
         if flags & EXTENSIONS == 0 {
             extensions.is_empty().ok_or(Error::Malformed)
         } else {
-            matches!(cbor::decode(extensions, self.limits), Ok(Value::Map(_))).ok_or(Error::Malformed)
+            matches!(cbor::decode(extensions, limits), Ok(Value::Map(_))).ok_or(Error::Malformed)
         }
     }
 
@@ -738,43 +743,38 @@ impl RelyingParty {
         Ok(out)
     }
 
-    /// Proposes the sign-in of `assertion`, after keyed reads of `store`: the credential record, the replay floor, and
-    /// the replay record of the challenge. The check refuses a challenge that the key did not make or that is older than
-    /// [`SIGN_IN_LIFETIME`] before any read, and a challenge that is not later than the replay floor after its read. A
-    /// restore raises the floor, so a challenge from before a restore refuses after it.
+    /// Reads the records of the sign-in of `assertion` from `store`, after its cheap refusals, and gives them to the
+    /// verification ([`SignInRecords::verify`]). The read refuses a challenge that the key did not make or that is
+    /// older than [`SIGN_IN_LIFETIME`] before any read, and a challenge that is not later than the replay floor or that
+    /// served a sign-in after its read. A restore raises the floor, so a challenge from before a restore refuses after
+    /// it.
     ///
-    /// The proposal reads the credential record at its version, and it writes the record only when the signature
-    /// counter advances or the backup state changes. A counter that does not advance, with a nonzero counter on either
-    /// side, is a possible clone: the stored value stays, and the evidence and the audit action record the signal. The
-    /// proposal inserts the replay record of the challenge, so the challenge serves once. Its operation identity is
-    /// new, so the same assertion again is a new operation that finds the replay record. [`SignIn::open`] adds the
-    /// session and gives the proposal: only its accepted commit releases the evidence and the session.
+    /// The read takes no driver, and the verification takes no store and no driver. Thus a host can read on the thread
+    /// that owns the store, verify on another thread, and then propose the commit ([`SignIn::open`]). The proposal
+    /// reads each record at the version of this read, so a commit between the read and the commit of the sign-in makes
+    /// it conflict.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One account revision lookup, one signature check, and three keyed lookups in two
-    /// store calls. An absent credential needs one more lookup for its removal mark, then the sign-in refuses.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One HMAC-SHA256 tag, one account revision lookup, and
+    /// three keyed lookups in two store calls. An absent credential needs one more lookup for its removal mark, then
+    /// the sign-in refuses.
     ///
     /// # Errors
     ///
     /// - [`Error::Challenge`] if the challenge is not one of the key, has ended, is not later than the replay floor,
     ///   or served a sign-in already: start a new ceremony.
-    /// - [`Error::Origin`] and [`Error::CrossOrigin`] as for a registration, and [`Error::RelyingParty`] and
-    ///   [`Error::UserPresence`] for the authenticator data.
+    /// - [`Error::Origin`] and [`Error::CrossOrigin`] as for a registration.
     /// - [`Error::Removed`] if the store has no record of the credential under this relying party and that handle,
     ///   and a removal ended it ([`RelyingParty::remove`]): tell the provider to forget the passkey.
     /// - [`Error::Credential`] if the assertion has no user handle of 32 bytes, or the store has no record of the
-    ///   credential and no removal mark. [`Error::Signature`] if the signature does not verify with the stored key.
-    /// - [`Error::Malformed`] if the backup eligibility differs from the registration, and for each other difference
-    ///   from the forms of WebAuthn Level 3.
-    /// - [`Error::Record`] if a record has no valid form, [`Error::Time`] if `now` has no bound, [`Error::Driver`] if
-    ///   the driver does not serve, and [`Error::Transition`] for the proposal. [`Failure::Store`] if a read fails.
-    pub async fn sign_in<S: Store>(
+    ///   credential and no removal mark.
+    /// - [`Error::Record`] if a record has no valid form, and [`Error::Time`] if `now` has no bound.
+    ///   [`Failure::Store`] if a read fails.
+    pub async fn sign_in_read<S: Store>(
         &self,
         store: &mut S,
-        assertion: &Assertion,
+        assertion: Assertion,
         now: Reading,
-        random: &mut ChaCha20Rng,
-        driver: &mut Driver,
-    ) -> Result<SignIn, Failure<S::Error>> {
+    ) -> Result<SignInRecords, Failure<S::Error>> {
         let challenge = &assertion.client_data.challenge;
         let created = self.created(challenge)?;
         let expires = created
@@ -783,6 +783,13 @@ impl RelyingParty {
         let latest = now.latest().map_err(Error::Time)?;
         (created <= latest && latest < expires).ok_or(Error::Challenge)?;
         assertion.client_data.check(self)?;
+        // The replay record stays past the end of the challenge by twice the bound of the reading, as the replay
+        // contract requires.
+        let bound = now.bound().ok_or(Error::Time(TimeError::UnknownBound))?;
+        let replay_end = bound
+            .checked_mul(2)
+            .and_then(|margin| expires.checked_add(margin))
+            .ok_or(Error::Time(TimeError::Overflow))?;
 
         let handle = assertion.user_handle.as_deref().ok_or(Error::Credential)?;
         let handle = UserHandle(<[u8; 32]>::try_from(handle).map_err(|_| Error::Credential)?);
@@ -803,96 +810,30 @@ impl RelyingParty {
             .key(&crypto::sha256(&[SIGN_IN_FORM.as_bytes(), challenge].concat()))
             .expect("a key of 33 bytes is valid");
         let [floor, used] = store.read_pair([&floor_key, &replay]).await.map_err(Failure::Store)?;
-        if let Some(floor) = &floor {
-            (created > record::floor_end(&floor.data, self.limits).ok_or(Error::Record)?).ok_or(Error::Challenge)?;
-        }
-        used.is_none().ok_or(Error::Challenge)?;
-
-        // The key binds the user handle, so the record is of the account of the assertion.
-        let (account, _, stored) = credential_form(&record.data, self.limits)?;
-        let (flags, reported, count, rest) = self.authenticator_data(&assertion.authenticator_data)?;
-        let single = |backup| backup == Backup::SingleDevice;
-        (single(reported) == single(stored.backup) && flags & ATTESTED == 0).ok_or(Error::Malformed)?;
-        self.extensions(flags, rest)?;
-        let message = [
-            &assertion.authenticator_data[..],
-            &crypto::sha256(&assertion.client_data_json),
-        ]
-        .concat();
-        let public = Key::decode(&stored.public_key, self.limits).map_err(|_| Error::Record)?;
-        TrustedKey::new(stored.algorithm, &public)
-            .map_err(|_| Error::Record)?
-            .verify_der(&message, &assertion.signature, &mut SignatureBudget::new(&self.limits))
-            .map_err(|_| Error::Signature)?;
-
-        let advances = count > stored.sign_count;
-        let possible_clone = !advances && (count | stored.sign_count) != 0;
-        let request = Value::Array(vec![Value::Bytes(&assertion.id), Value::Bytes(challenge)]);
-        let action = if possible_clone { SIGN_IN_CLONE } else { SIGN_IN };
-        let mut proposal = self.proposal(operation(random), &account, action, &request, now)?;
-        proposal.read(epoch.dependency()).map_err(Error::from)?;
-        proposal
-            .read(Dependency::Version(key.clone(), record.version))
-            .map_err(Error::from)?;
-        // No attestation proves where the key lives, so the evidence has no binding, and only the reported flags.
-        let mut evidence = Evidence::new(
-            Principal::Human(account.clone()),
-            Method::Passkey,
-            now,
-            flags & USER_VERIFIED != 0,
-            true,
-            None,
-            Some(stored.algorithm.report().authentication),
-        );
-        evidence.backup = Some(reported);
-        evidence.possible_clone = possible_clone;
-        // The record keeps the counter that advanced and the backup state of this assertion (WebAuthn Level 3, section
-        // 7.2, step 24). The counter never decreases.
-        if advances || reported != stored.backup {
-            let credential = Credential {
-                sign_count: count.max(stored.sign_count),
-                backup: reported,
-                ..stored
-            };
-            let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
-            let data = credential.record(&account, &handle);
-            proposal
-                .change(Change::Write {
-                    key,
-                    version,
-                    end: None,
-                    data,
-                })
-                .map_err(Error::from)?;
-        }
         let floor = match floor {
-            Some(floor) => Dependency::Version(floor_key, floor.version),
+            Some(floor) => {
+                let end = record::floor_end(&floor.data, self.limits).ok_or(Error::Record)?;
+                (created > end).ok_or(Error::Challenge)?;
+                Dependency::Version(floor_key, floor.version)
+            }
             None => Dependency::Absent(floor_key),
         };
-        proposal.read(floor).map_err(Error::from)?;
-        proposal.read(Dependency::Absent(replay.clone())).map_err(Error::from)?;
-        // The record stays past the end of the challenge by twice the bound of the reading, as the replay contract
-        // requires.
-        let bound = now.bound().ok_or(Error::Time(TimeError::UnknownBound))?;
-        let end = bound
-            .checked_mul(2)
-            .and_then(|margin| expires.checked_add(margin))
-            .ok_or(Error::Time(TimeError::Overflow))?;
-        let version = self.version(driver.allocate(Kind::Replay).map_err(Error::from)?);
-        let data = encode(&Value::Text(SIGN_IN_FORM));
-        proposal
-            .change(Change::Write {
-                key: replay,
-                version,
-                end: Some(end),
-                data,
-            })
-            .map_err(Error::from)?;
-        proposal.until(expires);
-        Ok(SignIn {
-            proposal,
-            evidence,
+        used.is_none().ok_or(Error::Challenge)?;
+        Ok(SignInRecords {
+            authority: self.authority.clone(),
+            id: self.id.clone(),
+            id_hash: self.id_hash,
+            limits: self.limits,
+            assertion,
+            now,
+            expires,
+            replay_end,
+            handle,
             epoch,
+            key,
+            record,
+            floor,
+            replay,
         })
     }
 
@@ -981,18 +922,20 @@ impl RelyingParty {
         request: &Value<'_>,
         now: Reading,
     ) -> Result<Proposal, Error> {
-        let audit = Audit {
-            actor,
-            action: Id::<Action>::new("rsauthnz", action).expect("each action of this module is a valid identifier"),
-            time: now,
-        };
-        let request = Value::Array(vec![self.authority.to_cbor(), Value::Text(&self.id), request.clone()]);
-        Ok(Proposal::new(operation, audit, &request, self.limits)?)
+        self.owner().proposal_by(operation, actor, action, request, now)
     }
 
     /// The version of a write: the authority and `value`, a new value of a counter of the driver.
     pub(crate) fn version(&self, value: u64) -> AuthorityVersion {
-        AuthorityVersion::new(self.authority.clone(), &value.to_be_bytes()).expect("an 8-byte coordinate is valid")
+        self.owner().version(value)
+    }
+
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            authority: &self.authority,
+            id: &self.id,
+            limits: self.limits,
+        }
     }
 
     /// Finds the storage key of `id` in the account's current passkey generation.
@@ -1140,6 +1083,7 @@ impl fmt::Debug for Response {
 }
 
 /// A sign-in response of a browser: `AuthenticationResponseJSON`, the result of `credential.toJSON()`.
+#[derive(Clone)]
 pub struct Assertion {
     id: Box<[u8]>,
     client_data: ClientData,
@@ -1178,7 +1122,8 @@ impl Assertion {
     }
 
     /// The credential ID of the assertion. A host reads it before it admits the sign-in, for example to bound the
-    /// waiting sign-ins of one credential. It is input of the peer: only [`RelyingParty::sign_in`] checks it.
+    /// waiting sign-ins of one credential. It is input of the peer: only [`RelyingParty::sign_in_read`] and
+    /// [`SignInRecords::verify`] check it.
     #[must_use]
     pub fn id(&self) -> &[u8] {
         &self.id
@@ -1279,6 +1224,7 @@ impl<'a> Fields<'a> {
 }
 
 /// The members of `clientDataJSON` that a check reads.
+#[derive(Clone)]
 struct ClientData {
     challenge: Box<[u8]>,
     origin: String,
@@ -1505,12 +1451,135 @@ impl Decision<'_> {
     }
 }
 
-/// A checked sign-in that waits for its session: the evidence, and the commit that [`RelyingParty::sign_in`] made.
+/// The owner of the records of a relying party: its authority, its relying party ID, and its limits. Each proposal
+/// names them.
+#[derive(Clone, Copy)]
+struct Owner<'a> {
+    authority: &'a Id<Authority>,
+    id: &'a str,
+    limits: Limits,
+}
+
+impl Owner<'_> {
+    /// A proposal of `actor` for `action` on `request`. Its request is `[authority, relying party ID, request]`, so
+    /// one operation identity under two relying parties of one store binds two requests.
+    fn proposal_by(
+        self,
+        operation: OperationId,
+        actor: Principal,
+        action: &str,
+        request: &Value<'_>,
+        now: Reading,
+    ) -> Result<Proposal, Error> {
+        let audit = Audit {
+            actor,
+            action: Id::<Action>::new("rsauthnz", action).expect("each action of this module is a valid identifier"),
+            time: now,
+        };
+        let request = Value::Array(vec![self.authority.to_cbor(), Value::Text(self.id), request.clone()]);
+        Ok(Proposal::new(operation, audit, &request, self.limits)?)
+    }
+
+    /// The version of a write: the authority and `value`, a new value of a counter of the driver.
+    fn version(self, value: u64) -> AuthorityVersion {
+        AuthorityVersion::new(self.authority.clone(), &value.to_be_bytes()).expect("an 8-byte coordinate is valid")
+    }
+}
+
+/// The records of a sign-in, which [`RelyingParty::sign_in_read`] read for an assertion. They own the assertion and the
+/// names of the relying party, and they hold no secret, so a host can move them to another thread.
+#[derive(Debug)]
+pub struct SignInRecords {
+    authority: Id<Authority>,
+    /// The relying party ID, and its SHA-256 digest.
+    id: String,
+    id_hash: [u8; 32],
+    limits: Limits,
+    assertion: Assertion,
+    now: Reading,
+    /// The end of the challenge, and the end of its replay record.
+    expires: Duration,
+    replay_end: Duration,
+    handle: UserHandle,
+    epoch: Epoch,
+    /// The key of the credential record, and the record.
+    key: transition::Key,
+    record: Record,
+    /// The read of the replay floor, and the key of the replay record of the challenge.
+    floor: Dependency,
+    replay: transition::Key,
+}
+
+impl SignInRecords {
+    /// Verifies the assertion against the records, and gives the sign-in that waits for its commit
+    /// ([`SignIn::open`]). It takes no store and no driver, so a host can run it on another thread.
+    ///
+    /// The verification checks the authenticator data (the hash of the relying party ID, the presence of the user, the
+    /// flags, and the extensions), the backup eligibility of the registration, and the signature with the stored key. A
+    /// counter that does not advance, with a nonzero counter on either side, is a possible clone: the stored value
+    /// stays, and the evidence and the audit action record the signal.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One signature check and one SHA-256 digest of
+    /// `clientDataJSON`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RelyingParty`] and [`Error::UserPresence`] for the authenticator data. [`Error::Signature`] if the
+    /// signature does not verify with the stored key. [`Error::Malformed`] if the backup eligibility differs from the
+    /// registration, and for each other difference from the forms of WebAuthn Level 3. [`Error::Record`] if the
+    /// credential record has no valid form.
+    pub fn verify(self) -> Result<SignIn, Error> {
+        // The key binds the user handle, so the record is of the account of the assertion.
+        let stored = Form::read(&self.record.data, self.limits)?;
+        let assertion = &self.assertion;
+        let (flags, reported, count, rest) =
+            RelyingParty::authenticator_data(&self.id_hash, &assertion.authenticator_data)?;
+        let single = |backup| backup == Backup::SingleDevice;
+        (single(reported) == single(stored.backup) && flags & ATTESTED == 0).ok_or(Error::Malformed)?;
+        RelyingParty::extensions(flags, rest, self.limits)?;
+        let message = [
+            &assertion.authenticator_data[..],
+            &crypto::sha256(&assertion.client_data_json),
+        ]
+        .concat();
+        let public = Key::decode(stored.public_key, self.limits).map_err(|_| Error::Record)?;
+        let verifier = cose::verifier(stored.algorithm, &public).map_err(|_| Error::Record)?;
+        let budget = &mut SignatureBudget::new(&self.limits);
+        matches!(verifier.verify_der(&message, &assertion.signature, budget), Ok(true)).ok_or(Error::Signature)?;
+        let advances = count > stored.sign_count;
+        // The record keeps the counter that advanced and the backup state of this assertion (WebAuthn Level 3, section
+        // 7.2, step 24). The counter never decreases.
+        let update = (advances || reported != stored.backup).then(|| Credential {
+            sign_count: count.max(stored.sign_count),
+            backup: reported,
+            ..stored.credential()
+        });
+        let possible_clone = !advances && (count | stored.sign_count) != 0;
+        let (account, algorithm) = (stored.account, stored.algorithm);
+        Ok(SignIn {
+            records: self,
+            account,
+            algorithm,
+            flags,
+            reported,
+            possible_clone,
+            update,
+        })
+    }
+}
+
+/// A verified sign-in that waits for its commit ([`SignInRecords::verify`]): its records, the account, the algorithm of
+/// the passkey, the flags and the backup state of the assertion, the possible-clone signal, and the credential record
+/// that the commit writes when the counter advances or the backup state changes.
 #[derive(Debug)]
 pub struct SignIn {
-    epoch: Epoch,
-    proposal: Proposal,
-    evidence: Evidence,
+    records: SignInRecords,
+    account: Id<Human>,
+    algorithm: Algorithm,
+    flags: u8,
+    reported: Backup,
+    possible_clone: bool,
+    update: Option<Credential>,
 }
 
 impl SignIn {
@@ -1523,65 +1592,169 @@ impl SignIn {
     /// Give the receipt of the lookup as [`Outcome::Accepted`](crate::transition::Outcome::Accepted). No second sign-in
     /// runs by itself.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse). One SHA-256 digest and one HMAC-SHA256 tag.
+    /// The proposal reads the credential record at its version, and it writes the record only when the signature
+    /// counter advances or the backup state changes. It inserts the replay record of the challenge, so the challenge
+    /// serves once. Its operation identity is new, so the same assertion again is a new operation that finds the replay
+    /// record.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). The encoding of the proposal, one SHA-256 digest, and one
+    /// HMAC-SHA256 tag.
     ///
     /// # Errors
     ///
-    /// [`Error::Session`] if `replaces` is a session of another audience, and for the errors of the session: the time
-    /// of the proposal has no bound, the driver does not serve, or the proposal refuses.
+    /// [`Error::Driver`] if the driver does not serve, and [`Error::Transition`] for the proposal. [`Error::Session`]
+    /// if `replaces` is a session of another audience, and for the errors of the session: the time of the proposal has
+    /// no bound, the driver does not serve, or the proposal refuses.
     pub fn open(
-        mut self,
+        self,
         sessions: &Sessions,
         replaces: Option<&Access>,
         random: &mut ChaCha20Rng,
         driver: &mut Driver,
     ) -> Result<(Proposal, Plan, Opening), Error> {
+        let Self {
+            records,
+            account,
+            algorithm,
+            flags,
+            reported,
+            possible_clone,
+            update,
+        } = self;
+        let owner = Owner {
+            authority: &records.authority,
+            id: &records.id,
+            limits: records.limits,
+        };
+        let assertion = &records.assertion;
+        let request = Value::Array(vec![
+            Value::Bytes(&assertion.id),
+            Value::Bytes(&assertion.client_data.challenge),
+        ]);
+        let action = if possible_clone { SIGN_IN_CLONE } else { SIGN_IN };
+        let actor = Principal::Human(account.clone());
+        let mut proposal = owner.proposal_by(operation(random), actor, action, &request, records.now)?;
+        proposal.read(records.epoch.dependency()).map_err(Error::from)?;
+        proposal
+            .read(Dependency::Version(records.key.clone(), records.record.version))
+            .map_err(Error::from)?;
+        // No attestation proves where the key lives, so the evidence has no binding, and only the reported flags.
+        let mut evidence = Evidence::new(
+            Principal::Human(account.clone()),
+            Method::Passkey,
+            records.now,
+            flags & USER_VERIFIED != 0,
+            true,
+            None,
+            Some(algorithm.report().authentication),
+        );
+        evidence.backup = Some(reported);
+        evidence.possible_clone = possible_clone;
+        if let Some(credential) = update {
+            let version = owner.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
+            let data = credential.record(&account, &records.handle);
+            proposal
+                .change(Change::Write {
+                    key: records.key,
+                    version,
+                    end: None,
+                    data,
+                })
+                .map_err(Error::from)?;
+        }
+        proposal.read(records.floor).map_err(Error::from)?;
+        proposal
+            .read(Dependency::Absent(records.replay.clone()))
+            .map_err(Error::from)?;
+        let version = owner.version(driver.allocate(Kind::Replay).map_err(Error::from)?);
+        proposal
+            .change(Change::Write {
+                key: records.replay,
+                version,
+                end: Some(records.replay_end),
+                data: encode(&Value::Text(SIGN_IN_FORM)),
+            })
+            .map_err(Error::from)?;
+        proposal.until(records.expires);
         let opening = sessions
-            .open(&mut self.proposal, self.evidence, &self.epoch, replaces, random, driver)
+            .open(&mut proposal, evidence, &records.epoch, replaces, random, driver)
             .map_err(Error::Session)?;
-        Ok((self.proposal, Plan::default(), opening))
+        Ok((proposal, Plan::default(), opening))
     }
 }
 
 /// The account, the user handle, and the credential of the credential record form `data`.
 pub(crate) fn credential_form(data: &[u8], limits: Limits) -> Result<(Id<Human>, UserHandle, Credential), Error> {
-    let form = cbor::decode(data, limits).map_err(|_| Error::Record)?;
-    let Value::Array(items) = &form else {
-        return Err(Error::Record);
-    };
-    let [
-        Value::Text(CREDENTIAL_FORM),
-        account,
-        Value::Bytes(handle),
-        Value::Bytes(id),
-        Value::Bytes(public_key),
-        alg,
-        Value::Unsigned(count),
-        Value::Bool(backup_eligible),
-        Value::Bool(backup_state),
-        Value::Unsigned(transports),
-        Value::Text(name),
-    ] = items.as_slice()
-    else {
-        return Err(Error::Record);
-    };
-    name_length(name)?;
-    let algorithm = ALGORITHMS
-        .into_iter()
-        .find(|algorithm| algorithm.report().cose.map(int).as_ref() == Some(alg))
-        .ok_or(Error::Record)?;
-    let credential = Credential {
-        id: (*id).into(),
-        algorithm,
-        public_key: (*public_key).into(),
-        sign_count: u32::try_from(*count).map_err(|_| Error::Record)?,
-        backup: backup(*backup_eligible, *backup_state).ok_or(Error::Record)?,
-        transports: u8::try_from(*transports).map_err(|_| Error::Record)?,
-        name: (*name).into(),
-    };
-    let account = Id::from_cbor(account).map_err(|_| Error::Record)?;
-    let handle = <[u8; 32]>::try_from(*handle).map_err(|_| Error::Record)?;
-    Ok((account, UserHandle(handle), credential))
+    let form = Form::read(data, limits)?;
+    let credential = form.credential();
+    Ok((form.account, form.handle, credential))
+}
+
+/// A credential record form, whose bytes stay in the record. A sign-in copies them only when it writes the record.
+struct Form<'a> {
+    account: Id<Human>,
+    handle: UserHandle,
+    id: &'a [u8],
+    public_key: &'a [u8],
+    algorithm: Algorithm,
+    sign_count: u32,
+    backup: Backup,
+    transports: u8,
+    name: &'a str,
+}
+
+impl<'a> Form<'a> {
+    /// The form of the credential record `data`.
+    fn read(data: &'a [u8], limits: Limits) -> Result<Self, Error> {
+        let form = cbor::decode(data, limits).map_err(|_| Error::Record)?;
+        let Value::Array(items) = &form else {
+            return Err(Error::Record);
+        };
+        let [
+            Value::Text(CREDENTIAL_FORM),
+            account,
+            Value::Bytes(handle),
+            Value::Bytes(id),
+            Value::Bytes(public_key),
+            alg,
+            Value::Unsigned(count),
+            Value::Bool(backup_eligible),
+            Value::Bool(backup_state),
+            Value::Unsigned(transports),
+            Value::Text(name),
+        ] = items.as_slice()
+        else {
+            return Err(Error::Record);
+        };
+        name_length(name)?;
+        Ok(Self {
+            account: Id::from_cbor(account).map_err(|_| Error::Record)?,
+            handle: UserHandle(<[u8; 32]>::try_from(*handle).map_err(|_| Error::Record)?),
+            id,
+            public_key,
+            algorithm: ALGORITHMS
+                .into_iter()
+                .find(|algorithm| algorithm.report().cose.map(int).as_ref() == Some(alg))
+                .ok_or(Error::Record)?,
+            sign_count: u32::try_from(*count).map_err(|_| Error::Record)?,
+            backup: backup(*backup_eligible, *backup_state).ok_or(Error::Record)?,
+            transports: u8::try_from(*transports).map_err(|_| Error::Record)?,
+            name,
+        })
+    }
+
+    /// The credential of the form, with copies of its bytes.
+    fn credential(&self) -> Credential {
+        Credential {
+            id: self.id.into(),
+            algorithm: self.algorithm,
+            public_key: self.public_key.into(),
+            sign_count: self.sign_count,
+            backup: self.backup,
+            transports: self.transports,
+            name: self.name.into(),
+        }
+    }
 }
 
 /// The record at `key`.

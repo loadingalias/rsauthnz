@@ -306,7 +306,7 @@ impl<S: Subject + Send + 'static> App<S> {
             (held < SHARE_MAX).ok_or(Problem::Busy)?;
             shares.insert(id.clone(), held.saturating_add(1));
         }
-        request.extensions_mut().insert(Arc::new(assertion));
+        request.extensions_mut().insert(assertion);
         Ok(Some(Share {
             shares: Arc::clone(&self.shares),
             id,
@@ -892,16 +892,15 @@ impl<S: Subject> State<S> {
         // The request path checked the request and parsed its assertion ([`App::share`]).
         let assertion = request
             .extensions()
-            .get::<Arc<Assertion>>()
+            .get::<Assertion>()
             .cloned()
             .ok_or(Problem::Recovery(Recovery::Refuse))?;
         let replaces = self.access(request, now).ok().map(|(access, _)| access);
-        let sign_in = wait(
-            self.rp
-                .sign_in(&mut self.store, &assertion, now, &mut self.random, &mut self.driver),
-        )?;
+        let records = wait(self.rp.sign_in_read(&mut self.store, assertion, now))?;
         let (proposal, plan, opening) =
-            sign_in.open(&self.sessions, replaces.as_ref(), &mut self.random, &mut self.driver)?;
+            records
+                .verify()?
+                .open(&self.sessions, replaces.as_ref(), &mut self.random, &mut self.driver)?;
         let receipt = self.commit((proposal, plan), now)?;
         let opened = opening
             .release(&Outcome::Accepted(receipt))

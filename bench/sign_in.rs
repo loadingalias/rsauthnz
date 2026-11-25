@@ -1,11 +1,14 @@
-//! The complete ES256 sign-in verification beside the rscrypto verification of the same signature.
+//! The ES256 sign-in verification beside the rscrypto verification of the same signature.
 //!
-//! `primitive` builds the P-256 key from its SEC1 bytes, reads the DER signature, and verifies it. `complete` reads the
-//! `AuthenticationResponseJSON` and proposes the sign-in on the memory binding. It commits nothing, so each iteration
-//! verifies the same assertion. Both sides start from stored bytes, so neither one holds a prepared key.
+//! `primitive` builds the P-256 key from its SEC1 bytes, reads the DER signature, and verifies it. `verify` verifies a
+//! parsed assertion against the records of its read (`SignInRecords::verify`), with no store and no driver. Both sides
+//! start from stored bytes, so neither one holds a prepared key. `parse` reads the `AuthenticationResponseJSON`, and
+//! `read` reads the records from the memory binding after the check of the challenge tag. These two cells have no bar.
+//! Nothing commits, so each iteration verifies the same assertion.
 //!
-//! `overhead` runs both sides in each sample and gives the difference of their times. A change of the speed of the
-//! host during the run then changes both sides of a sample.
+//! `overhead` runs `primitive` and `verify` in each sample and gives the difference of their times. A change of the
+//! speed of the host during the run then changes both sides of a sample. The records of a sample are read before its
+//! timers start, and each sign-in drops after them, because a host gives it to `SignIn::open`.
 //!
 //! Each interval has a confidence level of 97.5%. An interval of `overhead / primitive` from the bounds of both
 //! intervals thus has a level of at least 95%.
@@ -27,7 +30,7 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::time::Instant;
 
-use criterion::Criterion;
+use criterion::{BatchSize, Criterion};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
@@ -141,27 +144,48 @@ fn main() {
         key.verify(black_box(&message), &signature)
             .expect("the signature verifies");
     };
-    let mut complete = || {
-        let assertion = Assertion::parse(black_box(&json)).expect("an assertion");
-        ready(rp.sign_in(&mut memory, &assertion, at(11), &mut random, &mut driver)).expect("a verified sign-in")
+    let assertion = Assertion::parse(&json).expect("an assertion");
+    let read = |memory: &mut Memory, assertion: Assertion| {
+        ready(rp.sign_in_read(memory, assertion, at(11))).expect("the records")
     };
 
     let mut criterion = Criterion::default().confidence_level(0.975).configure_from_args();
     let mut group = criterion.benchmark_group("sign_in_es256");
     group.bench_function("primitive", |bencher| bencher.iter(&mut primitive));
-    group.bench_function("complete", |bencher| bencher.iter(&mut complete));
+    group.bench_function("parse", |bencher| {
+        bencher.iter(|| Assertion::parse(black_box(&json)).expect("an assertion"));
+    });
+    group.bench_function("read", |bencher| {
+        bencher.iter_batched(
+            || assertion.clone(),
+            |assertion| read(&mut memory, black_box(assertion)),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("verify", |bencher| {
+        bencher.iter_batched(
+            || read(&mut memory, assertion.clone()),
+            |records| black_box(records).verify().expect("a verified sign-in"),
+            BatchSize::SmallInput,
+        );
+    });
     group.bench_function("overhead", |bencher| {
         bencher.iter_custom(|iterations| {
+            let count = usize::try_from(iterations).expect("a count that this host can hold");
+            let records: Vec<_> = (0..count).map(|_| read(&mut memory, assertion.clone())).collect();
+            let mut verified = Vec::with_capacity(count);
             let started = Instant::now();
             for _ in 0..iterations {
                 primitive();
             }
             let primitive = started.elapsed();
             let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(complete());
+            for each in records {
+                verified.push(black_box(each).verify().expect("a verified sign-in"));
             }
-            started.elapsed().saturating_sub(primitive)
+            let verify = started.elapsed();
+            drop(verified);
+            verify.saturating_sub(primitive)
         });
     });
     group.finish();

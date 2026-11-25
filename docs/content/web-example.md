@@ -73,7 +73,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Step | Routes | Operations |
 | --- | --- | --- |
 | Sign up | `/sign-up/options`, `/sign-up/finish` | `rp.start` with `Decision::SignUp`, `rp.finish`, `registration.propose` ([Register](passkeys.md#register)) |
-| Sign in | `/sign-in/options`, `/sign-in/finish` | `rp.sign_in_options`, `rp.sign_in`, `sign_in.open`, `opening.release`, and the session cookie ([Sign in](passkeys.md#sign-in)) |
+| Sign in | `/sign-in/options`, `/sign-in/finish` | `rp.sign_in_options`, `rp.sign_in_read`, `records.verify`, `sign_in.open`, `opening.release`, and the session cookie ([Sign in](passkeys.md#sign-in)) |
 | The account page | `GET /account` | `sessions.check`, `rp.passkeys`, and `sessions.list`. The response gives the data of `signalRenamed` and `signalAccepted`: `rpId`, `userId`, `name`, `displayName`, and the `id` of each passkey |
 | Rename the account | `/account/rename` | A change of the directory of the example, with `name` and `displayName` ([Rename an account](accounts.md#rename-an-account)). A new name needs a `Fresh`, and a new display name needs only the session. A name of another account refuses |
 | Rename a passkey | `/passkeys/rename` | `rp.rename`. It needs no fresh user verification |
@@ -131,8 +131,9 @@ delays the sign-ins of the other accounts.
 A store that does not answer stops the application thread. Each request that needs the state then waits, up to the
 64 places, and the next one gets `503`. The pages and the sign-in options still serve.
 
-Verification and commits wait in the same queue. Each passkey operation, such as `rp.sign_in`, holds the store and
-the commit driver while it verifies.
+Verification and commits wait in the same queue. The application thread runs `records.verify()` too, although it
+takes no store and no driver ([Admit rsauthnz work](admission.md)). A host that verifies in its own pool keeps
+the signature checks out of this queue.
 
 The example sets no bound on connections or on the time to read the request headers. Put a server or a proxy with
 such bounds in front of a host that the public can reach.

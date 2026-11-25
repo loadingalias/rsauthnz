@@ -105,23 +105,29 @@ Before issuing options, wait until `now.earliest()` reaches that time. Each subs
 3. Check the request with `site.json_change`, then read the body with `Assertion::parse`. `assertion.id()` gives
    the credential ID before the sign-in checks it. A host can use it to bound the waiting sign-ins of one credential
    ([the limits of the web example](web-example.md#limits)).
-4. Call `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It checks the tag and the lifetime of
-   the challenge before any read. Then it reads the credential record, the replay floor, and the replay record of the
-   challenge, and it checks the assertion and its signature. It gives a `SignIn`. A passkey that a
+4. Call `rp.sign_in_read(&mut store, assertion, now)`. It checks the tag and the lifetime of the challenge, and the
+   origin, before any read. Then it reads the credential record, the replay floor, and the replay record of the
+   challenge. It gives the `SignInRecords`, which own the assertion. A passkey that a
    [removal](accounts.md#remove-a-passkey) ended refuses with `Error::Removed`, whose recovery is `Forget`: the
    `signIn` function of the browser adapter then tells the provider to forget the passkey.
-5. Call `sign_in.open(&sessions, replaces, &mut random, &mut driver)`. It adds a new [session](sessions.md) to the
+5. Call `records.verify()`. It checks the authenticator data and the signature with the stored key, and it gives a
+   `SignIn`. It takes no store and no driver, so a host can verify on another thread, outside a commit.
+6. Call `sign_in.open(&sessions, replaces, &mut random, &mut driver)`. It adds a new [session](sessions.md) to the
    commit, and ends the family of `replaces`, the current session of the browser, if it has one. It gives the
    proposal, its plan, and a `session::Opening`.
-6. Submit the proposal with its plan, and give the outcome to `opening.release(&outcome)`. Only the accepted commit
+7. Submit the proposal with its plan, and give the outcome to `opening.release(&outcome)`. Only the accepted commit
    gives `Opened`: the `Evidence` and the session. Only the commit driver makes an accepted receipt, from a durable
    commit or its outcome record. Thus no evidence and no session leave before the store holds the replay record, the
    session, and the audit.
-7. After a lost response (`Outcome::Unknown`), keep the opening. When the driver serves again, look up the operation
+8. After a lost response (`Outcome::Unknown`), keep the opening. When the driver serves again, look up the operation
    of the proposal with `driver.lookup`. Give a commit to `opening.release(&Outcome::Accepted(receipt))`, and answer
    the same request with its session. Answer each other result of the lookup as [Lost
    responses](http-binding.md#lost-responses) shows: the user signs in again with a new challenge. The same assertion
    again is a new operation, and its challenge refuses after a commit.
+
+The proposal reads each record at the version of the read. Thus another commit between the read and the commit of
+the sign-in makes the sign-in conflict. Then read and verify again: the challenge is still open. `sign_in_read` takes
+the assertion, so parse the body again, or keep a clone of the assertion before the read.
 
 The commit inserts the replay record of the challenge, so each challenge serves one sign-in. The commit reads the
 replay floor of the store. A restore raises the floor, so a challenge from before a restore refuses after it. The
@@ -345,15 +351,17 @@ gives its recovery, and `?` in a handler gives the `rsauthnz_http::Problem` of i
 | `Code` | The text is not a recovery code, or the account has no recovery code with the value | `Refuse` |
 | `Dit` | This build on this CPU cannot handle a recovery code with data-independent timing | `Refuse` |
 
-`finish` and `sign_in` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for a
-failed read, which is a crash of the binding.
+`finish` and `sign_in_read` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for
+a failed read, which is a crash of the binding. `records.verify()` and `sign_in.open` read no store, so they return
+`passkey::Error`.
 
 The cost class of `Response::parse`, `Assertion::parse`, `sign_in_options`, and `Registration::propose` is `Parse`.
-The cost class of `verify`, `finish`, and `sign_in` is `Verify` ([Admit rsauthnz work](admission.md)): `finish` makes
-one pending-record read, the recovery and enrollment revisions, and one passkey page. A valid `sign_in` reads the account revision,
-checks one signature, and makes three further keyed lookups in two store calls.
-It reads the credential first, then reads the replay floor and challenge record together.
-For an absent credential, it checks the removal mark and refuses. The cost class of
+The cost class of `rp.verify`, `finish`, `sign_in_read`, and `records.verify()` is `Verify` ([Admit rsauthnz
+work](admission.md)): `finish` makes one pending-record read, the recovery and enrollment revisions, and one passkey
+page. A valid `sign_in_read` checks one HMAC-SHA256 tag, reads the account revision, and makes three further keyed
+lookups in two store calls. It reads the credential first, then reads the replay floor and challenge record together.
+For an absent credential, it checks the removal mark and refuses. `records.verify()` checks one signature and reads
+no store. The cost class of `sign_in.open` is `Parse`. The cost class of
 `start` is `Mutate`. It looks up the account revision and reads one page of at most
 `CREDENTIALS_MAX` records, and its commit. A response has at most 64 KiB of JSON.
 

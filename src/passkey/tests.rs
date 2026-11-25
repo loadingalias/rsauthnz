@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-use crate::cose::{self, Key, TrustedKey};
+use crate::cose::{self, Key};
 use crate::crypto::{self, Algorithm};
 use crate::limits::{Limits, SignatureBudget};
 
@@ -57,7 +57,7 @@ fn hex(text: &str) -> Vec<u8> {
 fn the_published_assertions_verify_with_their_credential_keys() {
     for case in &CASES {
         let key = hex(case.key);
-        let trusted = TrustedKey::new(case.algorithm, &Key::decode(&key, Limits::default()).unwrap()).unwrap();
+        let verifier = cose::verifier(case.algorithm, &Key::decode(&key, Limits::default()).unwrap()).unwrap();
         let mut message = [
             hex(case.authenticator_data),
             crypto::sha256(&hex(case.client_data)).to_vec(),
@@ -66,15 +66,15 @@ fn the_published_assertions_verify_with_their_credential_keys() {
         let signature = hex(case.signature);
         let mut budget = SignatureBudget::new(&Limits::default());
         assert_eq!(
-            trusted.verify_der(&message, &signature, &mut budget),
-            Ok(()),
+            verifier.verify_der(&message, &signature, &mut budget),
+            Ok(true),
             "{}",
             case.name
         );
         message[0] ^= 1;
         assert_eq!(
-            trusted.verify_der(&message, &signature, &mut budget),
-            Err(cose::Error::Signature),
+            verifier.verify_der(&message, &signature, &mut budget),
+            Ok(false),
             "{}",
             case.name
         );

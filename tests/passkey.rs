@@ -327,15 +327,10 @@ impl Site {
         replaces: Option<&Access>,
     ) -> Result<(Proposal, Plan, Opening), Error> {
         let assertion = Assertion::parse(json)?;
-        let sign_in = self.rp.sign_in(
-            &mut self.node.memory,
-            &assertion,
-            now,
-            &mut self.random,
-            &mut self.node.driver,
-        );
-        let sign_in = ready(sign_in).map_err(refused)?;
-        sign_in.open(&self.sessions, replaces, &mut self.random, &mut self.node.driver)
+        let records = ready(self.rp.sign_in_read(&mut self.node.memory, assertion, now)).map_err(refused)?;
+        records
+            .verify()?
+            .open(&self.sessions, replaces, &mut self.random, &mut self.node.driver)
     }
 
     /// Proposes the sign-in of `json` at `now`, with a new session.
@@ -854,14 +849,8 @@ fn records_of_one_relying_party_serve_no_other_relying_party_of_the_store() {
         let options = other.sign_in_options(at(10), &mut site.random).expect("the options");
         let get = Get::new(&passkey, id, origin, authenticator::challenge(&options), HANDLE);
         let assertion = Assertion::parse(&get.json()).expect("an assertion");
-        let sign_in = other.sign_in(
-            &mut site.node.memory,
-            &assertion,
-            at(11),
-            &mut site.random,
-            &mut site.node.driver,
-        );
-        assert_eq!(ready(sign_in).map_err(refused).err(), Some(Error::Credential), "{id}");
+        let records = other.sign_in_read(&mut site.node.memory, assertion, at(11));
+        assert_eq!(ready(records).map_err(refused).err(), Some(Error::Credential), "{id}");
     }
     // The control: the passkey signs in at this relying party.
     let get = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
@@ -1075,6 +1064,31 @@ fn two_concurrent_sign_ins_with_counters_5_and_4_store_5_and_signal_on_4() {
     // The conflict restarts the sign-in: it reads the record again, and its challenge is still open.
     assert!(site.signed_in(&four, at(12)).possible_clone());
     assert_eq!(site.stored(&passkey).0, 5);
+}
+
+#[test]
+fn a_sign_in_that_verifies_on_another_thread_conflicts_after_a_commit_in_between() {
+    let mut site = Site::new();
+    let passkey = site.register(Algorithm::Es256, -7, 1, 1);
+    let mut late = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
+    late.sign_count = 2;
+    let mut early = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE);
+    early.sign_count = 3;
+    let assertion = Assertion::parse(&late.json()).expect("an assertion");
+    let records = ready(site.rp.sign_in_read(&mut site.node.memory, assertion, at(11))).expect("the records");
+    // The verification takes no store and no driver, so this thread commits another sign-in while it runs.
+    let sign_in = std::thread::scope(|scope| {
+        let verification = scope.spawn(move || records.verify());
+        assert!(!site.signed_in(&early.json(), at(11)).possible_clone());
+        verification.join().expect("the verification thread")
+    })
+    .expect("a verified sign-in");
+    // The proposal reads the credential record at the version of the read, so the commit in between makes it conflict.
+    let (proposal, plan, _) = sign_in
+        .open(&site.sessions, None, &mut site.random, &mut site.node.driver)
+        .expect("a proposal");
+    assert!(matches!(site.node.commit(proposal, plan), Outcome::Conflict));
+    assert_eq!(site.stored(&passkey).0, 3);
 }
 
 #[test]

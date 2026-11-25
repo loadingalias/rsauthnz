@@ -265,25 +265,8 @@ impl TrustedKey {
     /// [`Error::Malformed`] if a P-256 point, alone or in a composite key, is not on the curve, or if an RSA key does not
     /// have a modulus of 2,048 to 4,096 bits and the exponent 65,537.
     pub fn new(algorithm: Algorithm, key: &Key<'_>) -> Result<Self, Error> {
-        if key.alg.is_some_and(|alg| alg != algorithm) {
-            return Err(Error::KeyAlgorithm);
-        }
-        let verifier = match (algorithm, &key.public) {
-            (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
-            (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
-            (Algorithm::Rs256, PublicKey::Rsa { n, e }) => Verifier::rs256(n, e).ok_or(Error::Malformed)?,
-            (Algorithm::Ps256, PublicKey::Rsa { n, e }) => Verifier::ps256(n, e).ok_or(Error::Malformed)?,
-            (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
-            (Algorithm::MlDsa65Ed25519, PublicKey::MlDsa65Ed25519(public)) => {
-                Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Malformed)?
-            }
-            (Algorithm::MlDsa65EcdsaP256, PublicKey::MlDsa65EcdsaP256(public)) => {
-                Verifier::ml_dsa_65_ecdsa_p256(public).ok_or(Error::Malformed)?
-            }
-            _ => return Err(Error::KeyAlgorithm),
-        };
         Ok(Self {
-            verifier,
+            verifier: verifier(algorithm, key)?,
             kid: key.public.thumbprint(),
         })
     }
@@ -303,20 +286,6 @@ impl TrustedKey {
         &self.kid
     }
 
-    /// Verifies the WebAuthn assertion signature `signature` over `message`, after it charges `budget`. An ES256
-    /// signature is DER.
-    pub(crate) fn verify_der(
-        &self,
-        message: &[u8],
-        signature: &[u8],
-        budget: &mut SignatureBudget,
-    ) -> Result<(), Error> {
-        self.verifier
-            .verify_der(message, signature, budget)
-            .map_err(Error::Limit)?
-            .ok_or(Error::Signature)
-    }
-
     /// Verifies `signature` over `message` with the algorithm of the key, after it charges `budget`.
     pub(crate) fn verify(&self, message: &[u8], signature: &[u8], budget: &mut SignatureBudget) -> Result<(), Error> {
         self.verifier
@@ -324,6 +293,28 @@ impl TrustedKey {
             .map_err(Error::Limit)?
             .ok_or(Error::Signature)
     }
+}
+
+/// The verifier of `algorithm` with the public key of `key`, with the checks of [`TrustedKey::new`] and no thumbprint.
+/// A passkey sign-in uses it, because it names its key by the credential ID.
+pub(crate) fn verifier(algorithm: Algorithm, key: &Key<'_>) -> Result<Verifier, Error> {
+    if key.alg.is_some_and(|alg| alg != algorithm) {
+        return Err(Error::KeyAlgorithm);
+    }
+    Ok(match (algorithm, &key.public) {
+        (Algorithm::Ed25519, PublicKey::Ed25519(x)) => Verifier::ed25519(x),
+        (Algorithm::Es256, PublicKey::P256 { x, y }) => Verifier::es256(x, y).ok_or(Error::Malformed)?,
+        (Algorithm::Rs256, PublicKey::Rsa { n, e }) => Verifier::rs256(n, e).ok_or(Error::Malformed)?,
+        (Algorithm::Ps256, PublicKey::Rsa { n, e }) => Verifier::ps256(n, e).ok_or(Error::Malformed)?,
+        (Algorithm::MlDsa65, PublicKey::MlDsa65(public)) => Verifier::ml_dsa_65(public),
+        (Algorithm::MlDsa65Ed25519, PublicKey::MlDsa65Ed25519(public)) => {
+            Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Malformed)?
+        }
+        (Algorithm::MlDsa65EcdsaP256, PublicKey::MlDsa65EcdsaP256(public)) => {
+            Verifier::ml_dsa_65_ecdsa_p256(public).ok_or(Error::Malformed)?
+        }
+        _ => return Err(Error::KeyAlgorithm),
+    })
 }
 
 impl fmt::Debug for TrustedKey {

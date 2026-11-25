@@ -62,8 +62,8 @@ session too.
 
 ## Sign in
 
-1. Check the assertion with `rp.sign_in(&mut store, &assertion, now, &mut random, &mut driver)`. It gives a
-   `passkey::SignIn`, which has no proposal yet.
+1. Check the assertion with `rp.sign_in_read(&mut store, assertion, now)` and then `records.verify()` ([Sign
+   in](passkeys.md#sign-in)). It gives a `passkey::SignIn`, which has no proposal yet.
 2. Call `sign_in.open(&sessions, replaces, &mut random, &mut driver)`. `replaces` is the `Access` of the current
    session of the browser, if the request has one, and `None` otherwise. It gives the proposal, its plan, and an
    `Opening`.
