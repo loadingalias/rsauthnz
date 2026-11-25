@@ -14,8 +14,10 @@
 //!   HTTP/3.
 //! - [`Site::set_session`] and [`CookieName::session`] write and read a session identifier
 //!   ([`rsauthnz::session`]) in a cookie, with the base64url of data-independent timing.
+//! - [`machine_json`] admits the JSON body of a client that is no browser, such as an agent
+//!   ([`rsauthnz::agent`]), only with no cookie and no field that a browser sends.
 //!
-//! Each response of the binding has `Cache-Control: no-store`: [`json`], [`redirect`] to a path of the site, the
+//! Each response of the binding has `Cache-Control: no-store`: [`json`], [`waiting`], [`redirect`] to a path of the site, the
 //! problem responses of [`Refusal::response`] and [`problem`], the document of [`related_origins`], and the
 //! [`browser_module`] of passkey ceremonies. A problem body holds only its recovery, never a byte of
 //! the request. The HTTP version of a message changes no result.
@@ -73,10 +75,10 @@ mod response;
 use core::fmt;
 
 use http::Request;
-use http::header::{AsHeaderName, CONTENT_TYPE, HeaderMap, HeaderValue, ORIGIN};
+use http::header::{AsHeaderName, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN};
 
 pub use cookie::CookieName;
-pub use response::{Problem, RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins};
+pub use response::{Problem, RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins, waiting};
 
 /// The site that the binding serves: its origin, and the `SameSite` value of its cookies.
 #[derive(Clone, Debug)]
@@ -177,6 +179,42 @@ impl Site {
     }
 }
 
+/// The JSON body of `request` from a client that is no browser, such as an agent: an unsafe method, no `Origin`, no
+/// `Sec-Fetch-Site`, and no `Cookie`, a `Content-Type` of `application/json`, and at most `bytes_max` bytes. A browser
+/// sends `Origin` and `Sec-Fetch-Site` with each state change, and no script can remove them, so no page of any site can
+/// send this request with the cookies of a human. Thus the routes of an agent never take a session. Read the body with
+/// the body limit of the framework first.
+///
+/// Cost class: [`Parse`](rsauthnz::limits::Class::Parse).
+///
+/// # Errors
+///
+/// [`Refusal::Method`] for a safe method. [`Refusal::Origin`], [`Refusal::FetchSite`], and [`Refusal::Cookie`] if the
+/// request has that field. [`Refusal::ContentType`] and [`Refusal::BodyBytes`] as for [`Site::json_change`].
+pub fn machine_json<B: AsRef<[u8]>>(request: &Request<B>, bytes_max: usize) -> Result<&[u8], Refusal> {
+    if request.method().is_safe() {
+        return Err(Refusal::Method);
+    }
+    let headers = request.headers();
+    if headers.contains_key(ORIGIN) {
+        return Err(Refusal::Origin);
+    }
+    if headers.contains_key("sec-fetch-site") {
+        return Err(Refusal::FetchSite);
+    }
+    if headers.contains_key(COOKIE) {
+        return Err(Refusal::Cookie);
+    }
+    if one(headers, CONTENT_TYPE).is_none_or(|value| !json_media(value.as_bytes())) {
+        return Err(Refusal::ContentType);
+    }
+    let body = request.body().as_ref();
+    if body.len() > bytes_max {
+        return Err(Refusal::BodyBytes);
+    }
+    Ok(body)
+}
+
 /// The value of the field `name`, if `headers` has it exactly once.
 fn one<K: AsHeaderName>(headers: &HeaderMap, name: K) -> Option<&HeaderValue> {
     let mut values = headers.get_all(name).iter();
@@ -245,15 +283,18 @@ fn serialize(text: &str) -> Option<String> {
 pub enum Refusal {
     /// A state change has a safe method, such as `GET`.
     Method,
-    /// The `Origin` of a state change is missing, repeated, or not the origin of the site.
+    /// The `Origin` of a state change is missing, repeated, or not the origin of the site, or a request of a client that
+    /// is no browser has one.
     Origin,
-    /// The `Sec-Fetch-Site` of a state change is missing, repeated, or not `same-origin`.
+    /// The `Sec-Fetch-Site` of a state change is missing, repeated, or not `same-origin`, or a request of a client that
+    /// is no browser has one.
     FetchSite,
     /// The body is not `application/json`.
     ContentType,
     /// The body is longer than its bound.
     BodyBytes,
-    /// A cookie of the site is in the request twice, or its value has a byte that a cookie value cannot have.
+    /// A cookie of the site is in the request twice, or its value has a byte that a cookie value cannot have, or a
+    /// request of a client that is no browser has a cookie.
     Cookie,
     /// The target of a redirect is not a path of the site.
     Redirect,

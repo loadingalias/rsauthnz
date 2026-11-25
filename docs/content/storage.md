@@ -94,7 +94,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Recovery` | A recovery value | `Pays::Anchor` |
 | `Bootstrap` | A bootstrap value of an authority | `Pays::Anchor` |
 | `Administrator` | An administrator binding of an authority. It ends with its CLI credential, so expiry removes it | `None` |
-| `Agent` | An agent identity | `None` |
+| `Agent` | An agent identity: its owner, its public key, and its name ([Enroll an agent](agent-enrollment.md)) | `None` |
 | `Grant` | A grant and its current revision | `None` |
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
 | `Replay` | The replay record of one accepted signature, or of the challenge of one passkey sign-in | `None` |
@@ -108,6 +108,8 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Issuer` | An issuer of workload credentials: its authority, its current key and its previous key, its audiences, and its ceiling ([Issue and manage workload credentials](workload.md)) | `None` |
 | `Workload` | The registration of a workload: the workload, its registered proof key, and its generation | `None` |
 | `Removal` | The removal mark of a passkey, at the identifier of its credential key. It ends after 400 days, and a restore can lose it: a sign-in then refuses, which is safe ([Remove a passkey](accounts.md#remove-a-passkey)) | `None` |
+| `AccountState` | The newest recovery revision or enrollment revision of an account | `None` |
+| `AgentEnrollment` | A pending enrollment request of an agent, which its owner approves in a browser ([Enroll an agent](agent-enrollment.md)) | `Pays::Nothing` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for

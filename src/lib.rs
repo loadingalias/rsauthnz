@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod account;
+pub mod agent;
 pub mod authz;
 pub mod cbor;
 pub mod cli;

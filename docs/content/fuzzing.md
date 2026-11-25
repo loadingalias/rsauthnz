@@ -16,6 +16,7 @@ lock file. libFuzzer holds C++, so it stays out of each library closure.
 | `x509` | `x509::Certificate::parse`, `Certificate::verify`, `Certificate::timestamps` | An input over `CERTIFICATE_BYTES_MAX` refuses with `Error::Bytes`. A signature check runs only for a certificate that parses. A timestamp list with no trusted log gives no timestamp and does no signature work |
 | `session` | `session::Identifier::parse` | A cookie value of another length than `IDENTIFIER_CHARS` refuses |
 | `bootstrap` | `local::Bootstrap::parse` | No input panics |
+| `agent` | `agent::Enrollment::parse`, `agent::Finish::parse`, `agent::Loopback::parse` | A body over `agent::BODY_BYTES_MAX` and an address over `agent::LOOPBACK_BYTES_MAX` refuse |
 | `recovery` | `recovery::Code::parse` | A text of more than 64 bytes, or with another number of digits than 32 outside the hyphens and spaces, refuses |
 
 A signature check charges its `SignatureBudget` before its work ([Bound the signature
@@ -101,6 +102,7 @@ approval of the owner.
 | `x509` | The five OpenSSL certificates and the three Sigstore certificates of `tests/x509/`, and the two composite certificates of the LAMPS draft |
 | `session`, `bootstrap` | One identifier and one bootstrap value in their forms |
 | `recovery` | One recovery code in its text form |
+| `agent` | One enrollment body with a loopback address, and one finish body with a redirect code |
 
 ## Campaign record
 
@@ -122,8 +124,8 @@ rsauthnz `4680393` and the targets of this page. It ran the command of [Run a ta
 | `session` | 3,747,303 | 65 | 37,405 bytes |
 | `bootstrap` | 4,079,416 | 59 | 40,611 bytes |
 
-The longest input is the length limit that libFuzzer reached. The `recovery` target came after this campaign, and no
-campaign has run it yet. Only `x509`, `session`, and `bootstrap` passed their
+The longest input is the length limit that libFuzzer reached. The `recovery` and `agent` targets came after this
+campaign, and no campaign has run them yet. Only `x509`, `session`, and `bootstrap` passed their
 byte limits. Thus the over-limit refusals of `cbor`, `cose`, `credential`, `passkey`, and `jose` did not run in this
 campaign, and the next campaign adds `-len_control=0`.
 

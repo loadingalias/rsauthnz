@@ -4,6 +4,8 @@
 
 #[path = "passkey/account.rs"]
 mod account;
+#[path = "passkey/agent.rs"]
+mod agent;
 #[path = "passkey/authenticator.rs"]
 mod authenticator;
 #[path = "passkey/enroll.rs"]

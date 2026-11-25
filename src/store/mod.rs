@@ -156,6 +156,8 @@ pub enum Kind {
     Removal = 25,
     /// A durable recovery or enrollment revision of an account.
     AccountState = 26,
+    /// A pending enrollment request of an agent ([`crate::agent`]). Its consumption pays for no anchor.
+    AgentEnrollment = 27,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -170,7 +172,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -197,6 +199,7 @@ impl Kind {
         Self::Workload,
         Self::Removal,
         Self::AccountState,
+        Self::AgentEnrollment,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -209,7 +212,7 @@ impl Kind {
             | Self::Invitation
             | Self::Recovery
             | Self::Bootstrap => Some(Pays::Anchor),
-            Self::SignIn | Self::Approval => Some(Pays::Nothing),
+            Self::SignIn | Self::Approval | Self::AgentEnrollment => Some(Pays::Nothing),
             Self::Credential
             | Self::ProviderLink
             | Self::Session

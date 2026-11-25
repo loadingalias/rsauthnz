@@ -102,6 +102,19 @@ default port and no final `/`. Thus `Site::new("https://App.Example:443/")` admi
 `Site::new` refuses an origin with a path, a query, user information, or an IP address, and an `http://` origin other
 than `http://localhost`.
 
+## The check of a client that is no browser
+
+An agent is no browser, and its routes take no session ([Enroll an agent](agent-enrollment.md)). `machine_json(&request,
+bytes_max)` admits the JSON body of such a client:
+
+- The method is not safe.
+- The request has no `Origin`, no `Sec-Fetch-Site`, and no `Cookie`.
+- `Content-Type` is `application/json`, with no parameter or with `charset=utf-8`, and the body has at most
+  `bytes_max` bytes.
+
+A browser sends `Origin` and `Sec-Fetch-Site` with each state change, and no script can remove them. Thus no page of
+any site can send this request with the cookies of a human.
+
 ## Cookies
 
 Each cookie of the binding is a `__Host-` cookie: `CookieName::new("session")` is the cookie `__Host-session`. A
@@ -145,6 +158,7 @@ Each response of the binding has `Cache-Control: no-store`.
 | Operation | Response |
 | --- | --- |
 | `json(body)` | `200 OK`, `Content-Type: application/json` |
+| `waiting()` | `202 Accepted`, `Retry-After: 5`, and `{"interval":5}`: the answer to the finish of an agent that waits ([Enroll an agent](agent-enrollment.md#enroll-with-the-user-code)) |
 | `redirect(path)` | `303 See Other` to `path` |
 | `related_origins(&rp)` | `200 OK`, the document of the related origins of a relying party, for `RELATED_ORIGINS` (`/.well-known/webauthn`) ([Serve several domains](browser-adapter.md#serve-several-domains)) |
 | `browser_module()` | `200 OK`, `Content-Type: text/javascript; charset=utf-8`: the [browser adapter](browser-adapter.md) |
@@ -170,12 +184,12 @@ Each refusal of a request has the body `{"recovery":"refuse"}`:
 
 | Refusal | Cause | Status |
 | --- | --- | --- |
-| `Refusal::Method` | A state change has a safe method | `403 Forbidden` |
-| `Refusal::Origin` | `Origin` is missing, repeated, or not the origin of the site | `403 Forbidden` |
-| `Refusal::FetchSite` | `Sec-Fetch-Site` is missing, repeated, or not `same-origin` | `403 Forbidden` |
+| `Refusal::Method` | A state change, or a request of a client that is no browser, has a safe method | `403 Forbidden` |
+| `Refusal::Origin` | `Origin` is missing, repeated, or not the origin of the site. A request of a client that is no browser has one | `403 Forbidden` |
+| `Refusal::FetchSite` | `Sec-Fetch-Site` is missing, repeated, or not `same-origin`. A request of a client that is no browser has one | `403 Forbidden` |
 | `Refusal::ContentType` | The body is not `application/json` | `415 Unsupported Media Type` |
 | `Refusal::BodyBytes` | The body is longer than `bytes_max` | `413 Content Too Large` |
-| `Refusal::Cookie` | A cookie of the site is repeated, or its value is not valid | `400 Bad Request` |
+| `Refusal::Cookie` | A cookie of the site is repeated, or its value is not valid. A request of a client that is no browser has a cookie | `400 Bad Request` |
 | `Refusal::Redirect` | The target of a redirect is not a path of the site | `400 Bad Request` |
 
 The cost class of each check is `Parse` ([Admit rsauthnz work](admission.md)). Its work is linear in the bytes of the

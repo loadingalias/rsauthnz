@@ -11,8 +11,8 @@ use rsauthnz::passkey::RelyingParty;
 use rsauthnz::session::Identifier;
 use rsauthnz::transition::Recovery;
 use rsauthnz_http::{
-    CookieName, Error, Problem, RELATED_ORIGINS, Refusal, SameSite, Site, browser_module, json, problem, redirect,
-    related_origins,
+    CookieName, Error, Problem, RELATED_ORIGINS, Refusal, SameSite, Site, browser_module, json, machine_json, problem,
+    redirect, related_origins,
 };
 
 const ORIGIN: &str = "https://app.example";
@@ -23,6 +23,15 @@ type Found<'a> = (&'a [&'a [u8]], Option<&'a [u8]>);
 
 /// A case of the JSON check: the `Origin`, the `Content-Type`, the body, and the result.
 type Json<'a> = (&'a str, Option<&'a str>, &'a [u8], Result<&'a [u8], Refusal>);
+
+/// A case of the machine check: the method, one more field, the `Content-Type`, the body, and the result.
+type Machine<'a> = (
+    &'a str,
+    Option<(&'a str, &'a str)>,
+    &'a str,
+    &'a [u8],
+    Result<&'a [u8], Refusal>,
+);
 
 /// A `POST` of `version` with the `Origin` and the `Sec-Fetch-Site` that it names.
 fn change(version: Version, origin: Option<&str>, fetch_site: Option<&str>) -> Request<Vec<u8>> {
@@ -367,6 +376,53 @@ fn a_json_change_admits_only_json_within_its_bound() {
     for (origin, content_type, body, expected) in cases {
         let request = request(origin, content_type, body);
         assert_eq!(site.json_change(&request, 2), expected, "{content_type:?} {body:?}");
+    }
+}
+
+/// The routes of an agent take no request that a browser sends: a page of any site that sends one has its `Origin` and
+/// `Sec-Fetch-Site`, and can have the cookies of a human. So no route of an agent takes a session.
+#[test]
+fn a_machine_request_admits_json_with_no_browser_field_and_no_cookie() {
+    let request = |method: &str, field: Option<(&str, &str)>, content_type: &str, body: &[u8]| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/agent/enroll")
+            .header("content-type", content_type);
+        if let Some((name, value)) = field {
+            request = request.header(name, value);
+        }
+        request.body(body.to_vec()).unwrap()
+    };
+    let cases: [Machine<'_>; 7] = [
+        ("POST", None, "application/json", b"{}", Ok(b"{}")),
+        ("GET", None, "application/json", b"{}", Err(Refusal::Method)),
+        (
+            "POST",
+            Some(("origin", ORIGIN)),
+            "application/json",
+            b"{}",
+            Err(Refusal::Origin),
+        ),
+        (
+            "POST",
+            Some(("sec-fetch-site", "cross-site")),
+            "application/json",
+            b"{}",
+            Err(Refusal::FetchSite),
+        ),
+        (
+            "POST",
+            Some(("cookie", "__Host-session=abc")),
+            "application/json",
+            b"{}",
+            Err(Refusal::Cookie),
+        ),
+        ("POST", None, "text/plain", b"{}", Err(Refusal::ContentType)),
+        ("POST", None, "application/json", b"{ }", Err(Refusal::BodyBytes)),
+    ];
+    for (method, field, content_type, body, expected) in cases {
+        let request = request(method, field, content_type, body);
+        assert_eq!(machine_json(&request, 2), expected, "{method} {field:?} {content_type}");
     }
 }
 

@@ -2,6 +2,7 @@
 
 use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, RETRY_AFTER};
 use http::{Response, StatusCode};
+use rsauthnz::agent::POLL_INTERVAL;
 use rsauthnz::passkey::RelyingParty;
 use rsauthnz::transition::{Recover, Recovery};
 
@@ -17,6 +18,19 @@ const PROBLEM: HeaderValue = HeaderValue::from_static("application/problem+json"
 #[must_use]
 pub fn json(body: Vec<u8>) -> Response<Vec<u8>> {
     response(StatusCode::OK, HeaderValue::from_static("application/json"), body)
+}
+
+/// The answer to the finish of an agent whose request no account approved yet ([`Status::Waiting`]): `202 Accepted`,
+/// `Retry-After` and the body `{"interval":…}` with the seconds of [`POLL_INTERVAL`].
+///
+/// [`Status::Waiting`]: rsauthnz::agent::Status::Waiting
+#[must_use]
+pub fn waiting() -> Response<Vec<u8>> {
+    let seconds = POLL_INTERVAL.as_secs();
+    let body = format!(r#"{{"interval":{seconds}}}"#).into_bytes();
+    let mut response = response(StatusCode::ACCEPTED, HeaderValue::from_static("application/json"), body);
+    response.headers_mut().insert(RETRY_AFTER, HeaderValue::from(seconds));
+    response
 }
 
 /// The path of the document of related origins: `/.well-known/webauthn` ([WebAuthn Level 3, section 5.11]). Serve it
