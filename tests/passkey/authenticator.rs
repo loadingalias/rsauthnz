@@ -294,9 +294,9 @@ impl<'a> Get<'a> {
         }
     }
 
-    /// The `AuthenticationResponseJSON`, with the signature over the authenticator data and the digest of the client
-    /// data.
-    pub(crate) fn json(&self) -> Vec<u8> {
+    /// The `clientDataJSON`, the authenticator data, and the signature over the authenticator data and the digest of
+    /// the client data.
+    pub(crate) fn parts(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let client_data = write(|place| {
             place.object(|data| {
                 data.member("type").str("webauthn.get")?;
@@ -309,6 +309,12 @@ impl<'a> Get<'a> {
         data.push(self.flags);
         data.extend_from_slice(&self.sign_count.to_be_bytes());
         let signature = self.passkey.sign(&[&data[..], &crypto_sha256(&client_data)].concat());
+        (client_data, data, signature)
+    }
+
+    /// The `AuthenticationResponseJSON` of [`Self::parts`].
+    pub(crate) fn json(&self) -> Vec<u8> {
+        let (client_data, data, signature) = self.parts();
         write(|place| {
             place.object(|response| {
                 response.member("id").base64url(&self.passkey.id)?;
