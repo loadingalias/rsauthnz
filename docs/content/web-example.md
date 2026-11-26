@@ -54,14 +54,18 @@ Use a certificate for `localhost` that your browser trusts. The following comman
    cargo run --locked -p web -- --https
    ```
 
-3. Open `https://localhost:8443`. When enrolling the native CLI, use port `8081`. Its approval link opens the HTTPS page.
+3. Open `https://localhost:8443`. When enrolling the native CLI, use port `8081`. Its approval link opens the HTTPS page,
+   with its code. After the approval, the HTTPS page sends the browser to the loopback address of the CLI.
 
 The browser verifies the server certificate. The listener accepts connections on loopback and does not require a client certificate.
 Stop both processes when you finish. If you created temporary trust for this run, remove it and the test key.
 
 ## Approve a CLI
 
-Start enrollment in the terminal. Follow the printed address to `/cli`. You can also select **Connect a CLI** on the account page.
+Start enrollment in the terminal. The CLI opens `/cli` with its code in the address, and the page reviews the request
+at once. You can also select **Connect a CLI** on the account page and enter the code. For a CLI that listens on the
+loopback interface, the approval sends the browser to that CLI with its one-use redirect code. For a CLI with
+`--device-code`, the page warns that it finishes without the browser.
 Review the account, device name, and key fingerprint. Approval requires passkey verification within five minutes.
 If the account changes after review, review the request again. [Connect a CLI to your account](native-cli-example.md#connect-a-cli-to-your-account).
 A review and an approval each commit a check of the user code. A wrong code answers `{"recovery":"restart"}` and shows
@@ -87,7 +91,7 @@ and the handler checks it with `site.json_change` or `site.check_change` before 
 | Activate an invitation | `/invitation/options`, `/invitation/finish/{name}` | `rp.activation_options`, `rp.activate`, and `activation.propose`. The path names the account, so a name has only lowercase ASCII letters, digits, `.`, `-`, `_`, and `@` |
 | Make a recovery code | `/recovery-code` | `rp.recovery_code` with a `Fresh`. Only the accepted commit gives the code, and the page shows it once |
 | Recover | `/recover/options`, `/recover/finish` | `rp.recovery_options`, `rp.recover` with `Passkeys::End`, and one `attempt.propose` ([Recover](recovery.md#recover)) |
-| Review or approve a CLI | `/cli/request`, `/cli/approve` | Each commits a check of the user code. `authority.request` shows the device after its commit. `authority.approve` checks fresh verification and commits the approval. |
+| Review or approve a CLI | `/cli/request`, `/cli/approve` | Each commits a check of the user code. `authority.request` shows the device after its commit. `authority.approve` checks fresh verification and commits the approval. For a loopback request, the answer is `{"redirect":"<address>"}`, and the page goes there. |
 | Sign out | `/sign-out` | `sessions.revoke` with `Revoker::Own`, and `site.clear_cookie` |
 
 A sensitive change, such as a removal, a new code, a new account name, or the end of another session, needs a fresh
@@ -209,7 +213,7 @@ Keep the server running across browsers to use the same accounts. Remove your te
 | macOS aarch64, HTTP/1.1 and HTTP/2 | The tests pass, and the server serves the page and the sign-in options to `curl` over both protocols |
 | Linux x86_64, glibc and musl (Ubuntu 26.04) | The tests pass |
 | Windows x86_64 | Not run yet |
-| Chrome 158 on macOS aarch64, virtual passkey | Sign-up, passkey sign-in on the approval page, matching fingerprints, and native CLI approval passed. |
+| Chrome 158 on macOS aarch64, virtual passkey | Sign-up, passkey sign-in on the approval page, matching fingerprints, and native CLI approval passed. The loopback approval passed over HTTP and over HTTPS: the browser went to the listener of the CLI, which signed a status call. |
 | Safari 27.2 (22625.2.8.11.9), Apple Passwords with Touch ID on macOS 27.2.1 | Registration chose ES256 (`-7`) on HTTP and HTTPS with `-49` first. HTTP sign-in verified, but Safari omitted the `__Host-` cookie. A separate HTTPS check returned that cookie. The signed-in HTTPS account page still needs a run. |
 
 A host with persistent accounts needs its own storage binding.

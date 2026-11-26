@@ -85,7 +85,8 @@ pub(crate) fn run(
     Ok(())
 }
 
-/// The native CLI prints its loopback address. Send its browser navigation to the configured HTTPS site.
+/// The native CLI prints its loopback address. Send its browser navigation to the configured HTTPS site, with the
+/// query that holds the user code.
 async fn cli_address(request: Request, next: middleware::Next) -> axum::response::Response {
     if request.method() == http::Method::GET
         && request.uri().path() == "/cli"
@@ -94,7 +95,8 @@ async fn cli_address(request: Request, next: middleware::Next) -> axum::response
             .get(http::header::HOST)
             .is_some_and(|host| host == "localhost:8081")
     {
-        return axum::response::Redirect::temporary("https://localhost:8443/cli").into_response();
+        let query = request.uri().query().map_or(String::new(), |query| format!("?{query}"));
+        return axum::response::Redirect::temporary(&format!("https://localhost:8443/cli{query}")).into_response();
     }
     next.run(request).await
 }

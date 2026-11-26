@@ -13,19 +13,37 @@ Use the pinned Rust toolchain. Start the web example and create a passkey for yo
    cargo run --locked -p native-cli --features native-custody -- enroll "$HOME/.rsauthnz-laptop-cli" "Laptop"
    ```
 
-2. Open the local address printed by the CLI. Enter the **User code** and select **Review request**.
-3. Sign in if the page asks. Check the account and device name. Compare the fingerprint with your terminal.
-4. Select **Approve this CLI**. The terminal prints the approving account, then `Status admitted for` and its account ID.
-5. Use the same directory for later calls.
+   The CLI listens on `127.0.0.1` at a port that the OS chooses, and opens the approval page in your browser with its
+   code. When its output is not a terminal, for example in a script, it only prints the address: open it in a browser
+   on the same computer.
+2. Sign in if the page asks. Check the account and device name. Compare the fingerprint with your terminal. The page
+   says that the CLI runs on this computer.
+3. Select **Approve this CLI**. The browser goes to the CLI, which shows `Approved. Return to your terminal.` The
+   terminal prints the approving account, then `Status admitted for` and its account ID.
+4. Use the same directory for later calls.
 
    ```sh
    cargo run --locked -p native-cli --features native-custody -- status "$HOME/.rsauthnz-laptop-cli"
    ```
 
-The user code expires after ten minutes. While the request waits, the CLI polls every five seconds.
+The request ends after ten minutes, and the listener of the CLI ends with it. The listener takes one request.
 A wrong user code shows nothing of the request, and the page asks for the code again. After 5 wrong codes, start
 enrollment again in the terminal.
-The default loopback port is 8080. To use another port, give it after the device name. The CLI saves the port with the binding.
+The CLI connects to the web example on port 8080. To use another port, give it after the device name, such as `8081`
+for the HTTPS setup. The CLI saves the port with the binding.
+
+### Approve from a browser on another computer
+
+When the browser is on another computer, for example when the CLI runs over SSH, add `--device-code` after the
+device name or port:
+
+```sh
+cargo run --locked -p native-cli --features native-custody -- enroll "$HOME/.rsauthnz-laptop-cli" "Laptop" --device-code
+```
+
+The CLI prints the address of the approval page and the user code. Open the page, enter the **User code**, and select
+**Review request**. The page warns that this CLI finishes without the browser: approve it only if it runs on a
+computer that you control. While the request waits, the CLI polls every five seconds.
 
 The directory holds the private key, the binding, and the signed credential. Keep it for later calls.
 Before sending the finish, the CLI saves the account ID and credential serial. If the response is lost, the CLI looks up the credential.

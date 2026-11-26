@@ -1,14 +1,19 @@
 //! A browser approves the CLI key. Later calls use the same key and the saved account binding.
+//!
+//! By default the CLI listens on the loopback interface, opens the approval page in the browser of this computer, and
+//! takes the one-use redirect code that the browser brings after the approval. With `--device-code`, the CLI polls
+//! with its device code alone, for a browser on another computer.
 
 use core::time::Duration;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal as _, Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use bytes::Bytes;
 use http::{Request, header};
-use rsauthnz::agent::{DeviceCode, UserCode};
+use rsauthnz::agent::{DeviceCode, Loopback, RedirectCode, UserCode};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cli::{self, Call, Challenge};
 use rsauthnz::credential::Serial;
@@ -18,14 +23,31 @@ use rsauthnz::local::enroll::{CliId, ENROLLMENT_LIFETIME};
 use rsauthnz::transition::OperationId;
 use rscodec::base64::Profile::Url;
 use rscrypto::{ChaCha20Rng, Sha256};
-use tokio::time::{Instant, error::Elapsed, sleep_until, timeout};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpListener;
+use tokio::time::{Instant, error::Elapsed, sleep_until, timeout, timeout_at};
 
 use super::{Failure, clock, keys::Keys};
 
 const BODY_MAX: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const USAGE: &str = "Use native-cli enroll DIRECTORY NAME [PORT] or native-cli status DIRECTORY.";
+const USAGE: &str = "Use native-cli enroll DIRECTORY NAME [PORT] [--device-code] or native-cli status DIRECTORY.";
+/// The path of the loopback address of the CLI.
+const LOOPBACK_PATH: &str = "/approved";
+/// The most bytes of the request head that the listener reads.
+const HEAD_BYTES_MAX: usize = 8 * 1024;
+/// The most connections with no request that the listener takes, such as a connection that a browser opens early.
+const CONNECTIONS_MAX: usize = 8;
+
+/// How the CLI learns of the approval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// The browser of this computer brings the redirect code to the listener of the CLI.
+    Loopback,
+    /// The CLI polls with its device code, for a browser on another computer.
+    DeviceCode,
+}
 
 pub(super) fn run(
     command: &OsStr,
@@ -42,13 +64,17 @@ pub(super) fn run(
         Some("enroll") => {
             let name = args.next().ok_or(USAGE)?;
             let name = name.to_str().ok_or("the device name needs UTF-8 text")?;
-            let port = args.next().map_or(Ok(8080), |port| {
-                port.to_str().ok_or(USAGE)?.parse::<u16>().map_err(|_| USAGE)
-            })?;
-            if args.next().is_some() || port == 0 {
-                return Err(USAGE.into());
+            let (mut port, mut flow) = (None, Flow::Loopback);
+            for arg in args {
+                match arg.to_str().ok_or(USAGE)? {
+                    "--device-code" if flow == Flow::Loopback => flow = Flow::DeviceCode,
+                    text if port.is_none() => {
+                        port = Some(text.parse::<u16>().ok().filter(|port| *port != 0).ok_or(USAGE)?)
+                    }
+                    _ => return Err(USAGE.into()),
+                }
             }
-            runtime.block_on(enroll(directory, name, port, &mut random))
+            runtime.block_on(enroll(directory, name, port.unwrap_or(8080), flow, &mut random))
         }
         Some("status") if args.next().is_none() => {
             let saved = read(directory, "binding")?;
@@ -176,15 +202,31 @@ fn save(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     clippy::print_stdout,
     reason = "the CLI shows the code, the key fingerprint, and the approving account"
 )]
-async fn enroll(directory: &Path, name: &str, port: u16, random: &mut ChaCha20Rng) -> Result<(), Failure> {
+async fn enroll(directory: &Path, name: &str, port: u16, flow: Flow, random: &mut ChaCha20Rng) -> Result<(), Failure> {
     if directory.join("binding").try_exists()? {
         return Err("this directory already has an approval. Run native-cli status with this directory.".into());
     }
     let mut client = Client::connect(port).await?;
     let keys = Keys::open(directory, "holder", random)?;
     let public = keys.handle.public_key();
+    // The listener starts before the request, so that the request names its address. The OS chooses the port.
+    let listener = match flow {
+        Flow::Loopback => Some(TcpListener::bind((core::net::Ipv4Addr::LOCALHOST, 0)).await?),
+        Flow::DeviceCode => None,
+    };
+    let loopback = match &listener {
+        Some(listener) => {
+            let port = listener.local_addr()?.port();
+            Some(Loopback::parse(&format!("http://127.0.0.1:{port}{LOOPBACK_PATH}"))?)
+        }
+        None => None,
+    };
+    let deadline = Instant::now() + ENROLLMENT_LIFETIME;
+    let address = loopback
+        .as_ref()
+        .map_or(Value::Null, |loopback| Value::Text(loopback.as_str()));
     let response = client
-        .post("enroll", vec![Value::Text(name), Value::Bytes(&public)])
+        .post("enroll", vec![Value::Text(name), Value::Bytes(&public), address])
         .await?;
     let Value::Array(fields) = decode(&response)? else {
         return Err("invalid enrollment response".into());
@@ -197,11 +239,27 @@ async fn enroll(directory: &Path, name: &str, port: u16, random: &mut ChaCha20Rn
     let fingerprint = Sha256::digest(&public);
     let mut text = [0; 43];
     Url.encode(&fingerprint, &mut text)?;
-    println!("Open http://localhost:{port}/cli");
+    let page = match flow {
+        Flow::Loopback => format!("http://localhost:{port}/cli?code={code}"),
+        Flow::DeviceCode => format!("http://localhost:{port}/cli"),
+    };
+    println!("Open {page}");
     println!("User code {code}");
     println!("Key fingerprint {}", str::from_utf8(&text)?);
     io::stdout().flush()?;
-    let (id, name) = approval(&mut client, &code, &device).await?;
+    let redirect = match listener {
+        Some(listener) => {
+            // A run with no terminal, such as a script, prints the address and opens no browser.
+            if io::stdout().is_terminal()
+                && let Err(error) = open(&page)
+            {
+                println!("The browser did not open ({error}). Open the address in a browser on this computer.");
+            }
+            Some(receive(listener, deadline).await?)
+        }
+        None => None,
+    };
+    let (id, name) = approval(&mut client, &code, &device, redirect.as_ref(), deadline).await?;
     let binding = cbor::encode(
         &Value::Array(vec![
             Value::Unsigned(u64::from(port)),
@@ -219,6 +277,7 @@ async fn enroll(directory: &Path, name: &str, port: u16, random: &mut ChaCha20Rn
                 Value::Text(&code),
                 Value::Bytes(device.as_bytes()),
                 id.account.to_cbor(),
+                code_value(redirect.as_ref()),
             ],
         )
         .await;
@@ -235,10 +294,99 @@ async fn enroll(directory: &Path, name: &str, port: u16, random: &mut ChaCha20Rn
     status(&mut client, &keys, &id, &credential, random).await
 }
 
-/// Poll once more at the deadline. The authority can accept approval during the last sleep.
-async fn approval(client: &mut Client, code: &str, device: &DeviceCode) -> Result<(CliId, String), Failure> {
-    let fields = || vec![Value::Text(code), Value::Bytes(device.as_bytes())];
-    let deadline = Instant::now() + ENROLLMENT_LIFETIME;
+/// The redirect code of a loopback request, or null.
+fn code_value(redirect: Option<&RedirectCode>) -> Value<'_> {
+    redirect.map_or(Value::Null, |redirect| Value::Bytes(redirect.as_bytes()))
+}
+
+/// Opens `address` in the default browser of this computer. The CLI does not wait for the browser.
+fn open(address: &str) -> io::Result<()> {
+    let (program, arguments): (&str, &[&str]) = cfg_select! {
+        target_os = "macos" => ("open", &[]),
+        windows => ("rundll32", &["url.dll,FileProtocolHandler"]),
+        _ => ("xdg-open", &[]),
+    };
+    let mut child = Command::new(program)
+        .args(arguments)
+        .arg(address)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // An opener can wait for the browser to close, so a thread reaps it, and the CLI goes on.
+    std::thread::spawn(move || drop(child.wait()));
+    Ok(())
+}
+
+/// The redirect code that the browser brings to `listener`. The listener answers the first request and closes, so it
+/// takes one request. A connection that closes, or sends nothing within `REQUEST_TIMEOUT`, does not count. The listener
+/// ends at `deadline`.
+async fn receive(listener: TcpListener, deadline: Instant) -> Result<RedirectCode, Failure> {
+    for _ in 0..CONNECTIONS_MAX {
+        let (mut stream, _) = timeout_at(deadline, listener.accept()).await.map_err(
+            |_| "the approval did not reach the CLI before the end of the request. Start enrollment again.",
+        )??;
+        let until = deadline.min(Instant::now() + REQUEST_TIMEOUT);
+        let mut head = vec![0; HEAD_BYTES_MAX];
+        let mut len = 0;
+        // Read the complete head, so that the close after the answer resets no connection that has unread bytes.
+        while len < head.len() && !head[..len].ends_with(b"\r\n\r\n") {
+            match timeout_at(until, stream.read(&mut head[len..])).await {
+                Ok(Ok(read)) if read > 0 => len += read,
+                _ => break,
+            }
+        }
+        if len == 0 {
+            continue;
+        }
+        let code = redirect_code(&head[..len]);
+        let (status, text) = match code {
+            Some(_) => ("200 OK", "Approved. Return to your terminal."),
+            None => (
+                "400 Bad Request",
+                "This address takes only the redirect of an approval.",
+            ),
+        };
+        let answer = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n\
+             Connection: close\r\nContent-Length: {}\r\n\r\n{text}",
+            text.len()
+        );
+        // The answer only informs the human. The CLI goes on after a failed write.
+        drop(
+            timeout_at(until, async {
+                stream.write_all(answer.as_bytes()).await?;
+                stream.shutdown().await
+            })
+            .await,
+        );
+        return code.ok_or_else(|| "the browser brought no redirect code. Start enrollment again.".into());
+    }
+    Err("the listener had too many connections with no request. Start enrollment again.".into())
+}
+
+/// The redirect code of the request line `GET /approved?code=<base64url> HTTP/1.1` at the start of `head`.
+fn redirect_code(head: &[u8]) -> Option<RedirectCode> {
+    let line = head.split(|byte| *byte == b'\r').next()?;
+    let (method, rest) = line.split_once(|byte| *byte == b' ')?;
+    let (target, _) = rest.split_once(|byte| *byte == b' ')?;
+    let code = target.strip_prefix(format!("{LOOPBACK_PATH}?code=").as_bytes())?;
+    (method == b"GET" && Url.decoded_len(code).ok()? == 32).then_some(())?;
+    let mut bytes = [0; 32];
+    Url.decode(code, &mut bytes).ok()?;
+    Some(RedirectCode::from_bytes(bytes))
+}
+
+/// Poll once more at the deadline. The authority can accept approval during the last sleep. A loopback CLI polls once,
+/// with the redirect code of the approval.
+async fn approval(
+    client: &mut Client,
+    code: &str,
+    device: &DeviceCode,
+    redirect: Option<&RedirectCode>,
+    deadline: Instant,
+) -> Result<(CliId, String), Failure> {
+    let fields = || vec![Value::Text(code), Value::Bytes(device.as_bytes()), code_value(redirect)];
     loop {
         let final_poll = Instant::now() >= deadline;
         let response = match client.post("poll", fields()).await {
@@ -331,4 +479,54 @@ async fn status(
     }
     println!("Status admitted for {}", id.account);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use core::net::Ipv4Addr;
+    use core::time::Duration;
+
+    use rscodec::base64::Profile::Url;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::Instant;
+
+    use super::receive;
+
+    /// A connection that closes with no request does not count. The listener answers the first request, and then
+    /// closes: a later connection refuses, so no second request can bring another code.
+    #[tokio::test]
+    async fn the_listener_takes_one_request_and_then_refuses_connections() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut text = [0; 43];
+        Url.encode(&[7; 32], &mut text).unwrap();
+        let request = format!(
+            "GET /approved?code={} HTTP/1.1\r\nHost: {address}\r\n\r\n",
+            str::from_utf8(&text).unwrap()
+        );
+        let browser = async {
+            drop(TcpStream::connect(address).await.unwrap());
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).await.unwrap();
+            answer
+        };
+        let (received, answer) = tokio::join!(receive(listener, Instant::now() + Duration::from_secs(30)), browser);
+        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+        assert_eq!(received.unwrap().as_bytes(), &[7; 32]);
+        TcpStream::connect(address).await.unwrap_err();
+    }
+
+    /// With no request, the listener ends at its deadline, and then refuses connections.
+    #[tokio::test]
+    async fn the_listener_ends_at_its_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        receive(listener, deadline).await.unwrap_err();
+        assert!(Instant::now() >= deadline);
+        TcpStream::connect(address).await.unwrap_err();
+    }
 }

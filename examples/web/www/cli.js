@@ -21,6 +21,9 @@ async function review() {
   element("device").textContent = request.name;
   element("owner").textContent = request.account;
   element("fingerprint").textContent = request.fingerprint;
+  element("kind").textContent = request.loopback
+    ? "This CLI runs on this computer. After the approval, your browser returns to it."
+    : "This CLI finishes without this browser. Approve it only if it runs on a computer that you control.";
   reviewed = { code: value, accountId: request.accountId };
   details.hidden = false;
   message.textContent = "";
@@ -77,7 +80,20 @@ verify.onclick = () => run(async () => {
 });
 approve.onclick = () => run(async () => {
   if (!reviewed) return;
-  await change("/cli/approve", reviewed);
+  const answer = await change("/cli/approve", reviewed);
   details.hidden = form.hidden = true;
-  message.textContent = "Approved. Return to your terminal.";
+  if (answer.redirect) {
+    // The CLI listens on this computer. Its listener takes the one-use redirect code from the address.
+    message.textContent = "Approved. Your browser returns to the CLI.";
+    location.assign(answer.redirect);
+  } else {
+    message.textContent = "Approved. Return to your terminal.";
+  }
 });
+
+// The CLI opens this page with its code in the address.
+const given = new URLSearchParams(location.search).get("code");
+if (given) {
+  code.value = given;
+  run(review);
+}

@@ -3,7 +3,7 @@
 use axum::body::Bytes;
 use http::{Method, Request, Response, header};
 use rsauthnz::account::{FRESH_MAX, Fresh};
-use rsauthnz::agent::{DeviceCode, UserCode};
+use rsauthnz::agent::{DeviceCode, Loopback, RedirectCode, UserCode};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cli::{Call, Challenge};
 use rsauthnz::credential::Serial;
@@ -63,6 +63,15 @@ fn device(bytes: &[u8]) -> Result<DeviceCode, Problem> {
     Ok(DeviceCode::from_bytes(bytes.try_into().map_err(|_| REFUSE)?))
 }
 
+/// The redirect code of a loopback request, or null.
+fn redirect(value: &Value<'_>) -> Result<Option<RedirectCode>, Problem> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Bytes(bytes) => Ok(Some(RedirectCode::from_bytes((*bytes).try_into().map_err(|_| REFUSE)?))),
+        _ => Err(REFUSE),
+    }
+}
+
 fn identity(account: &Value<'_>, serial: u64) -> Result<CliId, Problem> {
     Ok(CliId {
         account: Id::<Human>::from_cbor(account).map_err(|_| REFUSE)?,
@@ -108,6 +117,7 @@ impl<S: Subject> State<S> {
                 out.member("account").str(&account.name)?;
                 out.member("accountId").str(&account.id.to_string())?;
                 out.member("fingerprint").base64url(&shown.fingerprint)?;
+                out.member("loopback").bool(shown.loopback.is_some())?;
                 out.member("approved").bool(shown.approved)
             })
         })
@@ -125,29 +135,42 @@ impl<S: Subject> State<S> {
                 self.cli
                     .approve(&mut self.store, &fresh, &code, serial, now, &mut self.random),
             )?;
-        let receipt = self.commit((proposal, plan), now)?;
-        checked.release(&Outcome::Accepted(receipt)).ok_or(AGAIN)?;
-        Ok(rsauthnz_http::json(b"{}".to_vec()))
+        let outcome = Outcome::Accepted(self.commit((proposal, plan), now)?);
+        let loopback = checked.release(&outcome).ok_or(AGAIN)?;
+        let (Some(loopback), Outcome::Accepted(receipt)) = (loopback, &outcome) else {
+            return Ok(rsauthnz_http::json(b"{}".to_vec()));
+        };
+        // The receipt gives the redirect code, and the page sends the browser to the listener of the CLI with it.
+        let code = receipt.artifact().and_then(|code| code.try_into().ok());
+        let code = RedirectCode::from_bytes(code.ok_or(Problem::Recovery(Recovery::Lookup))?);
+        reply(|place| place.object(|out| out.member("redirect").str(&loopback.redirect(&code))))
     }
 
     pub(super) fn cli_enroll(&mut self, request: &Request<Bytes>, now: Reading) -> Reply {
-        let [Value::Text(name), Value::Bytes(holder)] = input(request)? else {
+        let [Value::Text(name), Value::Bytes(holder), loopback] = input(request)? else {
             return Err(REFUSE);
         };
-        let (proposal, plan, code) =
-            self.cli
-                .enroll(holder.try_into().map_err(|_| REFUSE)?, name, now, &mut self.random)?;
+        let loopback = match loopback {
+            Value::Null => None,
+            Value::Text(text) => Some(Loopback::parse(text)?),
+            _ => return Err(REFUSE),
+        };
+        let holder = holder.try_into().map_err(|_| REFUSE)?;
+        let (proposal, plan, code) = self
+            .cli
+            .enroll(holder, name, loopback.as_ref(), now, &mut self.random)?;
         let device = self.artifact((proposal, plan), now)?;
         output(&Value::Array(vec![Value::Text(&code.text()), Value::Bytes(&device)]))
     }
 
     pub(super) fn cli_poll(&mut self, request: &Request<Bytes>, now: Reading) -> Reply {
-        let [Value::Text(code), Value::Bytes(secret)] = input(request)? else {
+        let [Value::Text(code), Value::Bytes(secret), redirect_code] = input(request)? else {
             return Err(REFUSE);
         };
+        let (code, secret, redirect_code) = (UserCode::parse(code)?, device(secret)?, redirect(&redirect_code)?);
         let status = wait(
             self.cli
-                .poll(&mut self.store, &UserCode::parse(code)?, &device(secret)?, now),
+                .poll(&mut self.store, &code, &secret, redirect_code.as_ref(), now),
         )?;
         match status {
             Status::Waiting => output(&Value::Null),
@@ -167,7 +190,7 @@ impl<S: Subject> State<S> {
     }
 
     pub(super) fn cli_finish(&mut self, request: &Request<Bytes>, now: Reading) -> Reply {
-        let [Value::Text(code), Value::Bytes(secret), account] = input(request)? else {
+        let [Value::Text(code), Value::Bytes(secret), account, redirect_code] = input(request)? else {
             return Err(REFUSE);
         };
         let account = Id::from_cbor(&account).map_err(|_| REFUSE)?;
@@ -175,6 +198,7 @@ impl<S: Subject> State<S> {
             &mut self.store,
             &UserCode::parse(code)?,
             &device(secret)?,
+            redirect(&redirect_code)?.as_ref(),
             &account,
             now,
         ))?;

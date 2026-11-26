@@ -12,6 +12,11 @@
 //! 4. The CLI submits the finish ([`Authority::finish`]): one commit consumes the request and binds the key of the CLI
 //!    to a CLI credential of the account. Its binding is an anchor of the account, and no sign-in method.
 //!
+//! A CLI in the same computer as the browser also gives a [`Loopback`] address, and it opens the approval page itself.
+//! After the approval, the browser goes to that address with a one-use [`RedirectCode`], and the poll and the finish
+//! of the CLI need that code too. So a human who approves the request of a remote CLI by mistake binds no key: the
+//! remote CLI never gets the redirect code. This is the loopback rule of agent enrollment ([`crate::agent`]).
+//!
 //! After a lost response of the finish, the CLI gives its account and its public key, and custody signs the credential
 //! of its binding again ([`Authority::account_credential`]). Each later call proves the possession of the key over a
 //! one-use challenge of its binding ([`Authority::account_challenge`], [`Authority::admit`]).
@@ -29,7 +34,7 @@ use crate::account::{
     Fresh,
     generation::{Epoch, Revision},
 };
-use crate::agent::{ATTEMPTS_MAX, Checked, DeviceCode, UserCode};
+use crate::agent::{ATTEMPTS_MAX, Checked, DeviceCode, Loopback, RedirectCode, UserCode};
 use crate::cbor::{self, Value};
 use crate::cli as calls;
 use crate::cose::PublicKey;
@@ -55,7 +60,7 @@ pub const CLI_NAME_BYTES_MAX: usize = 64;
 pub const ACCOUNT_CLIS_MAX: usize = 16;
 
 /// The first item of each CBOR form of this module. The number changes with the form.
-const REQUEST_FORM: &str = "rsauthnz.local.enrollment.3";
+const REQUEST_FORM: &str = "rsauthnz.local.enrollment.4";
 const ACCOUNT_FORM: &str = "rsauthnz.local.cli.2";
 /// The actions of the audit records.
 const ENROLL: &str = "cli.enroll";
@@ -71,6 +76,10 @@ pub struct Request {
     pub name: String,
     /// The SHA-256 digest of the public key of the CLI. The CLI shows the same digest, so the human can compare them.
     pub fingerprint: [u8; 32],
+    /// The loopback address of a CLI in the same computer as the browser, or `None` for a CLI that finishes with its
+    /// device code alone. Tell the human the difference: approve a request with no loopback address only for a CLI on
+    /// a computer that the human controls ([RFC 8628, section 5.4](https://www.rfc-editor.org/rfc/rfc8628#section-5.4)).
+    pub loopback: Option<Loopback>,
     /// The time of the request, as the time since the Unix epoch.
     pub created: Duration,
     /// The end of the request, as the time since the Unix epoch.
@@ -212,25 +221,44 @@ impl Finish<'_> {
     }
 }
 
-/// An enrollment request record: `["rsauthnz.local.enrollment.3", check, device, holder, name, created, attempts,
-/// approved]`. `check` is the last 4 letters of the user code, `device` the SHA-256 digest of the device code, `holder`
-/// the public key of the CLI, `created` the time of the request in whole seconds, `attempts` the number of wrong checks,
-/// and `approved` the account, reserved serial, and account revision, or null.
+/// An enrollment request record: `["rsauthnz.local.enrollment.4", check, device, holder, name, created, loopback,
+/// attempts, approved]`. `check` is the last 4 letters of the user code, `device` the SHA-256 digest of the device
+/// code, `holder` the public key of the CLI, `created` the time of the request in whole seconds, `loopback` the loopback
+/// address or null, `attempts` the number of wrong checks, and `approved` the account, reserved serial, account
+/// revision, and SHA-256 digest of the redirect code (or null), or null.
 struct Pending {
     check: [u8; 4],
     device: [u8; 32],
     holder: Vec<u8>,
     name: String,
     created: u64,
+    loopback: Option<Loopback>,
     attempts: u64,
-    approved: Option<(Id<Human>, Serial, Epoch)>,
+    approved: Option<Approval>,
+}
+
+/// The approval of a request: `[account, serial, epoch, redirect]`.
+struct Approval {
+    account: Id<Human>,
+    serial: Serial,
+    epoch: Epoch,
+    /// The SHA-256 digest of the redirect code of a loopback request.
+    redirect: Option<[u8; 32]>,
 }
 
 impl Pending {
     /// The record form.
     fn form(&self) -> Box<[u8]> {
-        let approved = self.approved.as_ref().map_or(Value::Null, |(account, serial, epoch)| {
-            Value::Array(vec![account.to_cbor(), Value::Unsigned(serial.0), epoch.form()])
+        let approved = self.approved.as_ref().map_or(Value::Null, |approval| {
+            Value::Array(vec![
+                approval.account.to_cbor(),
+                Value::Unsigned(approval.serial.0),
+                approval.epoch.form(),
+                approval
+                    .redirect
+                    .as_ref()
+                    .map_or(Value::Null, |digest| Value::Bytes(digest)),
+            ])
         });
         encode(&[
             Value::Text(REQUEST_FORM),
@@ -239,10 +267,24 @@ impl Pending {
             Value::Bytes(&self.holder),
             Value::Text(&self.name),
             Value::Unsigned(self.created),
+            self.loopback
+                .as_ref()
+                .map_or(Value::Null, |loopback| Value::Text(loopback.as_str())),
             Value::Unsigned(self.attempts),
             approved,
         ])
         .into_boxed_slice()
+    }
+
+    /// Checks that `code`, `device`, and `redirect` are the codes of this request, for its CLI. A loopback request
+    /// needs the redirect code of its approval, and a request with no loopback address takes none.
+    fn admits(&self, code: &UserCode, device: &DeviceCode, redirect: Option<&RedirectCode>) -> Result<(), Error> {
+        (self.check == *code.check() && self.device == device.digest()).ok_or(Error::Request)?;
+        (self.loopback.is_some() == redirect.is_some()).ok_or(Error::Redirect)?;
+        if let Some(approval) = &self.approved {
+            (approval.redirect == redirect.map(RedirectCode::digest)).ok_or(Error::Redirect)?;
+        }
+        Ok(())
     }
 }
 
@@ -282,7 +324,8 @@ pub(super) struct Account {
 
 impl Authority {
     /// Proposes an enrollment request of a CLI with the public key `holder`, an ML-DSA-65 + Ed25519 key, and the name
-    /// `name`. The CLI stores the private part of `holder` in custody before the request. The commit writes the
+    /// `name`, and for a CLI in the same computer as the browser with the address `loopback`. The CLI stores the
+    /// private part of `holder` in custody, and starts the listener of `loopback`, before the request. The commit writes the
     /// request, which ends after [`ENROLLMENT_LIFETIME`]. Give the CLI the user code at once, and the device code from
     /// the artifact of the accepted commit: [`DeviceCode::from_bytes`]. A request authenticates no caller, so its audit
     /// names the local owner. The operation identity is new: after a lost response, the CLI asks again, and the earlier
@@ -298,6 +341,7 @@ impl Authority {
         &self,
         holder: &[u8; 1984],
         name: &str,
+        loopback: Option<&Loopback>,
         now: Reading,
         random: &mut ChaCha20Rng,
     ) -> Result<(Proposal, Plan, UserCode), Error> {
@@ -326,6 +370,7 @@ impl Authority {
             holder: holder.to_vec(),
             name: name.into(),
             created: now.estimate().as_secs(),
+            loopback: loopback.cloned(),
             attempts: 0,
             approved: None,
         };
@@ -371,6 +416,7 @@ impl Authority {
         let request = right.then(|| Request {
             fingerprint: crypto::sha256(&pending.holder),
             name: pending.name.clone(),
+            loopback: pending.loopback.clone(),
             created: Duration::from_secs(pending.created),
             ends,
             approved: pending.approved.is_some(),
@@ -387,7 +433,9 @@ impl Authority {
     /// second approval conflicts. Its deadline is the earliest of the end of the verification and of the request.
     ///
     /// The approval is also a check of `code`: for a wrong code, the proposal counts the wrong check and approves
-    /// nothing. [`Checked::release`] of the outcome tells whether the approval committed.
+    /// nothing. [`Checked::release`] of the accepted commit gives the loopback address of a loopback request, or `None`
+    /// in it for another request. Only the receipt of that commit gives the redirect code:
+    /// [`RedirectCode::from_bytes`] of its artifact. Then send the browser to [`Loopback::redirect`].
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup, for an approved request one account
     /// revision lookup, and its commit.
@@ -404,7 +452,7 @@ impl Authority {
         serial: Serial,
         now: Reading,
         random: &mut ChaCha20Rng,
-    ) -> Result<(Proposal, Plan, Checked<()>), Failure<S::Error>> {
+    ) -> Result<(Proposal, Plan, Checked<Option<Loopback>>), Failure<S::Error>> {
         let account = fresh.account();
         let (key, record, mut pending) = self.pending(store, code, now).await?;
         if pending.check != *code.check() {
@@ -421,36 +469,58 @@ impl Authority {
             .estimate()
             .checked_add(ENROLLMENT_LIFETIME)
             .ok_or(Error::Time(TimeError::Overflow))?;
-        pending.approved = Some((account.clone(), serial, fresh.epoch.clone()));
-        self.rewrite(&mut proposal, key, &record, &pending, Some(end))?;
-        let checked = Checked::new(&proposal, Some(()));
+        let redirect = pending.loopback.is_some().then(|| {
+            let mut bytes = [0; 32];
+            random.fill_bytes(&mut bytes);
+            RedirectCode::from_bytes(bytes)
+        });
+        pending.approved = Some(Approval {
+            account: account.clone(),
+            serial,
+            epoch: fresh.epoch.clone(),
+            redirect: redirect.as_ref().map(RedirectCode::digest),
+        });
+        let version = self.rewrite(&mut proposal, key.clone(), &record, &pending, Some(end))?;
+        if let Some(redirect) = redirect {
+            proposal
+                .prepare(Prepared::new(redirect.as_bytes().to_vec(), key, version))
+                .map_err(Error::Transition)?;
+        }
+        let checked = Checked::new(&proposal, Some(pending.loopback));
         Ok((proposal, Plan::default(), checked))
     }
 
-    /// The state of the request of `code` for its CLI, which proves itself with its device code `device`. After
-    /// [`Status::Approved`], store the [`CliId`] before sending the finish. It also identifies the binding after a lost response.
+    /// The state of the request of `code` for its CLI, which proves itself with its device code `device`, and for a
+    /// loopback request also with the redirect code `redirect` that the browser brought to its loopback address. Thus a
+    /// loopback CLI asks once, after the redirect. After [`Status::Approved`], store the [`CliId`] before sending the
+    /// finish. It also identifies the binding after a lost response.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One request lookup and, for an approved request, one account revision lookup.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::request`], also when `device` is not the device code of the request.
+    /// The errors of [`Self::request`], also when `device` is not the device code of the request. [`Error::Redirect`]
+    /// if a loopback request has no redirect code or another one, or a request with no loopback address has one.
     pub async fn poll<S: Store>(
         &self,
         store: &mut S,
         code: &UserCode,
         device: &DeviceCode,
+        redirect: Option<&RedirectCode>,
         now: Reading,
     ) -> Result<Status, Failure<S::Error>> {
         let (_, _, pending) = self.pending(store, code, now).await?;
-        (pending.check == *code.check() && pending.device == device.digest()).ok_or(Error::Request)?;
-        Ok(pending.approved.map_or(Status::Waiting, |(account, serial, _)| {
-            Status::Approved(CliId { account, serial })
+        pending.admits(code, device, redirect)?;
+        Ok(pending.approved.map_or(Status::Waiting, |approval| {
+            Status::Approved(CliId {
+                account: approval.account,
+                serial: approval.serial,
+            })
         }))
     }
 
     /// The first step of the finish of the request of `code` by its CLI, which proves itself with its device code
-    /// `device`. The approval supplies the account and the reserved serial. Its `cnf` key is the public key of the request, so an approval
+    /// `device`, and for a loopback request also with the redirect code `redirect`. The approval supplies the account and the reserved serial. Its `cnf` key is the public key of the request, so an approval
     /// of one request binds no other key. Custody signs the bytes of [`Finish::to_be_signed`] with the issuer key, and
     /// [`Finish::finish`] gives the proposal.
     ///
@@ -458,7 +528,7 @@ impl Authority {
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::request`], also when `device` is not the device code of the request. [`Error::Waiting`] if
+    /// The errors of [`Self::poll`]. [`Error::Waiting`] if
     /// no account approved the request, and [`Error::Account`] if another account approved it. [`Error::Full`] if the
     /// account has [`ACCOUNT_CLIS_MAX`] bindings. [`Error::Credential`] if the draft refuses the public key.
     pub async fn finish<S: Store>(
@@ -466,13 +536,19 @@ impl Authority {
         store: &mut S,
         code: &UserCode,
         device: &DeviceCode,
+        redirect: Option<&RedirectCode>,
         account: &Id<Human>,
         now: Reading,
     ) -> Result<Finish<'_>, Failure<S::Error>> {
         let (key, record, pending) = self.pending(store, code, now).await?;
-        (pending.check == *code.check() && pending.device == device.digest()).ok_or(Error::Request)?;
+        pending.admits(code, device, redirect)?;
         let holder: &[u8; 1984] = pending.holder.as_slice().try_into().map_err(|_| Error::Record)?;
-        let (approved, serial, epoch) = pending.approved.ok_or(Error::Waiting)?;
+        let Approval {
+            account: approved,
+            serial,
+            epoch,
+            ..
+        } = pending.approved.ok_or(Error::Waiting)?;
         (&approved == account).ok_or(Error::Account)?;
         let capacity = self.capacity(store, account, &epoch, now).await?;
         let expires = now
@@ -639,8 +715,8 @@ impl Authority {
         (latest < record.end.ok_or(Error::Record)?).ok_or(Error::Expired)?;
         let pending = self.decode_request(&record).ok_or(Error::Record)?;
         (pending.attempts < ATTEMPTS_MAX).ok_or(Error::Locked)?;
-        if let Some((_, _, epoch)) = &pending.approved {
-            Self::check_epoch(store, epoch).await?;
+        if let Some(approval) = &pending.approved {
+            Self::check_epoch(store, &approval.epoch).await?;
         }
         Ok((key, record, pending))
     }
@@ -658,19 +734,35 @@ impl Authority {
             Value::Bytes(holder),
             Value::Text(name),
             Value::Unsigned(created),
+            loopback,
             Value::Unsigned(attempts),
             approved,
         ] = items.as_slice()
         else {
             return None;
         };
+        let loopback = match loopback {
+            Value::Null => None,
+            Value::Text(text) => Some(Loopback::parse(text).ok()?),
+            _ => return None,
+        };
         let approved = match approved {
             Value::Null => None,
             Value::Array(items) => {
-                let [account, Value::Unsigned(serial), epoch] = items.as_slice() else {
+                let [account, Value::Unsigned(serial), epoch, redirect] = items.as_slice() else {
                     return None;
                 };
-                Some((Id::from_cbor(account).ok()?, Serial(*serial), Epoch::parse(epoch)?))
+                let redirect = match redirect {
+                    Value::Null => None,
+                    Value::Bytes(digest) => Some((*digest).try_into().ok()?),
+                    _ => return None,
+                };
+                Some(Approval {
+                    account: Id::from_cbor(account).ok()?,
+                    serial: Serial(*serial),
+                    epoch: Epoch::parse(epoch)?,
+                    redirect,
+                })
             }
             _ => return None,
         };
@@ -680,6 +772,7 @@ impl Authority {
             holder: holder.to_vec(),
             name: (*name).into(),
             created: *created,
+            loopback,
             attempts: *attempts,
             approved,
         })

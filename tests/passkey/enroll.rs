@@ -5,7 +5,7 @@
 use core::time::Duration;
 
 use rsauthnz::account::Fresh;
-use rsauthnz::agent::{ATTEMPTS_MAX, Checked, DeviceCode, UserCode};
+use rsauthnz::agent::{ATTEMPTS_MAX, Checked, DeviceCode, Loopback, RedirectCode, UserCode};
 use rsauthnz::cbor::Value;
 use rsauthnz::cli::{Call, Challenge};
 use rsauthnz::cose::{Key as CoseKey, PublicKey, TrustedKey};
@@ -107,10 +107,21 @@ impl World {
 
     /// The request of a CLI with the key of `seed` at `seconds`.
     fn request(&mut self, seed: u8, seconds: u64) -> Cli {
+        self.request_at(seed, None, seconds)
+    }
+
+    /// The request of a CLI with the key of `seed` and the loopback address `loopback` at `seconds`.
+    fn request_at(&mut self, seed: u8, loopback: Option<&Loopback>, seconds: u64) -> Cli {
         let key = Pair::new(seed);
         let (proposal, plan, code) = self
             .authority
-            .enroll(&key.public, "alice-laptop", at(seconds), &mut self.site.random)
+            .enroll(
+                &key.public,
+                "alice-laptop",
+                loopback,
+                at(seconds),
+                &mut self.site.random,
+            )
             .expect("a request");
         let device = self.artifact((proposal, plan));
         let device = DeviceCode::from_bytes(device.try_into().expect("32 bytes"));
@@ -183,9 +194,25 @@ impl World {
 
     /// The proposal of the finish of the request of `cli` for `account` at `seconds`, which the issuer key signs.
     fn finish(&mut self, cli: &Cli, account: &Id<Human>, seconds: u64) -> Result<(Proposal, Plan), local::Error> {
-        let finish = self
-            .authority
-            .finish(&mut self.site.node.memory, &cli.code, &cli.device, account, at(seconds));
+        self.finish_with(cli, None, account, seconds)
+    }
+
+    /// The proposal of the finish of [`Self::finish`], with the redirect code `redirect`.
+    fn finish_with(
+        &mut self,
+        cli: &Cli,
+        redirect: Option<&RedirectCode>,
+        account: &Id<Human>,
+        seconds: u64,
+    ) -> Result<(Proposal, Plan), local::Error> {
+        let finish = self.authority.finish(
+            &mut self.site.node.memory,
+            &cli.code,
+            &cli.device,
+            redirect,
+            account,
+            at(seconds),
+        );
         let finish = ready(finish).map_err(refused_local)?;
         let signature = self.issuer.sign(&finish.to_be_signed());
         finish.finish(
@@ -296,9 +323,18 @@ impl World {
     }
 
     fn poll(&mut self, cli: &Cli, seconds: u64) -> Result<Status, local::Error> {
-        let poll = self
-            .authority
-            .poll(&mut self.site.node.memory, &cli.code, &cli.device, at(seconds));
+        self.poll_with(cli, None, seconds)
+    }
+
+    /// The poll of [`Self::poll`], with the redirect code `redirect`.
+    fn poll_with(&mut self, cli: &Cli, redirect: Option<&RedirectCode>, seconds: u64) -> Result<Status, local::Error> {
+        let poll = self.authority.poll(
+            &mut self.site.node.memory,
+            &cli.code,
+            &cli.device,
+            redirect,
+            at(seconds),
+        );
         ready(poll).map_err(refused_local)
     }
 }
@@ -550,6 +586,7 @@ fn a_cli_that_alice_approves_calls_for_her_account_and_makes_no_administrator_ca
         Ok(Some(Request {
             name: "alice-laptop".into(),
             fingerprint: rscrypto::Sha256::digest(&cli.key.public),
+            loopback: None,
             created: START + Duration::from_secs(20),
             ends: START + Duration::from_secs(20) + ENROLLMENT_LIFETIME,
             approved: false,
@@ -818,6 +855,62 @@ fn a_pending_request_of_the_earlier_form_refuses() {
     assert_eq!(world.show(&access, &code, 21), Err(local::Error::Request));
     let poll = world
         .authority
-        .poll(&mut world.site.node.memory, &code, &device, at(21));
+        .poll(&mut world.site.node.memory, &code, &device, None, at(21));
     assert_eq!(ready(poll).map_err(refused_local), Err(local::Error::Request));
+}
+
+/// A loopback request finishes only with the redirect code that the receipt of its approval gives to the browser. So a
+/// human who approves the request of a remote CLI by mistake binds no key: the device code alone finishes nothing, and
+/// tells nothing of the approval. A request with no loopback address takes no redirect code.
+#[test]
+fn a_loopback_cli_request_finishes_only_with_the_redirect_code_of_its_approval() {
+    let mut world = World::new();
+    let loopback = Loopback::parse("http://127.0.0.1:49152/approved").unwrap();
+    let cli = world.request_at(2, Some(&loopback), 20);
+    let plain = world.request(3, 20);
+    let (access, fresh) = world.session();
+    let shown = world.show(&access, &cli.code, 21).unwrap().expect("the code is right");
+    assert_eq!(shown.loopback.as_ref(), Some(&loopback));
+    let approve = world.authority.approve(
+        &mut world.site.node.memory,
+        &fresh,
+        &cli.code,
+        cli.serial,
+        at(21),
+        &mut world.site.random,
+    );
+    let (proposal, plan, checked) = ready(approve).map_err(refused_local).unwrap();
+    let outcome = world.site.node.commit(proposal, plan);
+    let Outcome::Accepted(receipt) = &outcome else {
+        panic!("the approval gave {outcome:?}");
+    };
+    let redirect = RedirectCode::from_bytes(receipt.artifact().unwrap().try_into().unwrap());
+    assert_eq!(checked.release(&outcome), Some(Some(loopback)));
+
+    let other = RedirectCode::from_bytes([7; 32]);
+    for wrong in [None, Some(&other)] {
+        assert_eq!(world.poll_with(&cli, wrong, 22), Err(local::Error::Redirect));
+        assert_eq!(
+            world.finish_with(&cli, wrong, &alice(), 22).err(),
+            Some(local::Error::Redirect)
+        );
+    }
+    world.approve(&plain, &fresh, 22).unwrap();
+    assert_eq!(
+        world.poll_with(&plain, Some(&redirect), 22),
+        Err(local::Error::Redirect)
+    );
+    assert_eq!(
+        world.finish_with(&plain, Some(&redirect), &alice(), 22).err(),
+        Some(local::Error::Redirect)
+    );
+
+    let approved = Status::Approved(CliId {
+        account: alice(),
+        serial: cli.serial,
+    });
+    assert_eq!(world.poll_with(&cli, Some(&redirect), 23), Ok(approved));
+    let finish = world.finish_with(&cli, Some(&redirect), &alice(), 23).unwrap();
+    let credential = world.artifact(finish);
+    assert_eq!(world.call(&cli, &credential, 24).unwrap().holder(), Holder::Account);
 }

@@ -1,4 +1,5 @@
-//! A person approves the real native CLI. A committed finish loses its response. The CLI recovers and proves possession.
+//! A person approves the real native CLI. With its device code, a committed finish loses its response, and the CLI
+//! recovers and proves possession. On the loopback interface, the browser brings the redirect code to the CLI.
 #![cfg(feature = "native-custody")]
 
 #[cfg(test)]
@@ -14,9 +15,11 @@ mod support;
 use core::mem::DropGuard;
 use core::time::Duration;
 use std::io::{BufRead as _, BufReader, Read as _};
+
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use authenticator::Passkey;
 use http::StatusCode;
@@ -77,6 +80,7 @@ async fn browser_approval_requires_fresh_verification_and_the_native_cli_recover
         .arg(&directory)
         .arg("Alice laptop")
         .arg(port.to_string())
+        .arg("--device-code")
         .stdout(Stdio::piped())
         .spawn()
         .expect("start the native CLI");
@@ -143,16 +147,7 @@ async fn browser_approval_requires_fresh_verification_and_the_native_cli_recover
     site.post(&mut browser, "/cli/approve", approve.as_bytes()).await;
     site.memory.inject(Fault::LostResponse);
 
-    let status = tokio::time::timeout(Duration::from_secs(25), async {
-        loop {
-            if let Some(status) = child.try_wait().expect("the CLI process") {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the CLI finishes after the approval");
+    let status = exit(&mut child).await;
     let mut tail = String::new();
     stdout.read_to_string(&mut tail).expect("the CLI result");
     assert!(status.success(), "{status} {tail}");
@@ -174,4 +169,103 @@ async fn browser_approval_requires_fresh_verification_and_the_native_cli_recover
         String::from_utf8_lossy(&output.stdout),
         format!("Status admitted for {id}\n")
     );
+}
+
+/// A CLI on this computer listens on the loopback interface and opens the approval page with its code. The approval
+/// sends the browser to the listener with the one-use redirect code, and the CLI then finishes and signs a status call.
+#[tokio::test]
+async fn a_loopback_cli_finishes_with_the_redirect_that_the_browser_brings() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let port = listener.local_addr().expect("port").port();
+    let origin = format!("http://localhost:{port}");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let site = Site::at(&origin, now - 10);
+    site.advance(10);
+    let router = site.router.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let mut browser = Browser::default();
+    let passkey = Passkey::new(Algorithm::Ed25519, -8, 1);
+    let handle = site
+        .register(
+            &mut browser,
+            ("/sign-up/options", "/sign-up/finish"),
+            br#"{"name":"alice"}"#,
+            &passkey,
+        )
+        .await;
+    site.sign_in(&mut browser, &passkey, handle).await;
+
+    // The output of the CLI is no terminal, so it prints the address and opens no browser.
+    let child = Command::new(env!("CARGO_BIN_EXE_native-cli"))
+        .arg("enroll")
+        .arg(site.issuer_dir.join("desktop"))
+        .arg("Desktop")
+        .arg(port.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the native CLI");
+    let mut child = DropGuard::new(child, |mut child| {
+        drop(child.kill());
+        drop(child.wait());
+    });
+    let stdout = child.stdout.take().expect("the CLI output");
+    let (mut stdout, opened, code) = tokio::task::spawn_blocking(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut lines = (&mut reader).lines();
+        let mut line = || lines.next().expect("CLI output").expect("a line");
+        let opened = line();
+        let code = line().strip_prefix("User code ").expect("the code").to_owned();
+        line();
+        (reader, opened, code)
+    })
+    .await
+    .expect("the CLI prompt");
+    assert_eq!(opened, format!("Open {origin}/cli?code={code}"));
+    let review = format!(r#"{{"code":"{code}"}}"#);
+    let shown = site.post(&mut browser, "/cli/request", review.as_bytes()).await;
+    assert!(String::from_utf8_lossy(&shown).contains(r#""loopback":true"#));
+    let id = member(&shown, "accountId");
+    let approve = format!(r#"{{"code":"{code}","accountId":"{id}"}}"#);
+    let approved = site.post(&mut browser, "/cli/approve", approve.as_bytes()).await;
+    let redirect = member(&approved, "redirect");
+    let (host, target) = redirect
+        .strip_prefix("http://")
+        .and_then(|address| address.split_once('/'))
+        .expect("a loopback address");
+    let mut stream = tokio::net::TcpStream::connect(host)
+        .await
+        .expect("the listener of the CLI");
+    let request = format!("GET /{target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("the redirect");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).await.expect("the answer of the CLI");
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+
+    let status = exit(&mut child).await;
+    let mut tail = String::new();
+    stdout.read_to_string(&mut tail).expect("the CLI result");
+    assert!(status.success(), "{status} {tail}");
+    assert_eq!(
+        tail,
+        format!("Approved account alice ({id})\nStatus admitted for {id}\n")
+    );
+}
+
+/// The exit status of the CLI `child`, which finishes soon after the approval.
+async fn exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("the CLI process") {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the CLI finishes after the approval")
 }

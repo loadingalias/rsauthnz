@@ -48,7 +48,7 @@ secret from the human.
 
 1. The CLI draws a key ID, and enrolls its key with `custody.enroll(id, Algorithm::MlDsa65Ed25519, random)`.
 2. The CLI sends its public key of 1,984 bytes and a name, such as `alice-laptop`. The authority calls
-   `authority.enroll(&holder, name, now, random)`, which gives the proposal, its plan, and an `agent::UserCode`. The
+   `authority.enroll(&holder, name, None, now, random)`, which gives the proposal, its plan, and an `agent::UserCode`. The
    name has 1 to `CLI_NAME_BYTES_MAX` (64) bytes and no control character. The artifact of the accepted commit is the 32
    bytes of the `agent::DeviceCode`. Give the CLI both codes. The request ends after `ENROLLMENT_LIFETIME` (10 minutes).
    The CLI path and [agent enrollment](agent-enrollment.md) use the same codes and the same check rule.
@@ -63,16 +63,40 @@ secret from the human.
      the code again. A wrong code counts against the bound.
 5. Get fresh verification from the browser session. Allocate `serial` with `driver.allocate(Kind::Credential)`.
    Commit the proposal and plan from `authority.approve(store, &fresh, &code, Serial(serial), now, random)`.
-   `checked.release(&outcome)` gives `Some(())` when the approval committed, and `None` for a wrong code or another
+   `checked.release(&outcome)` gives `Some(None)` when the approval committed, and `None` for a wrong code or another
    outcome.
-6. The CLI polls with `authority.poll(store, &code, &device, now)`. On `Status::Approved(id)`, save the account and serial in `id` before sending the finish.
-7. Submit `authority.finish(store, &code, &device, &id.account, now)`. Custody signs `finish.to_be_signed()`.
+6. The CLI polls with `authority.poll(store, &code, &device, None, now)`. On `Status::Approved(id)`, save the account and serial in `id` before sending the finish.
+7. Submit `authority.finish(store, &code, &device, None, &id.account, now)`. Custody signs `finish.to_be_signed()`.
    Submit the proposal and plan from `finish.finish(signature, operation)`. The accepted receipt carries the CLI credential.
 8. The CLI asks for a challenge with `authority.account_challenge(store, &id, &holder, now, random, operation)`,
    and makes each call as [Make a call](#make-a-call) says. `admitted.holder()` is `Holder::Account`.
 
 The finish binds the key that the request holds, so the approval of one request binds no other key. An account has
 at most `ACCOUNT_CLIS_MAX` (16) active bindings per issuer and passkey site. Two finishes for the last place can commit only once.
+
+### Enroll a CLI on the same computer with a loopback address
+
+A CLI on the same computer as the browser uses a loopback address. Then the human types no code, and a human who
+approves the request of a remote CLI by mistake binds no key: only the browser of the human gets the redirect code.
+Prefer this flow. Use the flow above only for a CLI whose browser is on another computer, for example over SSH.
+
+1. Before the request, the CLI listens on `127.0.0.1` at a port that the OS chooses. It gives the address, such as
+   `http://127.0.0.1:49152/approved`, as an `agent::Loopback`: `authority.enroll(&holder, name, Some(&loopback), now,
+   random)`. `Loopback::parse` takes only a loopback IP literal with a port and a path, and never `localhost`.
+2. The CLI opens the approval page with its code in the address, such as `/cli?code=WDJB-MJHT`. The page reads the
+   code from the address, and the check and the approval are as in steps 4 and 5. `request.loopback` tells the page
+   which flow the request uses.
+3. `checked.release(&outcome)` of the approval gives `Some(Some(loopback))`, and the artifact of the receipt is the 32
+   bytes of the redirect code: `RedirectCode::from_bytes(bytes)`. The page sends the browser to
+   `loopback.redirect(&redirect)`: the loopback address with the query `code=` and the base64url of the code.
+4. The listener of the CLI takes that one request, answers it, and closes. It ends at the end of the request.
+5. The CLI polls once with `authority.poll(store, &code, &device, Some(&redirect), now)`, saves the `CliId`, and
+   submits `authority.finish(store, &code, &device, Some(&redirect), &id.account, now)`. The rest is as in step 7.
+
+The poll and the finish of a loopback request refuse with `local::Error::Redirect` without its redirect code, or with
+another one. So the device code alone gives nothing, not even the account of the approval. A request with no loopback
+address refuses a redirect code. [Run the native CLI example](native-cli-example.md#connect-a-cli-to-your-account)
+shows both flows.
 
 ### List and disconnect a CLI
 
@@ -264,13 +288,14 @@ zeroization, its recovery, and the isolation that the OS enforces.
 
 | Operation | Side | Result |
 | --- | --- | --- |
-| `authority.enroll(&holder, name, now, random)` | Authority | `(Proposal, Plan, UserCode)`. The receipt gives the 32 bytes of the `DeviceCode` |
+| `authority.enroll(&holder, name, loopback, now, random)` | Authority | `(Proposal, Plan, UserCode)`. The receipt gives the 32 bytes of the `DeviceCode` |
 | `agent::UserCode::parse(text)`, `code.text()`, `agent::DeviceCode::from_bytes(bytes)`, `device.as_bytes()` | Both | The codes of a request, and their text and bytes |
-| `authority.request(store, &access, &code, now, random)` | Authority | `(Proposal, Plan, Checked<Request>)`. The `Request` of the approval page has `name`, `fingerprint`, `created`, `ends`, and `approved` |
-| `authority.approve(store, &fresh, &code, serial, now, random)` | Authority | `(Proposal, Plan, Checked<()>)`: the approval by the account of `fresh` |
+| `authority.request(store, &access, &code, now, random)` | Authority | `(Proposal, Plan, Checked<Request>)`. The `Request` of the approval page has `name`, `fingerprint`, `loopback`, `created`, `ends`, and `approved` |
+| `authority.approve(store, &fresh, &code, serial, now, random)` | Authority | `(Proposal, Plan, Checked<Option<Loopback>>)`: the approval by the account of `fresh`. For a loopback request, the receipt gives the 32 bytes of the `RedirectCode` |
 | `checked.release(&outcome)` | Authority | The answer of a right code from the accepted commit of its check, also after a lookup. `None` for a wrong code and each other outcome |
-| `authority.poll(store, &code, &device, now)` | Authority | `Status::Waiting`, or `Status::Approved(id)` |
-| `authority.finish(store, &code, &device, &id.account, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
+| `authority.poll(store, &code, &device, redirect, now)` | Authority | `Status::Waiting`, or `Status::Approved(id)` |
+| `authority.finish(store, &code, &device, redirect, &id.account, now)`, then `finish.finish(signature, operation)` | Authority | `(Proposal, Plan)`. The receipt gives the CLI credential |
+| `agent::Loopback::parse(text)`, `loopback.redirect(&code)`, `agent::RedirectCode::from_bytes(bytes)` | Both | The loopback address, the address of the redirect, and the redirect code |
 | `authority.account_credential(store, &id, &holder, now)`, then `reissue.finish(signature)` | Authority | The CLI credential of the account binding whose `cnf` key is `holder`, which custody signs again |
 | `authority.account_challenge(store, &id, &holder, now, random, operation)` | Authority | An `Offer` for the account binding whose `cnf` key is `holder` |
 | `authority.challenge(store, &administrator, now, random, operation)` | Authority | `Offer::Open(challenge)` while the binding holds a valid challenge, with no commit. Else `Offer::New(proposal, plan)`: the receipt gives the 32 bytes of the new challenge |
@@ -304,6 +329,7 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 | `local::Error::Waiting` | No account approved the request yet | Poll again after 5 seconds |
 | `local::Error::Approved` | An account approved the request already | Show the approval |
 | `local::Error::Account` | Another account approved the request | Finish with the account of the poll |
+| `local::Error::Redirect` | A loopback request has no redirect code or another one, or a request with no loopback address has one | Refuse. A CLI whose browser brought no redirect code makes a new request |
 | `local::Error::Full` | The account has 16 bindings | Wait for the end of a credential |
 | `local::Error::Credential` | The credential or the proof refuses: another request or operation, another key, or a credential after its end or of another authority | Refuse the call |
 
@@ -335,6 +361,12 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 - A user code proves nothing. Anyone can send a human the code of a request of their own CLI. So the page shows the
   name and the fingerprint, and asks the human to approve only a CLI on their own screen. The CLI shows the account of
   the approval.
+- The loopback flow binds no key of a remote CLI. A remote CLI can still make a request with no loopback address, and
+  finish it with its device code. So the page tells the human the flow of each request, and warns for a request with no
+  loopback address ([RFC 8628, section 5.4](https://www.rfc-editor.org/rfc/rfc8628#section-5.4)). A host whose CLIs
+  all run on the computer of the browser can refuse each request with no loopback address.
+- The redirect code is in the address of the loopback redirect, as an OAuth authorization code is in RFC 8252. It is
+  one-use, it goes only to the loopback interface, and it admits nothing without the device code.
 - A request pending at an upgrade to the form of this version refuses with `local::Error::Request`, and its CLI makes
   a new request. A CLI that finished its enrollment keeps its binding.
 - An account recovery ends prior CLI access. The owner can also disconnect one CLI. [List and disconnect a CLI](#list-and-disconnect-a-cli).
@@ -350,6 +382,7 @@ Finish reads the capacity revision and one device page. Listing uses one paired 
 The enrollment from a browser runs in the tests on this Mac (macOS aarch64), on the memory binding, with rscrypto in
 place of custody and the test authenticator of the passkey tests. They cover the journey, the approval of one request
 and the finish of another, an ended request, the attempt bound with checks at the same time, a request of the earlier
-form, a lost finish response, and a restore.
-Chrome 158 on macOS aarch64 also ran the approval page with a virtual passkey and the native CLI in file custody.
+form, the loopback flow and its redirect code, a lost finish response, and a restore.
+Chrome 158 on macOS aarch64 also ran the approval page with a virtual passkey and the native CLI in file custody, with
+the device code and with a loopback address, over HTTP and over HTTPS.
 [Run the native CLI example](native-cli-example.md#connect-a-cli-to-your-account).

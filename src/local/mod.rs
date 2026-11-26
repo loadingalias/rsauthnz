@@ -1552,6 +1552,9 @@ pub enum Error {
     Approved,
     /// Another account approved the enrollment request. The CLI finishes with the account of [`Authority::poll`].
     Account,
+    /// A loopback enrollment request has no redirect code or another one, or a request with no loopback address has
+    /// one. Refuse it. A CLI whose browser did not bring the redirect code makes a new request.
+    Redirect,
 }
 
 impl Recover for Error {
@@ -1595,6 +1598,7 @@ impl fmt::Display for Error {
             Self::Waiting => f.write_str("no account approved the enrollment request yet"),
             Self::Approved => f.write_str("an account approved the enrollment request already"),
             Self::Account => f.write_str("another account approved the enrollment request"),
+            Self::Redirect => f.write_str("the redirect code is missing, wrong, or not expected"),
         }
     }
 }
