@@ -15,5 +15,12 @@ http = "1.5"
 # The recovery of each outcome of a transition.
 rsauthnz = { version = "=0.1.0-alpha.1", path = ".." }
 
+[dev-dependencies]
+# The memory binding and the effect executor commit the issue of the credential of the signature tests: only the
+# receipt of an accepted transition gives its bytes.
+rsauthnz-conformance = { version = "=0.1.0-alpha.1", path = "../rsauthnz-conformance" }
+# The composite keys of the issuer and of the agent, which sign in place of custody in the signature tests.
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["mldsa65-ed25519"] }
+
 [lints]
 workspace = true

@@ -1009,3 +1009,6 @@ fn a_page_that_ends_at_a_grant_gives_it_with_its_last_use_on_the_next_page() {
     );
     assert_eq!(second.next, None);
 }
+
+#[path = "signature.rs"]
+mod signature;

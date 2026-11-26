@@ -18,6 +18,7 @@ lock file. libFuzzer holds C++, so it stays out of each library closure.
 | `bootstrap` | `local::Bootstrap::parse` | No input panics |
 | `agent` | `agent::Enrollment::parse`, `agent::Finish::parse`, `agent::Rotation::parse`, `agent::Loopback::parse` | A body over `agent::BODY_BYTES_MAX` and an address over `agent::LOOPBACK_BYTES_MAX` refuse |
 | `recovery` | `recovery::Code::parse` | A text of more than 64 bytes, or with another number of digits than 32 outside the hyphens and spaces, refuses |
+| `httpsig` | `httpsig::Profile::verify` | With drawn limits: a `Signature-Input` over `Limits::bytes` refuses with `Error::Field`, and no request verifies. The input gives the values of `Signature-Input`, `Signature`, `Content-Digest`, and `Agent-Credential`, and then the body, with a zero byte after each value |
 
 A signature check charges its `SignatureBudget` before its work ([Bound the signature
 checks](verification.md#bound-the-signature-checks)). Thus a budget that still has each check shows that no signature
@@ -30,7 +31,7 @@ their input to the core entry points that call them.
 ## Drawn limits
 
 A fuzzer reaches a limit only with an input that passes it, and in a short run libFuzzer makes no input of 64 KiB. So
-`cbor`, `cose`, and `credential` take their limits from the last 8 bytes of each input, as the `FuzzedDataProvider` of
+`cbor`, `cose`, `credential`, and `httpsig` take their limits from the last 8 bytes of each input, as the `FuzzedDataProvider` of
 libFuzzer takes its parameters from the end, and give the bytes before them to the parser:
 
 | Bytes | Limit | Range |
@@ -95,7 +96,7 @@ approval of the owner.
 
 | Directory | Seeds |
 | --- | --- |
-| `cbor` | Small items: integers, an array, a map, a tag, floats, strings, and nested arrays. Also the credential and the COSE key of `cose`. Each seed of `cbor`, `cose`, and `credential` ends with eight `0xff` bytes: the default [drawn limits](#drawn-limits) |
+| `cbor` | Small items: integers, an array, a map, a tag, floats, strings, and nested arrays. Also the credential and the COSE key of `cose`. Each seed of `cbor`, `cose`, `credential`, and `httpsig` ends with eight `0xff` bytes: the default [drawn limits](#drawn-limits) |
 | `cose`, `credential` | A credential of the credential format, from `credential::Draft` and its commit, and a `COSE_Key`. The Ed25519 key of the secret `[1; 32]` signed the credential; `fuzz/src/lib.rs` holds its public key |
 | `jose` | A JWT from `jose::signing_input` and `jose::compact`, signed by the same key, and a JWK set of the key |
 | `passkey` | The registration of the ES256 case of WebAuthn Level 3, section 16.2, and an assertion of the same credential |
@@ -103,6 +104,7 @@ approval of the owner.
 | `session`, `bootstrap` | One identifier and one bootstrap value in their forms |
 | `recovery` | One recovery code in its text form |
 | `agent` | One enrollment body with a loopback address, and one finish body with a redirect code |
+| `httpsig` | One signed request of the profile with the credential of `credential` and the body `{}`, and the default drawn limits. Its signature is 64 zero bytes, so it does not verify |
 
 ## Campaign record
 
@@ -124,8 +126,8 @@ rsauthnz `4680393` and the targets of this page. It ran the command of [Run a ta
 | `session` | 3,747,303 | 65 | 37,405 bytes |
 | `bootstrap` | 4,079,416 | 59 | 40,611 bytes |
 
-The longest input is the length limit that libFuzzer reached. The `recovery` and `agent` targets came after this
-campaign, and no campaign has run them yet. Only `x509`, `session`, and `bootstrap` passed their
+The longest input is the length limit that libFuzzer reached. The `recovery`, `agent`, and `httpsig` targets came after
+this campaign, and no campaign has run them yet. Only `x509`, `session`, and `bootstrap` passed their
 byte limits. Thus the over-limit refusals of `cbor`, `cose`, `credential`, `passkey`, and `jose` did not run in this
 campaign, and the next campaign adds `-len_control=0`.
 

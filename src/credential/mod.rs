@@ -159,7 +159,7 @@ pub const MAX_BYTES: usize = 8_192;
 /// The longest signature of a profile of this format. ML-DSA-65 + ECDSA P-256 has the 3,309 bytes of ML-DSA-65 and at
 /// most 72 bytes of DER ECDSA. ML-DSA-65 + Ed25519 has 3,373 bytes, ML-DSA-65 has 3,309 bytes, and Ed25519 and ES256
 /// have 64 bytes.
-const SIGNATURE_BYTES_MAX: usize = 3_381;
+pub(crate) const SIGNATURE_BYTES_MAX: usize = 3_381;
 
 /// The tag of a `COSE_Sign1` (RFC 9052 section 2).
 const SIGN1_TAG: u64 = 18;
@@ -917,25 +917,38 @@ impl<'a> Verified<'a, '_> {
         now: Reading,
         budget: &mut SignatureBudget,
     ) -> Result<Evidence, Error> {
+        let cose = &self.profile.cose;
+        self.proved(now, |key| {
+            check_proof(
+                key,
+                self.artifact,
+                &cose.audience,
+                proof,
+                challenge,
+                cose.limits,
+                budget,
+            )
+        })
+    }
+
+    /// The evidence of a proof of possession of the `cnf` key at the physical time `now`, after `prove` checks the proof
+    /// with that key: the checks and the evidence of [`Self::possession`], for a proof of another form, such as an HTTP
+    /// message signature ([`crate::httpsig`]).
+    pub(crate) fn proved<E: From<Error>>(
+        &self,
+        now: Reading,
+        prove: impl FnOnce(&TrustedKey) -> Result<(), E>,
+    ) -> Result<Evidence, E> {
         let key = self.confirmation.as_ref().ok_or(Error::NoConfirmation)?;
-        cose::validity(self.claims.not_before, self.claims.expires, now)?;
+        cose::validity(self.claims.not_before, self.claims.expires, now).map_err(Error::from)?;
         // The validity check proved a known bound. An artifact of the previous issuer key ends with that key.
         if self
             .until
             .is_some_and(|until| now.latest().is_ok_and(|now| now >= until))
         {
-            return Err(cose::Error::KeyId.into());
+            return Err(Error::from(cose::Error::KeyId).into());
         }
-        let cose = &self.profile.cose;
-        check_proof(
-            key,
-            self.artifact,
-            &cose.audience,
-            proof,
-            challenge,
-            cose.limits,
-            budget,
-        )?;
+        prove(key)?;
         let mut evidence = Evidence::new(
             self.claims.subject.principal(),
             Method::KeyPossession,

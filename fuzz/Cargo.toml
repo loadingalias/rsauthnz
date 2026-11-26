@@ -92,6 +92,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "httpsig"
+path = "fuzz_targets/httpsig.rs"
+test = false
+doc = false
+bench = false
+
 # Integer overflow is a defect in every profile, and an assertion of the crate must fire under the fuzzer.
 [profile.release]
 overflow-checks = true

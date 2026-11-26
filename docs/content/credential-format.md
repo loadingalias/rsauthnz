@@ -282,6 +282,9 @@ A credential is not a bearer token. Its holder proves possession of the `cnf` ke
    proof, because it is a separate artifact.
 4. The verifier consumes the challenge in the transition that uses the evidence.
 
+An agent can also prove possession with an HTTP message signature of each request by the `cnf` key. It needs no
+challenge, and it gives the same evidence ([Sign the requests of an agent](http-signatures.md)).
+
 The proof is a `COSE_Sign1` with the tag 18, signed by the `cnf` key. Its claims map holds `aud` (3), `iat` (6),
 the SHA-256 digest of the exact bytes of the credential (-65540), and the challenge (-65541). `possession`
 refuses a proof that does not bind this credential, the audience of the profile, and the challenge, in the encoding

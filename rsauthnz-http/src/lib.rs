@@ -16,6 +16,8 @@
 //!   ([`rsauthnz::session`]) in a cookie, with the base64url of data-independent timing.
 //! - [`machine_json`] admits the JSON body of a client that is no browser, such as an agent
 //!   ([`rsauthnz::agent`]), only with no cookie and no field that a browser sends.
+//! - [`signature_draft`], [`add_signature`], and [`verify_signature`] sign the request of an agent and verify it
+//!   ([`rsauthnz::httpsig`]).
 //!
 //! Each response of the binding has `Cache-Control: no-store`: [`json`], [`waiting`], [`redirect`] to a path of the site, the
 //! problem responses of [`Refusal::response`] and [`problem`], the document of [`related_origins`], and the
@@ -71,6 +73,7 @@
 
 mod cookie;
 mod response;
+mod signature;
 
 use core::fmt;
 
@@ -79,6 +82,7 @@ use http::header::{AsHeaderName, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, O
 
 pub use cookie::CookieName;
 pub use response::{Problem, RELATED_ORIGINS, browser_module, json, problem, redirect, related_origins, waiting};
+pub use signature::{add_signature, signature_draft, verify_signature};
 
 /// The site that the binding serves: its origin, and the `SameSite` value of its cookies.
 #[derive(Clone, Debug)]

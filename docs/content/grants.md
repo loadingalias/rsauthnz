@@ -111,7 +111,9 @@ key, add the previous key with `profile.with_previous(previous_key, until)`.
 
 ## Check each request
 
-Each request of the agent presents an agent credential that names its owner and the revision of its grant.
+Each request of the agent presents an agent credential that names its owner and the revision of its grant. The agent
+proves its key with a proof of possession ([Prove possession](credential-format.md#prove-possession)), or with an HTTP
+message signature of each request ([Sign the requests of an agent](http-signatures.md)). Both give the same evidence.
 `authz::check_agent` checks it against the store and the policy, and gives a `Granted` scope. The operation enforces
 the scope at each use, and an operation that commits takes its proposal from the scope. A revocation, a change, a key
 rotation, or a policy change stops the work at its next use and refuses a later commit.
@@ -189,7 +191,7 @@ reviews the grants on this page and revokes each one that they did not give.
 | `grants.credential(store, request, &issuer, &policy, now, &mut driver)` | The `grant::Pending` issue of an agent credential |
 | `pending.finish(&signature, &mut budget)` | `(Proposal, Plan, credential::Awaiting)` |
 | `released.json()` | The answer to the agent |
-| `grants.profile(key, &audience)` | The `credential::Profile` that verifies the agent credentials at the audience |
+| `grants.profile(key, &audience)` | The `credential::Profile` that verifies the agent credentials at the audience, also in an `httpsig::Profile` |
 | `usage.note(&scope, now)` | A `LastUse` at most once for each revision in each window |
 | `grants.record(store, &last_use, now)` | `Option<(Proposal, Plan)>` of the record of a last use |
 | `grants.list(store, &access, after, now)` | One `Page` of the grants of the owner, with their last uses |

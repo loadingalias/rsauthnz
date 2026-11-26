@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod custody;
 pub mod evidence;
 pub mod grant;
+pub mod httpsig;
 pub mod id;
 pub mod jose;
 pub mod limits;

@@ -115,6 +115,19 @@ bytes_max)` admits the JSON body of such a client:
 A browser sends `Origin` and `Sec-Fetch-Site` with each state change, and no script can remove them. Thus no page of
 any site can send this request with the cookies of a human.
 
+## Signed requests of an agent
+
+An agent can sign each request with its key and its agent credential, as RFC 9421 defines. The binding maps the
+profile of `rsauthnz::httpsig` to `http::Request` values ([Sign the requests of an agent](http-signatures.md)):
+
+| Operation | Use |
+| --- | --- |
+| `signature_draft(&key, &credential, &request, &nonce, lifetime, now)` | The agent: the draft of the signature of a request with an absolute target |
+| `add_signature(request.headers_mut(), &signed)` | The agent: adds the four fields of the signature, each marked sensitive |
+| `verify_signature(&profile, &request, now)` | The server: the `Evidence` of the agent. The authority is that of the target, or else the one `Host` |
+
+`?` converts each refusal into a problem with the recovery `Refuse` ([Return a problem](#return-a-problem)).
+
 ## Cookies
 
 Each cookie of the binding is a `__Host-` cookie: `CookieName::new("session")` is the cookie `__Host-session`. A
