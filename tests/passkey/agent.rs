@@ -1,29 +1,34 @@
 //! The enrollment of an agent that its human owner approves in a browser: the agent asks with its own key, alice
 //! approves with a fresh user verification of her passkey session, and the finish of the agent binds its key to an
-//! agent identity that she owns. A hosted agent also gives the token of its workload, which names no owner.
+//! agent identity that she owns. A hosted agent also gives the token of its workload, which names no owner. The agent
+//! rotates its key with both keys, and only its owner revokes it.
 
 use core::time::Duration;
 
 use rsauthnz::account::{FRESH_MAX, Fresh};
 use rsauthnz::agent::{
     ATTEMPTS_MAX, Agents, Binding, Bootstrap, Checked, DeviceCode, ENROLLMENT_LIFETIME, Enrollment, Error, Failure,
-    Finish, Identity, KEY_BYTES, Loopback, Platform, RedirectCode, Request, Started, Status, UserCode, Workload,
+    Finish, Identity, KEY_BYTES, Loopback, Platform, RedirectCode, Request, Rotation, Started, Status, UserCode,
+    Workload,
 };
+use rsauthnz::cbor::{self, Value};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz::id::{Authority, Id};
+use rsauthnz::id::{Agent as AgentId, Authority, Id, Principal};
 use rsauthnz::jose;
 use rsauthnz::limits::Limits;
 use rsauthnz::recovery::Passkeys;
 use rsauthnz::session::{Access, Check, Revoker};
+use rsauthnz::store::Kind;
 use rsauthnz::store::driver::Plan;
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
 use rsauthnz::trust::{self, Freshness, KeySet, Refresh};
 use rsauthnz_conformance::suite::Subject as _;
 use rscodec::base64::Profile::Url;
 use rscrypto::EcdsaP256SecretKey;
-use rscrypto::auth::MlDsa65Ed25519;
+use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 use super::authenticator::{Get, Passkey};
+use super::session::BOB;
 use super::{HANDLE, ORIGIN, RP_ID, START, Site, alice, at, ready, wrong};
 
 /// The site of alice with her passkey, and the agent enrollment of the site.
@@ -186,16 +191,92 @@ impl World {
     fn identity(&mut self, agent: &Agent) -> Result<Identity, Error> {
         ready(self.agents.identity(&mut self.site.node.memory, &agent.started.agent)).map_err(refused)
     }
+
+    /// An agent with the key of `seed` that alice enrolls: its request at 20, her approval at 22, its finish at 23.
+    fn enrolled(&mut self, seed: u8) -> Agent {
+        let agent = self.request(seed, "build-agent", None, 20);
+        let (_, fresh) = self.session();
+        assert!(matches!(self.approve(&agent, &fresh, 22), Outcome::Accepted(_)));
+        assert!(matches!(self.enroll(&agent, None, 23), Outcome::Accepted(_)));
+        agent
+    }
+
+    /// Commits the rotation `rotation` at `seconds`.
+    fn rotate(&mut self, rotation: &Rotation, seconds: u64) -> Result<Outcome, Error> {
+        let operation = OperationId::new(format!("rotate-{seconds}").as_bytes()).expect("an operation identity");
+        let rotate = self
+            .agents
+            .rotate(&mut self.site.node.memory, rotation, at(seconds), operation);
+        let proposal = ready(rotate).map_err(refused)?;
+        Ok(self.commit(proposal))
+    }
+
+    /// Commits the revocation of `agent` by the human of `access` at `seconds`.
+    fn revoke(&mut self, access: &Access, agent: &Agent, seconds: u64) -> Result<Outcome, Error> {
+        let revoke = self.agents.revoke(
+            &mut self.site.node.memory,
+            access,
+            &agent.started.agent,
+            at(seconds),
+            &mut self.site.random,
+        );
+        let proposal = ready(revoke).map_err(refused)?;
+        Ok(self.commit(proposal))
+    }
+
+    /// A session of bob, who has his own passkey, at 41, checked at 42.
+    fn bob(&mut self) -> (Access, Fresh) {
+        let passkey = self.site.register_bob();
+        let opened = self.site.session_of(&passkey, BOB, 41, None);
+        let access = self.site.active(opened.session.identifier(), at(42));
+        let fresh = Fresh::check(&access, FRESH_MAX, at(42)).expect("a fresh verification");
+        (access, fresh)
+    }
+
+    /// The actor of the audit record of the operation `operation`.
+    fn actor(&mut self, operation: &str) -> Principal {
+        let key = Kind::Audit.key(operation.as_bytes()).expect("a key");
+        let record = self.site.node.read(&key).expect("an audit record");
+        let value = cbor::decode(&record.data, Limits::default()).expect("an audit form");
+        let Value::Array(items) = &value else {
+            panic!("an audit form");
+        };
+        Principal::from_cbor(&items[1]).expect("an actor")
+    }
 }
 
-/// The public key of the composite profile from `seed`.
-fn key(seed: u8) -> [u8; KEY_BYTES] {
-    let (public, _) = MlDsa65Ed25519::generate_keypair(|out| {
+/// The composite key pair from `seed`.
+fn keypair(seed: u8) -> ([u8; KEY_BYTES], MlDsa65Ed25519SecretKey) {
+    let (public, secret) = MlDsa65Ed25519::generate_keypair(|out| {
         let _: () = out.fill(seed);
         Ok(())
     })
     .expect("a key pair");
-    public.to_bytes()
+    (public.to_bytes(), secret)
+}
+
+/// The public key of the composite profile from `seed`.
+fn key(seed: u8) -> [u8; KEY_BYTES] {
+    keypair(seed).0
+}
+
+/// The rotation of `agent` from the key of `old` to the key of `new`, whose statement of `generation` the keys of
+/// `signers` sign: the current key first, then the new key.
+fn rotation(agent: &Id<AgentId>, old: u8, new: u8, generation: u64, signers: [u8; 2]) -> Rotation {
+    let statement = Rotation::statement(agent, &key(old), &key(new), generation);
+    let [old_signature, new_signature] = signers.map(|seed| {
+        let signature = keypair(seed)
+            .1
+            .sign_deterministic(&statement, &[])
+            .expect("a signature");
+        signature.as_bytes().to_vec()
+    });
+    Rotation {
+        agent: agent.clone(),
+        key: Box::new(key(new)),
+        old_signature,
+        new_signature,
+    }
 }
 
 /// The base64url text of `bytes`.
@@ -287,7 +368,11 @@ fn the_messages_of_an_agent_name_no_owner_it_chose_and_hold_no_session_of_its_ow
     let enrolled = identity.json();
     assert_eq!(
         enrolled,
-        format!(r#"{{"agent":"{}","owner":"acme:alice"}}"#, agent.started.agent).into_bytes()
+        format!(
+            r#"{{"agent":"{}","owner":"acme:alice","generation":1}}"#,
+            agent.started.agent
+        )
+        .into_bytes()
     );
 
     let session = access.session().key().as_bytes();
@@ -680,4 +765,116 @@ fn a_missing_or_stale_key_set_refuses() {
         platform.verify(&token, &agent_key, at(600)).err(),
         Some(Error::Trust(trust::Error::Stale))
     );
+}
+
+/// A rotation needs a signature by the current key and by the new key over the statement of the current generation.
+/// After it, the old key refuses, and a statement of an earlier generation never matches again, also after a rotation
+/// back to the old key. A member of the body that names another owner changes no owner.
+#[test]
+fn a_rotation_needs_the_current_key_and_then_the_old_key_refuses() {
+    let mut world = World::new();
+    let agent = world.enrolled(2);
+    let id = agent.started.agent.clone();
+    assert_eq!(world.identity(&agent).expect("the identity").generation, 1);
+
+    for signers in [[3, 3], [4, 3], [3, 2]] {
+        let forged = rotation(&id, 2, 3, 1, signers);
+        assert_eq!(world.rotate(&forged, 30).err(), Some(Error::Signature), "{signers:?}");
+    }
+    assert_eq!(
+        world.rotate(&rotation(&id, 2, 3, 2, [2, 3]), 30).err(),
+        Some(Error::Signature)
+    );
+
+    let first = rotation(&id, 2, 3, 1, [2, 3]);
+    let body = format!(
+        r#"{{"agent":"{id}","key":"{}","old_signature":"{}","new_signature":"{}","owner":"acme:bob"}}"#,
+        base64url(&*first.key),
+        base64url(&first.old_signature),
+        base64url(&first.new_signature),
+    );
+    let parsed = Rotation::parse(body.as_bytes()).expect("a body");
+    assert!(matches!(world.rotate(&parsed, 31), Ok(Outcome::Accepted(_))));
+    let rotated = world.identity(&agent).expect("the identity");
+    assert_eq!((*rotated.key, rotated.generation), (key(3), 2));
+    assert_eq!((&rotated.owner, rotated.name.as_str()), (&alice(), "build-agent"));
+    // A lost response: the same body again tells that the rotation committed.
+    assert_eq!(world.rotate(&first, 32).err(), Some(Error::Rotated));
+    // The old key alone no longer rotates.
+    assert_eq!(
+        world.rotate(&rotation(&id, 2, 4, 2, [2, 4]), 33).err(),
+        Some(Error::Signature)
+    );
+
+    assert!(matches!(
+        world.rotate(&rotation(&id, 3, 2, 2, [3, 2]), 34),
+        Ok(Outcome::Accepted(_))
+    ));
+    assert_eq!(world.rotate(&first, 35).err(), Some(Error::Signature));
+    assert_eq!(world.identity(&agent).expect("the identity").generation, 3);
+}
+
+/// Only the owner revokes an agent: a revocation by another human refuses as if the agent did not exist. After the
+/// revocation, the identity, a rotation, and a second revocation refuse, and a restore from a snapshot before the
+/// revocation or before a rotation gives neither the identity nor the earlier key again.
+#[test]
+fn after_its_owner_revokes_an_agent_its_key_refuses_and_another_human_cannot_revoke_it() {
+    let mut world = World::new();
+    let agent = world.enrolled(2);
+    let before = world.site.node.memory.snapshot();
+    let (bob, _) = world.bob();
+    assert_eq!(world.revoke(&bob, &agent, 43).err(), Some(Error::NotEnrolled));
+    world.identity(&agent).unwrap();
+
+    let (alice, _) = world.session();
+    assert!(matches!(world.revoke(&alice, &agent, 44), Ok(Outcome::Accepted(_))));
+    assert_eq!(world.identity(&agent).err(), Some(Error::NotEnrolled));
+    let id = agent.started.agent.clone();
+    assert_eq!(
+        world.rotate(&rotation(&id, 2, 3, 1, [2, 3]), 45).err(),
+        Some(Error::NotEnrolled)
+    );
+    assert_eq!(world.revoke(&alice, &agent, 45).err(), Some(Error::NotEnrolled));
+
+    world.site.node.memory.restore(&before);
+    world.site.node.driver.restore(at(0)).expect("a restore");
+    world.site.node.run();
+    assert_eq!(world.identity(&agent).err(), Some(Error::NotEnrolled));
+
+    let rotated = world.request(5, "deploy-agent", None, 50);
+    let (_, fresh) = world.session();
+    assert!(matches!(world.approve(&rotated, &fresh, 52), Outcome::Accepted(_)));
+    assert!(matches!(world.enroll(&rotated, None, 53), Outcome::Accepted(_)));
+    let before = world.site.node.memory.snapshot();
+    let id = rotated.started.agent.clone();
+    assert!(matches!(
+        world.rotate(&rotation(&id, 5, 6, 1, [5, 6]), 54),
+        Ok(Outcome::Accepted(_))
+    ));
+    world.site.node.memory.restore(&before);
+    world.site.node.driver.restore(at(0)).expect("a restore");
+    world.site.node.run();
+    assert_eq!(world.identity(&rotated).err(), Some(Error::NotEnrolled));
+}
+
+/// No operation changes the owner of an identity. A new owner comes from a revocation and a new enrollment, which gives
+/// a new agent identifier, and the audit of each earlier commit keeps the earlier owner.
+#[test]
+fn a_new_owner_comes_only_from_a_new_enrollment_and_the_audit_keeps_the_earlier_owner() {
+    let mut world = World::new();
+    let first = world.enrolled(2);
+    let (alice, _) = world.session();
+    assert!(matches!(world.revoke(&alice, &first, 30), Ok(Outcome::Accepted(_))));
+
+    let (_, bob) = world.bob();
+    let again = world.request(2, "build-agent", None, 43);
+    assert!(matches!(world.approve(&again, &bob, 44), Outcome::Accepted(_)));
+    assert!(matches!(world.enroll(&again, None, 45), Outcome::Accepted(_)));
+    let identity = world.identity(&again).expect("the identity");
+    assert_ne!(identity.agent, first.started.agent);
+    assert_eq!(identity.owner, Id::new("acme", "bob").expect("an identifier"));
+    assert_eq!(world.identity(&first).err(), Some(Error::NotEnrolled));
+
+    assert_eq!(world.actor("finish-23"), Principal::Human(super::alice()));
+    assert_eq!(world.actor("finish-45"), Principal::Human(identity.owner));
 }

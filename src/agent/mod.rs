@@ -29,9 +29,15 @@
 //! request keeps the verified workload, and the approval page shows it. The workload names no owner: the human still
 //! approves, and the owner comes only from the approval.
 //!
+//! An agent rotates its key with signatures by its current key and by its new key ([`Agents::rotate`]). The owner
+//! revokes the agent from a session ([`Agents::revoke`]), and the commit ends the identity. No operation changes the
+//! owner of an identity: the owner revokes it, and a new enrollment gives a new agent identifier. The audit of each
+//! earlier commit keeps the earlier owner.
+//!
 //! An agent identity is not an authority anchor. A restore ends each pending request, and a restore from a snapshot
-//! before an enrollment loses the identity: the agent enrolls again. [`Agents::identity`] gives the current identity of
-//! an agent, with its owner and its key.
+//! before an enrollment loses the identity: the agent enrolls again. The restore journal keeps each rotation and each
+//! revocation, so no restore gives a revoked identity or an earlier key again. [`Agents::identity`] gives the current
+//! identity of an agent, with its owner and its key.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -48,7 +54,7 @@ use crate::account::{Fresh, generation::Epoch};
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::id::{Agent, Authority, AuthorityVersion, Human, Id, Principal};
-use crate::limits::Limits;
+use crate::limits::{Limits, SignatureBudget};
 use crate::session::Access;
 use crate::store::driver::Plan;
 use crate::store::{Kind, Record, Store};
@@ -101,12 +107,15 @@ const SLOTS: usize = 1 + 8;
 /// The first item of each CBOR form of this module. The number changes with the form.
 const REQUEST_FORM: &str = "rsauthnz.agent.enrollment.2";
 const AGENT_FORM: &str = "rsauthnz.agent.2";
+const ROTATION_FORM: &str = "rsauthnz.agent.rotation.1";
 
 /// The actions of the audit records.
 const REQUEST: &str = "agent.request";
 const CHECK: &str = "agent.code";
 const APPROVE: &str = "agent.approve";
 const ENROLL: &str = "agent.enroll";
+const ROTATE: &str = "agent.rotate";
+const REVOKE: &str = "agent.revoke";
 
 /// The letters of a user code: the base20 alphabet of RFC 8628, section 6.1, with no vowel, so no code spells a word.
 const LETTERS: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
@@ -418,6 +427,62 @@ impl Finish {
     }
 }
 
+/// The JSON body of a rotation of the key of an agent: `{"agent","key","old_signature","new_signature"}`, with the text
+/// form of the agent identifier, the base64url of the new public key, and the base64url of the signatures of the
+/// rotation statement ([`Rotation::statement`]) by the current key and by the new key. The reader ignores each other
+/// member, so a member that names an owner names none.
+#[derive(Debug)]
+pub struct Rotation {
+    /// The agent.
+    pub agent: Id<Agent>,
+    /// The new public key of the agent.
+    pub key: Box<[u8; KEY_BYTES]>,
+    /// The signature of the statement by the current key.
+    pub old_signature: Vec<u8>,
+    /// The signature of the statement by the new key.
+    pub new_signature: Vec<u8>,
+}
+
+impl Rotation {
+    /// Reads the body `json`, of at most [`BODY_BYTES_MAX`] bytes.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] if `json` is not a JSON object with an agent identifier, a key of [`KEY_BYTES`] bytes, and
+    /// two signatures, or is longer than its bound.
+    pub fn parse(json: &[u8]) -> Result<Self, Error> {
+        let [agent, key, old, new] = members(json, ["agent", "key", "old_signature", "new_signature"])?;
+        let agent = agent.ok_or(Error::Malformed)?;
+        let (namespace, value) = agent.split_once(':').ok_or(Error::Malformed)?;
+        let key = base64url(&key.ok_or(Error::Malformed)?)?;
+        Ok(Self {
+            agent: Id::new(namespace, value).map_err(|_| Error::Malformed)?,
+            key: Box::new(key.as_slice().try_into().map_err(|_| Error::Malformed)?),
+            old_signature: base64url(&old.ok_or(Error::Malformed)?)?,
+            new_signature: base64url(&new.ok_or(Error::Malformed)?)?,
+        })
+    }
+
+    /// The statement that the current key `old` and the new key `new` of `agent` each sign for the rotation from the
+    /// key generation `generation` ([`Identity::generation`]): the canonical CBOR form `["rsauthnz.agent.rotation.1",
+    /// agent, old, new, generation]`, with the SHA-256 digest of each key. Each rotation raises the generation, so a
+    /// statement of an earlier generation never matches again, also after a rotation back to an earlier key.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn statement(agent: &Id<Agent>, old: &[u8; KEY_BYTES], new: &[u8; KEY_BYTES], generation: u64) -> Vec<u8> {
+        encode(&[
+            Value::Text(ROTATION_FORM),
+            agent.to_cbor(),
+            Value::Bytes(&crypto::sha256(old)),
+            Value::Bytes(&crypto::sha256(new)),
+            Value::Unsigned(generation),
+        ])
+    }
+}
+
 /// The string members `names` of the JSON object `json`, in order. The reader ignores each other member.
 fn members<const N: usize>(json: &[u8], names: [&str; N]) -> Result<[Option<String>; N], Error> {
     let mut scratch = [Slot::EMPTY; SLOTS];
@@ -530,27 +595,76 @@ pub struct Identity {
     pub workload: Option<Workload>,
     /// The time of the finish, as the time since the Unix epoch.
     pub created: Duration,
-    /// The version of the identity record. A rotation or a revocation of the agent writes a new one.
+    /// The generation of the key: 1 at the enrollment, and 1 more for each rotation. The next rotation statement names
+    /// it ([`Rotation::statement`]).
+    pub generation: u64,
+    /// The version of the identity record. A rotation writes a new one, and a revocation ends the record.
     pub version: AuthorityVersion,
 }
 
 impl Identity {
-    /// The JSON body of the answer to the finish of the agent: `{"agent","owner"}`, the text form of each identifier.
+    /// The JSON body of the answer to the finish or to a rotation of the agent: `{"agent","owner","generation"}`, the
+    /// text form of each identifier and the generation of the key.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     #[must_use]
     pub fn json(&self) -> Vec<u8> {
         let (agent, owner) = (self.agent.to_string(), self.owner.to_string());
-        let mut out = vec![0; 64 + 6 * (agent.len() + owner.len())];
+        let mut out = vec![0; 96 + 6 * (agent.len() + owner.len())];
         let len = json::write(&mut out, |place| {
             place.object(|body| {
                 body.member("agent").str(&agent)?;
-                body.member("owner").str(&owner)
+                body.member("owner").str(&owner)?;
+                body.member("generation").u64(self.generation)
             })
         })
         .expect("the body fits its buffer");
         out.truncate(len);
         out
+    }
+
+    /// The record form: `["rsauthnz.agent.2", owner, key, name, created, workload]`, with `created` in whole seconds
+    /// and `workload` its issuer and its subject, or null.
+    fn form(&self) -> Box<[u8]> {
+        encode(&[
+            Value::Text(AGENT_FORM),
+            self.owner.to_cbor(),
+            Value::Bytes(&*self.key),
+            Value::Text(&self.name),
+            Value::Unsigned(self.created.as_secs()),
+            workload_form(self.workload.as_ref()),
+        ])
+        .into_boxed_slice()
+    }
+
+    /// The identity of `agent` in the record `record`, or `None` for another form within `limits`. The generation is
+    /// the count of the version.
+    fn parse(agent: &Id<Agent>, record: &Record, limits: Limits) -> Option<Self> {
+        let value = cbor::decode(&record.data, limits).ok()?;
+        let Value::Array(items) = &value else {
+            return None;
+        };
+        let [
+            Value::Text(AGENT_FORM),
+            owner,
+            Value::Bytes(key),
+            Value::Text(name),
+            Value::Unsigned(created),
+            workload,
+        ] = items.as_slice()
+        else {
+            return None;
+        };
+        Some(Self {
+            agent: agent.clone(),
+            owner: Id::from_cbor(owner).ok()?,
+            key: Box::new((*key).try_into().ok()?),
+            name: (*name).into(),
+            workload: workload_parse(workload)?,
+            created: Duration::from_secs(*created),
+            generation: u64::from_be_bytes(*record.version.coordinate().first_chunk::<8>()?),
+            version: record.version.clone(),
+        })
     }
 }
 
@@ -918,27 +1032,128 @@ impl Agents {
         proposal
             .read(Dependency::Absent(identity.clone()))
             .map_err(Error::Transition)?;
-        let data = encode(&[
-            Value::Text(AGENT_FORM),
-            owner.to_cbor(),
-            Value::Bytes(&*pending.key),
-            Value::Text(&pending.name),
-            Value::Unsigned(now.estimate().as_secs()),
-            workload_form(pending.workload.as_ref()),
-        ]);
+        let enrolled = Identity {
+            agent: pending.agent.clone(),
+            owner: owner.clone(),
+            key: pending.key.clone(),
+            name: pending.name.clone(),
+            workload: pending.workload.clone(),
+            created: Duration::from_secs(now.estimate().as_secs()),
+            generation: 1,
+            version: self.version(1, &crypto::sha256(&*pending.key)),
+        };
         proposal
             .change(Change::Write {
                 key: identity,
-                version: self.version(1, &crypto::sha256(&*pending.key)),
+                version: enrolled.version.clone(),
                 end: None,
-                data: data.into_boxed_slice(),
+                data: enrolled.form(),
             })
             .map_err(Error::Transition)?;
         Ok(Status::Approved(proposal, Plan::default()))
     }
 
-    /// The current identity of `agent`: its owner and its key. Each check of a request of the agent reads it, so a key
-    /// that no enrollment bound, or that a restore lost, refuses.
+    /// Proposes the rotation of the key of the agent of `rotation` to its new key. The current key and the new key
+    /// each sign the statement of the current generation ([`Rotation::statement`]), so a rotation needs both keys, and
+    /// a statement of an earlier generation never matches again. The commit writes the identity with the new key at
+    /// the next generation, and keeps its owner, its name, its workload, and its time of creation. The plan names the
+    /// identity as replaced, so the restore journal ends the earlier version: no restore gives the earlier key again.
+    /// Choose `operation`, and keep it for a lookup. Then answer with the [`Identity::json`] of [`Self::identity`].
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One identity lookup, and the signature checks of the two
+    /// composite signatures, each within the limits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotEnrolled`] if the store holds no identity of the agent, and [`Error::Record`] if its record has no
+    /// valid form. [`Error::Rotated`] if the new key is the current key: a rotation to it committed, for example
+    /// before a lost response. [`Error::Signature`] if a signature does not verify with its key over the statement,
+    /// also for a statement of another generation, or if the checks pass the limits. [`Error::Transition`] for the
+    /// proposal, and [`Failure::Store`] if the read fails.
+    pub async fn rotate<S: Store>(
+        &self,
+        store: &mut S,
+        rotation: &Rotation,
+        now: Reading,
+        operation: OperationId,
+    ) -> Result<(Proposal, Plan), Failure<S::Error>> {
+        let key = self.agent_key(&rotation.agent);
+        let record = read(store, &key).await?.ok_or(Error::NotEnrolled)?;
+        let mut identity = Identity::parse(&rotation.agent, &record, self.limits).ok_or(Error::Record)?;
+        (identity.key != rotation.key).ok_or(Error::Rotated)?;
+        let statement = Rotation::statement(&rotation.agent, &identity.key, &rotation.key, identity.generation);
+        for (public, signature) in [
+            (&*identity.key, &rotation.old_signature),
+            (&*rotation.key, &rotation.new_signature),
+        ] {
+            let verifier = crypto::Verifier::ml_dsa_65_ed25519(public).ok_or(Error::Signature)?;
+            let verified = verifier.verify(&statement, signature, &mut SignatureBudget::new(&self.limits));
+            verified.is_ok_and(|verified| verified).ok_or(Error::Signature)?;
+        }
+        let digest = crypto::sha256(&statement);
+        let request = Value::Array(vec![Value::Bytes(key.as_bytes()), Value::Bytes(&digest)]);
+        let actor = Principal::Agent(rotation.agent.clone());
+        let mut proposal = self.proposal(operation, actor, ROTATE, request, now)?;
+        proposal
+            .read(Dependency::Version(key.clone(), record.version.clone()))
+            .map_err(Error::Transition)?;
+        identity.version = self.next(&record.version, &crypto::sha256(&*rotation.key))?;
+        identity.key = rotation.key.clone();
+        proposal
+            .change(Change::Write {
+                key: key.clone(),
+                version: identity.version.clone(),
+                end: None,
+                data: identity.form(),
+            })
+            .map_err(Error::Transition)?;
+        let plan = Plan {
+            replaced: vec![key],
+            ..Plan::default()
+        };
+        Ok((proposal, plan))
+    }
+
+    /// Proposes the revocation of `agent` by the signed-in human of `access`, who must be its owner. The commit ends
+    /// the identity at the version that the proposal read, so the restore journal keeps the end, and each later check
+    /// of the agent refuses with [`Error::NotEnrolled`]. The proposal reads the session, so a revocation from a session
+    /// that ended refuses. To change the owner, revoke the agent, and enroll it again: the new enrollment gives a new
+    /// agent identifier.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One identity lookup, and its commit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotEnrolled`] if the store holds no identity of `agent`, also for an agent of another owner, so the
+    /// answer tells no other human that the agent exists. [`Error::Record`] if its record has no valid form.
+    /// [`Error::Transition`] for the proposal, and [`Failure::Store`] if the read fails.
+    pub async fn revoke<S: Store>(
+        &self,
+        store: &mut S,
+        access: &Access,
+        agent: &Id<Agent>,
+        now: Reading,
+        random: &mut ChaCha20Rng,
+    ) -> Result<(Proposal, Plan), Failure<S::Error>> {
+        let key = self.agent_key(agent);
+        let record = read(store, &key).await?.ok_or(Error::NotEnrolled)?;
+        let identity = Identity::parse(agent, &record, self.limits).ok_or(Error::Record)?;
+        let owner = access.session().account();
+        (identity.owner == *owner).ok_or(Error::NotEnrolled)?;
+        let actor = Principal::Human(owner.clone());
+        let request = Value::Bytes(key.as_bytes());
+        let mut proposal = self.proposal(OperationId::random(random), actor, REVOKE, request, now)?;
+        access.gate(&mut proposal).map_err(Error::Transition)?;
+        proposal
+            .read(Dependency::Version(key.clone(), record.version))
+            .map_err(Error::Transition)?;
+        proposal.change(Change::End(key)).map_err(Error::Transition)?;
+        Ok((proposal, Plan::default()))
+    }
+
+    /// The current identity of `agent`: its owner, its key, and the generation of its key. Each check of a request of
+    /// the agent reads it, so a key that no enrollment bound, that a rotation replaced, or that a revocation or a
+    /// restore ended refuses.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed lookup.
     ///
@@ -948,30 +1163,7 @@ impl Agents {
     /// form, and [`Failure::Store`] if the read fails.
     pub async fn identity<S: Store>(&self, store: &mut S, agent: &Id<Agent>) -> Result<Identity, Failure<S::Error>> {
         let record = read(store, &self.agent_key(agent)).await?.ok_or(Error::NotEnrolled)?;
-        let value = cbor::decode(&record.data, self.limits).map_err(|_| Error::Record)?;
-        let Value::Array(items) = &value else {
-            return Err(Failure::Refused(Error::Record));
-        };
-        let [
-            Value::Text(AGENT_FORM),
-            owner,
-            Value::Bytes(key),
-            Value::Text(name),
-            Value::Unsigned(created),
-            workload,
-        ] = items.as_slice()
-        else {
-            return Err(Failure::Refused(Error::Record));
-        };
-        Ok(Identity {
-            agent: agent.clone(),
-            owner: Id::from_cbor(owner).map_err(|_| Error::Record)?,
-            key: Box::new((*key).try_into().map_err(|_| Error::Record)?),
-            name: (*name).into(),
-            workload: workload_parse(workload).ok_or(Error::Record)?,
-            created: Duration::from_secs(*created),
-            version: record.version,
-        })
+        Ok(Identity::parse(agent, &record, self.limits).ok_or(Error::Record)?)
     }
 
     /// The key, the record, and the request of `code`, while it is open at `now` and not locked. Only the first 4
@@ -1141,8 +1333,13 @@ pub enum Error {
     Approved,
     /// A loopback request has no redirect code or another one, or a request of no loopback address has one.
     Redirect,
-    /// The store holds no identity of the agent: no enrollment bound it, or a restore lost it. The agent enrolls again.
+    /// The store holds no identity of the agent: no enrollment bound it, its owner revoked it, or a restore lost it.
+    /// The agent enrolls again.
     NotEnrolled,
+    /// The new key of a rotation is the current key of the agent: a rotation to it committed.
+    Rotated,
+    /// A signature of a rotation does not verify with its key over the statement of the current generation.
+    Signature,
     /// A record has no valid form. Restore the store from a snapshot.
     Record,
     /// The reading of the time has no bound, or a time overflows. Use a reading with a bound.
@@ -1173,6 +1370,8 @@ impl Recover for Error {
             | Self::Loopback
             | Self::Redirect
             | Self::NotEnrolled
+            | Self::Rotated
+            | Self::Signature
             | Self::Record
             | Self::Time(_)
             | Self::Trust(_)
@@ -1196,6 +1395,8 @@ impl fmt::Display for Error {
             Self::Approved => f.write_str("an account approved the enrollment request already"),
             Self::Redirect => f.write_str("the redirect code is missing, wrong, or not expected"),
             Self::NotEnrolled => f.write_str("the store holds no identity of the agent"),
+            Self::Rotated => f.write_str("the new key is the current key of the agent"),
+            Self::Signature => f.write_str("a signature of the rotation does not verify"),
             Self::Record => f.write_str("a record of agent enrollment has no valid form"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),

@@ -28,8 +28,13 @@ A hosted agent can give the identity of its workload in its request, in place of
 a cloud identity token, or a workload credential of rsauthnz. The request keeps the verified workload, and the approval
 page shows it. The workload names no owner: the human still approves, and the owner comes only from the approval.
 
+After the enrollment, the agent rotates its key with signatures by its current key and by its new key. Only its
+owner revokes it. No operation changes the owner of an identity: the owner revokes it, and a new enrollment gives a
+new agent identifier.
+
 An agent identity is not an authority anchor. A restore ends each pending request, and a restore from a snapshot
-before an enrollment loses the identity. The agent then enrolls again.
+before an enrollment loses the identity. The agent then enrolls again. The restore journal keeps each rotation and each
+revocation, so no restore gives a revoked identity or an earlier key again.
 
 ## Before you start
 
@@ -85,10 +90,11 @@ before an enrollment loses the identity. The agent then enrolls again.
    - `Status::Waiting`: answer with `rsauthnz_http::waiting()`, which is `202 Accepted` with `Retry-After: 5` and
      `{"interval":5}`. Nothing commits.
    - `Status::Approved(proposal, plan)`: commit it. Then read the identity with `agents.identity(store, &agent)`, and
-     answer with `rsauthnz_http::json(identity.json())`: `{"agent":"acme:…","owner":"acme:alice"}`.
+     answer with `rsauthnz_http::json(identity.json())`: `{"agent":"acme:…","owner":"acme:alice","generation":1}`.
+     The agent keeps the generation of its key for its next rotation.
 
 `agents.identity(store, &agent)` gives the current `Identity`: `agent`, `owner`, `key`, `name`, `workload`, `created`,
-and the `version` of its record. Each check of a request of the agent reads it, so a key that no enrollment bound refuses.
+the `generation` of the key, and the `version` of its record. Each check of a request of the agent reads it, so a key that no enrollment bound refuses.
 
 ## Enroll a local agent with a loopback address
 
@@ -184,6 +190,51 @@ a proof by its registered key.
 `Workload::credential` refuses a credential that a rotation, a recovery, or a revocation in the snapshot ended. The
 workload is the authority of the credential and its workload identifier.
 
+## Rotate the key of an agent
+
+A rotation replaces the key of an agent identity. The owner, the name, the workload, and the time of creation stay.
+It needs a signature by the current key and by the new key, so a party with only one of the keys cannot rotate.
+
+1. The agent stores the new key in custody. It makes the statement
+   `Rotation::statement(&agent, &current_key, &new_key, generation)` with the generation of its current key: 1 after
+   the enrollment, and the value of the last rotation answer after a rotation.
+2. The agent signs the statement with the current key and with the new key, and sends the rotation body:
+
+   ```json
+   {"agent":"acme:<22 base64url characters>","key":"<base64url of the new public key>",
+    "old_signature":"<base64url>","new_signature":"<base64url>"}
+   ```
+
+3. The route reads it with `machine_json` and `agent::Rotation::parse(body)`, and calls
+   `agents.rotate(store, &rotation, now, operation)`. Commit the proposal with its plan. The plan names the identity
+   as replaced, so the restore journal ends its earlier version.
+4. After the commit, the route reads the identity with `agents.identity(store, &agent)`, and answers with
+   `identity.json()`: `{"agent":"acme:…","owner":"acme:alice","generation":2}`.
+
+The statement is the canonical CBOR form `["rsauthnz.agent.rotation.1", agent, old, new, generation]`, with the
+SHA-256 digest of each key. Each rotation raises the generation, so a statement of an earlier generation never matches
+again, also after a rotation back to an earlier key. After the commit, the old key cannot rotate, and
+`agents.identity` gives the new key, so a check that reads the identity refuses the old key.
+
+## Revoke an agent
+
+The owner revokes an agent from a signed-in session. A revocation only removes authority, so it needs no fresh user
+verification.
+
+1. Check the session of the owner, and call `agents.revoke(store, &access, &agent, now, random)` with its `Access`.
+2. Commit the proposal and its plan. The commit ends the identity at the version that the proposal read.
+
+After the commit, `agents.identity`, a rotation, and a second revocation refuse with `Error::NotEnrolled`. The
+proposal reads the session, so a revocation from a session that ended refuses at the commit. A revocation by another
+human also refuses with `Error::NotEnrolled`, so the answer tells no other human that the agent exists.
+
+## Change the owner of an agent
+
+No operation changes the owner of an identity in place. The owner revokes the agent, and the agent enrolls again: the
+new owner approves the new request. The new identity has a new agent identifier, and it can have the same key. The
+audit records of the earlier commits keep the earlier owner, and the audit records of the new enrollment name the new
+owner.
+
 ## The routes of the agent
 
 The agent is no browser. `rsauthnz_http::machine_json` admits a request only with an unsafe method, with no `Origin`,
@@ -200,9 +251,14 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
   receipt of the lookup. For a loopback request whose redirect code is lost, the agent makes a new request.
 - **A lost response of a finish.** The agent reads its identity: `agents.identity(store, &agent)` with the agent
   identifier of step 2. `Error::NotEnrolled` shows that the finish did not commit.
+- **A lost response of a rotation.** The agent sends the same body again. `Error::Rotated` shows that the rotation
+  committed: the new key is current, and the generation is one more.
+- **A lost response of a revocation.** The server looks up the operation. A new revocation refuses with
+  `Error::NotEnrolled` when the earlier one committed.
 - **A restore.** A restore ends each pending request: a finish refuses with `Error::Request`. A restore from a snapshot
   before a finish loses the identity: `agents.identity` refuses with `Error::NotEnrolled`, and the agent enrolls
-  again.
+  again. A restore from a snapshot before a rotation or a revocation gives no identity: the journal ends the version
+  of the snapshot, so neither the earlier key nor the revoked identity serves again. The agent enrolls again.
 
 ## Operations
 
@@ -215,6 +271,9 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 | `checked.release(&outcome)` | Server | The answer of a right code from the accepted commit of its check, also after a lookup. `None` for a wrong code and each other outcome |
 | `agents.finish(store, &code, &device, redirect, now, operation)` | Server | `Status::Waiting`, or `Status::Approved(proposal, plan)` |
 | `agents.identity(store, &agent)` | Server | The current `Identity` of the agent |
+| `Rotation::statement(&agent, &old, &new, generation)` | Agent | The statement that the current key and the new key sign |
+| `Rotation::parse(json)`, `agents.rotate(store, &rotation, now, operation)` | Server | The rotation body, and `(Proposal, Plan)` of the rotation |
+| `agents.revoke(store, &access, &agent, now, random)` | Server | `(Proposal, Plan)` of the revocation by the owner |
 | `Enrollment::parse(json)`, `Finish::parse(json)` | Server | The bodies of the agent. `enrollment.bootstrap` holds the workload identity of a hosted agent. `Debug` shows no token |
 | `Platform { keys, binding }`, `platform.verify(&token, &key, now)` | Server | The `Workload` of a token of a configured platform |
 | `Workload::credential(&view, &profile, &credential, &proof, &key, now)` | Server | The `Workload` of a workload credential of rsauthnz |
@@ -226,7 +285,8 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 | `Loopback::parse(text)`, `loopback.redirect(&code)` | Both | The loopback address, and the address of the redirect |
 | `rsauthnz_http::machine_json(&request, bytes_max)`, `rsauthnz_http::waiting()` | Server | The check of a request of an agent, and the answer to a finish that waits |
 
-A request, a check, an approval, and a finish each read the request with one keyed lookup. A check and an approval
+A request, a check, an approval, and a finish each read the request with one keyed lookup. A rotation and a
+revocation each read the identity with one keyed lookup and commit. A rotation also checks two composite signatures. A check and an approval
 also commit. A finish of an approved
 request also reads the account revision of the approval, so a recovery of the account between the approval and the
 finish stops the finish. An identity read is one keyed lookup.
@@ -245,7 +305,9 @@ Each `agent::Error` implements `transition::Recover`, so `?` gives a `rsauthnz_h
 | `Error::Locked` | The request had `ATTEMPTS_MAX` (5) wrong checks of its user code | Make a new request |
 | `Error::Approved` | An account approved the request already | Show the approval |
 | `Error::Redirect` | A loopback request has no redirect code or another one, or a request with no loopback address has one | Refuse |
-| `Error::NotEnrolled` | The store holds no identity of the agent | Enroll again |
+| `Error::NotEnrolled` | The store holds no identity of the agent: no enrollment bound it, its owner revoked it, or a restore lost it. Also a revocation by another human | Enroll again |
+| `Error::Rotated` | The new key of a rotation is the current key: a rotation to it committed | Take the rotation as done |
+| `Error::Signature` | A signature of a rotation does not verify with its key over the statement of the current generation | Sign the statement of the current generation with both keys |
 | `Error::Record` | A record has no valid form | Restore the store from a snapshot |
 | `Error::Time` | The time reading has no bound, or a time overflows | Use a reading with a bound |
 | `Error::Transition` | The proposal refuses | Follow its recovery |
@@ -293,3 +355,8 @@ bundle and of JWT-SVIDs. They cover a token of the configured trust domain, a cl
 trust domain, another key of the agent, an ended token, a bearer platform, and a missing or stale key set. A workload
 credential with its proof runs with a trust snapshot, also after a revocation. No token of a SPIRE server or of a
 cloud platform ran.
+
+The rotation and the revocation run in the same tests. They cover a rotation with one key, with another key, and with
+a statement of another generation, a repeated rotation, the old key after a rotation, and a rotation back to an
+earlier key. They also cover a revocation by another human, each operation after a revocation, a restore before a
+revocation and before a rotation, and a new owner with the audit of both owners.
