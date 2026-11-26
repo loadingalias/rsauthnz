@@ -407,8 +407,9 @@ fn the_commit_writes_the_audit_and_the_outcome_as_records_that_a_keyed_read_find
         let record = ready(store.read(&Kind::Audit.key(b"op-1").unwrap())).unwrap().unwrap();
         assert_eq!(record.end, None);
         let expected = Value::Array(vec![
-            Value::Text("rsauthnz.store.audit.1"),
+            Value::Text("rsauthnz.store.audit.2"),
             actor.to_cbor(),
+            Value::Null,
             action.to_cbor(),
             Value::Array(vec![
                 Value::Array(vec![Value::Unsigned(1_000), Value::Unsigned(5)]),

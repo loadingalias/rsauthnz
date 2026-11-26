@@ -21,8 +21,9 @@ owner issues it, changes it, and revokes it. For example, alice lets her build a
   earlier version then refuses until its owner approves a new revision.
 - A permission can carry an **approval mark** (`Approval::Required`). The check gives the mark, and an operation of
   the permission then also needs a one-use approval of the owner.
-- A key rotation of the agent keeps its grant: the grant names the agent identity, not its key. A revocation of the
-  grant, or of the agent, ends it.
+- A key rotation of the agent keeps its grant: the grant names the agent identity, not its key. A credential of the
+  old key refuses, so the agent presents a credential of its new key. A revocation of the grant, or of the agent,
+  ends it.
 
 ## Before you start
 
@@ -58,19 +59,13 @@ A change is an issue for an agent that has a grant. Call `grants.issue` with the
 verification. The commit writes a new revision and ends the earlier one, also in the restore journal. Extending the
 deadline and adding a permission each need this approval: no other operation changes a grant.
 
-## Check each use
+## Check each request
 
-Each use of the agent checks the grant before the operation acts:
-
-1. Call `grants.admits(store, &agent, Use { audience, resource, action }, &policy, now)`.
-2. On success, the `Admitted` value gives `agent()`, `owner()`, `revision()`, `deadline()`, and `approval()`. The
-   deadline is the earlier of the grant deadline and the end of the permit of the owner.
-3. Add `admitted.gate(&mut proposal)` to the commit of the operation. The commit then reads the agent identity, the
-   grant revision, and the policy version of the check, and it ends at the deadline. A revocation, a change, a key
-   rotation, or a policy change between the check and the commit refuses the commit.
-
-The check refuses when the agent has no identity, the grant has ended, the grant names neither the audience nor the
-permission, the grant binds another policy version, or the policy does not permit the owner the action now.
+Each request of the agent presents an agent credential that names its owner and the revision of its grant.
+`authz::check_agent` checks it against the store and the policy, and gives a `Granted` scope. The operation enforces
+the scope at each use, and an operation that commits takes its proposal from the scope. A revocation, a change, a key
+rotation, or a policy change stops the work at its next use and refuses a later commit.
+[Check the request of an agent](authorization.md#check-the-request-of-an-agent) gives the steps and the refusals.
 
 ## Revoke a grant
 
@@ -111,13 +106,15 @@ reviews the grants on this page and revokes each one that they did not give.
 | `Grants::new(authority, limits)` | The grants of the agents of one authority |
 | `grants.issue(store, &fresh, &agent, &draft, &policy, now, random, &mut driver)` | `(Proposal, Plan, Grant)`: an issue, or a change with a new revision |
 | `grants.revoke(store, &access, &agent, now, random)` | `(Proposal, Plan)` of the revocation by the owner |
-| `grants.admits(store, &agent, request, &policy, now)` | The `Admitted` access of one use: `request` is a `Use` |
-| `admitted.gate(&mut proposal)` | Adds the reads of the check and its deadline to the commit of the operation |
+| `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now)` | The `Granted` scope of one request of the agent |
+| `scope.enforce(store, &action, &resource, &policy, now)` | Checks the scope again at one use, such as one chunk of a stream |
+| `scope.propose(operation, request, now)` | The proposal of an operation of the agent, whose audit names the agent and its owner |
 | `grants.list(store, &access, after, now)` | One `Page` of the grants of the owner |
 
 The cost class of each operation that reads the store is `Verify` ([Admit rsauthnz work](admission.md)). An issue
-makes two keyed lookups and one policy decision for each permission of the draft. A check makes two keyed lookups and
-one policy decision. A revocation makes one keyed lookup, and a listing one range read of at most 64 records.
+makes two keyed lookups and one policy decision for each permission of the draft. A check reads two keys in one read,
+makes one SHA-256 digest, and makes one policy decision. Each `enforce` reads two keys in one read. A revocation makes
+one keyed lookup, and a listing one range read of at most 64 records.
 
 ## Errors
 
@@ -132,9 +129,14 @@ read the store return `grant::Failure`: `Refused(error)`, or `Store(error)` for 
 | `Error::Authority` | The owner holds none of the requested permissions, or does not hold the permission of a use now | Refuse |
 | `Error::NotEnrolled` | The store holds no identity of the agent, or the agent has another owner | Refuse |
 | `Error::NoGrant` | The agent has no grant of the owner: none was given, it was revoked, or the agent was revoked | Refuse |
-| `Error::Expired` | The deadline of the grant passed | The owner can approve a new revision |
+| `Error::Principal` | The evidence of a request is not of an agent credential | Refuse |
+| `Error::Issuer` | Another authority issued the credential of the request | Refuse |
+| `Error::Owner` | The credential names another owner than the identity of the agent | Refuse |
+| `Error::Key` | The key of the proof is not the current key of the agent: a rotation replaced it | The agent proves its current key |
+| `Error::Revision` | The credential names another revision than the current grant: a change replaced it | The agent gets a credential of the current revision |
+| `Error::Expired` | The deadline of the grant passed, or the deadline of the scope of a request: the end of the permit of the owner or of the credential | The owner can approve a new revision, or the agent gets a new credential |
 | `Error::Audience` | The grant does not name the audience | Refuse |
-| `Error::Permission` | The grant does not name the action on the resource | Refuse |
+| `Error::Permission` | The grant does not name the action on the resource, or the operation of a scope is another action or resource | Refuse |
 | `Error::Policy` | The grant binds another policy version | The owner can approve a new revision |
 | `Error::Record` | A record has no valid form | Restore the store from a snapshot |
 | `Error::Time` | The time reading has no bound | Use a reading with a bound |
@@ -147,7 +149,9 @@ read the store return `grant::Failure`: `Refused(error)`, or `Store(error)` for 
   verification of a passkey session.
 - One grant has one deadline. Two deadlines for one agent need two grants, so they need two agents.
 - The approval mark is in the grant and in the check. The one-use approval of an operation is not in this release.
-- An agent presents no grant credential yet, and the active-access page shows no last use yet.
+- The check takes an agent credential that names the grant revision. rsauthnz does not issue it from the grant yet:
+  the application issues it with `credential::Draft` ([Issue a credential](credential-format.md#issue-a-credential)).
+- The active-access page shows no last use yet.
 
 ## Support
 
@@ -155,4 +159,8 @@ The tests on this Mac (macOS aarch64) run on the memory binding, with the test a
 They cover a draft wider than the authority of the owner, a permission that the owner loses after the issue, and a
 policy change. They also cover the deadline, the draft bounds, a change by another human, and an extension whose
 verification ended before its commit. They also cover a change that races a revocation, a restore before a change, a
-key rotation and a revocation of the agent, and the active-access page of two humans.
+key rotation and a revocation of the agent, and the active-access page of two humans. Each check presents an agent
+credential. The tests cover a credential of another authority, of another owner, of an earlier revision, and of a key
+that a rotation replaced. They also cover the audit of an operation of an agent, an agent actor outside a scope, a
+revocation during a streamed response with pending work, and a policy change, a rotation, and a change during a
+scope.

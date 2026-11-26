@@ -5,8 +5,9 @@ caller and to one exact request. It gives a checked scope, and the operation enf
 signature or an authentication alone gives no permission.
 
 A passkey sign-in ([Register a passkey and sign in](passkeys.md#sign-in)) and a workload proof ([Issue and manage
-workload credentials](workload.md)) give `Evidence`. The example on this page compiles, but it does not run a check:
-it has no verifier input.
+workload credentials](workload.md)) give `Evidence`. An agent has access only through the grant of its human owner, so
+its request has its own check ([Check the request of an agent](#check-the-request-of-an-agent)). The examples on this
+page compile, but they do not run a check: they have no verifier input.
 
 ## Implement the policy
 
@@ -30,8 +31,8 @@ A `Permit` names the decision:
 
 ## Check and enforce
 
-This example is also the example of the `rsauthnz::authz` module documentation. It has the "Agent request" shape:
-one check gives the scope that the operation uses.
+This example is also the first example of the `rsauthnz::authz` module documentation. One check gives the scope that
+the operation uses.
 
 ```rust
 use core::time::Duration;
@@ -71,7 +72,7 @@ impl Policy for OneAction {
     }
 }
 
-/// An agent request on a resource server: one check gives the scope that the operation enforces.
+/// A request on a resource server: one check gives the scope that the operation enforces.
 fn read_repo(evidence: &Evidence, policy: &OneAction, now: Reading) -> Result<(), Box<dyn core::error::Error>> {
     let action = Id::new("acme.repo", "repo.read")?;
     let resource = Id::new("acme.repo", "repo:x")?;
@@ -87,8 +88,9 @@ fn read_repo(evidence: &Evidence, policy: &OneAction, now: Reading) -> Result<()
 
 | Refusal | Cause |
 | --- | --- |
+| `Agent` | The evidence is of an agent. Check its request with `authz::check_agent` |
 | `Denied` | The policy gives no permit |
-| `Scope` | The permit names another principal, action, or resource. A human and an agent with the same raw identifier are different principals |
+| `Scope` | The permit names another principal, action, or resource. A human and a workload with the same raw identifier are different principals |
 | `Stale` | The permit is not of the current policy version |
 | `Requirements` | The evidence does not meet `requires`. A recovery is never phishing resistant |
 | `Expired` | `now` permits a time at or after the deadline |
@@ -109,3 +111,88 @@ after the deadline. `Checked` also gives the evidence, the permit, and the deadl
 
 `check` and `enforce` are in the `Parse` cost class. Each call of the policy is the cost of the application. See
 [Admit rsauthnz work](admission.md).
+
+## Check the request of an agent
+
+The request of an agent presents the evidence of an agent credential: the agent proves the possession of the
+credential with its key ([Prove possession](credential-format.md#prove-possession)). The credential names the agent,
+its human owner, the revision of its grant, and the audience. Its issuer asserts the owner and the revision. The agent
+never asserts its own owner.
+
+1. Verify the credential with the `Profile` of the audience, and check the proof of the agent with
+   `verified.possession(&proof, &challenge, now, &mut budget)`. It gives the `Evidence`.
+2. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`. It gives a
+   `Granted` scope, or a `grant::Failure`.
+3. At each use, call `scope.enforce(store, &action, &resource, &policy, now).await`. For a streamed response, call it
+   before each chunk.
+4. For an operation that commits, take the proposal from `scope.propose(operation, request, now)`. Add the changes of
+   the operation, and commit it ([Make a transition](transitions.md)).
+
+The check reads the identity of the agent and its grant from one store state (`Store::read_pair`). Then it refuses
+with a `grant::Error` ([Errors](grants.md#errors)) in this order:
+
+1. `Principal`: the evidence is not of an agent credential.
+2. `Issuer`: another authority issued the credential. An agent of one authority has no access at another.
+3. `NotEnrolled`, `Owner`, `Key`: the store has no identity of the agent, the credential names another owner, or the
+   key of the proof is not the current key of the agent. A credential of the key that a rotation replaced refuses.
+4. `NoGrant`, `Revision`: the agent has no grant, or the credential names another revision. A change of the grant
+   stops each credential of the earlier revision.
+5. `Expired`, `Audience`, `Permission`: the deadline of the grant passed, or the grant does not name the audience of
+   the credential or the action on the resource.
+6. `Policy`, `Authority`: the grant binds another policy version, or the policy does not permit the owner the action
+   on the resource now.
+
+Thus effective access is the grant intersected with the current authority of the owner. The requirements of the
+permit of the owner (`user_verified`, `phishing_resistant`, `max_age`) do not apply to the agent. They are
+requirements on the evidence of the owner, and the issue of the grant took a fresh user verification of the owner.
+
+The scope gives `agent()`, `owner()`, `revision()`, `deadline()`, and `approval()`. The deadline is the earliest of
+the grant deadline, the end of the permit of the owner, and the end of the credential. `approval()` is
+`Approval::Required` when the permission has an approval mark.
+
+`Granted::enforce` keeps no copy of the state. It refuses another action or resource with `Permission`, another
+policy version with `Policy`, and a time at or after the deadline with `Expired`. Then it reads the identity and the
+grant again with one `Store::read_pair`. It refuses with `NotEnrolled` after a revocation of the agent, `Key` after a
+rotation, `NoGrant` after a revocation of the grant, and `Revision` after a change. Thus pending work and a streamed
+response stop at their next use.
+
+`Granted::propose` gives a proposal whose audit names the agent as its actor, its owner as a separate field
+([Audit and outcome records](storage.md#audit-and-outcome-records)), and the action of the scope. Its request is
+`[resource, request]`. The commit reads the identity, the grant, and the policy version of the check, and it ends at
+the deadline. So a revocation, a change, a rotation, or a relevant policy change before the commit refuses it.
+`Proposal::new` refuses an agent actor with `transition::Error::Agent`, so no audit of an agent request lacks its
+owner.
+
+This example is the second example of the `rsauthnz::authz` module documentation:
+
+```rust
+use rsauthnz::authz::{self, Policy};
+use rsauthnz::evidence::Evidence;
+use rsauthnz::grant::{Failure, Grants};
+use rsauthnz::id::{Action, Id, Resource};
+use rsauthnz::store::Store;
+use rsauthnz::time::Reading;
+
+/// A streamed read by an agent: one check, then one use of the scope before each chunk. A revocation, a change of
+/// the grant, or a rotation of the key stops the stream at its next chunk.
+async fn stream_repo<S: Store>(
+    grants: &Grants,
+    store: &mut S,
+    evidence: &Evidence,
+    (action, resource): (&Id<Action>, &Id<Resource>),
+    policy: &impl Policy,
+    mut now: impl FnMut() -> Reading,
+    chunks: &[&[u8]],
+    mut send: impl FnMut(&[u8]),
+) -> Result<(), Failure<S::Error>> {
+    let scope = authz::check_agent(grants, store, evidence, action, resource, policy, now()).await?;
+    for chunk in chunks {
+        scope.enforce(store, action, resource, policy, now()).await?;
+        send(chunk);
+    }
+    Ok(())
+}
+```
+
+`check_agent` and `enforce` are in the `Verify` cost class. A check reads two keys in one read, makes one SHA-256
+digest of the key of the agent, and makes one policy decision. Each `enforce` reads two keys in one read.

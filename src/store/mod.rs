@@ -91,7 +91,7 @@ impl<R: fmt::Display, S: fmt::Display> fmt::Display for Failure<R, S> {
 impl<R: core::error::Error, S: core::error::Error> core::error::Error for Failure<R, S> {}
 
 /// The first item of the CBOR form of an audit record. Its number changes with the form.
-const AUDIT_FORM: &str = "rsauthnz.store.audit.1";
+const AUDIT_FORM: &str = "rsauthnz.store.audit.2";
 
 /// The kind of a record in the store. The first byte of the key of a record names its kind ([`Kind::key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -650,11 +650,13 @@ pub fn outcome_of(id: &OperationId, record: &Record) -> Option<Operation> {
 }
 
 /// The audit record of `proposal`, which its commit writes. Its key is [`Kind::Audit`] with the operation identity,
-/// so [`Store::read`] finds the audit of a commit. Its record form is the CBOR array `["rsauthnz.store.audit.1",
-/// actor, action, time, keys]`:
+/// so [`Store::read`] finds the audit of a commit. Its record form is the CBOR array `["rsauthnz.store.audit.2",
+/// actor, owner, action, time, keys]`:
 ///
 /// - `actor` and `action` are the canonical forms of [`Audit::actor`](transition::Audit::actor) and
 ///   [`Audit::action`](transition::Audit::action).
+/// - `owner` is the canonical form of the human owner of an agent actor ([`Proposal::owner`]), or null for a human, a
+///   workload, or the enrollment request of an agent that has no owner yet.
 /// - `time` is `[estimate, bound, source]` of the reading. The estimate and the bound are `[seconds, nanoseconds]`,
 ///   and the bound is null when it is unknown. The source is 1 for the system clock, 2 for the caller, and 0 for
 ///   another source.
@@ -681,6 +683,7 @@ pub fn audit_record(proposal: &Proposal) -> (Key, Record) {
     let form = Value::Array(vec![
         Value::Text(AUDIT_FORM),
         audit.actor.to_cbor(),
+        proposal.owner().map_or(Value::Null, Id::to_cbor),
         audit.action.to_cbor(),
         Value::Array(vec![
             duration(time.estimate()),

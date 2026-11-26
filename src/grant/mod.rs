@@ -7,9 +7,9 @@
 //! at the issue, and it binds the policy version of that decision.
 //!
 //! Effective access is the grant intersected with the current authority of the owner, under the policy version that
-//! the grant binds ([`Grants::admits`]). Each check resolves the policy again: a grant holds no copy of the authority
-//! of its owner. A relevant policy change raises the version, so it stops each grant of the earlier version until the
-//! owner approves a new revision. A key rotation of the agent keeps its grant. A revocation of the grant
+//! the grant binds ([`crate::authz::check_agent`]). Each check resolves the policy again: a grant holds no copy of the
+//! authority of its owner. A relevant policy change raises the version, so it stops each grant of the earlier version
+//! until the owner approves a new revision. A key rotation of the agent keeps its grant. A revocation of the grant
 //! ([`Grants::revoke`]) or of the agent ([`crate::agent::Agents::revoke`]) ends it.
 //!
 //! The active-access page of an owner shows the sessions of [`crate::session::Sessions::list`] and the grants of
@@ -60,7 +60,8 @@ const REVOKE: &str = "grant.revoke";
 pub enum Approval {
     /// The grant alone admits the operation.
     NotRequired,
-    /// The operation also needs a one-use approval of the owner. The check gives the mark ([`Admitted::approval`]).
+    /// The operation also needs a one-use approval of the owner. The check gives the mark
+    /// ([`Granted::approval`](crate::authz::Granted::approval)).
     Required,
 }
 
@@ -145,7 +146,7 @@ impl Grant {
 
     /// The grant of the record `record`, or `None` for another form, or for more audiences or permissions than
     /// `limits` permit. The revision is the coordinate of the version.
-    fn parse(record: &Record, limits: Limits) -> Option<Self> {
+    pub(crate) fn parse(record: &Record, limits: Limits) -> Option<Self> {
         let value = cbor::decode(&record.data, limits).ok()?;
         let Value::Array(items) = &value else {
             return None;
@@ -202,77 +203,6 @@ impl Grant {
     }
 }
 
-/// One use of a grant: an action on a resource at an audience ([`Grants::admits`]).
-#[derive(Clone, Copy, Debug)]
-pub struct Use<'a> {
-    /// The service that the agent calls.
-    pub audience: &'a Id<Audience>,
-    /// The resource.
-    pub resource: &'a Id<Resource>,
-    /// The action.
-    pub action: &'a Id<Action>,
-}
-
-/// The effective access of one use, which [`Grants::admits`] checked: the agent, its owner, the grant revision, and the
-/// end of the access. Its reads go into the commit of the operation ([`Self::gate`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Admitted {
-    agent: Id<Agent>,
-    owner: Id<Human>,
-    revision: u64,
-    deadline: Duration,
-    approval: Approval,
-    /// The agent identity, the grant revision, and the policy version that the check read.
-    reads: [Dependency; 3],
-}
-
-impl Admitted {
-    /// Requires the agent identity, the grant revision, and the policy version of the check at the commit of
-    /// `proposal`, so a revocation, a change, or a relevant policy change between the check and the commit refuses.
-    /// The proposal ends at [`Self::deadline`].
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    ///
-    /// # Errors
-    ///
-    /// [`transition::Error`] if the dependencies pass the limits of the proposal or conflict with its reads.
-    pub fn gate(&self, proposal: &mut Proposal) -> Result<(), transition::Error> {
-        self.reads.iter().try_for_each(|read| proposal.read(read.clone()))?;
-        proposal.until(self.deadline);
-        Ok(())
-    }
-
-    /// The agent.
-    #[must_use]
-    pub const fn agent(&self) -> &Id<Agent> {
-        &self.agent
-    }
-
-    /// The human owner of the agent.
-    #[must_use]
-    pub const fn owner(&self) -> &Id<Human> {
-        &self.owner
-    }
-
-    /// The revision of the grant.
-    #[must_use]
-    pub const fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// The end of the access: the earlier of the grant deadline and the end of the permit of the owner.
-    #[must_use]
-    pub const fn deadline(&self) -> Duration {
-        self.deadline
-    }
-
-    /// Whether the operation also needs a one-use approval of the owner.
-    #[must_use]
-    pub const fn approval(&self) -> Approval {
-        self.approval
-    }
-}
-
 /// One page of the grants of an owner ([`Grants::list`]).
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -285,9 +215,9 @@ pub struct Page {
 /// The grants of the agents of one authority: the authority of [`Agents`].
 #[derive(Clone, Debug)]
 pub struct Grants {
-    agents: Agents,
-    authority: Id<Authority>,
-    limits: Limits,
+    pub(crate) agents: Agents,
+    pub(crate) authority: Id<Authority>,
+    pub(crate) limits: Limits,
 }
 
 impl Grants {
@@ -432,59 +362,6 @@ impl Grants {
         Ok((proposal, Plan::default()))
     }
 
-    /// Checks one use of the grant of `agent` at `now`: the agent identity is current, the grant has not ended and
-    /// names the audience and the permission, its policy version is the current version of `policy`, and `policy`
-    /// permits the owner the action on the resource now. Thus effective access is the grant intersected with the
-    /// current authority of the owner. Give the [`Admitted`] reads to the commit of the operation ([`Admitted::gate`]).
-    ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). Two keyed lookups and one policy decision.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NotEnrolled`] if the store holds no identity of `agent`, and [`Error::NoGrant`] if it has no grant.
-    /// [`Error::Expired`] at or after the deadline, [`Error::Audience`] and [`Error::Permission`] for an audience or a
-    /// permission that the grant does not name, [`Error::Policy`] for a grant of another policy version, and
-    /// [`Error::Authority`] if the owner does not hold the permission now. [`Error::Record`] for a record with no
-    /// valid form, [`Error::Time`] for a reading with no bound, and [`Failure::Store`] if a read fails.
-    pub async fn admits<S: Store>(
-        &self,
-        store: &mut S,
-        agent: &Id<Agent>,
-        request: Use<'_>,
-        policy: &impl Policy,
-        now: Reading,
-    ) -> Result<Admitted, Failure<S::Error>> {
-        let latest = now.latest().map_err(Error::Time)?;
-        let identity = self.identity(store, agent).await?;
-        let key = key(&self.authority, &identity.owner, agent);
-        let record = read(store, &key).await?.ok_or(Error::NoGrant)?;
-        let grant = Grant::parse(&record, self.limits)
-            .filter(|grant| grant.agent == *agent && grant.owner == identity.owner)
-            .ok_or(Error::Record)?;
-        (latest < grant.deadline).ok_or(Error::Expired)?;
-        grant.audiences.contains(request.audience).ok_or(Error::Audience)?;
-        let permission = grant
-            .permissions
-            .iter()
-            .find(|permission| permission.resource == *request.resource && permission.action == *request.action)
-            .ok_or(Error::Permission)?;
-        (*policy.version() == grant.policy).ok_or(Error::Policy)?;
-        let principal = Principal::Human(identity.owner.clone());
-        let expires = permit(policy, &principal, request.resource, request.action, latest).ok_or(Error::Authority)?;
-        Ok(Admitted {
-            agent: agent.clone(),
-            owner: identity.owner,
-            revision: grant.revision,
-            deadline: grant.deadline.min(expires),
-            approval: permission.approval,
-            reads: [
-                Dependency::Version(self.agents.identity_key(agent), identity.version),
-                Dependency::Version(key, record.version),
-                Dependency::Policy(grant.policy),
-            ],
-        })
-    }
-
     /// Lists the grants of the owner, the signed-in human of `access`, that did not end at `now`. The page starts after
     /// `after`, or at the first key. Show it on the active-access page with the sessions of
     /// [`crate::session::Sessions::list`].
@@ -593,7 +470,7 @@ fn locator(authority: &Id<Authority>, owner: &Id<Human>) -> [u8; 16] {
 
 /// The end of the permit of `policy` for `principal` to do `action` on `resource`, or `None` if the policy permits it
 /// at no time after `latest`, or the permit is of another request or version.
-fn permit(
+pub(crate) fn permit(
     policy: &impl Policy,
     principal: &Principal,
     resource: &Id<Resource>,
@@ -644,7 +521,20 @@ pub enum Error {
     NotEnrolled,
     /// The agent has no grant: its owner gave none, revoked it, or the agent was revoked.
     NoGrant,
-    /// The deadline of the grant passed. The owner can approve a new revision.
+    /// The evidence is not of the credential of an agent: a human or a workload has no grant.
+    Principal,
+    /// Another authority issued the credential of the agent.
+    Issuer,
+    /// The credential names another owner than the identity of the agent.
+    Owner,
+    /// The key that proved the possession of the credential is not the current key of the agent: a rotation replaced
+    /// it. The agent proves its current key.
+    Key,
+    /// The credential names another revision than the current revision of the grant: a change replaced it. The agent
+    /// gets a credential of the current revision.
+    Revision,
+    /// The deadline of the grant passed, or the deadline of the scope of a request: the end of the permit of the owner
+    /// or of the credential of the agent. The owner can approve a new revision, or the agent gets a new credential.
     Expired,
     /// The grant does not name the audience.
     Audience,
@@ -684,6 +574,11 @@ impl fmt::Display for Error {
             Self::Authority => f.write_str("the owner does not hold the permission now"),
             Self::NotEnrolled => f.write_str("the store holds no identity of the agent"),
             Self::NoGrant => f.write_str("the agent has no grant"),
+            Self::Principal => f.write_str("the evidence is not of the credential of an agent"),
+            Self::Issuer => f.write_str("another authority issued the credential of the agent"),
+            Self::Owner => f.write_str("the credential names another owner than the identity of the agent"),
+            Self::Key => f.write_str("the key of the proof is not the current key of the agent"),
+            Self::Revision => f.write_str("the credential names another revision than the current grant"),
             Self::Expired => f.write_str("the deadline of the grant passed"),
             Self::Audience => f.write_str("the grant does not name the audience"),
             Self::Permission => f.write_str("the grant does not name the action on the resource"),

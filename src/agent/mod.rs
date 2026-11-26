@@ -639,7 +639,7 @@ impl Identity {
 
     /// The identity of `agent` in the record `record`, or `None` for another form within `limits`. The generation is
     /// the count of the version.
-    fn parse(agent: &Id<Agent>, record: &Record, limits: Limits) -> Option<Self> {
+    pub(crate) fn parse(agent: &Id<Agent>, record: &Record, limits: Limits) -> Option<Self> {
         let value = cbor::decode(&record.data, limits).ok()?;
         let Value::Array(items) = &value else {
             return None;
@@ -1058,7 +1058,8 @@ impl Agents {
     /// a statement of an earlier generation never matches again. The commit writes the identity with the new key at
     /// the next generation, and keeps its owner, its name, its workload, and its time of creation. The plan names the
     /// identity as replaced, so the restore journal ends the earlier version: no restore gives the earlier key again.
-    /// Choose `operation`, and keep it for a lookup. Then answer with the [`Identity::json`] of [`Self::identity`].
+    /// The audit names the agent and, as a separate field, its owner. Choose `operation`, and keep it for a lookup.
+    /// Then answer with the [`Identity::json`] of [`Self::identity`].
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One identity lookup, and the signature checks of the two
     /// composite signatures, each within the limits.
@@ -1094,6 +1095,7 @@ impl Agents {
         let request = Value::Array(vec![Value::Bytes(key.as_bytes()), Value::Bytes(&digest)]);
         let actor = Principal::Agent(rotation.agent.clone());
         let mut proposal = self.proposal(operation, actor, ROTATE, request, now)?;
+        proposal.attribute(identity.owner.clone());
         proposal
             .read(Dependency::Version(key.clone(), record.version.clone()))
             .map_err(Error::Transition)?;
@@ -1303,7 +1305,7 @@ impl Agents {
             time: now,
         };
         let request = Value::Array(vec![self.authority.to_cbor(), request]);
-        Proposal::new(operation, audit, &request, self.limits).map_err(Error::Transition)
+        Proposal::start(operation, audit, &request, self.limits).map_err(Error::Transition)
     }
 }
 

@@ -246,7 +246,7 @@ impl World {
 }
 
 /// The composite key pair from `seed`.
-fn keypair(seed: u8) -> ([u8; KEY_BYTES], MlDsa65Ed25519SecretKey) {
+pub(super) fn keypair(seed: u8) -> ([u8; KEY_BYTES], MlDsa65Ed25519SecretKey) {
     let (public, secret) = MlDsa65Ed25519::generate_keypair(|out| {
         let _: () = out.fill(seed);
         Ok(())
@@ -256,7 +256,7 @@ fn keypair(seed: u8) -> ([u8; KEY_BYTES], MlDsa65Ed25519SecretKey) {
 }
 
 /// The public key of the composite profile from `seed`.
-fn key(seed: u8) -> [u8; KEY_BYTES] {
+pub(super) fn key(seed: u8) -> [u8; KEY_BYTES] {
     keypair(seed).0
 }
 

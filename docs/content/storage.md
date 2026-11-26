@@ -137,9 +137,12 @@ binding of `proposal.operation()`: 32 bytes. `Store::outcome(&id)` reads this re
 `store::outcome_of(&id, &record)` gives its `transition::Operation`. A record in another form gives `None`.
 
 `store::audit_record(&proposal)` gives the key and the record of the audit. The record form is the CBOR array
-`["rsauthnz.store.audit.1", actor, action, time, keys]`:
+`["rsauthnz.store.audit.2", actor, owner, action, time, keys]`:
 
 - `actor` and `action` are the canonical CBOR forms of `audit.actor` and `audit.action`.
+- `owner` is the canonical CBOR form of the human owner of an agent actor (`proposal.owner()`). It is null for a
+  human, a workload, and the enrollment request of an agent, which has no owner yet. Only rsauthnz sets it, from the
+  identity record of the agent ([Check the request of an agent](authorization.md#check-the-request-of-an-agent)).
 - `time` is `[estimate, bound, source]` of the reading `audit.time`. The estimate and the bound are
   `[seconds, nanoseconds]`, and the bound is null when it is unknown. The source is 1 for the system clock, 2 for the
   caller, and 0 for another source.

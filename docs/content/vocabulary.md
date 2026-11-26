@@ -94,7 +94,7 @@ let version = AuthorityVersion::new(owner, &7_u64.to_be_bytes())?;
 | Recovery | `recovery()` |
 | A device or hardware binding of the key, which an attestation or a custody check proved. A passkey has none | `binding()` |
 | The authentication of the signature: `Hybrid`, `PostQuantum`, or `Classical` (`crypto::Authentication`), or `None` when rsauthnz verified no signature | `authentication()` |
-| The credential of the authentication: its verified claims, with the issuer, the audience, the purpose, the serial, the validity interval, and the owner of an agent, the SHA-256 digest of its bytes, and the end of its authority (`evidence::Artifact`), or `None` with no credential | `artifact()` |
+| The credential of the authentication: its verified claims, with the issuer, the audience, the purpose, the serial, the validity interval, and the owner and the grant revision of an agent, the COSE Key Thumbprint of its `cnf` key, the SHA-256 digest of its bytes, and the end of its authority (`evidence::Artifact`), or `None` with no credential | `artifact()` |
 | The end of the credential, or the end of the previous issuer key that verified it when that is earlier, after which the evidence gives no authority (`Artifact::end`) | `expires()` |
 | The backup state that the authenticator of a passkey reports (`evidence::Backup`: `SingleDevice`, `Eligible`, or `BackedUp`), or `None` for another method. It is a report, not a binding | `backup()` |
 | A possible clone of a passkey: its signature counter did not advance, with a nonzero counter on either side | `possible_clone()` |

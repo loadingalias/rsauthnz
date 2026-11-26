@@ -3,7 +3,7 @@ use core::time::Duration;
 
 use super::{Permit, Policy, Refusal, Request, Requirements, check};
 use crate::evidence::{Evidence, Method};
-use crate::id::{Action, Agent, AuthorityVersion, Human, Id, Principal, Resource};
+use crate::id::{Action, Agent, AuthorityVersion, Human, Id, Principal, Resource, Workload};
 use crate::time::{Reading, ReadingSource, TimeError};
 
 /// A policy with a list of permits. It gives the permit with the action and the resource of the request, and it
@@ -164,15 +164,33 @@ fn the_evidence_must_meet_the_requirements_and_the_deadline() {
 #[test]
 fn a_permit_for_another_principal_with_the_same_raw_id_refuses() {
     let policy = policy(7, read_x(ANY));
-    let agent = passkey(Principal::Agent(Id::<Agent>::new("acme", "u-17").unwrap()));
+    let workload = passkey(Principal::Workload(Id::<Workload>::new("acme", "u-17").unwrap()));
     assert_eq!(
         check(
-            &agent,
+            &workload,
             &action("repo.read"),
             &resource("repo:x"),
             &policy,
             reading(1_100)
         ),
         Err(Refusal::Scope)
+    );
+}
+
+/// An agent has access only through the grant of its owner. A policy that permits the agent itself gives it nothing.
+#[test]
+fn the_evidence_of_an_agent_refuses_even_when_the_policy_permits_the_agent() {
+    let agent = Principal::Agent(Id::<Agent>::new("acme", "u-17").unwrap());
+    let mut permit = read_x(ANY);
+    permit.principal = agent.clone();
+    assert_eq!(
+        check(
+            &passkey(agent),
+            &action("repo.read"),
+            &resource("repo:x"),
+            &policy(7, permit),
+            reading(1_100)
+        ),
+        Err(Refusal::Agent)
     );
 }

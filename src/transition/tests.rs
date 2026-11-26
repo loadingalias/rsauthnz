@@ -15,7 +15,7 @@ use crate::authz::{self, Permit, Policy, Request, Requirements};
 use crate::cbor::Value;
 use crate::crypto;
 use crate::evidence::{Evidence, Method};
-use crate::id::{Action, Agent, AuthorityVersion, Human, Id, Principal, Resource};
+use crate::id::{Action, AuthorityVersion, Human, Id, Principal, Resource, Workload};
 use crate::limits::{Limit, Limits};
 use crate::time::{Reading, ReadingSource};
 
@@ -121,10 +121,10 @@ fn reuse_of_an_operation_identity_with_different_input_refuses() {
         store.commit(proposal(b"op-1", human(), "grant.issue", "repo:x")),
         Outcome::Accepted(receipt) if receipt.operation() == &operation.id
     );
-    let agent = Principal::Agent(Id::<Agent>::new("acme", "u-17").unwrap());
+    let workload = Principal::Workload(Id::<Workload>::new("acme", "u-17").unwrap());
     for other in [
         proposal(b"op-1", human(), "grant.issue", "repo:y"),
-        proposal(b"op-1", agent, "grant.issue", "repo:x"),
+        proposal(b"op-1", workload, "grant.issue", "repo:x"),
         proposal(b"op-1", human(), "grant.change", "repo:x"),
     ] {
         let refused = store.commit(other);

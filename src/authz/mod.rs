@@ -48,7 +48,7 @@
 //!     }
 //! }
 //!
-//! /// An agent request on a resource server: one check gives the scope that the operation enforces.
+//! /// A request on a resource server: one check gives the scope that the operation enforces.
 //! fn read_repo(evidence: &Evidence, policy: &OneAction, now: Reading) -> Result<(), Box<dyn core::error::Error>> {
 //!     let action = Id::new("acme.repo", "repo.read")?;
 //!     let resource = Id::new("acme.repo", "repo:x")?;
@@ -58,10 +58,49 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! An agent has access only through the grant of its human owner ([`crate::grant`]), so [`check`] refuses the evidence
+//! of an agent. [`check_agent`] checks the request of an agent: its credential must name its owner and the current
+//! revision of its grant, and the policy must permit the owner the action on the resource now. It gives a [`Granted`]
+//! scope. The operation calls [`Granted::enforce`] at each use, for example before each chunk of a streamed response,
+//! so a revocation stops the work at its next use. An operation that commits takes its proposal from
+//! [`Granted::propose`], whose audit names the agent and its owner as separate fields.
+//!
+//! This example streams a repository to an agent. The host gives a reading of the clock for each use.
+//!
+//! ```
+//! use rsauthnz::authz::{self, Policy};
+//! use rsauthnz::evidence::Evidence;
+//! use rsauthnz::grant::{Failure, Grants};
+//! use rsauthnz::id::{Action, Id, Resource};
+//! use rsauthnz::store::Store;
+//! use rsauthnz::time::Reading;
+//!
+//! /// A streamed read by an agent: one check, then one use of the scope before each chunk. A revocation, a change of
+//! /// the grant, or a rotation of the key stops the stream at its next chunk.
+//! async fn stream_repo<S: Store>(
+//!     grants: &Grants,
+//!     store: &mut S,
+//!     evidence: &Evidence,
+//!     (action, resource): (&Id<Action>, &Id<Resource>),
+//!     policy: &impl Policy,
+//!     mut now: impl FnMut() -> Reading,
+//!     chunks: &[&[u8]],
+//!     mut send: impl FnMut(&[u8]),
+//! ) -> Result<(), Failure<S::Error>> {
+//!     let scope = authz::check_agent(grants, store, evidence, action, resource, policy, now()).await?;
+//!     for chunk in chunks {
+//!         scope.enforce(store, action, resource, policy, now()).await?;
+//!         send(chunk);
+//!     }
+//!     Ok(())
+//! }
+//! ```
 
 use core::fmt;
 use core::time::Duration;
 
+pub use self::agent::{Granted, check_agent};
 use crate::evidence::Evidence;
 use crate::id::{Action, AuthorityVersion, Id, Principal, Resource};
 use crate::time::{Reading, TimeError};
@@ -123,6 +162,7 @@ pub struct Requirements {
 ///
 /// # Errors
 ///
+/// [`Refusal::Agent`] for the evidence of an agent, which has access only through its grant ([`check_agent`]).
 /// [`Refusal::Denied`] if the policy gives no permit, and [`Refusal::Scope`] if the permit names another principal,
 /// action, or resource. [`Refusal::Stale`] if the permit is not of the current policy version, and
 /// [`Refusal::Requirements`] if the evidence does not meet its requirements. [`Refusal::Expired`] if `now` permits a
@@ -136,6 +176,9 @@ pub fn check(
     policy: &impl Policy,
     now: Reading,
 ) -> Result<Checked, Refusal> {
+    if let Principal::Agent(_) = evidence.subject() {
+        return Err(Refusal::Agent);
+    }
     let request = Request {
         principal: evidence.subject(),
         action,
@@ -235,6 +278,9 @@ impl Checked {
 /// The cause of a refused authorization. For each refusal, the recovery is to refuse the operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
+    /// The evidence is of an agent. An agent has access only through the grant of its owner: check its request with
+    /// [`check_agent`].
+    Agent,
     /// The policy does not permit the request.
     Denied,
     /// The permit or the operation names another principal, action, or resource than the scope.
@@ -252,6 +298,7 @@ pub enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Agent => f.write_str("the evidence is of an agent, which has access only through its grant"),
             Self::Denied => f.write_str("the policy does not permit the request"),
             Self::Scope => f.write_str("the operation is not in the scope"),
             Self::Stale => f.write_str("the permit is not of the current policy version"),
@@ -270,5 +317,6 @@ impl From<TimeError> for Refusal {
     }
 }
 
+mod agent;
 #[cfg(test)]
 mod tests;

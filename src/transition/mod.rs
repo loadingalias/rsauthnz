@@ -63,7 +63,7 @@ use rscrypto::{ChaCha20Rng, SecretVec};
 
 use crate::cbor::{self, Value};
 use crate::crypto;
-use crate::id::{Action, AuthorityVersion, Id, Principal};
+use crate::id::{Action, AuthorityVersion, Human, Id, Principal};
 use crate::limits::{Limit, Limits};
 use crate::store::Kind;
 use crate::time::Reading;
@@ -455,6 +455,9 @@ impl fmt::Debug for Intent {
 pub struct Proposal {
     operation: Operation,
     audit: Audit,
+    /// The human owner of the agent of [`Audit::actor`], which the audit record names. Only this crate sets it, from
+    /// the identity record of the agent, so the caller of a proposal cannot omit or substitute the owner.
+    owner: Option<Id<Human>>,
     dependencies: Vec<Dependency>,
     changes: Vec<Change>,
     intents: Vec<Intent>,
@@ -472,16 +475,29 @@ impl Proposal {
     /// form `["rsauthnz.transition.binding.1", actor, action, request]`. `request` must encode within `limits`, and the
     /// encoder refuses it at the first bound, before more work.
     ///
+    /// An agent acts only under the grant of its owner, so the actor of `audit` is a human or a workload. The proposal
+    /// of an operation of an agent comes from the scope of its grant
+    /// ([`Granted::propose`](crate::authz::Granted::propose)), whose audit names the owner.
+    ///
     /// # Errors
     ///
-    /// [`Error::Request`] if `request` has no CBOR encoding within `limits`.
+    /// [`Error::Agent`] if the actor is an agent, and [`Error::Request`] if `request` has no CBOR encoding within
+    /// `limits`.
     pub fn new(id: OperationId, audit: Audit, request: &Value<'_>, limits: Limits) -> Result<Self, Error> {
+        (!matches!(audit.actor, Principal::Agent(_))).ok_or(Error::Agent)?;
+        Self::start(id, audit, request, limits)
+    }
+
+    /// The proposal of [`Self::new`] for any actor. A proposal of an agent names its owner with [`Self::attribute`],
+    /// except the enrollment request of an agent that has no owner yet.
+    pub(crate) fn start(id: OperationId, audit: Audit, request: &Value<'_>, limits: Limits) -> Result<Self, Error> {
         let request = cbor::encode(request, limits).map_err(Error::Request)?;
         let prefix = cbor::prefix(&[Value::Text(BINDING_FORM), audit.actor.to_cbor(), audit.action.to_cbor()]);
         let binding = crypto::sha256_parts(&[&prefix, &request]);
         Ok(Self {
             operation: Operation { id, binding },
             audit,
+            owner: None,
             dependencies: Vec::new(),
             changes: Vec::new(),
             intents: Vec::new(),
@@ -598,6 +614,23 @@ impl Proposal {
         &self.audit
     }
 
+    /// The human owner of the agent that acts, or `None` for a human, a workload, or the enrollment request of an agent
+    /// that has no owner yet. The audit record names it ([`crate::store::audit_record`]).
+    #[must_use]
+    pub const fn owner(&self) -> Option<&Id<Human>> {
+        self.owner.as_ref()
+    }
+
+    /// Names `owner` as the human owner of the agent of [`Audit::actor`]. Call it only with the owner of the current
+    /// identity record of the agent.
+    pub(crate) fn attribute(&mut self, owner: Id<Human>) {
+        assert!(
+            matches!(self.audit.actor, Principal::Agent(_)),
+            "only the proposal of an agent names an owner"
+        );
+        self.owner = Some(owner);
+    }
+
     /// The reads of the decision, in the order of the first read of each policy and record.
     #[must_use]
     pub fn dependencies(&self) -> &[Dependency] {
@@ -622,6 +655,7 @@ impl Proposal {
         Self {
             operation,
             audit,
+            owner: None,
             dependencies: Vec::new(),
             changes: Vec::new(),
             intents: Vec::new(),
@@ -738,6 +772,9 @@ pub enum Error {
     /// The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound.
     /// Nothing committed.
     Expired,
+    /// The actor of the audit is an agent. An agent acts only under the grant of its owner: take the proposal from the
+    /// scope of the request ([`Granted::propose`](crate::authz::Granted::propose)).
+    Agent,
 }
 
 /// The recovery of a refusal: the action of its caller. Each error that a request can reach implements it, so a
@@ -762,7 +799,8 @@ impl Recover for Error {
             | Self::Intent
             | Self::LastAnchor
             | Self::Prepared
-            | Self::Expired => Recovery::Refuse,
+            | Self::Expired
+            | Self::Agent => Recovery::Refuse,
         }
     }
 }
@@ -783,6 +821,7 @@ impl fmt::Display for Error {
             Self::LastAnchor => f.write_str("the change ends the last sign-in method or administrator binding"),
             Self::Prepared => f.write_str("the proposal does not write the issuance record of the artifact"),
             Self::Expired => f.write_str("the commit can be at or after the deadline of the proposal"),
+            Self::Agent => f.write_str("the actor is an agent, which acts only under the scope of its grant"),
         }
     }
 }

@@ -178,6 +178,8 @@ const PURPOSE: u64 = 65_538;
 const PROOF_CREDENTIAL: u64 = 65_539;
 /// The challenge of the verifier that a proof binds (-65541).
 const PROOF_CHALLENGE: u64 = 65_540;
+/// The revision of the grant of an agent (-65542): an unsigned integer.
+const GRANT: u64 = 65_541;
 
 /// The claims of a credential or a receipt. Issuance writes them, and verification gives them back.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,20 +228,24 @@ impl Claims {
     }
 }
 
-/// The principal that an artifact names. An agent always names its human owner, and a human or a workload has no
-/// owner.
+/// The principal that an artifact names. An agent always names its human owner and the revision of the grant under
+/// which it acts, and a human or a workload has neither.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Subject {
     /// A person, for example the human of a CLI credential.
     Human(Id<Human>),
     /// A service or a host that acts for itself.
     Workload(Id<Workload>),
-    /// An agent and its accountable human owner. The issuer asserts the owner. An agent never asserts its own owner.
+    /// An agent, its accountable human owner, and the revision of the grant of the owner to the agent. The issuer
+    /// asserts the owner and the revision. An agent never asserts its own owner.
     Agent {
         /// The agent.
         agent: Id<Agent>,
         /// The human owner of the agent.
         owner: Id<Human>,
+        /// The revision of the grant ([`crate::grant::Grant::revision`]). A check of a request of the agent refuses
+        /// another revision ([`crate::authz::check_agent`]).
+        revision: u64,
     },
 }
 
@@ -756,12 +762,13 @@ impl Profile {
             return Err(Error::Claims);
         };
         let serial = Serial(u64::from_be_bytes((*serial).try_into().map_err(|_| Error::Claims)?));
-        let (mut subject, mut owner, mut purpose) = (None, None, None);
+        let (mut subject, mut owner, mut grant, mut purpose) = (None, None, None, None);
         // The decoder refused equal keys, so each claim has one value.
         for (key, value) in other {
             let claim = match key {
                 Value::Negative(SUBJECT) => &mut subject,
                 Value::Negative(OWNER) => &mut owner,
+                Value::Negative(GRANT) => &mut grant,
                 Value::Negative(PURPOSE) => &mut purpose,
                 _ => return Err(Error::Claims),
             };
@@ -779,10 +786,12 @@ impl Profile {
         let owner = owner
             .map(|owner| Id::<Human>::from_cbor(owner).map_err(|_| Error::Claims))
             .transpose()?;
-        let subject = match (principal, owner) {
-            (Principal::Human(human), None) => Subject::Human(human),
-            (Principal::Workload(workload), None) => Subject::Workload(workload),
-            (Principal::Agent(agent), Some(owner)) => Subject::Agent { agent, owner },
+        let subject = match (principal, owner, grant) {
+            (Principal::Human(human), None, None) => Subject::Human(human),
+            (Principal::Workload(workload), None, None) => Subject::Workload(workload),
+            (Principal::Agent(agent), Some(owner), Some(&Value::Unsigned(revision))) => {
+                Subject::Agent { agent, owner, revision }
+            }
             _ => return Err(Error::Claims),
         };
         let (public, confirmation) = match cnf {
@@ -876,8 +885,10 @@ impl<'a> Verified<'a, '_> {
     /// The challenge makes the proof fresh. Issue each challenge for one proof, and consume it in the transition that
     /// uses the evidence. The evidence records the subject, [`Method::KeyPossession`], `now`, and the
     /// [`Authentication`] of the `cnf` key. It also keeps the credential ([`Evidence::artifact`]): its verified claims,
-    /// with the issuer, the audience, the purpose, the serial, the end, and the owner of an agent, and the SHA-256
-    /// digest of its bytes. Thus a check of the evidence ends with the credential ([`authz::check`](crate::authz::check)).
+    /// with the issuer, the audience, the purpose, the serial, the end, and the owner and the grant revision of an
+    /// agent, the COSE Key Thumbprint of the `cnf` key, and the SHA-256 digest of its bytes. Thus a check of the
+    /// evidence ends with the credential ([`authz::check`](crate::authz::check)), and the check of an agent refuses a
+    /// key that a rotation replaced ([`authz::check_agent`](crate::authz::check_agent)).
     /// For a credential of the previous issuer key ([`Profile::with_previous`]), the check refuses at or after the end
     /// of that key, also for a [`Verified`] that an earlier reading gave, and the evidence ends there too.
     /// It records no user verification, no phishing resistance, and no device or hardware binding, because the proof
@@ -932,6 +943,7 @@ impl<'a> Verified<'a, '_> {
         );
         evidence.artifact = Some(Artifact {
             claims: self.claims.clone(),
+            confirmation: *key.kid(),
             digest: crypto::sha256(self.artifact),
             end: self
                 .until
@@ -1020,8 +1032,9 @@ fn payload(
         (Value::Negative(PURPOSE), claims.purpose.to_cbor()),
     ];
     entries.extend(not_before.map(|nbf| (Value::Unsigned(5), Value::Unsigned(nbf))));
-    if let Subject::Agent { owner, .. } = &claims.subject {
+    if let Subject::Agent { owner, revision, .. } = &claims.subject {
         entries.push((Value::Negative(OWNER), owner.to_cbor()));
+        entries.push((Value::Negative(GRANT), Value::Unsigned(*revision)));
     }
     // The `COSE_Key` member (1) holds the key with its `alg`.
     entries.extend(confirmation.map(|public| {

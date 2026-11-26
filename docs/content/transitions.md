@@ -14,7 +14,9 @@ commit that a storage binding implements.
 
 1. Start the proposal with `Proposal::new(id, audit, &request, limits)`. `id` is the `OperationId` of the
    operation. `audit` is the required `Audit`: the actor, the action of the transition, and the time of the
-   decision. `request` is the canonical CBOR value of the bounded request.
+   decision. `request` is the canonical CBOR value of the bounded request. The actor is a human or a workload: an
+   agent acts only under the grant of its owner, and its proposal comes from the scope of its request
+   (`Granted::propose`, [Check the request of an agent](authorization.md#check-the-request-of-an-agent)).
 2. Add each read of the decision with `proposal.read(dependency)`. Add the policy version, each record version,
    and each absence that the decision used, also when the transition does not change that record.
 3. Add each state change with `proposal.change(change)`. A read of the proposal must allow it.
@@ -199,6 +201,7 @@ operation stays in doubt, so the client never starts it again as a new operation
 | `LastAnchor` | The change ends the last sign-in method of an account, or the last administrator binding, that the restore journal records as live | `Refuse` |
 | `Prepared` | The proposal has an artifact, or no change writes the issuance record of the artifact at its version | `Refuse` |
 | `Expired` | The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound. Nothing committed | `Refuse` |
+| `Agent` | The actor of `Proposal::new` is an agent. Take the proposal from the scope of the request of the agent | `Refuse` |
 
 ## Limits
 

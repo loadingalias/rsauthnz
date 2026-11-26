@@ -21,7 +21,7 @@ use crate::time::{Reading, ReadingSource};
 
 /// The name of the stored form of evidence. Each change of the form gets a new name. After the first release, the
 /// reader keeps each released form.
-const FORM: &str = "rsauthnz.evidence.1";
+const FORM: &str = "rsauthnz.evidence.2";
 
 /// The facts that one authentication proved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,12 +41,14 @@ pub struct Evidence {
     pub(crate) possible_clone: bool,
 }
 
-/// The credential that an authentication used: its verified claims, the SHA-256 digest of its exact bytes, and the end
-/// of its authority. The claims hold the issuer, the audience, the purpose, the serial, the validity interval, and the
-/// owner of an agent.
+/// The credential that an authentication used: its verified claims, the key that proved its possession, the SHA-256
+/// digest of its exact bytes, and the end of its authority. The claims hold the issuer, the audience, the purpose, the
+/// serial, the validity interval, and the owner and the grant revision of an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Artifact {
     pub(crate) claims: Claims,
+    /// The COSE Key Thumbprint of the `cnf` key, which signed the proof of possession.
+    pub(crate) confirmation: [u8; 32],
     pub(crate) digest: [u8; 32],
     /// The end of the credential, or the end of the previous issuer key that verified it when that is earlier.
     pub(crate) end: Duration,
@@ -224,16 +226,17 @@ impl Evidence {
         self.artifact.as_ref().map(|artifact| artifact.end)
     }
 
-    /// The canonical CBOR form: the array `["rsauthnz.evidence.1", subject, method, time, user
+    /// The canonical CBOR form: the array `["rsauthnz.evidence.2", subject, method, time, user
     /// verified, phishing resistant, binding, authentication, artifact, backup, possible clone]`. The
     /// name gives the version of the form. The method, the binding,
     /// the authentication, and the backup state are numbers, with `null` for no binding, for no
     /// authentication, and for no backup state. The time is
     /// `[estimate, bound, source]`: the estimate of the Unix time as `[seconds, nanoseconds]`, the
     /// bound in the same form or `null` when it is unknown, and the source as a number. The artifact
-    /// is `null`, or `[issuer, audience, subject, owner, purpose, serial, not before, expires,
-    /// digest, end]`, with `null` for no owner and for no start, and each time as `[seconds,
-    /// nanoseconds]`.
+    /// is `null`, or `[issuer, audience, subject, owner, revision, purpose, serial, not before,
+    /// expires, confirmation, digest, end]`, with `null` for no owner, for no grant revision, and for
+    /// no start, and each time as `[seconds, nanoseconds]`. The confirmation is the COSE Key
+    /// Thumbprint of the `cnf` key.
     #[must_use]
     pub fn to_cbor(&self) -> Value<'_> {
         Value::Array(vec![
@@ -260,26 +263,32 @@ impl Evidence {
                 Some(Authentication::PostQuantum) => Value::Unsigned(2),
                 Some(Authentication::Classical) => Value::Unsigned(3),
             },
-            self.artifact
-                .as_ref()
-                .map_or(Value::Null, |Artifact { claims, digest, end }| {
-                    let owner = match &claims.subject {
-                        Subject::Agent { owner, .. } => owner.to_cbor(),
-                        Subject::Human(_) | Subject::Workload(_) => Value::Null,
-                    };
-                    Value::Array(vec![
-                        claims.issuer.to_cbor(),
-                        claims.audience.to_cbor(),
-                        claims.subject.to_cbor(),
-                        owner,
-                        claims.purpose.to_cbor(),
-                        Value::Unsigned(claims.serial.0),
-                        claims.not_before.map_or(Value::Null, duration_to_cbor),
-                        duration_to_cbor(claims.expires),
-                        Value::Bytes(digest),
-                        duration_to_cbor(*end),
-                    ])
-                }),
+            self.artifact.as_ref().map_or(Value::Null, |artifact| {
+                let Artifact {
+                    claims,
+                    confirmation,
+                    digest,
+                    end,
+                } = artifact;
+                let (owner, revision) = match &claims.subject {
+                    Subject::Agent { owner, revision, .. } => (owner.to_cbor(), Value::Unsigned(*revision)),
+                    Subject::Human(_) | Subject::Workload(_) => (Value::Null, Value::Null),
+                };
+                Value::Array(vec![
+                    claims.issuer.to_cbor(),
+                    claims.audience.to_cbor(),
+                    claims.subject.to_cbor(),
+                    owner,
+                    revision,
+                    claims.purpose.to_cbor(),
+                    Value::Unsigned(claims.serial.0),
+                    claims.not_before.map_or(Value::Null, duration_to_cbor),
+                    duration_to_cbor(claims.expires),
+                    Value::Bytes(confirmation),
+                    Value::Bytes(digest),
+                    duration_to_cbor(*end),
+                ])
+            }),
             match self.backup {
                 None => Value::Null,
                 Some(Backup::SingleDevice) => Value::Unsigned(1),
@@ -379,22 +388,25 @@ fn artifact_from_cbor(value: &Value<'_>) -> Option<Artifact> {
         audience,
         subject,
         owner,
+        revision,
         purpose,
         Value::Unsigned(serial),
         not_before,
         expires,
+        Value::Bytes(confirmation),
         Value::Bytes(digest),
         end,
     ] = items.as_slice()
     else {
         return None;
     };
-    let subject = match (Principal::from_cbor(subject).ok()?, owner) {
-        (Principal::Human(human), Value::Null) => Subject::Human(human),
-        (Principal::Workload(workload), Value::Null) => Subject::Workload(workload),
-        (Principal::Agent(agent), owner) => Subject::Agent {
+    let subject = match (Principal::from_cbor(subject).ok()?, owner, revision) {
+        (Principal::Human(human), Value::Null, Value::Null) => Subject::Human(human),
+        (Principal::Workload(workload), Value::Null, Value::Null) => Subject::Workload(workload),
+        (Principal::Agent(agent), owner, Value::Unsigned(revision)) => Subject::Agent {
             agent,
             owner: Id::from_cbor(owner).ok()?,
+            revision: *revision,
         },
         _ => return None,
     };
@@ -414,6 +426,7 @@ fn artifact_from_cbor(value: &Value<'_>) -> Option<Artifact> {
     (end <= claims.expires).then_some(())?;
     Some(Artifact {
         claims,
+        confirmation: (*confirmation).try_into().ok()?,
         digest: (*digest).try_into().ok()?,
         end,
     })

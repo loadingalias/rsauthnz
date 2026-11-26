@@ -14,7 +14,7 @@ issuer key can sign each kind, and an artifact of one purpose does not verify fo
 | Artifact | `cnf` key | Subject |
 | --- | --- | --- |
 | Workload credential | The key of the workload | `Subject::Workload` |
-| Agent credential | The key of the agent | `Subject::Agent`, with its human owner |
+| Agent credential | The key of the agent | `Subject::Agent`, with its human owner and the revision of its grant |
 | CLI enrollment credential | The key of the CLI | `Subject::Human` |
 | Enrollment receipt | None | The principal that enrolled |
 | Approval receipt | None | The principal that approved |
@@ -89,8 +89,9 @@ The claims map holds these claims, and no others:
 | -65537 | Subject | `subject` | The CBOR form of a `Principal`: `[kind, namespace, value]` |
 | -65538 | Owner | `subject` | The CBOR form of the `Id<Human>` that owns an agent. Only when the subject is an agent |
 | -65539 | Purpose | `purpose` | The CBOR form of an `Id<Purpose>` |
+| -65542 | Grant revision | `subject` | The revision of the grant of the owner to the agent (`Grant::revision`), an unsigned integer. Only when the subject is an agent |
 
-The subject, owner, and purpose keys are in the private-use range of RFC 8392: less than -65536.
+The subject, owner, purpose, and grant revision keys are in the private-use range of RFC 8392: less than -65536.
 [Vocabulary](vocabulary.md) gives the CBOR forms and the text form of an identifier. Take each serial from a
 counter of the store (`store::driver::Driver::allocate`), so that a restore never gives one serial twice.
 
@@ -114,7 +115,9 @@ The example credential below is 5,517 bytes. The default profile signs it, and i
 The composite signature and the composite key of the holder make up 5,357 bytes of the total. A credential of the
 hardware-bound profile is at most 41 bytes longer: its key has 2,017 bytes, and its signature has at most 3,381
 bytes. A credential of `MlDsa65`, `Ed25519`, or `Es256` is shorter than the example, because its key and its
-signature are shorter. Longer identifiers make the claims longer. The example is 2,675 bytes below the limit.
+signature are shorter. Longer identifiers make the claims longer. An agent credential also has the owner claim and
+the grant revision claim, which has at most 14 bytes: 5 for its key and at most 9 for its value. The example is
+2,675 bytes below the limit.
 
 A proof of possession of the example credential, with a challenge of 32 bytes, is 3,487 bytes. The holder sends one
 proof for each check of possession.
@@ -227,7 +230,8 @@ checks](verification.md#bound-the-signature-checks) gives.
 3. The artifact must have the exact form of [The format](#the-format): the tag 18, the protected bucket of the
    named key, and an empty unprotected bucket. Else it refuses with `Error::Form`.
 4. The claims must be the claims of this format: `iat`, `cti`, the subject, and the purpose. An agent must have
-   its owner, and a human or a workload must have none. A claim of another key, or a `sub` claim, refuses.
+   its owner and its grant revision, and a human or a workload must have neither. A claim of another key, or a
+   `sub` claim, refuses.
 5. The purpose must be the purpose of the profile.
 6. A `cnf` key must have the authentication of the issuer key.
 7. The claims map must be the encoding that issuance writes for these claims, or the artifact refuses with
@@ -268,8 +272,10 @@ the previous issuer key that verified it.
 
 The evidence records the subject, the method `Method::KeyPossession`, the reading `now`, and the authentication of
 the `cnf` key: `Hybrid`, `PostQuantum`, or `Classical`. It also keeps the credential: `evidence.artifact()` gives its
-verified claims, with the issuer, the audience, the purpose, the serial, the end, and the owner of an agent, and the
-SHA-256 digest of its bytes. `evidence.expires()` gives the end of the credential, or the end of the previous issuer
+verified claims, with the issuer, the audience, the purpose, the serial, the end, and the owner and the grant revision
+of an agent. It also keeps the COSE Key Thumbprint of the `cnf` key and the SHA-256 digest of the bytes of the
+credential. `authz::check_agent` compares the thumbprint with the current key of the agent, so a credential of a key
+that a rotation replaced refuses ([Check the request of an agent](authorization.md#check-the-request-of-an-agent)). `evidence.expires()` gives the end of the credential, or the end of the previous issuer
 key that verified it when that is earlier (`Artifact::end`). `authz::check` ends the checked scope there
 ([Authorize an operation](authorization.md)). It records no user verification, no phishing resistance,
 and no device or hardware binding, because the proof does not show them.

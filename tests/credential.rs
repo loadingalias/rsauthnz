@@ -281,6 +281,7 @@ fn an_issued_credential_round_trips_and_one_changed_claim_byte_refuses() {
             Subject::Agent {
                 agent: id("agent-4"),
                 owner: id("u-17"),
+                revision: 3,
             },
             id("agent"),
             Serial(9),
@@ -409,6 +410,7 @@ fn a_default_credential_is_within_the_declared_bound_and_a_longer_draft_refuses_
     claims.subject = Subject::Agent {
         agent: id(&long),
         owner: id(&long),
+        revision: u64::MAX,
     };
     claims.purpose = id(&long);
     assert_eq!(

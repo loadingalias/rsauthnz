@@ -216,7 +216,9 @@ It needs a signature by the current key and by the new key, so a party with only
 The statement is the canonical CBOR form `["rsauthnz.agent.rotation.1", agent, old, new, generation]`, with the
 SHA-256 digest of each key. Each rotation raises the generation, so a statement of an earlier generation never matches
 again, also after a rotation back to an earlier key. After the commit, the old key cannot rotate, and
-`agents.identity` gives the new key, so a check that reads the identity refuses the old key.
+`agents.identity` gives the new key, so a check that reads the identity refuses the old key. A credential of the old
+key refuses at the check of a request ([Check the request of an agent](authorization.md#check-the-request-of-an-agent)).
+The audit of the rotation names the agent and, as a separate field, its owner.
 
 ## Revoke an agent
 
