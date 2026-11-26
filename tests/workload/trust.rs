@@ -3,6 +3,8 @@
 
 use core::time::Duration;
 
+use rsauthnz::agent::{self, KEY_BYTES};
+use rsauthnz::credential;
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::{Authority, Id};
@@ -13,7 +15,7 @@ use rsauthnz::trust::{Draft, Error, Freshness, Profile, Refresh, Trust};
 use rsauthnz::workload::{self, Credential, Target};
 use rscrypto::auth::SlhDsaSha2_128s;
 
-use super::{Custody, Host, START, at, audience, authority, budget, ceiling, issuance, minutes, ready};
+use super::{Custody, Host, START, at, audience, authority, budget, ceiling, issuance, minutes, ready, runner_id};
 
 /// A snapshot ends 10 minutes after its issue, and a refresh is due after 5 minutes.
 const FRESHNESS: Freshness = Freshness {
@@ -266,4 +268,41 @@ fn a_snapshot_that_an_slh_dsa_root_signs_installs() {
     // A credential of the registration in the snapshot passes the check.
     let build = host.first("i-1");
     admits(&trust, &build, "build-api", at(1)).unwrap();
+}
+
+/// A hosted agent gives the credential of its workload and a proof by the registered key over the agent key, and the
+/// snapshot gives the workload. A proof over another agent key refuses, and so does a credential that a revocation
+/// before the snapshot ended.
+#[test]
+fn a_workload_credential_with_a_proof_over_the_agent_key_gives_its_workload() {
+    let (mut host, root) = (Host::new(ceiling()), Custody::new(20));
+    let build = audience("build-api");
+    let credential = host.first("i-1");
+    let mut trust = verifier(&root);
+    install(&mut trust, &host.snapshot(&root, at(0)), at(0)).unwrap();
+    let agent_key = [7; KEY_BYTES];
+    let challenge = agent::Workload::challenge(&agent_key);
+    let proof = host.runner.prove(credential.as_bytes(), &build, &challenge, at(1));
+    let hosted = |trust: &Trust, key: &[u8; KEY_BYTES], now: Reading| {
+        let view = trust.view(now).unwrap();
+        let profile = view
+            .issuer(&authority())
+            .unwrap()
+            .profile(&build, Limits::default())
+            .unwrap();
+        agent::Workload::credential(&view, &profile, credential.as_bytes(), &proof, key, now)
+    };
+    let workload = hosted(&trust, &agent_key, at(1)).unwrap();
+    assert_eq!(workload.issuer(), authority().to_string());
+    assert_eq!(workload.subject(), runner_id().to_string());
+    assert_eq!(
+        hosted(&trust, &[8; KEY_BYTES], at(1)).err(),
+        Some(agent::Error::Credential(credential::Error::Proof))
+    );
+
+    let record = host.record(&credential);
+    let revoked = host.revoke("rv-0", Target::Credential(credential.serial(), &record), at(1));
+    assert!(matches!(revoked, Outcome::Accepted(_)));
+    install(&mut trust, &host.snapshot(&root, at(5)), at(5)).unwrap();
+    assert_eq!(hosted(&trust, &agent_key, at(6)).err(), Some(agent::Error::Admission));
 }

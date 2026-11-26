@@ -671,6 +671,11 @@ impl Profile {
         })
     }
 
+    /// The limits of each artifact and proof of the profile.
+    pub(crate) const fn limits(&self) -> Limits {
+        self.cose.limits
+    }
+
     /// The profile that also verifies the artifacts of `previous`: the issuer key that the key of the profile replaced.
     /// It verifies them until `until`, the time from which no artifact that `previous` signed is valid. `until` is the
     /// time since the Unix epoch. A check whose reading can be at or after `until` refuses an artifact of `previous`.

@@ -369,3 +369,53 @@ fn an_access_token_has_its_type_and_the_claims_of_rfc_9068() {
         Some(Error::Claims)
     );
 }
+
+/// A JWT-SVID names a workload of the trust domain of its profile in `sub`, with any `iss` or none. A trust domain whose
+/// name starts with the configured name is another trust domain. A SPIFFE bundle marks a key of JWT-SVIDs `jwt-svid`,
+/// and a key marked `x509-svid` does not join.
+#[test]
+fn a_jwt_svid_names_a_workload_of_the_trust_domain_of_its_profile() {
+    const DOMAIN: &str = "spiffe://prod.example";
+    let (_, jwk) = ed25519();
+    let marked = |usage: &str| {
+        let key = jwk.replacen('{', &format!(r#"{{"use":"{usage}","#), 1);
+        format!(r#"{{"keys":[{key}],"spiffe_sequence":7,"spiffe_refresh_hint":300}}"#)
+    };
+    let svids = |set: &str| {
+        Profile::new(Algorithm::Ed25519, Kind::Svid, DOMAIN, AUDIENCE, Limits::default())?.with_key_set(set.as_bytes())
+    };
+    let bundle = svids(&marked("jwt-svid")).expect("a profile");
+    let token = |typ: Option<&str>, sub: &str| jwt(typ, &format!(r#"{{"sub":"{sub}","aud":"{AUDIENCE}","exp":1000}}"#));
+    let svid = |typ: Option<&str>, sub: &str| {
+        bundle
+            .verify_jwt(&token(typ, sub), at(900))
+            .map(|jwt| jwt.claims().sub.clone())
+    };
+    let workload = "spiffe://prod.example/ns/ci/sa/builder";
+    assert_eq!(svid(None, workload), Ok(Some(workload.into())));
+    assert_eq!(svid(Some("JOSE"), workload), Ok(Some(workload.into())));
+    assert_eq!(svid(Some("at+jwt"), workload), Err(Error::Type));
+    let iss = format!(r#"{{"iss":"https://other.example","sub":"{workload}","aud":"{AUDIENCE}","exp":1000}}"#);
+    bundle.verify_jwt(&jwt(None, &iss), at(900)).unwrap();
+    for other in ["spiffe://prod.example.evil/builder", "spiffe://other.example/builder"] {
+        assert_eq!(svid(None, other), Err(Error::Issuer), "{other}");
+    }
+    for malformed in [
+        "spiffe://prod.example",
+        "spiffe://prod.example/",
+        "spiffe://prod.example/ns//builder",
+        "spiffe://prod.example/ns/../builder",
+        "spiffe://Prod.example/builder",
+        "spiffe://prod.example/builder?x=1",
+        "https://prod.example/builder",
+    ] {
+        assert_eq!(svid(None, malformed), Err(Error::Claims), "{malformed}");
+    }
+
+    let x509 = svids(&marked("x509-svid")).expect("a profile");
+    assert_eq!(x509.verify(&token(None, workload)).err(), Some(Error::Key));
+    for issuer in ["spiffe://prod.example/builder", "https://prod.example", "spiffe://"] {
+        let profile = Profile::new(Algorithm::Ed25519, Kind::Svid, issuer, AUDIENCE, Limits::default());
+        assert_eq!(profile.err(), Some(Error::Issuer), "{issuer}");
+    }
+}

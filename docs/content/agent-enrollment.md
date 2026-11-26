@@ -24,6 +24,10 @@ A local agent can give a loopback address, such as `http://127.0.0.1:49152/agent
 the human goes to that address with a one-use redirect code, and the agent finishes only with that code. A human who
 approves the request of a remote agent by mistake then binds no key: the remote agent never gets the redirect code.
 
+A hosted agent can give the identity of its workload in its request, in place of a pasted secret: a SPIFFE JWT-SVID,
+a cloud identity token, or a workload credential of rsauthnz. The request keeps the verified workload, and the approval
+page shows it. The workload names no owner: the human still approves, and the owner comes only from the approval.
+
 An agent identity is not an authority anchor. A restore ends each pending request, and a restore from a snapshot
 before an enrollment loses the identity. The agent then enrolls again.
 
@@ -46,7 +50,7 @@ before an enrollment loses the identity. The agent then enrolls again.
    ```
 
    The route reads the body with `rsauthnz_http::machine_json(&request, agent::BODY_BYTES_MAX)` and
-   `agent::Enrollment::parse(body)`. It calls `agents.enroll(&enrollment.key, &enrollment.name, None, now, random)`,
+   `agent::Enrollment::parse(body)`. It calls `agents.enroll(&enrollment.key, &enrollment.name, None, None, now, random)`,
    and commits the proposal with its plan. The name has 1 to `NAME_BYTES_MAX` (64) bytes and no control character.
 2. The artifact of the accepted commit is the 32 bytes of the device code: `DeviceCode::from_bytes(bytes)`. The route
    answers with `rsauthnz_http::json(started.json(&device, "https://app.example/agent"))`:
@@ -83,8 +87,8 @@ before an enrollment loses the identity. The agent then enrolls again.
    - `Status::Approved(proposal, plan)`: commit it. Then read the identity with `agents.identity(store, &agent)`, and
      answer with `rsauthnz_http::json(identity.json())`: `{"agent":"acme:…","owner":"acme:alice"}`.
 
-`agents.identity(store, &agent)` gives the current `Identity`: `agent`, `owner`, `key`, `name`, `created`, and the
-`version` of its record. Each check of a request of the agent reads it, so a key that no enrollment bound refuses.
+`agents.identity(store, &agent)` gives the current `Identity`: `agent`, `owner`, `key`, `name`, `workload`, `created`,
+and the `version` of its record. Each check of a request of the agent reads it, so a key that no enrollment bound refuses.
 
 ## Enroll a local agent with a loopback address
 
@@ -109,6 +113,76 @@ A loopback address is `http://127.0.0.1:<port>/<path>` or `http://[::1]:<port>/<
 `LOOPBACK_BYTES_MAX` (128) bytes. The path has only letters, digits, `-`, `.`, `_`, `~`, and `/`, so it has no query
 and no fragment. The name `localhost` refuses, because a resolver can give another address. The redirect code alone
 admits nothing: the finish also needs the device code.
+
+## Bootstrap a hosted agent from its workload
+
+A hosted agent, such as a job in a cluster, proves the identity of its workload in its request. The human approves as
+in [Enroll with the user code](#enroll-with-the-user-code), and sees the verified workload on the approval page.
+
+### Configure a platform
+
+A `Platform` is an outside issuer of workload identity tokens that the host trusts: its fetched key set, and the
+binding of its tokens to the agent key.
+
+1. Build the profile of the issuer with `jose::Profile::new(algorithm, kind, issuer, audience, limits)`:
+   - For a SPIFFE trust domain, `kind` is `jose::Kind::Svid`, and `issuer` is the SPIFFE ID of the trust domain, such
+     as `spiffe://prod.example`. `algorithm` is the algorithm of the keys of its JWT bundle, such as `Algorithm::Es256`.
+   - For a cloud identity token, `kind` is `jose::Kind::Jwt`, and `issuer` is the `iss` of its tokens.
+   - `audience` names the enrollment of this authority, such as `https://app.example/agent`.
+2. Build `trust::KeySet::new(profile, freshness)`, and refresh it with the key set of the issuer
+   ([Refresh the key set of an outside issuer](trust-snapshots.md#refresh-the-key-set-of-an-outside-issuer)).
+3. Select the binding:
+   - `Binding::Key`: the audience of a token is the audience of the platform, `#`, and the base64url of the SHA-256
+     digest of the agent key. A stolen token then labels only the key that it names. Use it when the platform gives a
+     token for an audience that the caller names, as SPIRE, the metadata server of Google Cloud, and GitHub Actions do.
+   - `Binding::Bearer`: the audience of a token is the audience of the platform. A stolen token labels each key until
+     the token ends. Use it only for a platform that fixes the audience, such as a managed identity of Azure or a
+     projected service account token of Kubernetes.
+4. Make the platform: `Platform { keys, binding }`. A host with more than one platform selects the platform of a
+   request itself, for example by the route of the request.
+
+### Request with a token
+
+1. The agent stores its key in custody. It asks its platform for a token with the audience
+   `binding.audience(audience, &key)`, then sends the token in the enrollment body:
+
+   ```json
+   {"name":"builder","key":"<base64url of the 1,984-byte public key>","token":"<the compact JWT>"}
+   ```
+
+2. `Enrollment::parse(body)` gives `enrollment.bootstrap` as `Some(Bootstrap::Token(token))`. The route calls
+   `platform.verify(&token, &enrollment.key, now)`, which gives the `Workload`. Then it calls
+   `agents.enroll(&enrollment.key, &enrollment.name, None, Some(&workload), now, random)`, and continues with step 2
+   of [Enroll with the user code](#enroll-with-the-user-code).
+3. The approval page shows `request.workload` with the name and the fingerprint: `workload.issuer()` and
+   `workload.subject()`, as text.
+
+`platform.verify` checks the token with the fresh key set, for the audience of the binding. The workload is the issuer
+of the profile and the `sub` of the token. For a JWT-SVID, `sub` is a SPIFFE ID with a path in the trust domain, and
+`iss` is not read. Each other claim gives nothing, also a claim that names a person, such as `email` or `owner`.
+
+### Request with a workload credential
+
+A workload with a workload credential of rsauthnz ([Issue and manage workload credentials](workload.md)) gives the credential and
+a proof by its registered key.
+
+1. The credential has the audience of this authority. The workload signs a proof with its registered key:
+   `credential::ProofDraft::new(&registered, credential, &audience, &Workload::challenge(&key), now)`. The challenge
+   binds the SHA-256 digest of the agent key, so the proof starts the enrollment of that key only.
+2. The agent sends the base64url of both:
+
+   ```json
+   {"name":"builder","key":"<base64url>","credential":"<base64url>","proof":"<base64url>"}
+   ```
+
+3. `enrollment.bootstrap` is `Some(Bootstrap::Credential { credential, proof })`. The route takes the fresh `View` of
+   a trust snapshot ([Verify with a snapshot](trust-snapshots.md#verify-with-a-snapshot)) and the profile
+   `view.issuer(&issuer)` with `issuer.profile(&audience, limits)`. It calls
+   `Workload::credential(&view, &profile, &credential, &proof, &enrollment.key, now)` for the `Workload`, and enrolls
+   as in [Request with a token](#request-with-a-token).
+
+`Workload::credential` refuses a credential that a rotation, a recovery, or a revocation in the snapshot ended. The
+workload is the authority of the credential and its workload identifier.
 
 ## The routes of the agent
 
@@ -135,13 +209,17 @@ The JSON readers ignore each member that they do not name. A member such as `"ow
 | Operation | Side | Result |
 | --- | --- | --- |
 | `Agents::new(authority, limits)` | Server | The enrollment of agents under one authority |
-| `agents.enroll(&key, name, loopback, now, random)` | Server | `(Proposal, Plan, Started)`. `started.code` and `started.agent` at once. The receipt gives the 32 bytes of the `DeviceCode` |
-| `agents.request(store, &access, &code, now, random)` | Server | `(Proposal, Plan, Checked<Request>)`. The `Request` has `name`, `fingerprint`, `loopback`, `created`, `ends`, and `approved` |
+| `agents.enroll(&key, name, loopback, workload, now, random)` | Server | `(Proposal, Plan, Started)`. `started.code` and `started.agent` at once. The receipt gives the 32 bytes of the `DeviceCode` |
+| `agents.request(store, &access, &code, now, random)` | Server | `(Proposal, Plan, Checked<Request>)`. The `Request` has `name`, `fingerprint`, `loopback`, `workload`, `created`, `ends`, and `approved` |
 | `agents.approve(store, &fresh, &code, now, random)` | Server | `(Proposal, Plan, Checked<Option<Loopback>>)`. For a loopback request, the receipt gives the 32 bytes of the `RedirectCode` |
 | `checked.release(&outcome)` | Server | The answer of a right code from the accepted commit of its check, also after a lookup. `None` for a wrong code and each other outcome |
 | `agents.finish(store, &code, &device, redirect, now, operation)` | Server | `Status::Waiting`, or `Status::Approved(proposal, plan)` |
 | `agents.identity(store, &agent)` | Server | The current `Identity` of the agent |
-| `Enrollment::parse(json)`, `Finish::parse(json)` | Server | The bodies of the agent |
+| `Enrollment::parse(json)`, `Finish::parse(json)` | Server | The bodies of the agent. `enrollment.bootstrap` holds the workload identity of a hosted agent. `Debug` shows no token |
+| `Platform { keys, binding }`, `platform.verify(&token, &key, now)` | Server | The `Workload` of a token of a configured platform |
+| `Workload::credential(&view, &profile, &credential, &proof, &key, now)` | Server | The `Workload` of a workload credential of rsauthnz |
+| `binding.audience(audience, &key)`, `Workload::challenge(&key)` | Agent | The audience of a token, and the challenge of a proof, for the agent key |
+| `workload.issuer()`, `workload.subject()` | Server | The verified workload, for the approval page |
 | `started.json(&device, verification)`, `identity.json()` | Server | The JSON answers to the agent |
 | `UserCode::parse(text)`, `code.text()` | Both | The user code, and its text |
 | `DeviceCode::from_bytes(bytes)`, `RedirectCode::from_bytes(bytes)`, `as_bytes()` | Both | The codes, and their bytes. `Debug` shows no code |
@@ -159,7 +237,7 @@ Each `agent::Error` implements `transition::Recover`, so `?` gives a `rsauthnz_h
 
 | Error | Cause | Recovery |
 | --- | --- | --- |
-| `Error::Malformed` | A body is not of its form, or is longer than `BODY_BYTES_MAX` (4,096 bytes) | Refuse |
+| `Error::Malformed` | A body is not of its form, or is longer than `BODY_BYTES_MAX` (32,768 bytes). A body with a token and a credential, or with a credential and no proof, is not of its form | Refuse |
 | `Error::Name` | The name is empty, longer than 64 bytes, or holds a control character | Give another name |
 | `Error::Loopback` | The text is not a loopback address | Give a loopback address |
 | `Error::Request` | No open request has the codes: it ended, a finish consumed it, a restore ended it, or a recovery of the account of the approval ended the approval | Make a new request |
@@ -171,6 +249,11 @@ Each `agent::Error` implements `transition::Recover`, so `?` gives a `rsauthnz_h
 | `Error::Record` | A record has no valid form | Restore the store from a snapshot |
 | `Error::Time` | The time reading has no bound, or a time overflows | Use a reading with a bound |
 | `Error::Transition` | The proposal refuses | Follow its recovery |
+| `Error::Trust` | The key set of the platform is missing or stale, or the time reading refuses | Refresh the key set |
+| `Error::Token` | The token refuses: `jose::Error::Issuer` for another issuer or trust domain, `Audience` for another agent key, `Expired` past its end, or another `jose::Error` | The agent gets a new token |
+| `Error::Credential` | The workload credential or its proof refuses | Refuse |
+| `Error::Admission` | The trust snapshot does not admit the credential: it has no registration of the workload, or a rotation, a recovery, or a revocation ended the credential | The workload gets a new credential |
+| `Error::Workload` | The issuer or the subject is longer than `WORKLOAD_BYTES_MAX` (2,048 bytes), or holds a control character | Refuse |
 
 ## Limits
 
@@ -192,6 +275,10 @@ Each `agent::Error` implements `transition::Recover`, so `?` gives a `rsauthnz_h
   key of a remote agent.
 - The redirect code is in the address of the loopback redirect, as an OAuth authorization code is in RFC 8252. It is
   one-use, it goes only to the loopback interface, and it admits nothing without the device code.
+- A workload token is a bearer secret until it ends. Do not log the enrollment body. With `Binding::Bearer`, a stolen
+  token labels each key, so the approval page can show a true workload with the key of another party. The human still
+  compares the fingerprint.
+- The host fetches each key set from the address that it configures for the issuer, never from an address in a token.
 
 ## Support
 
@@ -200,3 +287,9 @@ passkey tests. They cover the journey with the JSON bodies and answers, the subs
 approvals, the attempt bound, an ended request, the loopback flow, the loopback address rule, a recovery of the owner
 between the approval and the finish, and a restore. No browser
 or example host runs the approval page yet.
+
+The hosted bootstrap runs in the same tests with an ES256 trust domain that the tests sign for, in the form of a SPIFFE
+bundle and of JWT-SVIDs. They cover a token of the configured trust domain, a claim that names an owner, another
+trust domain, another key of the agent, an ended token, a bearer platform, and a missing or stale key set. A workload
+credential with its proof runs with a trust snapshot, also after a revocation. No token of a SPIRE server or of a
+cloud platform ran.

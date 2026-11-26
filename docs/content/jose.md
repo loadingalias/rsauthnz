@@ -44,12 +44,16 @@ An RSA key has a modulus of 2,048 to
 
 ## Verify a token
 
-1. Build the profile with `Profile::new(algorithm, kind, issuer, audience, limits)`. `kind` is `Kind::Jwt`, or
-   `Kind::Access` for a JWT access token. `limits` bound the signature checks of each token.
+1. Build the profile with `Profile::new(algorithm, kind, issuer, audience, limits)`. `kind` is `Kind::Jwt`,
+   `Kind::Access` for a JWT access token, or `Kind::Svid` for a SPIFFE
+   [JWT-SVID](https://github.com/spiffe/spiffe/blob/main/standards/JWT-SVID.md). For `Kind::Svid`, `issuer` is the
+   SPIFFE ID of the trust domain, such as `spiffe://prod.example`, and another issuer refuses with `Error::Issuer`.
+   `limits` bound the signature checks of each token.
 2. Give it keys: `with_key(kid, trusted_key)` for a key that you hold, or `with_key_set(jwks)` for the JWK set
    ([RFC 7517](https://www.rfc-editor.org/rfc/rfc7517)) of the issuer. A key set gives each key whose type fits the
    algorithm. A key whose `alg` names another algorithm, whose `use` is not `sig`, or whose `key_ops` has no `verify`
-   does not join. A key whose `alg`, `use`, or `key_ops` has another form does not join either: `key_ops` is an
+   does not join. For `Kind::Svid`, `use` is `jwt-svid`, as a SPIFFE bundle marks the keys of JWT-SVIDs, and a key
+   marked `x509-svid` does not join. A key whose `alg`, `use`, or `key_ops` has another form does not join either: `key_ops` is an
    array of distinct strings ([RFC 7517, section 4.3](https://www.rfc-editor.org/rfc/rfc7517.html#section-4.3)). The
    other keys of the set still join. A key set is public, so a private member of any key, of any type, refuses the
    set with `Error::Key`. A profile has at most `KEYS_MAX` (16) keys.
@@ -58,11 +62,14 @@ An RSA key has a modulus of 2,048 to
 
 `verify_jwt` checks the claims after the signature:
 
-- `iss` is the issuer of the profile, and `aud`, one string or an array, names its audience.
+- `iss` is the issuer of the profile, and `aud`, one string or an array, names its audience. For `Kind::Svid`, `iss`
+  is not read: `sub` is a SPIFFE ID with a path in the trust domain of the profile. A trust domain whose name starts
+  with the configured name, such as `prod.example.evil`, is another trust domain.
 - `exp` is after the latest time of the reading, and `nbf`, if present, is at or before the earliest time. Each time
   is a whole number of seconds since the Unix epoch.
 - For `Kind::Access`, `typ` is `at+jwt` (also `application/at+jwt`, in any case), and the claims hold `sub`,
   `client_id`, `iat`, and `jti`.
+- For `Kind::Svid`, `typ`, if present, is `JWT` or `JOSE`, in any case.
 
 `jwt.claims()` gives the registered claims: `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `client_id`, and `scope`.
 Read each other claim from `jwt.jws().payload()`.
@@ -110,12 +117,12 @@ Each `jose::Error` is a small `Copy` value with no part of the token. For each o
 | `Header` | The header names a key URL, carries a key, or has `crit` or `b64` |
 | `Key` | No key of the profile fits the header, a key of the set has a private member, or a key of the type of the profile is not valid |
 | `Signature` | The signature does not verify |
-| `Type` | `typ` is not `at+jwt` for `Kind::Access` |
-| `Issuer` | `iss` is not the issuer of the profile |
+| `Type` | `typ` is not `at+jwt` for `Kind::Access`, or not `JWT` or `JOSE` for `Kind::Svid` |
+| `Issuer` | `iss` is not the issuer of the profile, or for `Kind::Svid`, `sub` is in another trust domain |
 | `Audience` | `aud` does not name the audience of the profile |
 | `Expired` | `exp` can be at or before the reading |
 | `NotYet` | `nbf` can be after the reading |
-| `Claims` | A required claim is missing, or a claim has another type |
+| `Claims` | A required claim is missing, or a claim has another type. For `Kind::Svid`, also a `sub` that is not a SPIFFE ID with a path |
 | `Time` | The reading has no bound |
 
 The cost class of `verify` and `verify_jwt` is `Verify`: the header checks, then one signature check. The cost class
@@ -126,4 +133,5 @@ of `with_key_set` is `Verify`, and of `signing_input` and `compact` is `Parse` (
 The JWS cases of RFC 7515 (RS256 and ES256), RFC 8037 (Ed25519), RFC 7520 section 6.3 (PS256), and RFC 9964
 appendix A.1 (ML-DSA-65), and the key set of RFC 7517, pass on this Mac. A composite ML-DSA-65 + Ed25519 token that
 rscrypto signs passes too: no published JOSE case has a composite key yet. rscodec's JSON reader reads each header,
-the claims, and each key set, and its fuzz campaign is not complete.
+the claims, and each key set, and its fuzz campaign is not complete. The JWT-SVID rules pass with an Ed25519 key that
+the tests sign with, in a key set of the SPIFFE bundle form. No token of a SPIRE server ran.

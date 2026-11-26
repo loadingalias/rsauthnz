@@ -7,6 +7,9 @@ for each request. It refuses a credential that a rotation, a recovery, or a revo
 A verifier that reads the store of the authority needs no snapshot: `workload::admits` checks the current
 registration ([Verify a credential at the audience](workload.md#verify-a-credential-at-the-audience)).
 
+A `KeySet` gives the same refresh to the JWK set of an outside issuer, such as a SPIFFE trust domain
+([Refresh the key set of an outside issuer](#refresh-the-key-set-of-an-outside-issuer)).
+
 ## The model
 
 - A **snapshot** is a `COSE_Sign1` with the tag 18. Its payload is the CBOR array `["rsauthnz.trust.snapshot.1",
@@ -74,6 +77,27 @@ the retry time after its start. The core starts no task and does no I/O.
 The install verifies the signature of the root before it reads the payload. Then it checks the authority, the order,
 and the time of the issue, before it makes a trusted key. A refusal keeps the installed snapshot.
 
+## Refresh the key set of an outside issuer
+
+A `KeySet` holds the JWK set of an outside issuer, such as the JWT bundle of a SPIFFE trust domain or the key set of a
+cloud OpenID Connect issuer. [Bootstrap a hosted agent from its workload](agent-enrollment.md#bootstrap-a-hosted-agent-from-its-workload)
+uses it. Its refresh, its one fetch at a time, and its retry are those of a `Trust`. A JWK set has no signature and no
+time of issue, so its age starts at the start of its fetch: the latest time of the reading of `refresh`.
+
+1. Build `KeySet::new(profile, freshness)` with a `jose::Profile` that fixes the algorithm, the kind, the issuer, and
+   the audience of the tokens ([Verify a token](jose.md#verify-a-token)). `freshness` follows the rules of
+   [Choose the times](#choose-the-times), and `KeySet::new` refuses other times with `Error::Freshness`.
+2. Call `keys.refresh(now)`. On `Refresh::Fetch(ticket)`, fetch the set over TLS from the address that you configure
+   for the issuer, never from an address in a token. Give the bytes to `keys.install(ticket, &bytes, now)`, or the
+   failure to `keys.fail(ticket)`.
+3. Call `keys.view(now)`. It gives the profile with the keys of the installed set while the set is fresh.
+
+`install` refuses a set that is not a JWK set within the bounds of `jose::Profile::with_key_set`, or that has no key of
+the algorithm of the profile, with `Error::KeySet`. It refuses a fetch that started `max_age` or more ago with
+`Error::Stale`. A refusal keeps the installed set, and it counts as a failed fetch. `view` refuses with
+`Error::Missing` before the first install, and with `Error::Stale` at or after the end of the set. A key that the
+issuer removes verifies for at most `max_age` plus `uncertainty` after the fetch.
+
 ## Time readings
 
 Each operation takes a time reading with a known bound, at most the declared `uncertainty`. The trust keeps the latest
@@ -101,17 +125,21 @@ Each `trust::Error` is a small `Copy` value with no secret.
 | `Form` | The payload or a record is not its form | Refuse the snapshot |
 | `Limit(limit)` | The snapshot or the store is larger than a bound of the limits | Raise the limits on both sides |
 | `Ticket` | The ticket is not the fetch in flight | Drop the answer of the earlier fetch |
+| `KeySet(error)` | The fetched JWK set is not valid within its bounds, or has no key of the algorithm of its profile | Keep the installed set. Check the address of the issuer |
 
 `view.admits` gives the errors of `workload::admits`: `Unregistered`, `Possession`, and `Revoked`.
 `Draft::read` returns `trust::Failure`: `Refused(error)`, or `Store(error)` for a failed read.
 
 The cost class of `Trust::install` and `Draft::read` is `Verify` ([Admit rsauthnz work](admission.md)). Each makes one
-signature check of the root, and one trusted key for each issuer key. The cost class of `refresh`, `fail`, `view`,
-`view.admits`, and `Profile::new` is `Parse`.
+signature check of the root, and one trusted key for each issuer key. The cost class of `KeySet::install` is `Verify`:
+one trusted key for each key of the algorithm. The cost class of `refresh`, `fail`, `view`, `view.admits`,
+`Profile::new`, and `KeySet::new` is `Parse`.
 
 ## Support
 
 The tests on this Mac (macOS aarch64) cover a composite root and an SLH-DSA-SHA2-128s root on the memory binding. They
 cover an older snapshot after a newer one, another snapshot of the same issue, and the maximum age. They also cover a
 rollback of the time, a replayed old snapshot, a changed signature or payload, and a reading with no bound. Ten
-concurrent refresh requests make one fetch, and a remote verifier sees a revocation after its refresh.
+concurrent refresh requests make one fetch, and a remote verifier sees a revocation after its refresh. The tests of
+agent enrollment cover a key set with no install, a set past its end, and an install that refuses and keeps the
+installed set.

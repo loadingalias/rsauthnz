@@ -1,24 +1,30 @@
 //! The enrollment of an agent that its human owner approves in a browser: the agent asks with its own key, alice
 //! approves with a fresh user verification of her passkey session, and the finish of the agent binds its key to an
-//! agent identity that she owns.
+//! agent identity that she owns. A hosted agent also gives the token of its workload, which names no owner.
+
+use core::time::Duration;
 
 use rsauthnz::account::{FRESH_MAX, Fresh};
 use rsauthnz::agent::{
-    ATTEMPTS_MAX, Agents, Checked, DeviceCode, ENROLLMENT_LIFETIME, Enrollment, Error, Failure, Finish, Identity,
-    KEY_BYTES, Loopback, RedirectCode, Request, Started, Status, UserCode,
+    ATTEMPTS_MAX, Agents, Binding, Bootstrap, Checked, DeviceCode, ENROLLMENT_LIFETIME, Enrollment, Error, Failure,
+    Finish, Identity, KEY_BYTES, Loopback, Platform, RedirectCode, Request, Started, Status, UserCode, Workload,
 };
+use rsauthnz::crypto::Algorithm;
 use rsauthnz::id::{Authority, Id};
+use rsauthnz::jose;
 use rsauthnz::limits::Limits;
 use rsauthnz::recovery::Passkeys;
 use rsauthnz::session::{Access, Check, Revoker};
 use rsauthnz::store::driver::Plan;
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
+use rsauthnz::trust::{self, Freshness, KeySet, Refresh};
 use rsauthnz_conformance::suite::Subject as _;
 use rscodec::base64::Profile::Url;
+use rscrypto::EcdsaP256SecretKey;
 use rscrypto::auth::MlDsa65Ed25519;
 
 use super::authenticator::{Get, Passkey};
-use super::{HANDLE, ORIGIN, RP_ID, Site, alice, at, ready, wrong};
+use super::{HANDLE, ORIGIN, RP_ID, START, Site, alice, at, ready, wrong};
 
 /// The site of alice with her passkey, and the agent enrollment of the site.
 struct World {
@@ -63,10 +69,21 @@ impl World {
 
     /// The request of an agent with the key of `seed` and the name `name` at `seconds`.
     fn request(&mut self, seed: u8, name: &str, loopback: Option<&Loopback>, seconds: u64) -> Agent {
-        let key = key(seed);
+        self.hosted(key(seed), name, loopback, None, seconds)
+    }
+
+    /// The request of an agent with the key `key`, the name `name`, and the verified workload `workload` at `seconds`.
+    fn hosted(
+        &mut self,
+        key: [u8; KEY_BYTES],
+        name: &str,
+        loopback: Option<&Loopback>,
+        workload: Option<&Workload>,
+        seconds: u64,
+    ) -> Agent {
         let (proposal, plan, started) = self
             .agents
-            .enroll(&key, name, loopback, at(seconds), &mut self.site.random)
+            .enroll(&key, name, loopback, workload, at(seconds), &mut self.site.random)
             .expect("a request");
         let device = DeviceCode::from_bytes(self.artifact((proposal, plan)));
         Agent { key, started, device }
@@ -230,7 +247,14 @@ fn the_messages_of_an_agent_name_no_owner_it_chose_and_hold_no_session_of_its_ow
     let enrollment = Enrollment::parse(body.as_bytes()).expect("a body");
     let (proposal, plan, started) = world
         .agents
-        .enroll(&enrollment.key, &enrollment.name, None, at(20), &mut world.site.random)
+        .enroll(
+            &enrollment.key,
+            &enrollment.name,
+            None,
+            None,
+            at(20),
+            &mut world.site.random,
+        )
         .expect("a request");
     let device = DeviceCode::from_bytes(world.artifact((proposal, plan)));
     let answer = started.json(&device, "https://app.example/agent");
@@ -481,4 +505,179 @@ fn a_recovery_of_the_owner_between_the_approval_and_the_finish_ends_the_approval
     assert!(matches!(world.commit((finish, plan)), Outcome::Conflict));
     assert_eq!(world.finish(&agent, None, 27).err(), Some(Error::Request));
     assert_eq!(world.identity(&agent).err(), Some(Error::NotEnrolled));
+}
+
+/// The trust domain of the hosted agents, and the audience of their tokens: the enrollment of the authority.
+const DOMAIN: &str = "spiffe://prod.example";
+const AUDIENCE: &str = "https://app.example/agent";
+
+/// A key set ends 10 minutes after the start of its fetch, and a refresh is due after 5 minutes.
+const FRESHNESS: Freshness = Freshness {
+    max_age: Duration::from_secs(600),
+    uncertainty: Duration::from_secs(1),
+    propagation: Duration::from_secs(660),
+    retry: Duration::from_secs(60),
+};
+
+/// A SPIFFE trust domain of the tests: the ES256 key of its JWT bundle, and the key ID of that key.
+struct Domain {
+    secret: EcdsaP256SecretKey,
+    kid: String,
+}
+
+impl Domain {
+    fn new(seed: u8) -> Self {
+        Self {
+            secret: EcdsaP256SecretKey::from_bytes([seed; 32]).expect("a scalar"),
+            kid: format!("jwt-{seed}"),
+        }
+    }
+
+    /// The JWT bundle of the trust domain, as its bundle endpoint serves it.
+    fn bundle(&self) -> String {
+        let point = self.secret.public_key().to_sec1_bytes();
+        let (x, y) = (base64url(&point[1..33]), base64url(&point[33..]));
+        format!(
+            r#"{{"keys":[{{"use":"jwt-svid","kty":"EC","crv":"P-256","kid":"{}","x":"{x}","y":"{y}"}}],"spiffe_sequence":1}}"#,
+            self.kid
+        )
+    }
+
+    /// The JWT-SVID of `sub` for the audience `aud`, which ends `ends` seconds past [`START`], with the claims `more`.
+    fn svid(&self, sub: &str, aud: &str, ends: u64, more: &str) -> String {
+        let exp = START.as_secs() + ends;
+        let claims = format!(r#"{{"sub":"{sub}","aud":["{aud}"],"exp":{exp}{more}}}"#);
+        let input = jose::signing_input(Algorithm::Es256, Some(&self.kid), Some("JWT"), claims.as_bytes())
+            .expect("a signing input");
+        let signature = self.secret.try_sign(input.as_bytes()).expect("a signature");
+        jose::compact(&input, &signature.to_bytes())
+    }
+}
+
+/// The key set of the trust domain [`DOMAIN`], with no set.
+fn keys() -> KeySet {
+    let profile =
+        jose::Profile::new(Algorithm::Es256, jose::Kind::Svid, DOMAIN, AUDIENCE, Limits::default()).expect("a profile");
+    KeySet::new(profile, FRESHNESS).expect("a key set")
+}
+
+/// Installs `bundle` in `keys` at `seconds`, through the one fetch that the refresh gives.
+fn install(keys: &mut KeySet, bundle: &str, seconds: u64) -> Result<(), trust::Error> {
+    let Refresh::Fetch(ticket) = keys.refresh(at(seconds)).expect("a refresh") else {
+        panic!("a refresh is due");
+    };
+    keys.install(ticket, bundle.as_bytes(), at(seconds))
+}
+
+/// The platform of [`DOMAIN`] with `binding`, whose key set the fetch at 0 installs from the bundle of `domain`.
+fn platform(domain: &Domain, binding: Binding) -> Platform {
+    let mut keys = keys();
+    install(&mut keys, &domain.bundle(), 0).expect("an install");
+    Platform { keys, binding }
+}
+
+/// A hosted agent gives a JWT-SVID of the configured trust domain for its own key. The request shows the workload to
+/// alice, and its identity keeps it. A claim that names a person gives no owner: the request waits for an approval, and
+/// the owner is the human of the approval.
+#[test]
+fn a_jwt_svid_of_the_configured_trust_domain_starts_an_enrollment_that_alice_approves() {
+    let mut world = World::new();
+    let domain = Domain::new(5);
+    let platform = platform(&domain, Binding::Key);
+    let (agent_key, workload) = (key(2), "spiffe://prod.example/ns/ci/sa/builder");
+    let aud = Binding::Key.audience(AUDIENCE, &agent_key);
+    let owner = r#","email":"mallory@example.com","owner":"acme:mallory""#;
+    let token = domain.svid(workload, &aud, 300, owner);
+    let body = format!(
+        r#"{{"name":"builder","key":"{}","token":"{token}"}}"#,
+        base64url(&agent_key)
+    );
+    let enrollment = Enrollment::parse(body.as_bytes()).expect("a body");
+    let Some(Bootstrap::Token(token)) = &enrollment.bootstrap else {
+        panic!("the body has a token");
+    };
+    assert!(!format!("{enrollment:?}").contains(token.as_str()));
+    let verified = platform.verify(token, &enrollment.key, at(20)).expect("a workload");
+    assert_eq!((verified.issuer(), verified.subject()), (DOMAIN, workload));
+
+    let agent = world.hosted(*enrollment.key, &enrollment.name, None, Some(&verified), 20);
+    assert!(matches!(world.finish(&agent, None, 21), Ok(Status::Waiting)));
+    let (access, fresh) = world.session();
+    let shown = world.show(&access, &agent.started.code, 21).expect("a request");
+    assert_eq!(shown.expect("the code is right").workload.as_ref(), Some(&verified));
+    assert!(matches!(world.approve(&agent, &fresh, 22), Outcome::Accepted(_)));
+    assert!(matches!(world.enroll(&agent, None, 23), Outcome::Accepted(_)));
+    let identity = world.identity(&agent).expect("the identity");
+    assert_eq!(identity.owner, alice());
+    assert_eq!(identity.workload, Some(verified));
+}
+
+/// A token of another trust domain refuses: one signed by another bundle key, and one that a key of the configured
+/// bundle signs for a workload of another trust domain. A token past its end refuses, and so does a token for another
+/// agent key. A bearer platform takes its fixed audience for each key.
+#[test]
+fn a_token_of_another_trust_domain_for_another_key_or_past_its_end_refuses() {
+    let domain = Domain::new(5);
+    let platform = platform(&domain, Binding::Key);
+    let (agent_key, workload) = (key(2), "spiffe://prod.example/ns/ci/sa/builder");
+    let aud = Binding::Key.audience(AUDIENCE, &agent_key);
+    let verify = |token: &str, key: &[u8; KEY_BYTES], seconds: u64| platform.verify(token, key, at(seconds)).err();
+    assert_eq!(verify(&domain.svid(workload, &aud, 300, ""), &agent_key, 20), None);
+
+    let other = Domain::new(6).svid("spiffe://other.example/ns/ci/sa/builder", &aud, 300, "");
+    assert_eq!(verify(&other, &agent_key, 20), Some(Error::Token(jose::Error::Key)));
+    let crossed = domain.svid("spiffe://other.example/ns/ci/sa/builder", &aud, 300, "");
+    assert_eq!(
+        verify(&crossed, &agent_key, 20),
+        Some(Error::Token(jose::Error::Issuer))
+    );
+    let ended = domain.svid(workload, &aud, 30, "");
+    assert_eq!(verify(&ended, &agent_key, 40), Some(Error::Token(jose::Error::Expired)));
+    let stolen = domain.svid(workload, &aud, 300, "");
+    assert_eq!(verify(&stolen, &key(3), 20), Some(Error::Token(jose::Error::Audience)));
+
+    let bearer = self::platform(&domain, Binding::Bearer);
+    let fixed = domain.svid(workload, AUDIENCE, 300, "");
+    for agent_key in [key(2), key(3)] {
+        bearer.verify(&fixed, &agent_key, at(20)).unwrap();
+    }
+    assert_eq!(
+        bearer.verify(&stolen, &agent_key, at(20)).err(),
+        Some(Error::Token(jose::Error::Audience))
+    );
+}
+
+/// A platform with no installed key set refuses, and so does one whose set passed its maximum age. A refresh that gives
+/// no valid set, or no key of the algorithm, keeps the installed set until its end.
+#[test]
+fn a_missing_or_stale_key_set_refuses() {
+    let domain = Domain::new(5);
+    let (agent_key, workload) = (key(2), "spiffe://prod.example/ns/ci/sa/builder");
+    let token = domain.svid(workload, &Binding::Key.audience(AUDIENCE, &agent_key), 900, "");
+    let empty = Platform {
+        keys: keys(),
+        binding: Binding::Key,
+    };
+    assert_eq!(
+        empty.verify(&token, &agent_key, at(20)).err(),
+        Some(Error::Trust(trust::Error::Missing))
+    );
+
+    let mut platform = platform(&domain, Binding::Key);
+    let x509 = domain.bundle().replace("jwt-svid", "x509-svid");
+    assert_eq!(
+        install(&mut platform.keys, "{\"keys\":", 300),
+        Err(trust::Error::KeySet(jose::Error::Malformed))
+    );
+    assert_eq!(platform.keys.refresh(at(330)), Ok(Refresh::Pending));
+    assert_eq!(
+        install(&mut platform.keys, &x509, 360),
+        Err(trust::Error::KeySet(jose::Error::Key))
+    );
+    // The fetch started at the latest time of its reading, 1, so the set ends at 601. A reading at 600 can be at 601.
+    platform.verify(&token, &agent_key, at(599)).unwrap();
+    assert_eq!(
+        platform.verify(&token, &agent_key, at(600)).err(),
+        Some(Error::Trust(trust::Error::Stale))
+    );
 }

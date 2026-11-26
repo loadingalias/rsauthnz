@@ -24,6 +24,11 @@
 //! human that approved. So a human who approves the request of a remote agent by mistake binds no key: the remote
 //! agent never gets the redirect code.
 //!
+//! A hosted agent can ask with the identity of its workload in place of a pasted secret: a JWT workload identity token
+//! of a configured [`Platform`], such as a JWT-SVID, or a workload credential of this library ([`Workload`]). The
+//! request keeps the verified workload, and the approval page shows it. The workload names no owner: the human still
+//! approves, and the owner comes only from the approval.
+//!
 //! An agent identity is not an authority anchor. A restore ends each pending request, and a restore from a snapshot
 //! before an enrollment loses the identity: the agent enrolls again. [`Agents::identity`] gives the current identity of
 //! an agent, with its owner and its key.
@@ -51,6 +56,11 @@ use crate::time::{Reading, TimeError};
 use crate::transition::{
     self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal, Recover, Recovery,
 };
+use crate::{credential, jose, trust};
+
+mod hosted;
+
+pub use hosted::{Binding, Bootstrap, Platform, WORKLOAD_BYTES_MAX, Workload};
 
 /// The lifetime of an enrollment request: 10 minutes. An approval gives the agent the same time again to finish.
 pub const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(10 * 60);
@@ -70,14 +80,16 @@ pub const ATTEMPTS_MAX: u64 = 5;
 /// The bytes of the public key of an agent: a composite ML-DSA-65 + Ed25519 key.
 pub const KEY_BYTES: usize = 1984;
 
-/// The most bytes of a JSON body of an agent: the base64url of its key is 2,646 bytes.
+/// The most bytes of a JSON body of an agent. The base64url of its key is 2,646 bytes, of a workload credential and of
+/// its proof at most 10,923 bytes each, and a token has at most [`jose::TOKEN_BYTES_MAX`] bytes.
 pub const BODY_BYTES_MAX: usize = BODY.input_bytes_max as usize;
 
 /// The limits of a JSON body of an agent.
 const BODY: json::Limits = json::Limits {
-    input_bytes_max: 4096,
+    input_bytes_max: 32 * 1024,
     depth_max: 1,
-    string_bytes_max: 2_700,
+    // A token has at most `jose::TOKEN_BYTES_MAX` bytes.
+    string_bytes_max: 16 * 1024,
     members_max: 8,
     elements_max: 0,
     number_digits_max: 0,
@@ -87,8 +99,8 @@ const BODY: json::Limits = json::Limits {
 const SLOTS: usize = 1 + 8;
 
 /// The first item of each CBOR form of this module. The number changes with the form.
-const REQUEST_FORM: &str = "rsauthnz.agent.enrollment.1";
-const AGENT_FORM: &str = "rsauthnz.agent.1";
+const REQUEST_FORM: &str = "rsauthnz.agent.enrollment.2";
+const AGENT_FORM: &str = "rsauthnz.agent.2";
 
 /// The actions of the audit records.
 const REQUEST: &str = "agent.request";
@@ -320,9 +332,11 @@ impl Started {
     }
 }
 
-/// The JSON body of an enrollment request of an agent: `{"name","key","loopback"}`, with the base64url of the key and
-/// an optional loopback address. The reader ignores each other member, so a member that names an owner names none.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The JSON body of an enrollment request of an agent: `{"name","key","loopback","token","credential","proof"}`, with
+/// the base64url of the key, an optional loopback address, and for a hosted agent either a token, or the base64url of a
+/// workload credential and of its proof. The reader ignores each other member, so a member that names an owner names
+/// none.
+#[derive(Debug)]
 pub struct Enrollment {
     /// The public key of the agent.
     pub key: Box<[u8; KEY_BYTES]>,
@@ -330,6 +344,8 @@ pub struct Enrollment {
     pub name: String,
     /// The loopback address of a local agent.
     pub loopback: Option<Loopback>,
+    /// The workload identity of a hosted agent, which the host checks before [`Agents::enroll`].
+    pub bootstrap: Option<Bootstrap>,
 }
 
 impl Enrollment {
@@ -340,14 +356,26 @@ impl Enrollment {
     /// # Errors
     ///
     /// [`Error::Malformed`] if `json` is not a JSON object with a name and a key of [`KEY_BYTES`] bytes, or is longer
-    /// than its bound. [`Error::Loopback`] if the loopback address is not valid.
+    /// than its bound, or has a token with a credential or a proof, or a credential with no proof or a proof with no
+    /// credential. [`Error::Loopback`] if the loopback address is not valid.
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
-        let [name, key, loopback] = members(json, ["name", "key", "loopback"])?;
+        let [name, key, loopback, token, credential, proof] =
+            members(json, ["name", "key", "loopback", "token", "credential", "proof"])?;
         let key = base64url(&key.ok_or(Error::Malformed)?)?;
+        let bootstrap = match (token, credential, proof) {
+            (None, None, None) => None,
+            (Some(token), None, None) => Some(Bootstrap::Token(token)),
+            (None, Some(credential), Some(proof)) => Some(Bootstrap::Credential {
+                credential: base64url(&credential)?,
+                proof: base64url(&proof)?,
+            }),
+            _ => return Err(Error::Malformed),
+        };
         Ok(Self {
             key: Box::new(key.as_slice().try_into().map_err(|_| Error::Malformed)?),
             name: name.ok_or(Error::Malformed)?,
             loopback: loopback.as_deref().map(Loopback::parse).transpose()?,
+            bootstrap,
         })
     }
 }
@@ -429,6 +457,8 @@ pub struct Request {
     pub fingerprint: [u8; 32],
     /// The loopback address of a local agent, or `None` for an agent that finishes with its device code alone.
     pub loopback: Option<Loopback>,
+    /// The verified workload of a hosted agent, or `None` for an agent that gave none. Show it as text.
+    pub workload: Option<Workload>,
     /// The time of the request, as the time since the Unix epoch.
     pub created: Duration,
     /// The end of the request, as the time since the Unix epoch.
@@ -496,6 +526,8 @@ pub struct Identity {
     pub key: Box<[u8; KEY_BYTES]>,
     /// The name that the agent gave at its request.
     pub name: String,
+    /// The verified workload of the request of a hosted agent, or `None`.
+    pub workload: Option<Workload>,
     /// The time of the finish, as the time since the Unix epoch.
     pub created: Duration,
     /// The version of the identity record. A rotation or a revocation of the agent writes a new one.
@@ -522,11 +554,11 @@ impl Identity {
     }
 }
 
-/// An enrollment request record: `["rsauthnz.agent.enrollment.1", check, device, agent, key, name, created, loopback,
-/// attempts, approved]`. `check` is the last 4 letters of the user code, `device` the SHA-256 digest of the device
-/// code, `created` the time of the request in whole seconds, `loopback` the loopback address or null, `attempts` the
-/// number of wrong checks, and `approved` the account, its revision, and the digest of the redirect code (or null), or
-/// null.
+/// An enrollment request record: `["rsauthnz.agent.enrollment.2", check, device, agent, key, name, created, loopback,
+/// attempts, approved, workload]`. `check` is the last 4 letters of the user code, `device` the SHA-256 digest of the
+/// device code, `created` the time of the request in whole seconds, `loopback` the loopback address or null,
+/// `attempts` the number of wrong checks, `approved` the account, its revision, and the digest of the redirect code
+/// (or null), or null, and `workload` its issuer and its subject, or null.
 struct Pending {
     check: [u8; 4],
     device: [u8; 32],
@@ -537,6 +569,7 @@ struct Pending {
     loopback: Option<Loopback>,
     attempts: u64,
     approved: Option<(Id<Human>, Epoch, Option<[u8; 32]>)>,
+    workload: Option<Workload>,
 }
 
 impl Pending {
@@ -562,6 +595,7 @@ impl Pending {
                 .map_or(Value::Null, |loopback| Value::Text(loopback.as_str())),
             Value::Unsigned(self.attempts),
             approved,
+            workload_form(self.workload.as_ref()),
         ])
         .into_boxed_slice()
     }
@@ -583,6 +617,7 @@ impl Pending {
             loopback,
             Value::Unsigned(attempts),
             approved,
+            workload,
         ] = items.as_slice()
         else {
             return None;
@@ -617,7 +652,27 @@ impl Pending {
             loopback,
             attempts: *attempts,
             approved,
+            workload: workload_parse(workload)?,
         })
+    }
+}
+
+/// The form of the workload `workload` of a record: `[issuer, subject]`, or null.
+fn workload_form(workload: Option<&Workload>) -> Value<'_> {
+    workload.map_or(Value::Null, |workload| {
+        Value::Array(vec![Value::Text(workload.issuer()), Value::Text(workload.subject())])
+    })
+}
+
+/// The workload of the form `value` of a record, or `None` in it for null. `None` for another form.
+fn workload_parse(value: &Value<'_>) -> Option<Option<Workload>> {
+    match value {
+        Value::Null => Some(None),
+        Value::Array(items) => match items.as_slice() {
+            [Value::Text(issuer), Value::Text(subject)] => Workload::new(issuer, subject).ok().map(Some),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -630,8 +685,9 @@ impl Agents {
         Self { authority, limits }
     }
 
-    /// Proposes an enrollment request of an agent with the public key `key` and the name `name`, and for a local agent
-    /// with the address `loopback`. The agent stores the private part of `key` in custody before the request. The
+    /// Proposes an enrollment request of an agent with the public key `key` and the name `name`, for a local agent with
+    /// the address `loopback`, and for a hosted agent with its verified workload `workload`, which the request keeps
+    /// for the approval page. The agent stores the private part of `key` in custody before the request. The
     /// commit writes the request, which ends after [`ENROLLMENT_LIFETIME`]. Give the agent the [`Started`] value at
     /// once, and the device code from the artifact of the accepted commit: [`DeviceCode::from_bytes`]. A request
     /// authenticates no caller, so its audit names the agent, and no field names an owner. The operation identity is
@@ -649,6 +705,7 @@ impl Agents {
         key: &[u8; KEY_BYTES],
         name: &str,
         loopback: Option<&Loopback>,
+        workload: Option<&Workload>,
         now: Reading,
         random: &mut ChaCha20Rng,
     ) -> Result<(Proposal, Plan, Started), Error> {
@@ -678,6 +735,7 @@ impl Agents {
             loopback: loopback.cloned(),
             attempts: 0,
             approved: None,
+            workload: workload.cloned(),
         };
         let actor = Principal::Agent(agent.clone());
         let mut proposal = self.proposal(
@@ -732,6 +790,7 @@ impl Agents {
             fingerprint: crypto::sha256(&*pending.key),
             name: pending.name.clone(),
             loopback: pending.loopback.clone(),
+            workload: pending.workload.clone(),
             created: Duration::from_secs(pending.created),
             ends,
             approved: pending.approved.is_some(),
@@ -865,6 +924,7 @@ impl Agents {
             Value::Bytes(&*pending.key),
             Value::Text(&pending.name),
             Value::Unsigned(now.estimate().as_secs()),
+            workload_form(pending.workload.as_ref()),
         ]);
         proposal
             .change(Change::Write {
@@ -898,6 +958,7 @@ impl Agents {
             Value::Bytes(key),
             Value::Text(name),
             Value::Unsigned(created),
+            workload,
         ] = items.as_slice()
         else {
             return Err(Failure::Refused(Error::Record));
@@ -907,6 +968,7 @@ impl Agents {
             owner: Id::from_cbor(owner).map_err(|_| Error::Record)?,
             key: Box::new((*key).try_into().map_err(|_| Error::Record)?),
             name: (*name).into(),
+            workload: workload_parse(workload).ok_or(Error::Record)?,
             created: Duration::from_secs(*created),
             version: record.version,
         })
@@ -983,7 +1045,7 @@ impl Agents {
     }
 
     /// The key of the request of `code`: [`Kind::AgentEnrollment`] with the SHA-256 digest of the canonical CBOR form
-    /// `["rsauthnz.agent.enrollment.1", authority, locator]`, where `locator` is the first 4 letters of the code.
+    /// `["rsauthnz.agent.enrollment.2", authority, locator]`, where `locator` is the first 4 letters of the code.
     fn request_key(&self, code: &UserCode) -> Key {
         let digest = crypto::sha256(&encode(&[
             Value::Text(REQUEST_FORM),
@@ -994,7 +1056,7 @@ impl Agents {
     }
 
     /// The key of the identity record of `agent`: [`Kind::Agent`] with the SHA-256 digest of the canonical CBOR form
-    /// `["rsauthnz.agent.1", authority, agent]`.
+    /// `["rsauthnz.agent.2", authority, agent]`.
     fn agent_key(&self, agent: &Id<Agent>) -> Key {
         let digest = crypto::sha256(&encode(&[
             Value::Text(AGENT_FORM),
@@ -1087,6 +1149,17 @@ pub enum Error {
     Time(TimeError),
     /// The proposal refuses. The error gives the recovery.
     Transition(transition::Error),
+    /// The key set of the platform is missing or stale, or the reading refuses. Refresh the key set.
+    Trust(trust::Error),
+    /// The workload identity token refuses. The agent gets a new token.
+    Token(jose::Error),
+    /// The workload credential or its proof refuses.
+    Credential(credential::Error),
+    /// The trust snapshot does not admit the workload credential: it has no registration of the workload, or a
+    /// rotation, a recovery, or a revocation ended the credential. The workload gets a new credential.
+    Admission,
+    /// The issuer or the subject of the workload is longer than [`WORKLOAD_BYTES_MAX`] or holds a control character.
+    Workload,
 }
 
 impl Recover for Error {
@@ -1101,7 +1174,12 @@ impl Recover for Error {
             | Self::Redirect
             | Self::NotEnrolled
             | Self::Record
-            | Self::Time(_) => Recovery::Refuse,
+            | Self::Time(_)
+            | Self::Trust(_)
+            | Self::Token(_)
+            | Self::Credential(_)
+            | Self::Admission
+            | Self::Workload => Recovery::Refuse,
         }
     }
 }
@@ -1121,6 +1199,11 @@ impl fmt::Display for Error {
             Self::Record => f.write_str("a record of agent enrollment has no valid form"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),
+            Self::Trust(error) => write!(f, "the key set of the platform refused: {error}"),
+            Self::Token(error) => write!(f, "the workload identity token refused: {error}"),
+            Self::Credential(error) => write!(f, "the workload credential refused: {error}"),
+            Self::Admission => f.write_str("the trust snapshot does not admit the workload credential"),
+            Self::Workload => f.write_str("the issuer or the subject of the workload is not valid"),
         }
     }
 }

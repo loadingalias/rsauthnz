@@ -23,6 +23,9 @@
 //! Each install is monotonic: a snapshot older than the installed one refuses, and so does another snapshot with the
 //! same time of issue. The trust keeps the latest time that it saw, from each reading and from each snapshot, so a
 //! wall-clock rollback of the injected time does not make an ended snapshot serve again.
+//!
+//! A [`KeySet`] holds the JWK set of an outside issuer, such as a SPIFFE trust domain, with the same freshness and the
+//! same refresh. The set has no signature, so its age starts at the start of its fetch.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -38,6 +41,7 @@ use crate::credential::{self, Serial, Subject};
 use crate::crypto;
 use crate::custody::Handle;
 use crate::id::{Authority, Id, Workload};
+use crate::jose;
 use crate::limits::{Limit, Limits, SignatureBudget};
 use crate::store::driver::PAGE;
 use crate::store::{Kind, Record, Store};
@@ -65,6 +69,18 @@ pub struct Freshness {
     pub retry: Duration,
 }
 
+impl Freshness {
+    /// Refuses times that cannot keep their promises.
+    fn check(&self) -> Result<(), Error> {
+        let reach = self.max_age.checked_add(self.uncertainty);
+        let valid = !self.max_age.is_zero()
+            && !self.retry.is_zero()
+            && self.retry <= self.max_age / 2
+            && reach.is_some_and(|reach| reach <= self.propagation);
+        valid.ok_or(Error::Freshness)
+    }
+}
+
 /// The trust of a verifier: the authority of its snapshots, its root, its freshness, and the limits of each snapshot.
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -85,12 +101,7 @@ impl Profile {
     /// [`Error::Freshness`] if the maximum age or the retry time is zero, the retry time is more than half of the
     /// maximum age, or the maximum age plus the uncertainty is past the propagation objective.
     pub fn new(authority: Id<Authority>, root: Handle, freshness: Freshness, limits: Limits) -> Result<Self, Error> {
-        let reach = freshness.max_age.checked_add(freshness.uncertainty);
-        let valid = !freshness.max_age.is_zero()
-            && !freshness.retry.is_zero()
-            && freshness.retry <= freshness.max_age / 2
-            && reach.is_some_and(|reach| reach <= freshness.propagation);
-        valid.ok_or(Error::Freshness)?;
+        freshness.check()?;
         Ok(Self {
             authority,
             root,
@@ -114,28 +125,22 @@ impl Profile {
 pub struct Trust {
     profile: Profile,
     installed: Option<Snapshot>,
-    /// The latest time that the trust saw, in nanoseconds since the Unix epoch: the earliest time of each reading, and
-    /// the issue of each snapshot. It only grows.
-    floor: AtomicU64,
-    /// The fetch in flight, and the time of its start.
-    fetch: Option<(Ticket, Duration)>,
-    /// The start of the last fetch that failed.
-    failed: Option<Duration>,
-    tickets: u64,
+    schedule: Schedule,
 }
 
-/// The identity of one fetch of a snapshot.
+/// The identity of one fetch of a snapshot or a key set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(u64);
 
-/// What the host does after [`Trust::refresh`].
+/// What the host does after [`Trust::refresh`] or [`KeySet::refresh`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Refresh {
     /// Fetch a snapshot, and give its bytes to [`Trust::install`], or its failure to [`Trust::fail`], with the ticket.
+    /// For a key set, the same calls of [`KeySet`].
     Fetch(Ticket),
     /// A fetch is in flight, or the last one failed less than the retry time ago. Fetch nothing.
     Pending,
-    /// The installed snapshot is not due for a refresh.
+    /// The installed snapshot or key set is not due for a refresh.
     Fresh,
 }
 
@@ -145,13 +150,11 @@ impl Trust {
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     #[must_use]
     pub const fn new(profile: Profile) -> Self {
+        let schedule = Schedule::new(profile.freshness);
         Self {
             profile,
             installed: None,
-            floor: AtomicU64::new(0),
-            fetch: None,
-            failed: None,
-            tickets: 0,
+            schedule,
         }
     }
 
@@ -166,24 +169,8 @@ impl Trust {
     /// [`Error::Time`] and [`Error::Uncertain`] for a reading with no bound or a larger bound than the declared
     /// uncertainty.
     pub fn refresh(&mut self, now: Reading) -> Result<Refresh, Error> {
-        let now = self.time(now)?;
-        let retry = self.profile.freshness.retry;
-        let waits = |start: Duration| start.checked_add(retry).is_none_or(|next| now < next);
-        if self.fetch.is_some_and(|(_, start)| waits(start)) || self.failed.is_some_and(waits) {
-            return Ok(Refresh::Pending);
-        }
-        let half = self.profile.freshness.max_age / 2;
-        let due = self
-            .installed
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.issued.checked_add(half).is_none_or(|due| now >= due));
-        if !due {
-            return Ok(Refresh::Fresh);
-        }
-        self.tickets = self.tickets.checked_add(1).ok_or(Error::Time(TimeError::Overflow))?;
-        let ticket = Ticket(self.tickets);
-        self.fetch = Some((ticket, now));
-        Ok(Refresh::Fetch(ticket))
+        let issued = self.installed.as_ref().map(|snapshot| snapshot.issued);
+        self.schedule.refresh(issued, now)
     }
 
     /// Installs the snapshot `bytes` of the fetch `ticket` at `now`. The check verifies the signature of the root
@@ -202,12 +189,9 @@ impl Trust {
     /// [`Error::Future`], and [`Error::Stale`] as above. [`Error::Limit`] for more issuer keys than [`Limits::keys`],
     /// and [`Error::Time`] and [`Error::Uncertain`] for the reading.
     pub fn install(&mut self, ticket: Ticket, bytes: &[u8], now: Reading) -> Result<(), Error> {
-        let (current, start) = self.fetch.ok_or(Error::Ticket)?;
-        (current == ticket).ok_or(Error::Ticket)?;
-        self.fetch = None;
+        let start = self.schedule.take(ticket)?;
         let installed = self.accept(bytes, now);
-        self.failed = installed.is_err().then_some(start);
-        installed
+        self.schedule.settle(start, installed)
     }
 
     /// Ends the fetch `ticket`, which failed. The next fetch waits for the retry time after its start. Another ticket
@@ -215,12 +199,7 @@ impl Trust {
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     pub fn fail(&mut self, ticket: Ticket) {
-        if let Some((current, start)) = self.fetch
-            && current == ticket
-        {
-            self.fetch = None;
-            self.failed = Some(start);
-        }
+        self.schedule.fail(ticket);
     }
 
     /// The installed snapshot at `now`, while it is fresh.
@@ -232,41 +211,16 @@ impl Trust {
     /// [`Error::Missing`] with no snapshot, [`Error::Stale`] at or after the end of the installed one, and
     /// [`Error::Time`] and [`Error::Uncertain`] for the reading.
     pub fn view(&self, now: Reading) -> Result<View<'_>, Error> {
-        let now = self.time(now)?;
+        let now = self.schedule.time(now)?;
         let snapshot = self.installed.as_ref().ok_or(Error::Missing)?;
-        let end = self.end(snapshot.issued)?;
+        let end = self.schedule.end(snapshot.issued)?;
         (now < end).ok_or(Error::Stale)?;
         Ok(View { snapshot, end })
     }
 
-    /// The time of `now` for a check: the latest time that the reading permits, or the latest time that the trust saw
-    /// when that is later. It keeps the earliest time of the reading.
-    fn time(&self, now: Reading) -> Result<Duration, Error> {
-        let bound = now.bound().ok_or(Error::Time(TimeError::UnknownBound))?;
-        (bound <= self.profile.freshness.uncertainty).ok_or(Error::Uncertain)?;
-        let earliest = now.earliest().map_err(Error::Time)?;
-        let latest = now.latest().map_err(Error::Time)?;
-        let floor = self.raise(earliest);
-        Ok(latest.max(floor))
-    }
-
-    /// Raises the latest time that the trust saw to `time`, and gives it. The maximum needs no order with other memory.
-    fn raise(&self, time: Duration) -> Duration {
-        let time = u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
-        let floor = self.floor.fetch_max(time, Ordering::Relaxed).max(time);
-        Duration::from_nanos(floor)
-    }
-
-    /// The end of a snapshot issued at `issued`.
-    fn end(&self, issued: Duration) -> Result<Duration, Error> {
-        issued
-            .checked_add(self.profile.freshness.max_age)
-            .ok_or(Error::Time(TimeError::Overflow))
-    }
-
     /// The checks of [`Self::install`].
     fn accept(&mut self, bytes: &[u8], now: Reading) -> Result<(), Error> {
-        let now = self.time(now)?;
+        let now = self.schedule.time(now)?;
         let Profile {
             authority,
             root,
@@ -305,11 +259,202 @@ impl Trust {
             }
         }
         (issued <= now).ok_or(Error::Future)?;
-        (now < self.end(issued)?).ok_or(Error::Stale)?;
+        (now < self.schedule.end(issued)?).ok_or(Error::Stale)?;
         let snapshot = Snapshot::read(issued, digest, issuers, workloads, *limits)?;
-        self.raise(issued);
+        self.schedule.raise(issued);
         self.installed = Some(snapshot);
         Ok(())
+    }
+}
+
+/// The JWK set of an outside issuer, such as the JWT bundle of a SPIFFE trust domain or the key set of a cloud OpenID
+/// Connect issuer, and the state of its refresh. The host fetches the set from the address that it configures for the
+/// issuer, never from an address in a token, with its own I/O. It shares the set as it shares a [`Trust`].
+///
+/// A JWK set has no signature and no time of issue. So its age starts at the start of its fetch: the latest time of the
+/// reading of [`Self::refresh`]. The set ends after the maximum age of the [`Freshness`]. Thus a key that the issuer
+/// removes verifies for at most the maximum age plus the uncertainty after the fetch. The refresh, the one fetch at a
+/// time, and the retry are those of [`Trust`].
+#[derive(Debug)]
+pub struct KeySet {
+    profile: jose::Profile,
+    /// The profile with the keys of the installed set, and the start of its fetch.
+    installed: Option<(Duration, jose::Profile)>,
+    schedule: Schedule,
+}
+
+impl KeySet {
+    /// The key set of the issuer of `profile`, with no set yet. Each install gives `profile` with the keys of the set
+    /// that fit its algorithm, so the profile fixes the algorithm, the kind, the issuer, and the audience of each token.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Freshness`] for times that cannot keep their promises, as for [`Profile::new`].
+    pub fn new(profile: jose::Profile, freshness: Freshness) -> Result<Self, Error> {
+        freshness.check()?;
+        Ok(Self {
+            profile,
+            installed: None,
+            schedule: Schedule::new(freshness),
+        })
+    }
+
+    /// Whether to fetch the set at `now`, as [`Trust::refresh`] gives it for a snapshot.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Trust::refresh`].
+    pub fn refresh(&mut self, now: Reading) -> Result<Refresh, Error> {
+        let fetched = self.installed.as_ref().map(|(start, _)| *start);
+        self.schedule.refresh(fetched, now)
+    }
+
+    /// Installs the JWK set `bytes` of the fetch `ticket` at `now`. A set past its maximum age refuses: the fetch
+    /// started too long ago. A refusal keeps the installed set, and it counts as a failed fetch.
+    ///
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One trusted key for each key of the algorithm.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ticket`] if `ticket` is not the fetch in flight. [`Error::KeySet`] if the set is not a JWK set within
+    /// the bounds of [`jose::Profile::with_key_set`], or has no key of the algorithm of the profile. [`Error::Stale`] as
+    /// above, and [`Error::Time`] and [`Error::Uncertain`] for the reading.
+    pub fn install(&mut self, ticket: Ticket, bytes: &[u8], now: Reading) -> Result<(), Error> {
+        let start = self.schedule.take(ticket)?;
+        let installed = self.accept(start, bytes, now);
+        self.schedule.settle(start, installed)
+    }
+
+    /// Ends the fetch `ticket`, which failed, as [`Trust::fail`] does.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    pub fn fail(&mut self, ticket: Ticket) {
+        self.schedule.fail(ticket);
+    }
+
+    /// The profile with the keys of the installed set at `now`, while the set is fresh.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Missing`] with no set, [`Error::Stale`] at or after the end of the installed one, and [`Error::Time`]
+    /// and [`Error::Uncertain`] for the reading.
+    pub fn view(&self, now: Reading) -> Result<&jose::Profile, Error> {
+        let now = self.schedule.time(now)?;
+        let (start, profile) = self.installed.as_ref().ok_or(Error::Missing)?;
+        (now < self.schedule.end(*start)?).ok_or(Error::Stale)?;
+        Ok(profile)
+    }
+
+    /// The checks of [`Self::install`] for a fetch that started at `start`.
+    fn accept(&mut self, start: Duration, bytes: &[u8], now: Reading) -> Result<(), Error> {
+        let now = self.schedule.time(now)?;
+        (now < self.schedule.end(start)?).ok_or(Error::Stale)?;
+        let profile = self.profile.clone().with_key_set(bytes).map_err(Error::KeySet)?;
+        profile.has_keys().ok_or(Error::KeySet(jose::Error::Key))?;
+        self.installed = Some((start, profile));
+        Ok(())
+    }
+}
+
+/// The refresh of one fetched source: the latest time that it saw, the fetch in flight, and the last failure.
+#[derive(Debug)]
+struct Schedule {
+    freshness: Freshness,
+    /// The latest time that the source saw, in nanoseconds since the Unix epoch: the earliest time of each reading, and
+    /// the issue of each snapshot. It only grows.
+    floor: AtomicU64,
+    /// The fetch in flight, and the time of its start.
+    fetch: Option<(Ticket, Duration)>,
+    /// The start of the last fetch that failed.
+    failed: Option<Duration>,
+    tickets: u64,
+}
+
+impl Schedule {
+    const fn new(freshness: Freshness) -> Self {
+        Self {
+            freshness,
+            floor: AtomicU64::new(0),
+            fetch: None,
+            failed: None,
+            tickets: 0,
+        }
+    }
+
+    /// Whether to fetch at `now`, for an installed value of the time `issued`, or `None`.
+    fn refresh(&mut self, issued: Option<Duration>, now: Reading) -> Result<Refresh, Error> {
+        let now = self.time(now)?;
+        let retry = self.freshness.retry;
+        let waits = |start: Duration| start.checked_add(retry).is_none_or(|next| now < next);
+        if self.fetch.is_some_and(|(_, start)| waits(start)) || self.failed.is_some_and(waits) {
+            return Ok(Refresh::Pending);
+        }
+        let half = self.freshness.max_age / 2;
+        let due = issued.is_none_or(|issued| issued.checked_add(half).is_none_or(|due| now >= due));
+        if !due {
+            return Ok(Refresh::Fresh);
+        }
+        self.tickets = self.tickets.checked_add(1).ok_or(Error::Time(TimeError::Overflow))?;
+        let ticket = Ticket(self.tickets);
+        self.fetch = Some((ticket, now));
+        Ok(Refresh::Fetch(ticket))
+    }
+
+    /// Ends the fetch `ticket` for its install, and gives the time of its start.
+    fn take(&mut self, ticket: Ticket) -> Result<Duration, Error> {
+        let (current, start) = self.fetch.ok_or(Error::Ticket)?;
+        (current == ticket).ok_or(Error::Ticket)?;
+        self.fetch = None;
+        Ok(start)
+    }
+
+    /// Gives `installed`, the result of the install of the fetch that started at `start`. A refusal counts as a failed
+    /// fetch.
+    fn settle(&mut self, start: Duration, installed: Result<(), Error>) -> Result<(), Error> {
+        self.failed = installed.is_err().then_some(start);
+        installed
+    }
+
+    /// Ends the fetch `ticket`, which failed. Another ticket changes nothing.
+    fn fail(&mut self, ticket: Ticket) {
+        if let Some((current, start)) = self.fetch
+            && current == ticket
+        {
+            self.fetch = None;
+            self.failed = Some(start);
+        }
+    }
+
+    /// The time of `now` for a check: the latest time that the reading permits, or the latest time that the source saw
+    /// when that is later. It keeps the earliest time of the reading.
+    fn time(&self, now: Reading) -> Result<Duration, Error> {
+        let bound = now.bound().ok_or(Error::Time(TimeError::UnknownBound))?;
+        (bound <= self.freshness.uncertainty).ok_or(Error::Uncertain)?;
+        let earliest = now.earliest().map_err(Error::Time)?;
+        let latest = now.latest().map_err(Error::Time)?;
+        let floor = self.raise(earliest);
+        Ok(latest.max(floor))
+    }
+
+    /// Raises the latest time that the source saw to `time`, and gives it. The maximum needs no order with other
+    /// memory.
+    fn raise(&self, time: Duration) -> Duration {
+        let time = u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+        let floor = self.floor.fetch_max(time, Ordering::Relaxed).max(time);
+        Duration::from_nanos(floor)
+    }
+
+    /// The end of a value issued, or fetched, at `issued`.
+    fn end(&self, issued: Duration) -> Result<Duration, Error> {
+        issued
+            .checked_add(self.freshness.max_age)
+            .ok_or(Error::Time(TimeError::Overflow))
     }
 }
 
@@ -657,6 +802,8 @@ pub enum Error {
     Limit(Limit),
     /// The ticket is not the fetch in flight.
     Ticket,
+    /// The fetched JWK set is not valid within its bounds, or has no key of the algorithm of its profile.
+    KeySet(jose::Error),
 }
 
 impl fmt::Display for Error {
@@ -676,6 +823,7 @@ impl fmt::Display for Error {
             Self::Form => f.write_str("the trust snapshot or a record is not its form"),
             Self::Limit(limit) => write!(f, "the trust snapshot is larger than a bound: {limit:?}"),
             Self::Ticket => f.write_str("the ticket is not the fetch in flight"),
+            Self::KeySet(error) => write!(f, "the fetched key set refused: {error}"),
         }
     }
 }

@@ -136,6 +136,39 @@ pub enum Kind {
     Jwt,
     /// A JWT access token of RFC 9068: `typ` is `at+jwt`, and the claims hold `sub`, `client_id`, `iat`, and `jti`.
     Access,
+    /// A [JWT-SVID] of SPIFFE. The issuer of the profile is the SPIFFE ID of a trust domain, such as
+    /// `spiffe://example.org`, and `sub` is the [SPIFFE ID] of a workload in it, with a path. A JWT-SVID can omit
+    /// `iss`, so the check does not read it. `typ`, if present, is `JWT` or `JOSE`.
+    ///
+    /// [JWT-SVID]: https://github.com/spiffe/spiffe/blob/main/standards/JWT-SVID.md
+    /// [SPIFFE ID]: https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md
+    Svid,
+}
+
+/// The most bytes of a SPIFFE ID, and of the name of a trust domain (SPIFFE ID, sections 2.1 and 2.3).
+const SPIFFE_ID_BYTES_MAX: usize = 2048;
+const TRUST_DOMAIN_BYTES_MAX: usize = 255;
+
+/// The path of the SPIFFE ID `id`, which is empty or starts with `/`. `None` if `id` is not a SPIFFE ID: the scheme
+/// `spiffe`, a trust domain of lowercase letters, digits, `.`, `-`, and `_`, and path segments of letters, digits, `.`,
+/// `-`, and `_`, with no empty segment, no `.` or `..`, and no query or fragment.
+fn spiffe_path(id: &str) -> Option<&str> {
+    (id.len() <= SPIFFE_ID_BYTES_MAX).then_some(())?;
+    let rest = id.strip_prefix("spiffe://")?;
+    let (domain, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+    let domain_valid = (1..=TRUST_DOMAIN_BYTES_MAX).contains(&domain.len())
+        && domain
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-_".contains(&byte));
+    let segments_valid = path.split('/').skip(1).all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+    });
+    (domain_valid && segments_valid).then_some(path)
 }
 
 /// A trusted verification profile: the algorithm and the keys of the tokens that it accepts, and the kind, the issuer,
@@ -158,9 +191,13 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::Algorithm`] if `algorithm` has no JOSE name.
+    /// [`Error::Algorithm`] if `algorithm` has no JOSE name. [`Error::Issuer`] for [`Kind::Svid`] if `issuer` is not
+    /// the SPIFFE ID of a trust domain, with no path.
     pub fn new(algorithm: Algorithm, kind: Kind, issuer: &str, audience: &str, limits: Limits) -> Result<Self, Error> {
         alg(algorithm).ok_or(Error::Algorithm)?;
+        if kind == Kind::Svid {
+            spiffe_path(issuer).is_some_and(str::is_empty).ok_or(Error::Issuer)?;
+        }
         Ok(Self {
             algorithm,
             kind,
@@ -187,7 +224,8 @@ impl Profile {
     }
 
     /// The profile with each key of the JWK set `set` ([RFC 7517]) whose type fits the algorithm of the profile. A key
-    /// whose `alg` names another algorithm, whose `use` is not `sig`, or whose `key_ops` has no `verify` does not join.
+    /// whose `alg` names another algorithm, whose `use` is not `sig` (`jwt-svid` for [`Kind::Svid`], as a SPIFFE bundle
+    /// marks it), or whose `key_ops` has no `verify` does not join.
     /// A key whose `alg`, `use`, or `key_ops` the reader cannot read does not join either: a `key_ops` is an array of
     /// distinct strings (RFC 7517 section 4.3). A set is public, so a private member of any key refuses the set.
     ///
@@ -263,7 +301,9 @@ impl Profile {
         })
         .map_err(|_| Error::Malformed)?;
         for jwk in jwks {
-            if let Some(key) = jwk.key(self.algorithm)? {
+            // A SPIFFE bundle marks each key with its SVID type (SPIFFE Trust Domain and Bundle, section 4.2.2).
+            let usage = if self.kind == Kind::Svid { "jwt-svid" } else { "sig" };
+            if let Some(key) = jwk.key(self.algorithm, usage)? {
                 (self.keys.len() < KEYS_MAX).ok_or(Error::Limit)?;
                 self.keys.push(key);
             }
@@ -274,6 +314,16 @@ impl Profile {
     /// Whether the profile has a key.
     pub(crate) fn has_keys(&self) -> bool {
         !self.keys.is_empty()
+    }
+
+    /// The issuer of the profile.
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The audience of the profile.
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
     }
 
     /// Checks the JWS `token` in the compact serialization, and gives its header and its payload. The token has at
@@ -339,34 +389,45 @@ impl Profile {
 
     /// Checks the JWT `token` ([`Self::verify`]) and its claims at `now`: the issuer and the audience of the profile,
     /// `exp` after the latest time of `now`, and `nbf`, if present, at or before its earliest time. A profile of
-    /// [`Kind::Access`] also checks `typ` and the claims of RFC 9068. Each time is a whole number of seconds since the
-    /// Unix epoch.
+    /// [`Kind::Access`] also checks `typ` and the claims of RFC 9068, and a profile of [`Kind::Svid`] checks `typ` and
+    /// the trust domain of `sub` in place of `iss`. Each time is a whole number of seconds since the Unix epoch.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). The checks of [`Self::verify`].
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::verify`]. [`Error::Type`] if `typ` is not `at+jwt` for [`Kind::Access`].
-    /// [`Error::Issuer`], [`Error::Audience`], [`Error::Expired`], and [`Error::NotYet`] for the claims, and
-    /// [`Error::Claims`] if a required claim is missing or has another type. [`Error::Time`] if `now` has no bound.
+    /// The errors of [`Self::verify`]. [`Error::Type`] if `typ` is not `at+jwt` for [`Kind::Access`], or is not `JWT`
+    /// or `JOSE` for [`Kind::Svid`]. [`Error::Issuer`], [`Error::Audience`], [`Error::Expired`], and [`Error::NotYet`]
+    /// for the claims, also [`Error::Issuer`] for a `sub` of another trust domain. [`Error::Claims`] if a required
+    /// claim is missing or has another type, or `sub` is not a SPIFFE ID with a path. [`Error::Time`] if `now` has no
+    /// bound.
     pub fn verify_jwt(&self, token: &str, now: Reading) -> Result<Jwt, Error> {
+        self.verify_jwt_to(token, &self.audience, now)
+    }
+
+    /// Checks the JWT `token` as [`Self::verify_jwt`] does, for the audience `audience` in place of the audience of the
+    /// profile.
+    pub(crate) fn verify_jwt_to(&self, token: &str, audience: &str, now: Reading) -> Result<Jwt, Error> {
         let jws = self.verify(token)?;
-        if self.kind == Kind::Access {
-            jws.typ
-                .as_deref()
-                .is_some_and(|typ| {
-                    let typ = typ.to_ascii_lowercase();
-                    typ.strip_prefix("application/").unwrap_or(&typ) == "at+jwt"
-                })
-                .ok_or(Error::Type)?;
+        let typ = jws.typ.as_deref().map(str::to_ascii_lowercase);
+        let typ = typ
+            .as_deref()
+            .map(|typ| typ.strip_prefix("application/").unwrap_or(typ));
+        match self.kind {
+            Kind::Jwt => {}
+            Kind::Access => (typ == Some("at+jwt")).ok_or(Error::Type)?,
+            Kind::Svid => typ.is_none_or(|typ| typ == "jwt" || typ == "jose").ok_or(Error::Type)?,
         }
         let claims = Claims::parse(&jws.payload)?;
-        (claims.iss.as_deref() == Some(&*self.issuer)).ok_or(Error::Issuer)?;
-        claims
-            .aud
-            .iter()
-            .any(|aud| **aud == *self.audience)
-            .ok_or(Error::Audience)?;
+        if self.kind == Kind::Svid {
+            let sub = claims.sub.as_deref().ok_or(Error::Claims)?;
+            let path = spiffe_path(sub).ok_or(Error::Claims)?;
+            (!path.is_empty()).ok_or(Error::Claims)?;
+            (sub.strip_suffix(path) == Some(&*self.issuer)).ok_or(Error::Issuer)?;
+        } else {
+            (claims.iss.as_deref() == Some(&*self.issuer)).ok_or(Error::Issuer)?;
+        }
+        claims.aud.iter().any(|aud| **aud == *audience).ok_or(Error::Audience)?;
         let exp = claims.exp.ok_or(Error::Claims)?;
         (now.latest().map_err(Error::Time)? < Duration::from_secs(exp)).ok_or(Error::Expired)?;
         if let Some(nbf) = claims.nbf {
@@ -404,9 +465,9 @@ struct Jwk<'a> {
 }
 
 impl Jwk<'_> {
-    /// The key ID and the trusted key of the JWK for `algorithm`, or `None` if its type, its `alg`, its `use`, or its
-    /// `key_ops` does not fit.
-    fn key(&self, algorithm: Algorithm) -> Result<Option<Entry>, Error> {
+    /// The key ID and the trusted key of the JWK for `algorithm`, or `None` if its type, its `alg`, its `use` other than
+    /// `usage`, or its `key_ops` does not fit.
+    fn key(&self, algorithm: Algorithm, usage: &str) -> Result<Option<Entry>, Error> {
         (!self.private).ok_or(Error::Key)?;
         let fits = self.kty.is_some_and(|kty| match algorithm {
             Algorithm::Ed25519 => kty == "OKP" && self.crv.is_some_and(|crv| crv == "Ed25519"),
@@ -420,7 +481,7 @@ impl Jwk<'_> {
         let restricted = self.unreadable
             || self.verify == Some(false)
             || self.alg.is_some_and(|alg| !names(algorithm, alg))
-            || self.usage.is_some_and(|usage| usage != "sig");
+            || self.usage.is_some_and(|named| named != usage);
         if !fits || restricted {
             return Ok(None);
         }
