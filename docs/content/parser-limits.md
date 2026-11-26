@@ -32,7 +32,8 @@ from `Limits::default()`, and set each field that you change. A refusal names it
 
 The fields `dependencies` and `intents` bound a transition proposal, not a codec. [Propose a
 transition](transitions.md#limits) gives them. The field `signature_checks` bounds the signature checks of one
-artifact. [Bound the signature checks](verification.md#bound-the-signature-checks) gives it.
+artifact. [Bound the signature checks](verification.md#bound-the-signature-checks) gives it. The fields `audiences`
+(8) and `permissions` (32) bound a grant: [Grant an agent access](grants.md#issue-a-grant) gives them.
 
 Each limit refuses before the decoder allocates memory. Each error value is a small `Copy` value that holds no
 input text and no allocation.

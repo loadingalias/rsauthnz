@@ -95,7 +95,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Bootstrap` | A bootstrap value of an authority | `Pays::Anchor` |
 | `Administrator` | An administrator binding of an authority. It ends with its CLI credential, so expiry removes it | `None` |
 | `Agent` | An agent identity: its owner, its public key, its name, and the verified workload of a hosted agent ([Enroll an agent](agent-enrollment.md)) | `None` |
-| `Grant` | A grant and its current revision | `None` |
+| `Grant` | The grant of an agent at its current revision: its owner, audiences, permissions, deadline, and policy version ([Grant an agent access](grants.md)) | `None` |
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
 | `Replay` | The replay record of one accepted signature, or of the challenge of one passkey sign-in | `None` |
 | `ReplayFloor` | The replay floor of the store. Each replay insert reads it as a dependency | `None` |

@@ -123,7 +123,8 @@ Thus a restore from a snapshot before a renewal ends that family, and no generat
 - **List:** `sessions.list(&mut store, &access, after, now)` confirms the session, then reads one `Page` of at most
   `PAGE_MAX` (64) records: each session of the account that did not end. `page.next` is the key after which the next
   page starts, or `None`. Each `Session` gives its `key()`, its `evidence()`, `started()`, `issued()`, `end()`, and
-  `expires()`.
+  `expires()`. The active-access page also lists the grants of the account to its agents
+  ([The active-access page](grants.md#the-active-access-page)).
 - **Revoke:** give a listed session to `sessions.revoke` with its `Revoker`. The end of another session of the
   account, such as the session of a lost laptop, is a sensitive change: give `Revoker::Fresh(&fresh)`, a fresh user
   verification of the account ([Manage accounts](accounts.md#fresh-user-verification)). The commit reads the session

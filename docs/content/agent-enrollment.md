@@ -5,7 +5,8 @@ an agent identity: the agent identifier, the account of its owner, and the publi
 receives the session or a credential of its owner, and no value from the agent names its owner. Module
 `rsauthnz::agent` gives the operations, and `rsauthnz-http` gives the check of the routes of the agent.
 
-An enrolled agent has no access yet. A grant gives it access to named resource actions until a deadline.
+An enrolled agent has no access yet. A grant gives it access to named resource actions until a deadline ([Grant an
+agent access](grants.md)).
 
 ## The model
 
@@ -192,7 +193,8 @@ workload is the authority of the credential and its workload identifier.
 
 ## Rotate the key of an agent
 
-A rotation replaces the key of an agent identity. The owner, the name, the workload, and the time of creation stay.
+A rotation replaces the key of an agent identity. The owner, the name, the workload, the time of creation, and the
+grant ([Grant an agent access](grants.md)) stay.
 It needs a signature by the current key and by the new key, so a party with only one of the keys cannot rotate.
 
 1. The agent stores the new key in custody. It makes the statement
@@ -222,7 +224,8 @@ The owner revokes an agent from a signed-in session. A revocation only removes a
 verification.
 
 1. Check the session of the owner, and call `agents.revoke(store, &access, &agent, now, random)` with its `Access`.
-2. Commit the proposal and its plan. The commit ends the identity at the version that the proposal read.
+2. Commit the proposal and its plan. The commit ends the identity and its grant at the versions that the proposal
+   read.
 
 After the commit, `agents.identity`, a rotation, and a second revocation refuse with `Error::NotEnrolled`. The
 proposal reads the session, so a revocation from a session that ended refuses at the commit. A revocation by another

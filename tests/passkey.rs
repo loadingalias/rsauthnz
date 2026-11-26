@@ -10,6 +10,8 @@ mod agent;
 mod authenticator;
 #[path = "passkey/enroll.rs"]
 mod enroll;
+#[path = "passkey/grant.rs"]
+mod grant;
 #[path = "passkey/recovery.rs"]
 mod recovery;
 #[path = "passkey/session.rs"]

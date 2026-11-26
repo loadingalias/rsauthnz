@@ -32,8 +32,8 @@ use super::session::BOB;
 use super::{HANDLE, ORIGIN, RP_ID, START, Site, alice, at, ready, wrong};
 
 /// The site of alice with her passkey, and the agent enrollment of the site.
-struct World {
-    site: Site,
+pub(super) struct World {
+    pub(super) site: Site,
     passkey: Passkey,
     agents: Agents,
 }
@@ -42,14 +42,14 @@ struct World {
 type Proposed<T> = (Proposal, Plan, Checked<T>);
 
 /// An agent that asked for an enrollment: its public key, and the values of its request.
-struct Agent {
+pub(super) struct Agent {
     key: [u8; KEY_BYTES],
-    started: Started,
+    pub(super) started: Started,
     device: DeviceCode,
 }
 
 impl World {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut site = Site::new();
         let passkey = site.register(rsauthnz::crypto::Algorithm::Ed25519, -8, 1, 0);
         let authority: Id<Authority> = Id::new("acme", "agents").expect("an identifier");
@@ -60,7 +60,7 @@ impl World {
         }
     }
 
-    fn commit(&mut self, (proposal, plan): (Proposal, Plan)) -> Outcome {
+    pub(super) fn commit(&mut self, (proposal, plan): (Proposal, Plan)) -> Outcome {
         self.site.node.commit(proposal, plan)
     }
 
@@ -95,7 +95,7 @@ impl World {
     }
 
     /// The session of a passkey sign-in of alice at 11, checked at 12, and its fresh user verification.
-    fn session(&mut self) -> (Access, Fresh) {
+    pub(super) fn session(&mut self) -> (Access, Fresh) {
         let (access, fresh, _) = self.signed_in();
         (access, fresh)
     }
@@ -193,7 +193,7 @@ impl World {
     }
 
     /// An agent with the key of `seed` that alice enrolls: its request at 20, her approval at 22, its finish at 23.
-    fn enrolled(&mut self, seed: u8) -> Agent {
+    pub(super) fn enrolled(&mut self, seed: u8) -> Agent {
         let agent = self.request(seed, "build-agent", None, 20);
         let (_, fresh) = self.session();
         assert!(matches!(self.approve(&agent, &fresh, 22), Outcome::Accepted(_)));
@@ -202,7 +202,7 @@ impl World {
     }
 
     /// Commits the rotation `rotation` at `seconds`.
-    fn rotate(&mut self, rotation: &Rotation, seconds: u64) -> Result<Outcome, Error> {
+    pub(super) fn rotate(&mut self, rotation: &Rotation, seconds: u64) -> Result<Outcome, Error> {
         let operation = OperationId::new(format!("rotate-{seconds}").as_bytes()).expect("an operation identity");
         let rotate = self
             .agents
@@ -212,7 +212,7 @@ impl World {
     }
 
     /// Commits the revocation of `agent` by the human of `access` at `seconds`.
-    fn revoke(&mut self, access: &Access, agent: &Agent, seconds: u64) -> Result<Outcome, Error> {
+    pub(super) fn revoke(&mut self, access: &Access, agent: &Agent, seconds: u64) -> Result<Outcome, Error> {
         let revoke = self.agents.revoke(
             &mut self.site.node.memory,
             access,
@@ -225,7 +225,7 @@ impl World {
     }
 
     /// A session of bob, who has his own passkey, at 41, checked at 42.
-    fn bob(&mut self) -> (Access, Fresh) {
+    pub(super) fn bob(&mut self) -> (Access, Fresh) {
         let passkey = self.site.register_bob();
         let opened = self.site.session_of(&passkey, BOB, 41, None);
         let access = self.site.active(opened.session.identifier(), at(42));
@@ -262,7 +262,7 @@ fn key(seed: u8) -> [u8; KEY_BYTES] {
 
 /// The rotation of `agent` from the key of `old` to the key of `new`, whose statement of `generation` the keys of
 /// `signers` sign: the current key first, then the new key.
-fn rotation(agent: &Id<AgentId>, old: u8, new: u8, generation: u64, signers: [u8; 2]) -> Rotation {
+pub(super) fn rotation(agent: &Id<AgentId>, old: u8, new: u8, generation: u64, signers: [u8; 2]) -> Rotation {
     let statement = Rotation::statement(agent, &key(old), &key(new), generation);
     let [old_signature, new_signature] = signers.map(|seed| {
         let signature = keypair(seed)

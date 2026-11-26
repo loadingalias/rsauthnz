@@ -62,7 +62,7 @@ use crate::time::{Reading, TimeError};
 use crate::transition::{
     self, Audit, Change, Dependency, Key, OperationId, Outcome, Prepared, Proposal, Recover, Recovery,
 };
-use crate::{credential, jose, trust};
+use crate::{credential, grant, jose, trust};
 
 mod hosted;
 
@@ -1115,12 +1115,12 @@ impl Agents {
     }
 
     /// Proposes the revocation of `agent` by the signed-in human of `access`, who must be its owner. The commit ends
-    /// the identity at the version that the proposal read, so the restore journal keeps the end, and each later check
-    /// of the agent refuses with [`Error::NotEnrolled`]. The proposal reads the session, so a revocation from a session
-    /// that ended refuses. To change the owner, revoke the agent, and enroll it again: the new enrollment gives a new
-    /// agent identifier.
+    /// the identity and its grant ([`crate::grant`]) at the versions that the proposal read, so the restore journal
+    /// keeps both ends, and each later check of the agent refuses with [`Error::NotEnrolled`]. The proposal reads the
+    /// session, so a revocation from a session that ended refuses. To change the owner, revoke the agent, and enroll it
+    /// again: the new enrollment gives a new agent identifier.
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One identity lookup, and its commit.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). Two keyed lookups, and the commit.
     ///
     /// # Errors
     ///
@@ -1148,7 +1148,19 @@ impl Agents {
             .read(Dependency::Version(key.clone(), record.version))
             .map_err(Error::Transition)?;
         proposal.change(Change::End(key)).map_err(Error::Transition)?;
+        let grant = grant::key(&self.authority, owner, agent);
+        if let Some(record) = read(store, &grant).await? {
+            proposal
+                .read(Dependency::Version(grant.clone(), record.version))
+                .map_err(Error::Transition)?;
+            proposal.change(Change::End(grant)).map_err(Error::Transition)?;
+        }
         Ok((proposal, Plan::default()))
+    }
+
+    /// The key of the identity record of `agent`, which a grant check reads.
+    pub(crate) fn identity_key(&self, agent: &Id<Agent>) -> Key {
+        self.agent_key(agent)
     }
 
     /// The current identity of `agent`: its owner, its key, and the generation of its key. Each check of a request of
