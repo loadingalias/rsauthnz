@@ -10,7 +10,7 @@ use crate::cbor::Value;
 use crate::cose::PublicKey;
 use crate::credential::Subject;
 use crate::evidence::Evidence;
-use crate::grant::{self, Approval, Error, Failure, Grant, Grants};
+use crate::grant::{self, Approval, Error, Failure, Grant, Grants, LastUse};
 use crate::id::{Action, Agent, AuthorityVersion, Human, Id, Principal, Resource};
 use crate::limits::Limits;
 use crate::store::{Record, Store};
@@ -35,8 +35,8 @@ use crate::transition::{self, Audit, Dependency, Key, OperationId, Proposal};
 ///
 /// # Errors
 ///
-/// [`Error::Principal`] if the evidence is not of the credential of an agent, and [`Error::Issuer`] for a credential
-/// of another authority. [`Error::NotEnrolled`] if the store holds no identity of the agent, [`Error::Owner`] if the
+/// [`Error::Principal`] if the evidence is not of an agent credential of the purpose [`grant::purpose`], and
+/// [`Error::Issuer`] for a credential of another authority. [`Error::NotEnrolled`] if the store holds no identity of the agent, [`Error::Owner`] if the
 /// credential names another owner, and [`Error::Key`] if a rotation replaced the key. [`Error::NoGrant`] if the agent
 /// has no grant, and [`Error::Revision`] if the credential names another revision. [`Error::Expired`] at or after the
 /// deadline of the grant, [`Error::Audience`] and [`Error::Permission`] for an audience or a permission that the grant
@@ -58,6 +58,7 @@ pub async fn check_agent<S: Store>(
     let Subject::Agent { agent, owner, revision } = &claims.subject else {
         return Err(Error::Principal.into());
     };
+    (claims.purpose == grant::purpose()).ok_or(Error::Principal)?;
     (claims.issuer == grants.authority).ok_or(Error::Issuer)?;
     let identity_key = grants.agents.identity_key(agent);
     let grant_key = grant::key(&grants.authority, owner, agent);
@@ -92,6 +93,7 @@ pub async fn check_agent<S: Store>(
         resource: resource.clone(),
         approval: permission.approval,
         deadline: grant.deadline.min(expires).min(artifact.end()),
+        ends: grant.deadline,
         policy: grant.policy,
         identity: (identity_key, identity.version),
         grant: (grant_key, record.version),
@@ -111,6 +113,8 @@ pub struct Granted {
     resource: Id<Resource>,
     approval: Approval,
     deadline: Duration,
+    /// The grant deadline.
+    ends: Duration,
     /// The policy version of the grant.
     policy: AuthorityVersion,
     /// The key and the version of the identity record of the agent that the check read.
@@ -224,5 +228,17 @@ impl Granted {
     #[must_use]
     pub const fn approval(&self) -> Approval {
         self.approval
+    }
+
+    /// The last use of the grant in the window that starts at `window` ([`grant::Usage::note`]).
+    pub(crate) fn last_use(&self, window: Duration) -> LastUse {
+        LastUse {
+            agent: self.agent.clone(),
+            owner: self.owner.clone(),
+            revision: self.revision,
+            grant: self.grant.clone(),
+            ends: self.ends,
+            window,
+        }
     }
 }

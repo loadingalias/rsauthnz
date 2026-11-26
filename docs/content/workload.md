@@ -56,13 +56,14 @@ verifier.
 3. Call `Pending::new(request, &issuer_record, &registration_record, &policy, &mut driver, now, limits)`.
 4. Give the bytes of `pending.to_be_signed()` to custody. Custody signs them with the current issuer key.
 5. Call `pending.finish(&signature, &mut budget)`. It verifies the signature with the issuer key, and it puts the
-   credential into the proposal. It gives the `Proposal`, its `Plan`, and an `Awaiting` value, which holds no
-   credential.
+   credential into the proposal. It gives the `Proposal`, its `Plan`, and a `credential::Awaiting` value, which holds
+   no credential.
 6. Submit the proposal with `driver.submit(proposal, plan)`, and run the driver.
 7. Give the outcome of the commit to `awaiting.release(outcome)`. Only an accepted commit of this operation gives the
-   `Credential`. Send `credential.as_bytes()` to the workload. `Awaiting` keeps the SHA-256 digest of its own
-   credential, so the receipt of another issuance under the same operation refuses with `Error::Operation`. Thus the
-   serial and the end of the `Credential` are always those of its bytes.
+   `credential::Released` credential. Send `credential.as_bytes()` to the workload. `Awaiting` keeps the SHA-256
+   digest of its own credential, so the receipt of another issuance under the same operation refuses with
+   `Release::Operation`. Thus the serial and the end of the released credential are always those of its bytes.
+   [Release a credential](credential-format.md#release-a-credential) gives each refusal of the release.
 
 `Pending::new` does these checks before custody signs. It refuses at the first check that fails:
 
@@ -92,11 +93,12 @@ The commit writes the issuance record of the credential (`credential::record_key
 record, and the outcome record together. The issuance record holds the issuer, the workload, the audience, the
 purpose, and the end, but not the credential. It ends when the credential ends, so expiry removes it. The proposal
 has the deadline of its checked scope: the earliest end of the permit, of the maximum age of the evidence, and of the
-credential of the evidence. A commit after it refuses with `Error::Transition(transition::Error::Expired)`.
+credential of the evidence. A commit after it refuses, and the release gives
+`Release::Refused(transition::Error::Expired)`.
 
 Each issuance writes the registration record, so that an issuance and a revocation that race cannot both commit.
-Two issuances of one workload at the same time conflict too. The second one refuses with `Error::Conflict`, and the
-workload asks again as a new operation. Read the registration record again before each request.
+Two issuances of one workload at the same time conflict too. The release of the second one gives
+`Release::Conflict`, and the workload asks again as a new operation. Read the registration record again before each request.
 
 ## Renew a credential
 
@@ -265,7 +267,7 @@ longest time that a revocation needs to reach it. Choose the lifetime with that 
 
 ## After a lost response
 
-`awaiting.release` gives `Error::Unknown(operation)` when the commit can have occurred. The workload gets no
+`awaiting.release` gives `Release::Unknown(operation)` when the commit can have occurred. The workload gets no
 credential. rsauthnz does not try the operation again.
 
 1. Look up the operation with `driver.lookup(operation)`.
@@ -274,7 +276,7 @@ credential. rsauthnz does not try the operation again.
    one has its bytes. Ask for a credential as a new operation, with a new `OperationId`.
 
 A new proposal of the same request under the same identity, after its first commit, commits nothing. Its release
-gives `Error::Committed`. After a lost recovery that committed, recover again as a new operation: its commit also
+gives `Release::Committed`. After a lost recovery that committed, recover again as a new operation: its commit also
 ends the credential that no one received. A revocation and an issuer rotation follow the same lookup.
 
 ## After a restore
@@ -453,7 +455,8 @@ assert_eq!(workload::admits(&verified, current.as_ref(), Limits::default()), Err
 
 ## Errors
 
-Each refusal is a `workload::Error`. Refuse the request unless the table gives another recovery.
+Each refusal of an operation is a `workload::Error`. Refuse the request unless the table gives another recovery. The
+release of a credential refuses with a `credential::Release` ([Release a credential](credential-format.md#release-a-credential)).
 
 | Error | Cause | Recovery |
 | --- | --- | --- |
@@ -474,11 +477,7 @@ Each refusal is a `workload::Error`. Refuse the request unless the table gives a
 | `Credential(credential::Error)` | The format refused the draft, the current credential, a proof, or the signature of custody, or a challenge is longer than `credential::MAX_BYTES` | Refuse |
 | `Refusal(authz::Refusal)` | The policy refused | Refuse |
 | `Driver(driver::Error)` | The driver gave no value | As the driver error gives |
-| `Transition(transition::Error)` | The proposal or the commit refused | As `error.recovery()` gives |
-| `Conflict` | A dependency changed before the commit, so nothing committed | Read the records again, and ask as a new operation |
-| `Unknown(operation)` | The commit can have occurred | [After a lost response](#after-a-lost-response) |
-| `Committed` | An earlier submission of the operation committed, so this one released nothing | Ask as a new operation |
-| `Operation` | The outcome is of another operation, or the receipt is of another issuance under this operation | Give the outcome of the commit of this proposal |
+| `Transition(transition::Error)` | The proposal refused | As `error.recovery()` gives |
 
 ## Record forms
 

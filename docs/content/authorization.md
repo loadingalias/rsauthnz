@@ -116,22 +116,25 @@ after the deadline. `Checked` also gives the evidence, the permit, and the deadl
 
 The request of an agent presents the evidence of an agent credential: the agent proves the possession of the
 credential with its key ([Prove possession](credential-format.md#prove-possession)). The credential names the agent,
-its human owner, the revision of its grant, and the audience. Its issuer asserts the owner and the revision. The agent
-never asserts its own owner.
+its human owner, the revision of its grant, and the audience. The authority issues it from the grant
+([Get an agent credential](grants.md#get-an-agent-credential)), so its issuer asserts the owner and the revision. The
+agent never asserts its own owner.
 
-1. Verify the credential with the `Profile` of the audience, and check the proof of the agent with
-   `verified.possession(&proof, &challenge, now, &mut budget)`. It gives the `Evidence`.
+1. Verify the credential with the profile of the audience, `grants.profile(issuer_key, &audience)?.verify(&credential,
+   now, &mut budget)`, and check the proof of the agent with `verified.possession(&proof, &challenge, now, &mut
+   budget)`. It gives the `Evidence`.
 2. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`. It gives a
    `Granted` scope, or a `grant::Failure`.
 3. At each use, call `scope.enforce(store, &action, &resource, &policy, now).await`. For a streamed response, call it
-   before each chunk.
+   before each chunk. To show the last use on the active-access page, note the scope after the check
+   ([Record last use](grants.md#record-last-use)).
 4. For an operation that commits, take the proposal from `scope.propose(operation, request, now)`. Add the changes of
    the operation, and commit it ([Make a transition](transitions.md)).
 
 The check reads the identity of the agent and its grant from one store state (`Store::read_pair`). Then it refuses
 with a `grant::Error` ([Errors](grants.md#errors)) in this order:
 
-1. `Principal`: the evidence is not of an agent credential.
+1. `Principal`: the evidence is not of an agent credential of the purpose `rsauthnz:agent` (`grant::purpose()`).
 2. `Issuer`: another authority issued the credential. An agent of one authority has no access at another.
 3. `NotEnrolled`, `Owner`, `Key`: the store has no identity of the agent, the credential names another owner, or the
    key of the proof is not the current key of the agent. A credential of the key that a rotation replaced refuses.

@@ -6,7 +6,8 @@ receives the session or a credential of its owner, and no value from the agent n
 `rsauthnz::agent` gives the operations, and `rsauthnz-http` gives the check of the routes of the agent.
 
 An enrolled agent has no access yet. A grant gives it access to named resource actions until a deadline ([Grant an
-agent access](grants.md)).
+agent access](grants.md)), and the agent then gets a credential of its grant with a proof of its key
+([Get an agent credential](grants.md#get-an-agent-credential)).
 
 ## The model
 

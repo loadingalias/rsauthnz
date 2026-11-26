@@ -19,9 +19,11 @@ issuer key can sign each kind, and an artifact of one purpose does not verify fo
 | Enrollment receipt | None | The principal that enrolled |
 | Approval receipt | None | The principal that approved |
 
-The application chooses the purpose of each kind, as an `Id<Purpose>`, except for a workload credential. The
-`rsauthnz::workload` module issues each workload credential with the purpose `rsauthnz:workload`, through its
-transition ([Issue and manage workload credentials](workload.md)). A receipt has no `cnf` key, so it cannot prove
+The application chooses the purpose of each kind, as an `Id<Purpose>`, except for a workload credential and an agent
+credential. The `rsauthnz::workload` module issues each workload credential with the purpose `rsauthnz:workload`,
+through its transition ([Issue and manage workload credentials](workload.md)). The `rsauthnz::grant` module issues
+each agent credential with the purpose `rsauthnz:agent` (`grant::purpose()`), from the grant of the agent
+([Get an agent credential](grants.md#get-an-agent-credential)). A receipt has no `cnf` key, so it cannot prove
 possession.
 
 ## Declare the profile of an audience
@@ -211,6 +213,23 @@ let proof = draft.finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits
 let evidence = verified.possession(&proof, &challenge, now, &mut SignatureBudget::new(&Limits::default()))?;
 assert_eq!(evidence.method(), Method::KeyPossession);
 ```
+
+## Release a credential
+
+A transition that issues a credential, such as `workload::Pending` and `grant::Pending`, gives a
+`credential::Awaiting` value from its `finish`. It holds no credential: only the operation identity and the SHA-256
+digest of its credential. After the commit, `awaiting.release(outcome)` gives the `credential::Released` value:
+`as_bytes()`, `serial()`, `expires()`, and `renew_at()`, half the lifetime after the issue. `Debug` shows the length
+of the bytes, and never the bytes. Each other outcome refuses with a `credential::Release`, which implements
+`transition::Recover`:
+
+| Release | Cause | Recovery |
+| --- | --- | --- |
+| `Conflict` | A dependency changed before the commit, so nothing committed | `Restart`: read the records again, and ask as a new operation |
+| `Unknown(operation)` | The commit can have occurred: its response was lost. The credential is never released | `Lookup`: look up the operation, and never ask again as a new operation before the lookup answers |
+| `Committed` | An earlier submission of the operation committed, so this one released nothing | `Restart`: ask as a new operation |
+| `Operation` | The outcome is of another operation, or the receipt is of another issuance under this operation | `Refuse`: give the outcome of the commit of this proposal |
+| `Refused(transition::Error)` | The commit refused, for example at the deadline of the proposal | The recovery of the error |
 
 ## Verify a credential
 

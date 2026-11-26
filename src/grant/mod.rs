@@ -27,7 +27,7 @@ use rscrypto::ChaCha20Rng;
 
 use crate::account::Fresh;
 use crate::agent::{self, Agents};
-use crate::authz::{Policy, Request};
+use crate::authz::{self, Policy};
 use crate::cbor::{self, Value};
 use crate::crypto;
 use crate::id::{Action, Agent, Audience, Authority, AuthorityVersion, Human, Id, Principal, Resource};
@@ -38,8 +38,17 @@ use crate::store::{Kind, Record, Store};
 use crate::time::{Reading, TimeError};
 use crate::transition::{self, Audit, Change, Dependency, Key, OperationId, Proposal, Recover, Recovery};
 
-/// The most grants of one page of [`Grants::list`].
+pub use self::credential::{Body, LIFETIME_DEFAULT, LIFETIME_MAX, Pending, Request, purpose, statement};
+pub use self::usage::{GRANULARITY_DEFAULT, LastUse, USES_DEFAULT, Usage};
+
+mod credential;
+mod usage;
+
+/// The most records of one page of [`Grants::list`]: grants and their last uses.
 pub const PAGE_MAX: usize = 64;
+
+/// The bytes of the key of a grant: its kind, the locator of its owner, and 16 bytes of the digest of its agent.
+const GRANT_KEY_BYTES: usize = 33;
 
 /// The records of one range read of [`Grants::list`].
 const PAGE: NonZeroUsize = NonZeroUsize::new(PAGE_MAX).expect("the bound is not zero");
@@ -108,6 +117,9 @@ pub struct Grant {
     pub revision: u64,
     /// The version of the grant record.
     pub version: AuthorityVersion,
+    /// The start of the window of the last use of this revision that a host recorded ([`Grants::record`]), as the time
+    /// since the Unix epoch, or `None`. Only [`Grants::list`] gives it.
+    pub last_use: Option<Duration>,
 }
 
 impl Grant {
@@ -199,6 +211,7 @@ impl Grant {
             issued: Duration::from_secs(*issued),
             revision: u64::from_be_bytes(*record.version.coordinate().first_chunk::<8>()?),
             version: record.version.clone(),
+            last_use: None,
         })
     }
 }
@@ -310,6 +323,7 @@ impl Grants {
             revision,
             version: AuthorityVersion::new(self.authority.clone(), &revision.to_be_bytes())
                 .expect("an 8-byte coordinate is valid"),
+            last_use: None,
         };
         proposal
             .change(Change::Write {
@@ -362,11 +376,13 @@ impl Grants {
         Ok((proposal, Plan::default()))
     }
 
-    /// Lists the grants of the owner, the signed-in human of `access`, that did not end at `now`. The page starts after
-    /// `after`, or at the first key. Show it on the active-access page with the sessions of
-    /// [`crate::session::Sessions::list`].
+    /// Lists the grants of the owner, the signed-in human of `access`, that did not end at `now`, each with the last use
+    /// of its revision ([`Grant::last_use`]). The page starts after `after`, or at the first key. Show it on the
+    /// active-access page with the sessions of [`crate::session::Sessions::list`].
     ///
-    /// Cost class: [`Verify`](crate::limits::Class::Verify). One range read of at most [`PAGE_MAX`] records.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One range read of at most [`PAGE_MAX`] records: each
+    /// grant, and the record of its last use next to it. A full page that ends at a grant leaves that grant to the
+    /// next page, with its last use.
     ///
     /// # Errors
     ///
@@ -385,16 +401,28 @@ impl Grants {
             .key(&locator(&self.authority, owner))
             .expect("a key of 17 bytes is valid");
         let records = store.range(&prefix, after, PAGE).await.map_err(Failure::Store)?;
-        let next = if records.len() == PAGE_MAX {
-            records.last().map(|(key, _)| key.clone())
-        } else {
-            None
+        let full = records.len() == PAGE_MAX;
+        let grant_key = |key: &Key| key.as_bytes().len() == GRANT_KEY_BYTES;
+        // The last use of the last grant of a full page can be the first record of the next page.
+        let records = match records.split_last() {
+            Some(((key, _), rest)) if full && grant_key(key) => rest,
+            _ => &records[..],
         };
+        let next = full.then(|| records.last().map(|(key, _)| key.clone())).flatten();
         let mut grants = Vec::with_capacity(records.len());
-        for (_, record) in &records {
-            let grant = Grant::parse(record, self.limits)
+        let mut records = records.iter().peekable();
+        while let Some((key, record)) = records.next() {
+            // A last use whose grant ended stays until its own end.
+            if !grant_key(key) {
+                continue;
+            }
+            let mut grant = Grant::parse(record, self.limits)
                 .filter(|grant| grant.owner == *owner)
                 .ok_or(Error::Record)?;
+            if let Some((_, used)) = records.next_if(|(next, _)| *next == usage::use_key(key)) {
+                let (revision, window) = usage::parse_use(used, self.limits).ok_or(Error::Record)?;
+                grant.last_use = (revision == grant.revision).then_some(window);
+            }
             if latest < grant.deadline {
                 grants.push(grant);
             }
@@ -477,7 +505,7 @@ pub(crate) fn permit(
     action: &Id<Action>,
     latest: Duration,
 ) -> Option<Duration> {
-    let request = Request {
+    let request = authz::Request {
         principal,
         action,
         resource,
@@ -545,6 +573,16 @@ pub enum Error {
     Policy,
     /// A record has no valid form. Restore the store from a snapshot.
     Record,
+    /// The lifetime of a credential request is past [`LIFETIME_MAX`] or under one second. Ask for a shorter or a longer
+    /// one, or for the default.
+    Lifetime,
+    /// The granularity of a [`Usage`] is not a whole number of seconds, at least one.
+    Granularity,
+    /// The JSON body of a credential request is not a request ([`Body::parse`]).
+    Malformed,
+    /// The credential format refused: the proof of a request, the draft, or the signature of custody. An issuer key of
+    /// SLH-DSA refuses with [`crate::credential::Error::Profile`]: it signs no credential.
+    Credential(crate::credential::Error),
     /// The reading of the time has no bound. Use a reading with a bound.
     Time(TimeError),
     /// The commit driver does not serve, or its counter has no next value.
@@ -584,6 +622,10 @@ impl fmt::Display for Error {
             Self::Permission => f.write_str("the grant does not name the action on the resource"),
             Self::Policy => f.write_str("the grant binds another policy version"),
             Self::Record => f.write_str("a grant record has no valid form"),
+            Self::Lifetime => f.write_str("the lifetime is past the most or under one second"),
+            Self::Granularity => f.write_str("the granularity is not a whole number of seconds, at least one"),
+            Self::Malformed => f.write_str("the body is not a credential request"),
+            Self::Credential(error) => write!(f, "the credential format refused: {error}"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Driver(error) => write!(f, "the commit driver refused: {error}"),
             Self::Transition(error) => write!(f, "the proposal refused: {error}"),

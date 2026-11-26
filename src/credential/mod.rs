@@ -148,6 +148,10 @@ use crate::store::Kind;
 use crate::time::Reading;
 use crate::transition::{self, Change, Dependency, Key, Prepared, Proposal};
 
+mod release;
+
+pub use self::release::{Awaiting, Release, Released};
+
 /// The most bytes of an encoded credential, receipt, or proof. A draft that can be longer refuses before custody signs
 /// it, and verification refuses a longer input before it decodes it.
 pub const MAX_BYTES: usize = 8_192;

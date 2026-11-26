@@ -11,7 +11,7 @@
 //! the policy and the ceiling, and makes the draft and the [`Proposal`]. Custody signs [`Pending::to_be_signed`]
 //! outside the core. [`Pending::finish`] verifies the signature and puts the credential into the proposal, where it
 //! stays private. The application submits the proposal to the commit driver. Only [`Awaiting::release`] of the
-//! accepted commit of that proposal gives the [`Credential`]. Thus the store records the credential and its audit
+//! accepted commit of that proposal gives the [`Released`](credential::Released) credential. Thus the store records the credential and its audit
 //! before the workload gets it. A lost response gives no credential, and the core does not try the operation again.
 //!
 //! The first issuance comes from a principal that the policy permits [`Mode::Issue`], such as an operator. A
@@ -256,7 +256,7 @@ use core::time::Duration;
 use crate::authz::{self, Policy, Refusal};
 use crate::cbor::{self, Value};
 use crate::cose::{self, Key, PublicKey, TrustedKey};
-use crate::credential::{self, Claims, Draft, Serial, Subject};
+use crate::credential::{self, Awaiting, Claims, Draft, Serial, Subject};
 use crate::crypto;
 use crate::evidence::Evidence;
 use crate::id::{Action, Audience, Authority, AuthorityVersion, Id, Principal, Purpose, Resource, Workload};
@@ -264,10 +264,10 @@ use crate::limits::{Limits, SignatureBudget};
 use crate::store::driver::{self, Driver, Plan};
 use crate::store::{Kind, Record};
 use crate::time::Reading;
-use crate::transition::{self, Audit, Change, Dependency, Operation, OperationId, Outcome, Proposal};
+use crate::transition::{self, Audit, Change, Dependency, OperationId, Proposal};
 
 /// The lifetime of a credential when the request names none, unless the ceiling of the issuer is shorter. Renew a
-/// credential at half its lifetime ([`Credential::renew_at`]).
+/// credential at half its lifetime ([`Released::renew_at`](credential::Released::renew_at)).
 pub const LIFETIME_DEFAULT: Duration = Duration::from_secs(3_600);
 
 /// The most audiences of one issuer. A record with this many audiences of the longest identifiers is within the
@@ -1245,112 +1245,9 @@ impl Pending {
             expires,
         } = self;
         let prepared = draft.finish(signature, budget)?;
-        let awaiting = Awaiting {
-            operation: proposal.operation().id.clone(),
-            digest: crypto::sha256(prepared.bytes()),
-            serial,
-            issued,
-            expires,
-        };
+        let awaiting = Awaiting::new(&proposal, &prepared, serial, issued, expires);
         proposal.prepare(prepared)?;
         Ok((proposal, plan, awaiting))
-    }
-}
-
-/// An issuance whose proposal waits for its commit. It holds no credential, only the SHA-256 digest of its credential.
-#[derive(Debug)]
-pub struct Awaiting {
-    operation: OperationId,
-    digest: [u8; 32],
-    serial: Serial,
-    issued: Duration,
-    expires: Duration,
-}
-
-impl Awaiting {
-    /// The serial of the credential. The commit writes the issuance record of this serial
-    /// ([`credential::record_key`]).
-    #[must_use]
-    pub const fn serial(&self) -> Serial {
-        self.serial
-    }
-
-    /// The credential that the accepted commit of the proposal of this issuance releases: the credential of this
-    /// issuance, with its serial and its validity interval. Each other outcome gives no credential, also the receipt of
-    /// another issuance under the same operation.
-    ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Unknown`] if the commit can have occurred, [`Error::Conflict`] if a dependency changed first, and
-    /// [`Error::Transition`] if the commit refused. [`Error::Committed`] if an earlier submission of the operation
-    /// committed, so that this one releases nothing. [`Error::Operation`] for the outcome of another operation, and for
-    /// the receipt of another issuance under this operation.
-    pub fn release(self, outcome: Outcome) -> Result<Credential, Error> {
-        match outcome {
-            Outcome::Accepted(receipt) if *receipt.operation() == self.operation => {
-                let bytes = receipt.artifact().ok_or(Error::Committed)?;
-                (crypto::sha256(bytes) == self.digest).ok_or(Error::Operation)?;
-                Ok(Credential {
-                    bytes: bytes.into(),
-                    serial: self.serial,
-                    issued: self.issued,
-                    expires: self.expires,
-                })
-            }
-            Outcome::Accepted(_) => Err(Error::Operation),
-            Outcome::Conflict => Err(Error::Conflict),
-            Outcome::Refused(error) => Err(Error::Transition(error)),
-            Outcome::Unknown(operation) => Err(Error::Unknown(operation)),
-        }
-    }
-}
-
-/// A workload credential that a commit released: its encoded bytes, its serial, and its validity interval.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Credential {
-    bytes: Box<[u8]>,
-    serial: Serial,
-    issued: Duration,
-    expires: Duration,
-}
-
-impl Credential {
-    /// The encoded credential.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// The serial.
-    #[must_use]
-    pub const fn serial(&self) -> Serial {
-        self.serial
-    }
-
-    /// The end of the credential, as the time since the Unix epoch. The credential is not valid at this time and
-    /// after it.
-    #[must_use]
-    pub const fn expires(&self) -> Duration {
-        self.expires
-    }
-
-    /// The time to renew the credential: half its lifetime after its issue time, as the time since the Unix epoch.
-    #[must_use]
-    pub fn renew_at(&self) -> Duration {
-        self.issued.saturating_add(self.expires.saturating_sub(self.issued) / 2)
-    }
-}
-
-impl fmt::Debug for Credential {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credential")
-            .field("len", &self.bytes.len())
-            .field("serial", &self.serial)
-            .field("issued", &self.issued)
-            .field("expires", &self.expires)
-            .finish()
     }
 }
 
@@ -1646,19 +1543,8 @@ pub enum Error {
     Refusal(Refusal),
     /// The commit driver gave no value. Its error gives the recovery.
     Driver(driver::Error),
-    /// The proposal or the commit refused. Its error gives the recovery.
+    /// The proposal refused. Its error gives the recovery.
     Transition(transition::Error),
-    /// A dependency changed before the commit, so nothing committed. Read the records again, and ask again as a new
-    /// operation.
-    Conflict,
-    /// The commit can have occurred: its response was lost. Look up the operation, and never ask again as a new
-    /// operation before the lookup answers. A credential whose response was lost is never released.
-    Unknown(Operation),
-    /// An earlier submission of the operation committed, so this one releases nothing. Ask for a credential as a new
-    /// operation.
-    Committed,
-    /// The outcome is of another operation, or the receipt is of another issuance under the same operation.
-    Operation,
 }
 
 impl fmt::Display for Error {
@@ -1691,10 +1577,6 @@ impl fmt::Display for Error {
             Self::Refusal(refusal) => write!(f, "the policy refused: {refusal}"),
             Self::Driver(error) => write!(f, "the commit driver gave no value: {error}"),
             Self::Transition(error) => write!(f, "the transition refused: {error}"),
-            Self::Conflict => f.write_str("a dependency changed before the commit"),
-            Self::Unknown(_) => f.write_str("the outcome of the commit is unknown"),
-            Self::Committed => f.write_str("an earlier submission of the operation committed"),
-            Self::Operation => f.write_str("the outcome is of another operation or another issuance"),
         }
     }
 }

@@ -194,10 +194,19 @@ impl World {
 
     /// An agent with the key of `seed` that alice enrolls: its request at 20, her approval at 22, its finish at 23.
     pub(super) fn enrolled(&mut self, seed: u8) -> Agent {
-        let agent = self.request(seed, "build-agent", None, 20);
+        self.enrolled_at(seed, 20)
+    }
+
+    /// An agent with the key of `seed` that alice enrolls: its request at `seconds`, her approval 2 seconds later, and
+    /// its finish 3 seconds later. The finish names its time, so each enrollment of one world needs its own time.
+    pub(super) fn enrolled_at(&mut self, seed: u8, seconds: u64) -> Agent {
+        let agent = self.request(seed, "build-agent", None, seconds);
         let (_, fresh) = self.session();
-        assert!(matches!(self.approve(&agent, &fresh, 22), Outcome::Accepted(_)));
-        assert!(matches!(self.enroll(&agent, None, 23), Outcome::Accepted(_)));
+        assert!(matches!(
+            self.approve(&agent, &fresh, seconds + 2),
+            Outcome::Accepted(_)
+        ));
+        assert!(matches!(self.enroll(&agent, None, seconds + 3), Outcome::Accepted(_)));
         agent
     }
 
@@ -280,7 +289,7 @@ pub(super) fn rotation(agent: &Id<AgentId>, old: u8, new: u8, generation: u64, s
 }
 
 /// The base64url text of `bytes`.
-fn base64url(bytes: &[u8]) -> String {
+pub(super) fn base64url(bytes: &[u8]) -> String {
     let mut out = vec![0; Url.encoded_len(bytes.len()).expect("a length")];
     let text = Url.encode(bytes, &mut out).expect("a buffer of the length");
     String::from_utf8(text.to_vec()).expect("ASCII")

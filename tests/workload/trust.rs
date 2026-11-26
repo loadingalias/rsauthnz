@@ -4,7 +4,7 @@
 use core::time::Duration;
 
 use rsauthnz::agent::{self, KEY_BYTES};
-use rsauthnz::credential;
+use rsauthnz::credential::{self, Released};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::custody::{Handle, KeyId};
 use rsauthnz::id::{Authority, Id};
@@ -12,7 +12,7 @@ use rsauthnz::limits::Limits;
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
 use rsauthnz::transition::Outcome;
 use rsauthnz::trust::{Draft, Error, Freshness, Profile, Refresh, Trust};
-use rsauthnz::workload::{self, Credential, Target};
+use rsauthnz::workload::{self, Target};
 use rscrypto::auth::SlhDsaSha2_128s;
 
 use super::{Custody, Host, START, at, audience, authority, budget, ceiling, issuance, minutes, ready, runner_id};
@@ -67,7 +67,7 @@ fn install(trust: &mut Trust, snapshot: &[u8], now: Reading) -> Result<(), Error
 
 /// The check of a remote verifier: `credential` verifies at `audience` under the issuer of the snapshot, and the
 /// snapshot admits it, at `now`.
-fn admits(trust: &Trust, credential: &Credential, audience: &str, now: Reading) -> Result<(), workload::Error> {
+fn admits(trust: &Trust, credential: &Released, audience: &str, now: Reading) -> Result<(), workload::Error> {
     let view = trust.view(now).unwrap();
     let issuer = view.issuer(&authority()).unwrap();
     let profile = issuer.profile(&self::audience(audience), Limits::default())?;

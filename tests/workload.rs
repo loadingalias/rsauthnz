@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use rsauthnz::authz::{self, Permit, Policy, Refusal, Requirements};
 use rsauthnz::cbor::Value;
 use rsauthnz::cose::{self, PublicKey, TrustedKey};
-use rsauthnz::credential::{self, Claims, Draft, ProofDraft, Serial, Subject};
+use rsauthnz::credential::{self, Awaiting, Claims, Draft, ProofDraft, Release, Released, Serial, Subject};
 use rsauthnz::crypto::Algorithm;
 use rsauthnz::evidence::Evidence;
 use rsauthnz::id::{Audience, Authority, AuthorityVersion, Human, Id, Principal, Workload};
@@ -26,8 +26,8 @@ use rsauthnz::store::{self, Journal, Kind, Profile, Record, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, OperationId, Outcome, Proposal};
 use rsauthnz::workload::{
-    self, Awaiting, By, Ceiling, Credential, Error, Issuer, IssuerRotation, LIFETIME_DEFAULT, Mode, Pending,
-    Registration, Replace, Request, Retire, Revocation, Target,
+    self, By, Ceiling, Error, Issuer, IssuerRotation, LIFETIME_DEFAULT, Mode, Pending, Registration, Replace, Request,
+    Retire, Revocation, Target,
 };
 use rsauthnz_conformance::memory::{Memory, Schedule, Snapshot};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
@@ -338,7 +338,7 @@ impl Host {
 
     /// The check of a verifier that reads the current state: `credential` verifies at `audience` under the profile of
     /// the current issuer record, and the current registration admits it, at `now`.
-    fn admits(&mut self, credential: &Credential, audience: &str, now: Reading) -> Result<(), Error> {
+    fn admits(&mut self, credential: &Released, audience: &str, now: Reading) -> Result<(), Error> {
         let profile = self.issuer().profile(&self::audience(audience), Limits::default())?;
         let verified = profile.verify(credential.as_bytes(), now, &mut budget())?;
         let registration = self.registration();
@@ -369,13 +369,13 @@ impl Host {
         (proposal, plan, awaiting, signature)
     }
 
-    /// The credential of `request` at `now`, or the refusal of the issuance or of its commit.
-    fn issue(&mut self, request: Request<'_>, now: Reading) -> Result<Credential, Error> {
+    /// The credential of `request` at `now`, which its commit releases, or the refusal of the issuance.
+    fn issue(&mut self, request: Request<'_>, now: Reading) -> Result<Released, Error> {
         let pending = self.pending(request, now)?;
         let signature = self.issuer.sign(&pending.to_be_signed());
         let (proposal, plan, awaiting) = pending.finish(&signature, &mut budget())?;
         let outcome = self.node.commit(proposal, plan);
-        awaiting.release(outcome)
+        Ok(awaiting.release(outcome).expect("the commit releases the credential"))
     }
 
     /// The commit of the revocation of the operation `name` of `target` by the operator at `now`.
@@ -394,7 +394,7 @@ impl Host {
     }
 
     /// The issuance record of `credential`, as the store holds it.
-    fn record(&mut self, credential: &Credential) -> Record {
+    fn record(&mut self, credential: &Released) -> Record {
         self.node.read(&credential::record_key(credential.serial())).unwrap()
     }
 
@@ -420,7 +420,7 @@ impl Host {
     }
 
     /// The first issuance of the operation `name` by the operator, for `build-api` with the default lifetime.
-    fn first(&mut self, name: &str) -> Credential {
+    fn first(&mut self, name: &str) -> Released {
         let (operator, build) = (self.operator.clone(), audience("build-api"));
         self.issue(issuance(name, &operator, &build), at(0)).unwrap()
     }
@@ -430,11 +430,11 @@ impl Host {
     fn renew(
         &mut self,
         name: &str,
-        credential: &Credential,
+        credential: &Released,
         key: &Custody,
         lifetime: Option<Duration>,
         now: Reading,
-    ) -> Result<Credential, Error> {
+    ) -> Result<Released, Error> {
         let build = audience("build-api");
         let bound = workload::binding(name.as_bytes(), &op(name), &authority(), &runner_id(), &build, None);
         let proof = key.prove(credential.as_bytes(), &build, &bound, now);
@@ -457,12 +457,12 @@ impl Host {
     fn rotate(
         &mut self,
         name: &str,
-        credential: &Credential,
+        credential: &Released,
         key: &Custody,
         new: &Custody,
         signer: &Custody,
         now: Reading,
-    ) -> Result<Credential, Error> {
+    ) -> Result<Released, Error> {
         let build = audience("build-api");
         let new_key = new.public();
         let bound = |challenge: &[u8]| {
@@ -567,7 +567,7 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     let serial = awaiting.serial();
     host.node.memory.inject(Fault::LostResponse);
     let outcome = host.node.commit(proposal, plan);
-    let Err(Error::Unknown(operation)) = awaiting.release(outcome) else {
+    let Err(Release::Unknown(operation)) = awaiting.release(outcome) else {
         panic!("a lost response released a credential, or gave another error than an unknown outcome");
     };
     host.node.start();
@@ -591,7 +591,7 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     let serial = awaiting.serial();
     assert_eq!(
         awaiting.release(host.node.commit(again, plan)).err(),
-        Some(Error::Committed)
+        Some(Release::Committed)
     );
     assert_eq!(host.node.read(&credential::record_key(serial)), None);
 
@@ -600,7 +600,7 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     let serial = awaiting.serial();
     host.node.memory.inject(Fault::CrashBeforeCommit);
     let outcome = host.node.commit(proposal, plan);
-    assert!(matches!(awaiting.release(outcome), Err(Error::Unknown(_))));
+    assert!(matches!(awaiting.release(outcome), Err(Release::Unknown(_))));
     host.node.start();
     assert_eq!(host.node.read(&credential::record_key(serial)), None);
 
@@ -883,7 +883,7 @@ fn a_replacement_host_gets_a_credential_and_the_old_hosts_credential_refuses() {
     let renewed = host.renew("r-1", &old, &old_host, None, at(10)).unwrap();
     assert_eq!(
         awaiting.release(host.node.commit(proposal, plan)).err(),
-        Some(Error::Conflict)
+        Some(Release::Conflict)
     );
     host.admits(&renewed, "build-api", at(11)).unwrap();
 
@@ -957,7 +957,7 @@ fn an_issuance_and_a_revocation_that_race_conflict_so_no_credential_survives_its
     assert!(matches!(host.revoke("rv-2", Target::All, at(31)), Outcome::Accepted(_)));
     assert_eq!(
         awaiting.release(host.node.commit(proposal, plan)).err(),
-        Some(Error::Conflict)
+        Some(Release::Conflict)
     );
     assert_eq!(host.admits(&renewed, "build-api", at(32)), Err(Error::Revoked));
 }
@@ -1204,7 +1204,7 @@ fn an_issuance_after_the_end_of_the_credential_of_its_evidence_refuses() {
     host.node.memory.set_clock(at(60));
     assert_eq!(
         awaiting.release(host.node.commit(proposal, plan)).err(),
-        Some(Error::Transition(rsauthnz::transition::Error::Expired))
+        Some(Release::Refused(rsauthnz::transition::Error::Expired))
     );
     // The control: the same issuance before the end commits.
     host.node.memory.set_clock(at(59));
@@ -1221,7 +1221,7 @@ fn the_receipt_of_another_issuance_under_the_same_operation_releases_nothing() {
     let (_, _, second, _) = host.signed(issuance("i-1", &operator, &build), at(1));
     assert_eq!(
         second.release(host.node.commit(proposal, plan)).err(),
-        Some(Error::Operation)
+        Some(Release::Operation)
     );
     // The control: the receipt of an issuance releases its own credential, with its own serial.
     let (proposal, plan, awaiting, _) = host.signed(issuance("i-2", &operator, &build), at(1));
@@ -1267,6 +1267,6 @@ fn the_same_request_under_two_issuers_binds_two_requests() {
     // the commit of the first issuer.
     assert_eq!(
         awaiting.release(host.node.commit(proposal, plan)).err(),
-        Some(Error::Transition(rsauthnz::transition::Error::Reuse))
+        Some(Release::Refused(rsauthnz::transition::Error::Reuse))
     );
 }

@@ -91,7 +91,7 @@ pub const KEY_BYTES: usize = 1984;
 pub const BODY_BYTES_MAX: usize = BODY.input_bytes_max as usize;
 
 /// The limits of a JSON body of an agent.
-const BODY: json::Limits = json::Limits {
+pub(crate) const BODY: json::Limits = json::Limits {
     input_bytes_max: 32 * 1024,
     depth_max: 1,
     // A token has at most `jose::TOKEN_BYTES_MAX` bytes.
@@ -102,7 +102,7 @@ const BODY: json::Limits = json::Limits {
 };
 
 /// The slots of the reader: one object, and each of its keys.
-const SLOTS: usize = 1 + 8;
+pub(crate) const SLOTS: usize = 1 + 8;
 
 /// The first item of each CBOR form of this module. The number changes with the form.
 const REQUEST_FORM: &str = "rsauthnz.agent.enrollment.2";
@@ -500,13 +500,13 @@ fn members<const N: usize>(json: &[u8], names: [&str; N]) -> Result<[Option<Stri
 }
 
 /// The text of a JSON string, with its escapes read.
-fn text(value: Str<'_>) -> Result<String, json::Error> {
+pub(crate) fn text(value: Str<'_>) -> Result<String, json::Error> {
     let mut out = vec![0; value.len()];
     Ok(value.decode(&mut out)?.into())
 }
 
 /// The bytes of the base64url text `text`, with no padding.
-fn base64url(text: &str) -> Result<Vec<u8>, Error> {
+pub(crate) fn base64url(text: &str) -> Result<Vec<u8>, Error> {
     let mut out = vec![0; Url.decoded_len(text.as_bytes()).map_err(|_| Error::Malformed)?];
     Url.decode(text.as_bytes(), &mut out).map_err(|_| Error::Malformed)?;
     Ok(out)

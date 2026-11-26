@@ -3,17 +3,18 @@
 //! current authority of the owner. Each change needs a fresh verification of the owner, and a restore releases no
 //! revision twice.
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use rsauthnz::account::{FRESH_MAX, Fresh};
 use rsauthnz::authz::{self, Granted, Permit, Policy, Request, Requirements};
 use rsauthnz::cbor::{self, Value};
 use rsauthnz::cose::{Key, PublicKey, TrustedKey};
-use rsauthnz::credential::{Claims, Draft as CredentialDraft, Profile, ProofDraft, Serial, Subject};
+use rsauthnz::credential::{Claims, Draft as CredentialDraft, ProofDraft, Released, Serial, Subject};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz::evidence::Evidence;
-use rsauthnz::grant::{Approval, Draft, Error, Failure, Grant, Grants, Permission};
-use rsauthnz::id::{Action, Audience, AuthorityVersion, Human, Id, Principal, Purpose, Resource, Workload};
+use rsauthnz::custody::{Handle, KeyId};
+use rsauthnz::grant::{self, Approval, Draft, Error, Failure, Grant, Grants, LIFETIME_MAX, Permission, Usage};
+use rsauthnz::id::{Action, Audience, Authority, AuthorityVersion, Human, Id, Principal, Resource, Workload};
 use rsauthnz::limits::{Limit, Limits, SignatureBudget};
 use rsauthnz::session::Access;
 use rsauthnz::store::Kind;
@@ -22,7 +23,7 @@ use rsauthnz::transition::{self, Audit, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::suite::Subject as _;
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519PublicKey, MlDsa65Ed25519SecretKey};
 
-use super::agent::{Agent, World, key, keypair, rotation};
+use super::agent::{Agent, World, base64url, key, keypair, rotation};
 use super::{START, alice, at, ready};
 
 /// The audience of the grants of the tests.
@@ -78,10 +79,6 @@ fn audience(name: &str) -> Id<Audience> {
     Id::new("acme", name).expect("an identifier")
 }
 
-fn purpose() -> Id<Purpose> {
-    Id::new("acme", "agent").expect("an identifier")
-}
-
 /// The permission of `name` on `on`, with no approval mark.
 fn permission(on: &str, name: &str) -> Permission {
     Permission {
@@ -115,6 +112,49 @@ impl Issuer {
     fn key(&self) -> TrustedKey {
         trusted(PublicKey::MlDsa65Ed25519(&self.public.to_bytes()))
     }
+
+    /// The handle of the issuer key in custody.
+    fn handle(&self) -> Handle {
+        Handle::new(
+            KeyId::from_bytes([7; 16]),
+            Algorithm::MlDsa65Ed25519,
+            &self.public.to_bytes(),
+        )
+        .expect("a handle")
+    }
+
+    /// The signature of custody over `message`.
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        let signature = self.secret.sign_deterministic(message, &[]).expect("a signature");
+        signature.as_bytes().to_vec()
+    }
+}
+
+/// The authority of the agents and of their grants.
+fn authority() -> Id<Authority> {
+    Id::new("acme", AUTHORITY).expect("an identifier")
+}
+
+/// The signature budget of one artifact.
+fn budget() -> SignatureBudget {
+    SignatureBudget::new(&Limits::default())
+}
+
+/// The proof of possession of the agent key of `holder` over `bytes` for `audience` and `challenge` at `seconds`.
+fn prove(holder: u8, bytes: &[u8], audience: &Id<Audience>, challenge: &[u8], seconds: u64) -> Vec<u8> {
+    let draft = ProofDraft::new(
+        &trusted(PublicKey::MlDsa65Ed25519(&key(holder))),
+        bytes,
+        audience,
+        challenge,
+        at(seconds),
+    )
+    .expect("a proof draft");
+    let signature = keypair(holder)
+        .1
+        .sign_deterministic(&draft.to_be_signed(), &[])
+        .expect("a signature");
+    draft.finish(signature.as_bytes(), &mut budget()).expect("a proof")
 }
 
 /// The trusted key of the composite public key `public`.
@@ -127,14 +167,21 @@ fn trusted(public: PublicKey<'_>) -> TrustedKey {
     TrustedKey::new(Algorithm::MlDsa65Ed25519, &key).expect("a composite key")
 }
 
-/// What a credential of the agent names: its issuer, the owner, the grant revision, and the audience. The agent key of
-/// `holder` proves its possession.
-struct Presented<'a> {
+/// A credential of the agent that a test presents: its bytes, its issuer, its audience, and the seed of the agent key
+/// that proves its possession.
+struct Shown<'a> {
+    bytes: Vec<u8>,
+    issuer: &'a str,
+    audience: &'a str,
+    holder: u8,
+}
+
+/// What a forged credential of the agent names: its issuer, the owner, and the grant revision. The issuer key of the
+/// tests signs it with the generic credential draft, as an issuer that does not read the grant would.
+struct Forged<'a> {
     issuer: &'a str,
     owner: Id<Human>,
     revision: u64,
-    audience: &'a str,
-    holder: u8,
 }
 
 /// Alice, her agent enrolled at 23 with the key of seed 2, the grants of its authority, and the policy at version 1,
@@ -145,12 +192,10 @@ struct Grantor {
     grants: Grants,
     policy: Held,
     issuer: Issuer,
-    /// The revision of the last grant that committed, which each credential of [`Self::check`] names.
-    revision: u64,
     /// The seed of the current key of the agent.
     holder: u8,
-    /// The serial of the last credential.
-    serial: u64,
+    /// The number of the last credential: the nonce of an issue, or the serial of a forged credential.
+    count: u64,
 }
 
 impl Grantor {
@@ -161,18 +206,16 @@ impl Grantor {
         Self {
             world,
             agent,
-            grants: Grants::new(Id::new("acme", AUTHORITY).expect("an identifier"), Limits::default()),
+            grants: Grants::new(authority(), Limits::default()),
             policy: Held {
                 version,
                 held: vec![(resource("repo-x"), action("repo.read"))],
             },
             issuer: Issuer::new(7),
-            revision: 0,
             holder: 2,
-            serial: 0,
+            count: 0,
         }
     }
-
     /// The proposal of the grant of `permissions` at [`API`] until `deadline` by the human of `fresh` at `seconds`.
     fn propose(
         &mut self,
@@ -213,27 +256,78 @@ impl Grantor {
     fn issue(&mut self, fresh: &Fresh, permissions: &[Permission], deadline: Duration, seconds: u64) -> Grant {
         let (proposal, plan, grant) = self.propose(fresh, permissions, deadline, seconds).expect("a grant");
         assert!(matches!(self.world.commit((proposal, plan)), Outcome::Accepted(_)));
-        self.revision = grant.revision;
         grant
     }
 
-    /// The credential of `presented` for the agent, which the issuer of `presented` signs at `seconds`, and which
-    /// ends one day after [`START`]. Only the receipt of its issuance commit gives its bytes.
-    fn credential(&mut self, presented: &Presented<'_>, seconds: u64) -> Vec<u8> {
-        self.serial += 1;
+    /// The credential of the agent for `at_audience` and `lifetime`, which the authority issues at `seconds` from the
+    /// grant ([`Grants::credential`]). The key of `holder` proves the request, and custody signs with the issuer key.
+    fn issued(
+        &mut self,
+        holder: u8,
+        at_audience: &str,
+        lifetime: Option<Duration>,
+        seconds: u64,
+    ) -> Result<Released, Error> {
+        self.count += 1;
+        let (agent, audience) = (self.agent.started.agent.clone(), audience(at_audience));
+        let mut nonce = [0; 32];
+        nonce[..8].copy_from_slice(&self.count.to_be_bytes());
+        let statement = grant::statement(&authority(), &agent, &audience, lifetime);
+        let proof = prove(holder, &statement, &audience, &nonce, seconds);
+        // The body of the agent, with a member that names an owner, which names none.
+        let lifetime = lifetime.map_or_else(String::new, |lifetime| format!(r#""lifetime":{},"#, lifetime.as_secs()));
+        let body = format!(
+            r#"{{"agent":"{agent}","audience":"{audience}",{lifetime}"nonce":"{}","proof":"{}","owner":"acme:bob"}}"#,
+            base64url(&nonce),
+            base64url(&proof),
+        );
+        let body = grant::Body::parse(body.as_bytes()).expect("a body");
+        self.request(body.request(), seconds)
+    }
+
+    /// The credential of `request`, which the authority issues at `seconds` and its commit releases.
+    fn request(&mut self, request: grant::Request<'_>, seconds: u64) -> Result<Released, Error> {
+        let handle = self.issuer.handle();
+        let node = &mut self.world.site.node;
+        let credential = self.grants.credential(
+            &mut node.memory,
+            request,
+            &handle,
+            &self.policy,
+            at(seconds),
+            &mut node.driver,
+        );
+        let pending = ready(credential).map_err(refused)?;
+        let signature = self.issuer.sign(&pending.to_be_signed());
+        let (proposal, plan, awaiting) = pending.finish(&signature, &mut budget())?;
+        let outcome = self.world.commit((proposal, plan));
+        Ok(awaiting.release(outcome).expect("the commit releases the credential"))
+    }
+
+    /// The credential of `forged` at `at_audience` for the current key of the agent, which the issuer key signs at
+    /// `seconds` with the generic credential draft, and which ends one day after [`START`].
+    fn forged<'a>(&mut self, forged: &Forged<'a>, at_audience: &'a str, seconds: u64) -> Shown<'a> {
+        self.count += 1;
         let claims = Claims::new(
-            Id::new("acme", presented.issuer).expect("an identifier"),
-            audience(presented.audience),
+            Id::new("acme", forged.issuer).expect("an identifier"),
+            audience(at_audience),
             Subject::Agent {
                 agent: self.agent.started.agent.clone(),
-                owner: presented.owner.clone(),
-                revision: presented.revision,
+                owner: forged.owner.clone(),
+                revision: forged.revision,
             },
-            purpose(),
-            Serial(self.serial),
+            grant::purpose(),
+            Serial(
+                self.world
+                    .site
+                    .node
+                    .driver
+                    .allocate(Kind::Credential)
+                    .expect("a serial"),
+            ),
             time(86_400),
         );
-        let holder = key(presented.holder);
+        let holder = key(self.holder);
         let draft = CredentialDraft::credential(
             &self.issuer.key(),
             &claims,
@@ -241,69 +335,42 @@ impl Grantor {
             at(seconds),
         )
         .expect("a draft");
-        let signature = self
-            .issuer
-            .secret
-            .sign_deterministic(&draft.to_be_signed(), &[])
-            .expect("a signature");
+        let signature = self.issuer.sign(&draft.to_be_signed());
         let audit = Audit {
-            actor: Principal::Workload(Id::<Workload>::new("acme", presented.issuer).expect("an identifier")),
+            actor: Principal::Workload(Id::<Workload>::new("acme", forged.issuer).expect("an identifier")),
             action: Id::new("acme", "credential.issue").expect("an identifier"),
             time: at(seconds),
         };
-        let operation = OperationId::new(format!("credential-{}", self.serial).as_bytes()).expect("an identity");
+        let operation = OperationId::new(format!("forged-{}", self.count).as_bytes()).expect("an identity");
         let mut proposal = Proposal::new(operation, audit, &Value::Null, Limits::default()).expect("a proposal");
         draft.record(&mut proposal).expect("the issuance record");
-        let prepared = draft
-            .finish(signature.as_bytes(), &mut SignatureBudget::new(&Limits::default()))
-            .expect("a credential");
+        let prepared = draft.finish(&signature, &mut budget()).expect("a credential");
         proposal.prepare(prepared).expect("the issuance record");
-        match self.world.commit((proposal, Plan::default())) {
+        let bytes = match self.world.commit((proposal, Plan::default())) {
             Outcome::Accepted(receipt) => receipt.artifact().expect("the credential").to_vec(),
             outcome => panic!("the issuance gave {outcome:?}"),
+        };
+        Shown {
+            bytes,
+            issuer: forged.issuer,
+            audience: at_audience,
+            holder: self.holder,
         }
     }
 
-    /// The evidence of the credential of `presented` at `seconds`: the profile of its issuer and audience verifies it,
-    /// and the agent key of `presented` signs the proof of possession.
-    fn evidence(&mut self, presented: &Presented<'_>, seconds: u64) -> Evidence {
-        let credential = self.credential(presented, seconds);
-        let audience = audience(presented.audience);
-        let issuer = Id::new("acme", presented.issuer).expect("an identifier");
-        let profile = Profile::new(
-            self.issuer.key(),
-            issuer,
-            audience.clone(),
-            purpose(),
-            Limits::default(),
-        )
-        .expect("a profile");
-        let budget = || SignatureBudget::new(&Limits::default());
+    /// The check of the action `name` on `on` by the agent that presents `shown` at `seconds`: the profile of the issuer
+    /// and the audience of `shown` verifies it, and the agent key of `shown` proves its possession.
+    fn present(&mut self, shown: &Shown<'_>, on: &str, name: &str, seconds: u64) -> Result<Granted, Error> {
+        let audience = audience(shown.audience);
+        let grants = Grants::new(Id::new("acme", shown.issuer).expect("an identifier"), Limits::default());
+        let profile = grants.profile(self.issuer.key(), &audience).expect("a profile");
         let verified = profile
-            .verify(&credential, at(seconds), &mut budget())
+            .verify(&shown.bytes, at(seconds), &mut budget())
             .expect("a credential");
-        let holder = key(presented.holder);
-        let draft = ProofDraft::new(
-            &trusted(PublicKey::MlDsa65Ed25519(&holder)),
-            &credential,
-            &audience,
-            &CHALLENGE,
-            at(seconds),
-        )
-        .expect("a proof draft");
-        let signature = keypair(presented.holder)
-            .1
-            .sign_deterministic(&draft.to_be_signed(), &[])
-            .expect("a signature");
-        let proof = draft.finish(signature.as_bytes(), &mut budget()).expect("a proof");
-        verified
+        let proof = prove(shown.holder, &shown.bytes, &audience, &CHALLENGE, seconds);
+        let evidence = verified
             .possession(&proof, &CHALLENGE, at(seconds), &mut budget())
-            .expect("the evidence")
-    }
-
-    /// The check of the action `name` on `on` by the agent of `presented` at `seconds`.
-    fn present(&mut self, presented: &Presented<'_>, on: &str, name: &str, seconds: u64) -> Result<Granted, Error> {
-        let evidence = self.evidence(presented, seconds);
+            .expect("the evidence");
         let (action, resource) = (action(name), resource(on));
         let check = authz::check_agent(
             &self.grants,
@@ -317,22 +384,35 @@ impl Grantor {
         ready(check).map_err(refused)
     }
 
-    /// What the current credential of the agent names at `at_audience`: the authority, alice, the last revision, and the
-    /// current key.
-    fn current<'a>(&self, at_audience: &'a str) -> Presented<'a> {
-        Presented {
+    /// The credential `released` of the agent at `at_audience`, as its current key shows it.
+    fn shown<'a>(&self, released: &Released, at_audience: &'a str) -> Shown<'a> {
+        Shown {
+            bytes: released.as_bytes().to_vec(),
             issuer: AUTHORITY,
-            owner: alice(),
-            revision: self.revision,
             audience: at_audience,
             holder: self.holder,
         }
     }
 
-    /// The check of the action `name` on `on` at `at_audience` by the agent with its current credential at `seconds`.
+    /// The check of the action `name` on `on` at `at_audience` by the agent at `seconds`, with a new credential of its
+    /// current key.
     fn check(&mut self, at_audience: &str, on: &str, name: &str, seconds: u64) -> Result<Granted, Error> {
-        let presented = self.current(at_audience);
-        self.present(&presented, on, name, seconds)
+        let released = self.issued(self.holder, at_audience, None, seconds)?;
+        let shown = self.shown(&released, at_audience);
+        self.present(&shown, on, name, seconds)
+    }
+
+    /// Notes the use of `scope` in `usage` at `seconds`. It gives `None` when `usage` gives no last use. Else it
+    /// commits the record of the last use when the store holds no later one, and gives whether a record committed.
+    fn note(&mut self, usage: &mut Usage, scope: &Granted, seconds: u64) -> Option<bool> {
+        let last_use = usage.note(scope, at(seconds))?;
+        let record = self
+            .grants
+            .record(&mut self.world.site.node.memory, &last_use, at(seconds));
+        Some(match ready(record).map_err(refused).expect("a proposal") {
+            Some(proposal) => matches!(self.world.commit(proposal), Outcome::Accepted(_)),
+            None => false,
+        })
     }
 
     /// Enforces `scope` on the read of `repo-x` at `seconds`.
@@ -393,7 +473,8 @@ fn a_grant_keeps_only_what_its_owner_holds_and_each_use_checks_her_current_autho
 
     let scope = grantor.check(API, "repo-x", "repo.read", 31).expect("a use");
     assert_eq!((scope.owner(), scope.revision()), (&alice(), grant.revision));
-    assert_eq!(scope.deadline(), time(3600));
+    // The credential of the check ends first: 15 minutes after its issue.
+    assert_eq!(scope.deadline(), time(31 + 900));
     assert_eq!(
         grantor.check(API, "repo-y", "repo.write", 31).err(),
         Some(Error::Permission)
@@ -485,16 +566,15 @@ fn an_extension_needs_a_fresh_verification_of_its_owner() {
         Outcome::Refused(transition::Error::Expired)
     ));
     grantor.world.site.node.memory.set_clock(at(45));
-    assert_eq!(
-        grantor.check(API, "repo-x", "repo.read", 45).expect("a use").deadline(),
-        time(3600)
-    );
+    let (access, _) = grantor.world.session();
+    assert_eq!(grantor.list(&access, 45), core::slice::from_ref(&first));
 
     let (_, fresh) = grantor.world.session();
     let changed = grantor.issue(&fresh, &read, time(7200), 46);
     assert!(changed.revision > first.revision);
     let scope = grantor.check(API, "repo-x", "repo.read", 47).expect("a use");
-    assert_eq!((scope.revision(), scope.deadline()), (changed.revision, time(7200)));
+    assert_eq!(scope.revision(), changed.revision);
+    assert_eq!(grantor.list(&access, 47), [changed]);
 }
 
 /// A change and a revocation that read one revision commit at most once.
@@ -542,10 +622,14 @@ fn a_rotation_keeps_the_grant_and_a_revocation_of_the_agent_ends_it() {
     let mut grantor = Grantor::new();
     let (access, fresh) = grantor.world.session();
     let grant = grantor.issue(&fresh, &[permission("repo-x", "repo.read")], time(3600), 30);
+    let before = grantor.issued(2, API, None, 30).expect("a credential");
     let id = grantor.agent.started.agent.clone();
     let rotated = grantor.world.rotate(&rotation(&id, 2, 3, 1, [2, 3]), 31);
     assert!(matches!(rotated, Ok(Outcome::Accepted(_))));
-    assert_eq!(grantor.check(API, "repo-x", "repo.read", 32).err(), Some(Error::Key));
+    let old = grantor.shown(&before, API);
+    assert_eq!(grantor.present(&old, "repo-x", "repo.read", 32).err(), Some(Error::Key));
+    // The old key cannot get a credential either.
+    assert!(matches!(grantor.issued(2, API, None, 32), Err(Error::Credential(_))));
     grantor.holder = 3;
     assert_eq!(
         grantor.check(API, "repo-x", "repo.read", 32).expect("a use").revision(),
@@ -599,31 +683,33 @@ fn a_request_refuses_a_credential_of_another_authority_another_owner_or_an_earli
         (&grantor.agent.started.agent, &alice(), first.revision)
     );
 
-    let tenant = Presented {
+    let tenant = Forged {
         issuer: "other-agents",
-        ..grantor.current(API)
+        owner: alice(),
+        revision: first.revision,
     };
+    let tenant = grantor.forged(&tenant, API, 32);
     assert_eq!(
         grantor.present(&tenant, "repo-x", "repo.read", 32).err(),
         Some(Error::Issuer)
     );
-    let substituted = Presented {
+    let substituted = Forged {
+        issuer: AUTHORITY,
         owner: Id::new("acme", "bob").expect("an identifier"),
-        ..grantor.current(API)
+        revision: first.revision,
     };
+    let substituted = grantor.forged(&substituted, API, 32);
     assert_eq!(
         grantor.present(&substituted, "repo-x", "repo.read", 32).err(),
         Some(Error::Owner)
     );
 
+    let earlier = grantor.issued(2, API, None, 33).expect("a credential");
     let (_, fresh) = grantor.world.session();
-    grantor.issue(&fresh, &read, time(7200), 33);
-    let earlier = Presented {
-        revision: first.revision,
-        ..grantor.current(API)
-    };
+    grantor.issue(&fresh, &read, time(7200), 34);
+    let earlier = grantor.shown(&earlier, API);
     assert_eq!(
-        grantor.present(&earlier, "repo-x", "repo.read", 34).err(),
+        grantor.present(&earlier, "repo-x", "repo.read", 35).err(),
         Some(Error::Revision)
     );
 }
@@ -731,4 +817,195 @@ fn a_policy_change_a_rotation_or_a_change_of_the_grant_stops_a_scope_at_its_next
     let (_, fresh) = grantor.world.session();
     grantor.issue(&fresh, &read, time(7200), 39);
     assert_eq!(grantor.enforce(&scope, 40).err(), Some(Error::Revision));
+}
+
+/// A credential ends at the earlier of its lifetime and the grant deadline, so a refresh never extends the grant, and a
+/// refresh at or after the deadline refuses. A lifetime past the most, or under one second, refuses.
+#[test]
+fn a_credential_ends_at_the_grant_deadline_and_a_refresh_past_it_refuses() {
+    let mut grantor = Grantor::new();
+    let (_, fresh) = grantor.world.session();
+    grantor.issue(&fresh, &[permission("repo-x", "repo.read")], time(600), 30);
+    let profile = grantor
+        .grants
+        .profile(grantor.issuer.key(), &audience(API))
+        .expect("a profile");
+    let end = |credential: &Released| {
+        let verified = profile.verify(credential.as_bytes(), at(31), &mut budget());
+        verified.expect("a credential").claims().expires
+    };
+    // The default lifetime of 15 minutes ends after the deadline.
+    let first = grantor.issued(2, API, None, 30).expect("a credential");
+    assert_eq!(end(&first), time(600));
+    // The answer to the agent: its credential, its end, and the time to renew it, half its lifetime after 30.
+    let answer = format!(
+        r#"{{"credential":"{}","expires":{},"renew_at":{}}}"#,
+        base64url(first.as_bytes()),
+        time(600).as_secs(),
+        time(315).as_secs()
+    );
+    assert_eq!(first.json(), answer.as_bytes());
+    let short = grantor
+        .issued(2, API, Some(Duration::from_secs(60)), 40)
+        .expect("a credential");
+    assert_eq!(end(&short), time(100));
+
+    for lifetime in [LIFETIME_MAX + Duration::from_secs(1), Duration::from_millis(999)] {
+        assert_eq!(grantor.issued(2, API, Some(lifetime), 41).err(), Some(Error::Lifetime));
+    }
+    // The reading at 598 can be at 599, and the reading at 599 can be at the deadline.
+    let last = grantor.issued(2, API, None, 598).expect("a credential");
+    assert_eq!(last.expires(), time(600));
+    assert_eq!(grantor.issued(2, API, None, 599).err(), Some(Error::Expired));
+}
+
+/// A credential that names a grant or an agent that a revocation ended refuses, also before its own end.
+#[test]
+fn a_credential_of_a_revoked_grant_or_agent_refuses() {
+    let mut grantor = Grantor::new();
+    let (access, fresh) = grantor.world.session();
+    let read = [permission("repo-x", "repo.read")];
+    grantor.issue(&fresh, &read, time(3600), 30);
+    let before = grantor.issued(2, API, None, 30).expect("a credential");
+    let revocation = grantor.revocation(&access, 31).expect("a revocation");
+    assert!(matches!(grantor.world.commit(revocation), Outcome::Accepted(_)));
+    let shown = grantor.shown(&before, API);
+    assert_eq!(
+        grantor.present(&shown, "repo-x", "repo.read", 32).err(),
+        Some(Error::NoGrant)
+    );
+
+    let (_, fresh) = grantor.world.session();
+    grantor.issue(&fresh, &read, time(3600), 33);
+    let before = grantor.issued(2, API, None, 33).expect("a credential");
+    let agent = &grantor.agent;
+    let revoked = grantor.world.revoke(&access, agent, 34);
+    assert!(matches!(revoked, Ok(Outcome::Accepted(_))));
+    let shown = grantor.shown(&before, API);
+    assert_eq!(
+        grantor.present(&shown, "repo-x", "repo.read", 35).err(),
+        Some(Error::NotEnrolled)
+    );
+}
+
+/// An issue needs a proof by the current key of the agent over the exact request. A proof by another key, or over a
+/// request for another audience, refuses, so no party issues a credential in the name of an agent.
+#[test]
+fn an_issue_needs_a_proof_of_the_current_key_over_the_exact_request() {
+    let mut grantor = Grantor::new();
+    let (_, fresh) = grantor.world.session();
+    grantor.issue(&fresh, &[permission("repo-x", "repo.read")], time(3600), 30);
+    let (agent, api) = (grantor.agent.started.agent.clone(), audience(API));
+    let nonce = [9; 32];
+    let other = audience("other-api");
+    let proofs = [
+        (3, grant::statement(&authority(), &agent, &api, None), &api),
+        (2, grant::statement(&authority(), &agent, &other, None), &other),
+    ];
+    for (holder, statement, proved) in proofs {
+        let request = grant::Request {
+            agent: &agent,
+            audience: &api,
+            lifetime: None,
+            nonce: &nonce,
+            proof: &prove(holder, &statement, proved, &nonce, 31),
+        };
+        assert!(matches!(grantor.request(request, 31), Err(Error::Credential(_))));
+    }
+}
+
+/// Repeated checks in one window give at most one last use, and one commit records it: the page shows the start of
+/// the window. A second host that notes the same use proposes nothing. A change of the grant drops the last use of
+/// the earlier revision from the page. A full table notes no new revision until the next window.
+#[test]
+fn repeated_checks_within_one_granularity_give_at_most_one_last_use() {
+    let mut grantor = Grantor::new();
+    let (access, fresh) = grantor.world.session();
+    let read = [permission("repo-x", "repo.read")];
+    grantor.issue(&fresh, &read, time(3600), 30);
+    let one = NonZeroUsize::MIN;
+    let mut usage = Usage::new(Duration::from_secs(60), one).expect("a table");
+    let last_use = |grantor: &mut Grantor, seconds| grantor.list(&access, seconds)[0].last_use;
+
+    // START is a whole minute, so the checks from 31 to 59 are in the window that starts at START.
+    let scope = grantor.check(API, "repo-x", "repo.read", 31).expect("a use");
+    assert_eq!(grantor.note(&mut usage, &scope, 31), Some(true));
+    assert_eq!(last_use(&mut grantor, 31), Some(time(0)));
+    for seconds in [40, 59] {
+        let scope = grantor.check(API, "repo-x", "repo.read", seconds).expect("a use");
+        assert_eq!(grantor.note(&mut usage, &scope, seconds), None);
+    }
+    let mut other = Usage::default();
+    assert_eq!(grantor.note(&mut other, &scope, 45), Some(false));
+
+    let (_, fresh) = grantor.world.session();
+    grantor.issue(&fresh, &read, time(3600), 50);
+    assert_eq!(last_use(&mut grantor, 50), None);
+    let scope = grantor.check(API, "repo-x", "repo.read", 55).expect("a use");
+    assert_eq!(grantor.note(&mut usage, &scope, 55), None);
+    let scope = grantor.check(API, "repo-x", "repo.read", 61).expect("a use");
+    assert_eq!(grantor.note(&mut usage, &scope, 61), Some(true));
+    assert_eq!(last_use(&mut grantor, 61), Some(time(60)));
+}
+
+/// A full page of the active-access page that ends at a grant leaves that grant to the next page, with its last use.
+/// Thus each grant shows its last use once, also at the end of a page.
+#[test]
+fn a_page_that_ends_at_a_grant_gives_it_with_its_last_use_on_the_next_page() {
+    let mut grantor = Grantor::new();
+    let read = [permission("repo-x", "repo.read")];
+    // 33 more agents of alice, enrolled from 24 to 56, each with a grant at 60.
+    let agents: Vec<_> = (3..36)
+        .map(|seed| (grantor.world.enrolled_at(seed, u64::from(seed) + 21), seed))
+        .collect();
+    let (access, fresh) = grantor.world.session();
+    let mut agents: Vec<_> = agents
+        .into_iter()
+        .map(|(mut agent, seed)| {
+            core::mem::swap(&mut grantor.agent, &mut agent);
+            grantor.issue(&fresh, &read, time(3600), 60);
+            core::mem::swap(&mut grantor.agent, &mut agent);
+            (agent, seed)
+        })
+        .collect();
+    let page = |grantor: &mut Grantor, after| {
+        let list = grantor
+            .grants
+            .list(&mut grantor.world.site.node.memory, &access, after, at(70));
+        ready(list).map_err(refused).expect("a page")
+    };
+    let order: Vec<_> = page(&mut grantor, None)
+        .grants
+        .into_iter()
+        .map(|grant| grant.agent)
+        .collect();
+    assert_eq!(order.len(), 33);
+
+    // Each grant in the order of the page has a last use, except the 32nd. The 31 pairs and the 32nd grant are 63
+    // records, so the 64th record is the 33rd grant, and its last use is the 65th.
+    let mut usage = Usage::default();
+    for (index, agent) in order.iter().enumerate() {
+        if index == 31 {
+            continue;
+        }
+        let at_index = agents.iter().position(|(held, _)| held.started.agent == *agent);
+        let (held, seed) = agents.swap_remove(at_index.expect("an agent of the page"));
+        grantor.agent = held;
+        grantor.holder = seed;
+        let scope = grantor.check(API, "repo-x", "repo.read", 61).expect("a use");
+        assert_eq!(grantor.note(&mut usage, &scope, 61), Some(true));
+    }
+
+    let first = page(&mut grantor, None);
+    let used: Vec<_> = first.grants.iter().map(|grant| grant.last_use.is_some()).collect();
+    assert_eq!(used.len(), 32);
+    assert!(used[..31].iter().all(|used| *used) && !used[31]);
+    let second = page(&mut grantor, first.next.as_ref());
+    assert_eq!(second.grants.len(), 1);
+    assert_eq!(
+        (&second.grants[0].agent, second.grants[0].last_use),
+        // The default window of 5 minutes that holds 61 starts at START.
+        (&order[32], Some(time(0)))
+    );
+    assert_eq!(second.next, None);
 }
