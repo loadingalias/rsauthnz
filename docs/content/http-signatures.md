@@ -6,8 +6,9 @@ The server verifies the request with no state of its own, and gets the same evid
 the grant check gives the scope of the request. Module `rsauthnz::httpsig` gives the profile, and `rsauthnz-http`
 maps it to `http::Request` values.
 
-Use this profile for an HTTP API that verifies with rsauthnz, also behind a proxy that ends TLS. Each request pays
-for one composite signature and one credential: about 12 KB of fields ([Size of a request](#size-of-a-request)).
+Use this profile for an HTTP API that verifies with rsauthnz, also behind a proxy that ends TLS or changes `Host`.
+Each request pays for one composite signature and one credential: about 12 KB of fields
+([Size of a request](#size-of-a-request)).
 
 ## The profile
 
@@ -16,12 +17,20 @@ The signature covers these components, each one time, in any order:
 | Component | Value |
 | --- | --- |
 | `@method` | The method, such as `POST` |
-| `@authority` | The host and the port of the target, in lowercase: `Host` in HTTP/1.1, `:authority` in HTTP/2 and HTTP/3 |
 | `@path` | The path of the target, with each percent-encoded byte as the request has it |
 | `@query` | `?` and the query of the target, or `?` alone for a target with no query |
 | `content-digest` | The SHA-256 digest of the body ([RFC 9530](https://www.rfc-editor.org/rfc/rfc9530)), also of an empty body |
 | `content-type` | The media type, when the request has one. A changed media type can change how the server reads the same body |
 | `agent-credential` | The agent credential: the grant reference. It names the agent, its owner, the grant revision, and the audience |
+
+The signature covers no authority. The audience of the credential is the recipient of the request: a verifier takes
+only the credentials of its own audience, such as `acme:api`. The verifier never reads `Host` or `:authority`, so a
+proxy can change them. The WIMSE HTTP-signature draft binds its recipient in the same way, with a signed audience.
+
+Each server of one audience takes the requests of the others. For example, if `api.example.com` and
+`api-eu.example.com` have one audience, a request for one of them verifies at the other. If the requests of a
+service must not verify at another service, give each service its own audience. The grant names each audience of the
+agent ([Issue a grant](grants.md#issue-a-grant)).
 
 The signature has exactly four parameters, in any order: `created` and `expires` in whole seconds since the Unix
 epoch, `nonce`, and `tag="rsauthnz-agent"` (`httpsig::TAG`). The nonce is the base64url text of 16 to 32 random bytes
@@ -36,20 +45,19 @@ A signed request has these four fields:
 ```http
 Content-Digest: sha-256=:<base64 of 32 bytes>:
 Agent-Credential: :<base64 of the credential>:
-Signature-Input: agent=("@method" "@authority" "@path" "@query" "content-digest" "content-type" "agent-credential");created=1800000040;expires=1800000100;nonce="<base64url of 16 bytes>";tag="rsauthnz-agent"
+Signature-Input: agent=("@method" "@path" "@query" "content-digest" "content-type" "agent-credential");created=1800000040;expires=1800000100;nonce="<base64url of 16 bytes>";tag="rsauthnz-agent"
 Signature: agent=:<base64 of the signature>:
 ```
 
 The `cnf` key of the credential signs the signature base with its algorithm. Each agent key is ML-DSA-65 + Ed25519,
 which signs with the empty context ([Signature profiles](profiles.md)). The verifier also checks Ed25519 and ES256
-signatures: the vectors of RFC 9421 Appendix B.2.6, B.3, and B.4 verify.
+signatures: the signatures of RFC 9421 Appendix B.2.6 and B.3 verify over their signature bases.
 
 ## Before you start
 
 - An agent with a grant, and an agent credential for the audience of the server
   ([Get an agent credential](grants.md#get-an-agent-credential)). The agent key is in custody ([Custody](custody.md)).
-- At the server: the public key of the issuer of the authority, and the authorities that the agents send, such as
-  `api.example.com`.
+- At the server: the public key of the issuer of the authority, and the audience of the server, such as `acme:api`.
 - The body of the request in memory, which the framework read within its body limit. The content digest needs each
   byte of the body before the operation runs.
 - A verifier accepts one signed request again until its `expires`. No replay store refuses a repeated signature yet.
@@ -60,8 +68,8 @@ signatures: the vectors of RFC 9421 Appendix B.2.6, B.3, and B.4 verify.
 
 The agent signs each request just before it sends it.
 
-1. Build the `http::Request` with an absolute target, such as `https://api.example.com/repos/repo-x/labels?ref=main`,
-   its fields, and its body.
+1. Build the `http::Request` with its target, such as `https://api.example.com/repos/repo-x/labels?ref=main`, its
+   fields, and its body.
 2. Make 16 random bytes from the entropy source of the agent: the nonce. Use a new nonce for each request.
 3. Call `rsauthnz_http::signature_draft(&agent_key, &credential, &request, &nonce, httpsig::LIFETIME_DEFAULT, now)`.
    `agent_key` is the trusted key of the agent: the `cnf` key of `credential`. The lifetime is in whole seconds, and
@@ -76,18 +84,17 @@ signed with a credential of the key that a rotation replaced refuses at the gran
 
 ## Verify a request
 
-1. At startup, build the verifier: `httpsig::Profile::new(grants.profile(issuer_key, &audience)?, &authorities)?`.
-   `authorities` are the hosts, with a port when it is not the default, that the agents send. They compare in
-   lowercase with no other change, so list each form that the agents send. The longest window is 5 minutes
+1. At startup, build the verifier of the audience of the server:
+   `httpsig::Profile::new(grants.profile(issuer_key, &audience)?)`. The longest window is 5 minutes
    (`WINDOW_MAX_DEFAULT`), and the clock skew of an agent is 30 seconds (`SKEW_DEFAULT`). Change them with
    `profile.with_window(window_max, skew)`.
-2. For each request, call `rsauthnz_http::verify_signature(&profile, &request, now)`. It takes the authority of the
-   target, which HTTP/2 and HTTP/3 give, or else the one `Host` of HTTP/1.1. It gives the `Evidence` of the agent.
+2. For each request, call `rsauthnz_http::verify_signature(&profile, &request, now)`. It reads the method, the path,
+   the query, the fields, and the body, and no authority. It gives the `Evidence` of the agent.
 3. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`, and use the `Granted`
    scope ([Check the request of an agent](authorization.md#check-the-request-of-an-agent)).
 
-A host with no `http` values builds an `httpsig::Request`: the method, the authority, the path, the query, each field
-as a name and a value, and the body. The agent signs it with `httpsig::Draft::new`, and the server verifies it with
+A host with no `http` values builds an `httpsig::Request`: the method, the path, the query, each field as a name and
+a value, and the body. The agent signs it with `httpsig::Draft::new`, and the server verifies it with
 `profile.verify(&request, now)`.
 
 `verify` runs each cheap check first. The two signature checks come last: the credential, then the request, each with
@@ -98,16 +105,17 @@ each `httpsig::Error` with `?` into `403 Forbidden` and `{"recovery":"refuse"}`
 ## Size of a request
 
 Each request carries one signature and one credential. `add_signature` marks the fields sensitive, so an HTTP/2 or
-HTTP/3 encoder that keeps the mark never indexes them, and each request sends them again. Measured on a signed `POST` with a JSON body, with an agent credential of the tests (the
-issuer `acme:agents`, the audience `acme:api`, and an agent identifier of 22 characters):
+HTTP/3 encoder that keeps the mark never indexes them, and each request sends them again. Measured on a signed `POST`
+with a JSON body, with an agent credential of the tests (the issuer `acme:agents`, the audience `acme:api`, and an
+agent identifier of 22 characters):
 
 | Field | Bytes of the value |
 | --- | --- |
 | `Agent-Credential` | 7,398: the base64 of a credential of 5,547 bytes |
 | `Signature` | 4,508: the base64 of a composite signature of 3,373 bytes |
-| `Signature-Input` | 188, with `content-type` |
+| `Signature-Input` | 175, with `content-type` |
 | `Content-Digest` | 54 |
-| Total, with the names, `: `, and the line ends of HTTP/1.1 | 12,218 |
+| Total, with the names, `: `, and the line ends of HTTP/1.1 | 12,205 |
 
 Longer identifiers make the credential longer. A credential has at most 8,192 bytes, which gives 10,926 bytes of
 field value. In the measured request, each field line has less than 8 KiB, and the four lines leave about 4 KB of a
@@ -118,13 +126,13 @@ and proxy on the path.
 
 A proxy between the agent and the verifier breaks each signature that it changes. It must keep:
 
-- The method, the authority (`Host` or `:authority`), the path, and the query, byte for byte. For nginx, set
-  `proxy_set_header Host $host`: its default sends the name of the upstream.
+- The method, the path, and the query, byte for byte.
 - The body, with no change of its encoding, and `Content-Type`.
 - `Content-Digest`, `Agent-Credential`, `Signature-Input`, and `Signature`.
 
-A proxy can add its own signature to `Signature-Input` and `Signature` under its own label, and it can add other
-fields. A proxy can end TLS: the scheme is not covered.
+A proxy can add its own signature to `Signature-Input` and `Signature` under its own label. It can add other fields,
+change the order of the fields, and change the case of their names. A proxy can also end TLS and change `Host` or
+`:authority`, as nginx does by default: the signature covers no scheme and no authority.
 
 ## Errors
 
@@ -133,7 +141,6 @@ request.
 
 | Error | Cause |
 | --- | --- |
-| `Authority` | The authority is not an authority of the profile, or the request has no authority, or two `Host` fields |
 | `Field(field)` | `Signature-Input`, `Signature`, `Content-Digest`, or `Agent-Credential` is missing, longer than `Limits::bytes`, or not valid |
 | `Tag` | No signature has the tag of the profile, or two have it |
 | `Components` | The covered components are not those of the profile, or a request with `Content-Type` does not cover it |
@@ -144,7 +151,7 @@ request.
 | `Expired` | The latest time of the verifier can be at or after `expires` |
 | `Digest` | `Content-Digest` has no `sha-256` member, or it is not the digest of the body |
 | `Value` | A covered value has a byte that is not visible ASCII, or a derived value is empty |
-| `Credential(error)` | The credential refused ([Errors](credential-format.md#errors)) |
+| `Credential(error)` | The credential refused ([Errors](credential-format.md#errors)). A credential of another audience refuses with `credential::Error::Cose(cose::Error::Audience)` |
 | `Signature` | The `cnf` key of the credential did not sign the request, or a covered component changed |
 | `Limit(limit)` | A signature check costs more than its budget |
 | `Time(error)` | The reading of the time has no bound |
@@ -159,7 +166,7 @@ request.
 | `draft.finish(&signature, &mut budget)` | The `Signed` fields, after the check of the signature |
 | `rsauthnz_http::add_signature(headers, &signed)` | Adds the four fields to an `http::HeaderMap` |
 | `signed.fields()` | Each field: its name and its value |
-| `httpsig::Profile::new(credential_profile, &authorities)` | The verifier of the authorities |
+| `httpsig::Profile::new(credential_profile)` | The verifier of the audience of the credential profile |
 | `profile.with_window(window_max, skew)` | The verifier with another window and skew |
 | `rsauthnz_http::verify_signature(&profile, &request, now)` | The `Evidence` of the agent of an `http::Request` |
 | `profile.verify(&request, now)` | The `Evidence` of the agent of an `httpsig::Request` |

@@ -1,5 +1,5 @@
-//! The `http` mapping of the HTTP message signatures of an agent: a request that the agent signs with an absolute
-//! target verifies at the server over HTTP/1.1, with `Host`, and over HTTP/2, with the authority of its target.
+//! The `http` mapping of the HTTP message signatures of an agent: a request that the agent signs verifies at the server
+//! over HTTP/1.1 and HTTP/2, also after a proxy changes its authority.
 
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
@@ -106,10 +106,11 @@ fn issued(claims: &Claims, holder: &[u8; 1984], now: Reading) -> Vec<u8> {
 }
 
 /// The agent signs a change with an absolute target, and the server receives it with an origin-form target and `Host`
-/// over HTTP/1.1, and with the authority of its target over HTTP/2. Each verifies, and a request with no authority, or
-/// with two, refuses.
+/// over HTTP/1.1, and with the authority of its target over HTTP/2. Each verifies. A proxy that sends the name of the
+/// upstream as `Host`, as nginx does by default, or another authority, or no `Host`, changes no covered part, so the
+/// request verifies too. Another query refuses.
 #[test]
-fn a_request_that_the_agent_signs_verifies_at_the_server_over_each_http_version() {
+fn a_signed_request_verifies_over_each_http_version_and_after_a_proxy_changes_its_authority() {
     let now = Reading::new(
         Duration::from_secs(1_800_000_000),
         Some(Duration::from_secs(1)),
@@ -149,7 +150,7 @@ fn a_request_that_the_agent_signs_verifies_at_the_server_over_each_http_version(
         Limits::default(),
     )
     .unwrap();
-    let profile = Profile::new(credentials, &["api.example"]).unwrap();
+    let profile = Profile::new(credentials);
     let received = |uri: &str, version: Version, hosts: &[&str]| {
         let mut request = Request::post(uri).version(version);
         for host in hosts {
@@ -167,17 +168,18 @@ fn a_request_that_the_agent_signs_verifies_at_the_server_over_each_http_version(
     let http2 = received("https://api.example/repos/repo-x/labels?ref=main", Version::HTTP_2, &[]);
     verify_signature(&profile, &http2, now).unwrap();
 
-    let no_host = received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &[]);
-    assert_eq!(verify_signature(&profile, &no_host, now).err(), Some(Error::Authority));
-    let two_hosts = received(
-        "/repos/repo-x/labels?ref=main",
-        Version::HTTP_11,
-        &["api.example", "api.example"],
-    );
-    assert_eq!(
-        verify_signature(&profile, &two_hosts, now).err(),
-        Some(Error::Authority)
-    );
+    let proxied = [
+        received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &["backend:8080"]),
+        received(
+            "http://10.0.0.7:8080/repos/repo-x/labels?ref=main",
+            Version::HTTP_2,
+            &[],
+        ),
+        received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &[]),
+    ];
+    for request in &proxied {
+        verify_signature(&profile, request, now).unwrap();
+    }
     let other_path = received("/repos/repo-x/labels?ref=dev", Version::HTTP_11, &["api.example"]);
     assert_eq!(
         verify_signature(&profile, &other_path, now).err(),

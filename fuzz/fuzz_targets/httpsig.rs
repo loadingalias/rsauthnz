@@ -31,10 +31,9 @@ fuzz_target!(|data: &[u8]| {
         limits,
     )
     .expect("a profile");
-    let profile = Profile::new(credentials, &["api.example"]).expect("a verifier");
+    let profile = Profile::new(credentials);
     let request = Request {
         method: "POST",
-        authority: "api.example",
         path: "/",
         query: None,
         fields: &fields,

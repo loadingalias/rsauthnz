@@ -1,20 +1,18 @@
 //! The HTTP message signatures of an agent (RFC 9421). Each request carries the agent credential and a signature by its
-//! key over the method, the target, the authority, the body, and the credential, which is the grant reference. The
-//! verifier gives the evidence that the grant check takes, and a change of each covered part refuses.
+//! key over the method, the target, the body, and the credential, which is the grant reference and names the audience.
+//! The verifier gives the evidence that the grant check takes. A change of each covered part refuses, and so does a
+//! verifier of another audience.
 
 use core::time::Duration;
 
 use rsauthnz::authz;
-use rsauthnz::cose::PublicKey;
-use rsauthnz::credential::Released;
+use rsauthnz::cose::{self, PublicKey};
+use rsauthnz::credential::{self, Released};
 use rsauthnz::httpsig::{Draft, Error, Field, LIFETIME_DEFAULT, Profile, Request, Signed};
 use rsauthnz::time::{Reading, ReadingSource};
 use rscodec::base64::Profile::Standard;
 
 use super::{API, Grantor, action, at, audience, budget, key, keypair, permission, refused, resource, time, trusted};
-
-/// The authorities of the verifier: two hosts of one service.
-const AUTHORITIES: [&str; 2] = ["api.example", "api-eu.example"];
 
 /// The nonce of each signature of the tests that needs no other one.
 const NONCE: [u8; 16] = [9; 16];
@@ -23,7 +21,6 @@ const NONCE: [u8; 16] = [9; 16];
 #[derive(Clone)]
 struct Sent {
     method: &'static str,
-    authority: &'static str,
     path: &'static str,
     query: Option<&'static str>,
     fields: Vec<(&'static str, Vec<u8>)>,
@@ -31,11 +28,10 @@ struct Sent {
 }
 
 impl Sent {
-    /// The read of `repo-x` at `api.example`, with no body.
+    /// The read of `repo-x`, with no body.
     fn read() -> Self {
         Self {
             method: "GET",
-            authority: "api.example",
             path: "/repos/repo-x",
             query: None,
             fields: vec![("accept", b"application/json".to_vec())],
@@ -43,11 +39,10 @@ impl Sent {
         }
     }
 
-    /// A change of `repo-x` at `api.example`, with a JSON body and a query.
+    /// A change of `repo-x`, with a JSON body and a query.
     fn change() -> Self {
         Self {
             method: "POST",
-            authority: "api.example",
             path: "/repos/repo-x/labels",
             query: Some("ref=main"),
             fields: vec![("content-type", b"application/json".to_vec())],
@@ -59,7 +54,6 @@ impl Sent {
     fn with<'a>(&'a self, fields: &'a [(&'a str, &'a [u8])]) -> Request<'a> {
         Request {
             method: self.method,
-            authority: self.authority,
             path: self.path,
             query: self.query,
             fields,
@@ -107,7 +101,7 @@ fn standard(bytes: &[u8]) -> String {
 }
 
 /// Alice and her agent with a grant of the read of `repo-x` at [`API`] until one hour after `START`, a credential of
-/// the agent from 30, and the verifier of [`AUTHORITIES`].
+/// the agent from 30, and the verifier of [`API`].
 fn granted() -> (Grantor, Released, Profile) {
     let mut grantor = Grantor::new();
     let (_, fresh) = grantor.world.session();
@@ -117,7 +111,7 @@ fn granted() -> (Grantor, Released, Profile) {
         .grants
         .profile(grantor.issuer.key(), &audience(API))
         .expect("a profile");
-    let profile = Profile::new(profile, &AUTHORITIES).expect("a verifier");
+    let profile = Profile::new(profile);
     (grantor, credential, profile)
 }
 
@@ -142,7 +136,8 @@ fn verify(profile: &Profile, sent: &Sent, seconds: u64) -> Result<rsauthnz::evid
 }
 
 /// A signed read gives the evidence of the agent, and the grant check of that evidence gives the scope of alice. A
-/// change with a body, a query, and a media type verifies too, and so does a request that a proxy also signs.
+/// change with a body, a query, and a media type verifies too. So does a request that a proxy also signs, with another
+/// field, its fields in another order, their names in uppercase, and space around their values.
 #[test]
 fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
     let (mut grantor, credential, profile) = granted();
@@ -170,34 +165,36 @@ fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
         .field("signature-input")
         .extend_from_slice(br#", proxy=("@method");created=1"#);
     proxied.field("signature").extend_from_slice(b", proxy=:AAAA:");
-    verify(&profile, &proxied, 41).unwrap();
+    proxied.fields.push(("x-forwarded-for", b"203.0.113.7".to_vec()));
+    proxied.fields.reverse();
+    let upper: Vec<(String, Vec<u8>)> = proxied
+        .fields
+        .iter()
+        .map(|(name, value)| (name.to_ascii_uppercase(), [b"  ", value.as_slice(), b" "].concat()))
+        .collect();
+    let fields: Vec<(&str, &[u8])> = upper
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_slice()))
+        .collect();
+    profile.verify(&proxied.with(&fields), at(41)).unwrap();
 }
 
-/// Each change of a covered part of a signed request refuses: the method, the path, the query, the authority, the
-/// body, the media type, and the credential, which is the grant reference. A signature by another key refuses too.
+/// Each change of a covered part of a signed request refuses: the method, the path, the query, the body, the media type,
+/// and the credential, which is the grant reference. A signature by another key refuses too, and a verifier of another
+/// audience refuses the request: the audience of the credential binds its recipient.
 #[test]
-fn a_changed_method_target_authority_body_or_grant_reference_refuses() {
+fn a_changed_method_target_body_or_grant_reference_or_another_audience_refuses() {
     let (mut grantor, credential, profile) = granted();
     let sent = signed(&Sent::change(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
     verify(&profile, &sent, 41).unwrap();
     // A second credential of the same agent and grant: another serial, so other bytes.
     let other = grantor.issued(2, API, None, 35).expect("a credential");
     let body = br#"{"label":"merged"}"#;
-    let cases: [(&str, Change, Error); 10] = [
+    let cases: [(&str, Change, Error); 8] = [
         ("method", |sent, _| sent.method = "PUT", Error::Signature),
         ("path", |sent, _| sent.path = "/repos/repo-y/labels", Error::Signature),
         ("query", |sent, _| sent.query = Some("ref=dev"), Error::Signature),
         ("no query", |sent, _| sent.query = None, Error::Signature),
-        (
-            "authority",
-            |sent, _| sent.authority = "api-eu.example",
-            Error::Signature,
-        ),
-        (
-            "authority of another verifier",
-            |sent, _| sent.authority = "api.other.example",
-            Error::Authority,
-        ),
         ("body", |sent, body| sent.body = body.to_vec(), Error::Digest),
         (
             "body and digest",
@@ -224,6 +221,15 @@ fn a_changed_method_target_authority_body_or_grant_reference_refuses() {
         change(&mut changed, body);
         assert_eq!(verify(&profile, &changed, 41).err(), Some(expected), "{name}");
     }
+    let billing = grantor
+        .grants
+        .profile(grantor.issuer.key(), &audience("billing"))
+        .expect("a profile");
+    assert_eq!(
+        verify(&Profile::new(billing), &sent, 41).err(),
+        Some(Error::Credential(credential::Error::Cose(cose::Error::Audience))),
+        "another audience"
+    );
     let mut swapped = sent;
     *swapped.field("agent-credential") = format!(":{}:", standard(other.as_bytes())).into_bytes();
     assert_eq!(
@@ -286,12 +292,11 @@ fn a_signature_outside_its_window_refuses() {
 fn by_hand(sent: &Sent, credential: &[u8], params: &str) -> Sent {
     let digest = format!("sha-256=:{}:", standard(&rscrypto::Sha256::digest(&sent.body)));
     let credential = format!(":{}:", standard(credential));
-    let inner = format!(r#"("@method" "@authority" "@path" "@query" "content-digest" "agent-credential"){params}"#);
+    let inner = format!(r#"("@method" "@path" "@query" "content-digest" "agent-credential"){params}"#);
     let base = format!(
-        "\"@method\": {}\n\"@authority\": {}\n\"@path\": {}\n\"@query\": ?{}\n\"content-digest\": {digest}\n\
+        "\"@method\": {}\n\"@path\": {}\n\"@query\": ?{}\n\"content-digest\": {digest}\n\
          \"agent-credential\": {credential}\n\"@signature-params\": {inner}",
         sent.method,
-        sent.authority,
         sent.path,
         sent.query.unwrap_or_default(),
     );

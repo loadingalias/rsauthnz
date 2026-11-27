@@ -5,12 +5,15 @@
 //!
 //! The signature covers these components, in any order, each once:
 //!
-//! - `@method`, `@authority`, `@path`, and `@query` (RFC 9421 section 2.2). `@query` is `?` for a request with no
-//!   query.
+//! - `@method`, `@path`, and `@query` (RFC 9421 section 2.2). `@query` is `?` for a request with no query.
 //! - `content-digest`: the SHA-256 digest of the body ([RFC 9530]), also of an empty body.
 //! - `content-type`, when the request has it. A changed media type can change how the server reads the same body.
 //! - `agent-credential` ([`CREDENTIAL`]): the agent credential, a byte sequence ([RFC 8941]). It is the grant
 //!   reference: it names the agent, its owner, the grant revision, and the audience.
+//!
+//! The signature covers no authority. The audience of the credential is the recipient: the credential profile of the
+//! verifier refuses a credential of another audience. Thus a proxy can change `Host` or `:authority`, and the verifier
+//! never reads them. The WIMSE HTTP-signature draft binds its recipient in the same way, with a signed audience.
 //!
 //! The parameters are `created`, `expires`, `nonce`, and `tag`, in any order, each once. The tag is [`TAG`], and the
 //! nonce is the base64url of 16 to 32 random bytes of the agent. A verifier takes the one signature with the tag, so a
@@ -23,8 +26,8 @@
 //!
 //! Each request carries one composite signature of 3,373 bytes and one credential of about 5.5 KB, in base64. A
 //! binding marks these fields sensitive, so an HTTP/2 or HTTP/3 encoder never indexes them, and each request sends
-//! them again. A proxy between the agent and the verifier must keep the method, the authority, the path, the query,
-//! the body, `Content-Type`, and the four fields of the signature.
+//! them again. A proxy between the agent and the verifier must keep the method, the path, the query, the body,
+//! `Content-Type`, and the four fields of the signature.
 //!
 //! [RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
 //! [RFC 9530]: https://www.rfc-editor.org/rfc/rfc9530
@@ -89,9 +92,6 @@ const CONTENT_TYPE: &str = "content-type";
 pub struct Request<'a> {
     /// The method, such as `POST`, in its case.
     pub method: &'a str,
-    /// The authority of the target: `Host` in HTTP/1.1, and `:authority` in HTTP/2 and HTTP/3. The signature takes it
-    /// in lowercase. Send it with no default port.
-    pub authority: &'a str,
     /// The path of the target, with each percent-encoded byte as the request has it. An empty path is `/`.
     pub path: &'a str,
     /// The query of the target, with no `?`, or `None` for a target with no query.
@@ -186,7 +186,7 @@ impl Draft {
         let content_digest = format!("sha-256=:{}:", base64(&crypto::sha256(request.body)));
         let credential = format!(":{}:", base64(credential));
         let content_type = combined(request.fields, CONTENT_TYPE);
-        let mut input = format!(r#"{LABEL}=("@method" "@authority" "@path" "@query" "{CONTENT_DIGEST}""#);
+        let mut input = format!(r#"{LABEL}=("@method" "@path" "@query" "{CONTENT_DIGEST}""#);
         if content_type.is_some() {
             input.push_str(r#" "content-type""#);
         }
@@ -260,41 +260,29 @@ impl fmt::Debug for Draft {
     }
 }
 
-/// A trusted verification profile of HTTP message signatures: the profile of the credentials, the authorities of the
-/// verifier, the longest window of a signature, and the clock skew of an agent.
+/// A trusted verification profile of HTTP message signatures: the profile of the credentials, the longest window of a
+/// signature, and the clock skew of an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
     credential: credential::Profile,
-    /// The authorities in lowercase.
-    authorities: Vec<String>,
     window_max: Duration,
     skew: Duration,
 }
 
 impl Profile {
-    /// The profile that verifies the requests at each authority of `authorities` of the holders of the credentials
-    /// that `credential` verifies, such as the profile of [`Grants::profile`](crate::grant::Grants::profile). An
-    /// authority is a host and an optional port, as the agents send it, such as `api.example.com`. It compares in
-    /// lowercase, with no other change, so list each form that the agents send. The window is
-    /// [`WINDOW_MAX_DEFAULT`], and the skew is [`SKEW_DEFAULT`].
+    /// The profile that verifies the requests of the holders of the credentials that `credential` verifies, such as the
+    /// profile of [`Grants::profile`](crate::grant::Grants::profile). The audience of `credential` is the recipient,
+    /// so a request with a credential of another audience refuses. The window is [`WINDOW_MAX_DEFAULT`], and the skew
+    /// is [`SKEW_DEFAULT`].
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Authority`] if `authorities` is empty, or an authority is empty or has a byte that is not visible ASCII.
-    pub fn new(credential: credential::Profile, authorities: &[&str]) -> Result<Self, Error> {
-        let valid = |authority: &&str| !authority.is_empty() && authority.bytes().all(|byte| byte.is_ascii_graphic());
-        (!authorities.is_empty() && authorities.iter().all(valid)).ok_or(Error::Authority)?;
-        Ok(Self {
+    #[must_use]
+    pub const fn new(credential: credential::Profile) -> Self {
+        Self {
             credential,
-            authorities: authorities
-                .iter()
-                .map(|authority| authority.to_ascii_lowercase())
-                .collect(),
             window_max: WINDOW_MAX_DEFAULT,
             skew: SKEW_DEFAULT,
-        })
+        }
     }
 
     /// The profile that takes a window of at most `window_max` and a clock skew of `skew`, each in whole seconds.
@@ -313,15 +301,15 @@ impl Profile {
     ///
     /// The checks come in this order, and each signature check comes after each other check:
     ///
-    /// 1. The authority is an authority of the profile.
-    /// 2. `Signature-Input` has exactly one signature with the tag [`TAG`]. It covers the components of the profile,
+    /// 1. `Signature-Input` has exactly one signature with the tag [`TAG`]. It covers the components of the profile,
     ///    and it has the parameters of the profile.
-    /// 3. The window: `expires` is after `created` by at most the longest window, `created` is not later than the
+    /// 2. The window: `expires` is after `created` by at most the longest window, `created` is not later than the
     ///    earliest time of `now` plus the skew, and the latest time of `now` is before `expires`.
-    /// 4. `Signature` has a byte sequence with the label of that signature.
-    /// 5. The `sha-256` member of `Content-Digest` is the SHA-256 digest of the body.
-    /// 6. The credential verifies with the credential profile at `now` ([`credential::Profile::verify`]).
-    /// 7. The `cnf` key of the credential signed the signature base.
+    /// 3. `Signature` has a byte sequence with the label of that signature.
+    /// 4. The `sha-256` member of `Content-Digest` is the SHA-256 digest of the body.
+    /// 5. The credential verifies with the credential profile at `now` ([`credential::Profile::verify`]): its issuer,
+    ///    its audience, its purpose, and its validity.
+    /// 6. The `cnf` key of the credential signed the signature base.
     ///
     /// A replayed signature verifies again until its `expires`.
     ///
@@ -332,15 +320,13 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::Authority`], [`Error::Tag`], [`Error::Components`], [`Error::Parameters`], [`Error::Nonce`],
+    /// [`Error::Tag`], [`Error::Components`], [`Error::Parameters`], [`Error::Nonce`],
     /// [`Error::Window`], [`Error::Early`], [`Error::Expired`], [`Error::Digest`], [`Error::Signature`], and
     /// [`Error::Limit`] for each check. [`Error::Field`] for a field of the profile that is missing, longer than
     /// [`Limits::bytes`], or not valid. [`Error::Value`] for a covered value that cannot go into the signature base.
     /// [`Error::Credential`] for a refused credential, and [`Error::Time`] for a reading with no bound.
     pub fn verify(&self, request: &Request<'_>, now: Reading) -> Result<Evidence, Error> {
         let limits = self.credential.limits();
-        let authority = request.authority.to_ascii_lowercase();
-        self.authorities.contains(&authority).ok_or(Error::Authority)?;
         let inputs = field(request, SIGNATURE_INPUT, Field::SignatureInput)?;
         let inputs = sf::dictionary(&inputs, &limits).map_err(|_| Error::Field(Field::SignatureInput))?;
         let tag = (&b"tag"[..], Bare::String(TAG.as_bytes()));
@@ -415,16 +401,15 @@ fn profile_parameters(parameters: &Parameters<'_>) -> Result<(u64, u64), Error> 
 
 /// Checks that `components` are the components of the profile, with `content-type` when the request has it.
 fn covered(components: &[Item<'_>], content_type: bool) -> Result<(), Error> {
-    let required: [&[u8]; 7] = [
+    let required: [&[u8]; 6] = [
         b"@method",
-        b"@authority",
         b"@path",
         b"@query",
         CONTENT_DIGEST.as_bytes(),
         CREDENTIAL.as_bytes(),
         CONTENT_TYPE.as_bytes(),
     ];
-    let required = &required[..if content_type { 7 } else { 6 }];
+    let required = &required[..if content_type { 6 } else { 5 }];
     // With equal counts, each required name once makes each component a required name.
     let each = required.iter().all(|name| {
         components
@@ -502,9 +487,6 @@ fn base(
             .ok_or(Error::Components)?;
         let value: Cow<'_, [u8]> = match name {
             b"@method" => derived(request.method.as_bytes())?,
-            b"@authority" => derived(request.authority.to_ascii_lowercase().as_bytes())?
-                .into_owned()
-                .into(),
             b"@path" if request.path.is_empty() => Cow::Borrowed(b"/"),
             b"@path" => derived(request.path.as_bytes())?,
             b"@query" => {
@@ -583,8 +565,6 @@ pub enum Error {
     /// A field of the profile is missing, longer than [`Limits::bytes`], or not valid. Each signature field is a
     /// dictionary, `Content-Digest` is a dictionary, and the credential is one byte sequence.
     Field(Field),
-    /// The authority of the request is not an authority of the profile, or a profile has no valid authority.
-    Authority,
     /// No signature has the tag [`TAG`], or more than one has it.
     Tag,
     /// The covered components are not the components of the profile: another component, a component twice, a
@@ -636,7 +616,6 @@ impl fmt::Display for Error {
                 };
                 write!(f, "the {name} field of the request is missing or not valid")
             }
-            Self::Authority => f.write_str("the authority is not an authority of the verifier"),
             Self::Tag => f.write_str("the request does not have exactly one signature of the profile"),
             Self::Components => f.write_str("the signature does not cover the components of the profile"),
             Self::Parameters => f.write_str("the signature does not have the parameters of the profile"),
