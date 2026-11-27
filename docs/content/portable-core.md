@@ -191,7 +191,7 @@ On `wasm32-unknown-unknown`, the consumer has exactly these crates. The core has
 
 | Target | Evidence |
 | --- | --- |
-| `wasm32-unknown-unknown` in a dedicated Worker | The report of each case passes in Chrome 158.0.8127.37, Firefox 160.0.1, and Safari 27.2, on macOS 27.2.1 aarch64 |
+| `wasm32-unknown-unknown` in a dedicated Worker | The report of each case passes in Chrome 158.0.8127.89, Firefox 161.0, and Safari 27.2, on macOS 27.2.1 aarch64 |
 | `aarch64-apple-ios`, `aarch64-linux-android` | The consumer compiles as an rlib. No device run, custody, or mobile binding is claimed |
 
 The browser runs establish the behavior of the core, not persistent browser custody or storage, and not a real

@@ -10,7 +10,6 @@ use rsauthnz::cbor::Value;
 use rsauthnz::cose::{Key, PublicKey, TrustedKey};
 use rsauthnz::credential::{self, Claims, Draft, Serial, Subject};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz::evidence::Method;
 use rsauthnz::httpsig::{Error, LIFETIME_DEFAULT, Profile};
 use rsauthnz::id::{Id, Principal};
 use rsauthnz::limits::{Limits, SignatureBudget};
@@ -163,8 +162,7 @@ fn a_signed_request_verifies_over_each_http_version_and_after_a_proxy_changes_it
         request
     };
     let http1 = received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &["api.example"]);
-    let checked = verify_signature(&profile, &http1, now).unwrap();
-    assert_eq!(checked.evidence().method(), Method::KeyPossession);
+    let _checked = verify_signature(&profile, &http1, now).expect("a check");
     let http2 = received("https://api.example/repos/repo-x/labels?ref=main", Version::HTTP_2, &[]);
     let _checked = verify_signature(&profile, &http2, now).expect("a check");
 

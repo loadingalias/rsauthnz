@@ -42,7 +42,7 @@ pub fn add_signature(headers: &mut HeaderMap, signed: &Signed) {
 
 /// Verifies the signature of the request `request` at the physical time `now` with `profile`
 /// ([`Profile::verify`]), and gives the [`Checked`] signature. Its replay insert gives the evidence of the agent
-/// ([`Checked::accept`], [`Checked::include`]). It reads no authority, so a proxy can change `Host` or `:authority`.
+/// ([`Checked::accept`], [`Checked::check_agent`]). It reads no authority, so a proxy can change `Host` or `:authority`.
 /// Read the body with the body limit of the framework first.
 ///
 /// Cost class: [`Verify`](rsauthnz::limits::Class::Verify).

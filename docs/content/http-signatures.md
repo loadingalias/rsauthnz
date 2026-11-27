@@ -94,10 +94,11 @@ signed with a credential of the key that a rotation replaced refuses at the gran
    replay record of the signature, and gives the `Evidence` of the agent. Then call `authz::check_agent(&grants, store,
    &evidence, &action, &resource, &policy, now).await`, and use the `Granted` scope ([Check the request of an
    agent](authorization.md#check-the-request-of-an-agent)).
-4. For a request that commits a transition, call `authz::check_agent` with `checked.evidence()`. Make the proposal
-   with `scope.propose(operation, request, now)` and the changes of the operation. Then call
-   `checked.include(store, &mut proposal).await`, and commit the proposal. The replay insert is a condition of that
-   commit, so the operation and the replay record commit together or not at all.
+4. For a request that commits a transition, call `checked.check_agent(&grants, store, &action, &resource, &policy,
+   now).await`. It reads the replay floor, does the check of `authz::check_agent`, and gives an `httpsig::Pending`
+   scope. Then call `pending.propose(operation, request, now)`. It gives the `Granted` scope and the proposal, with the
+   replay insert in the proposal. Add the changes of the operation, and commit the proposal. The operation and the
+   replay record commit together or not at all.
 
 A host with no `http` values builds an `httpsig::Request`: the method, the path, the query, each field as a name and
 a value, and the body. The agent signs it with `httpsig::Draft::new`, and the server verifies it with
@@ -108,8 +109,13 @@ its own budget of `Limits::signature_checks`. A request that fails a check inser
 request takes no room in the share of the agent. A handler that returns `Result<Response<Vec<u8>>, Problem>` converts
 each refusal with `?` ([Return a problem](http-binding.md#return-a-problem)).
 
-Use the evidence of `checked.evidence()` only for a request whose commit includes the insert. The evidence of a
-signature with no replay insert does not show that the request is not a repetition.
+A `Checked` signature gives no evidence and no scope without its replay insert. `accept` inserts before it gives the
+evidence, and the proposal of a `Pending` scope holds the insert. Select the path by the effects of the request:
+
+- A request that commits nothing calls `accept`.
+- A request whose effects are all in its commit calls `check_agent`. Its commit refuses a repetition.
+- A request with an effect outside the store, such as a call to another service, calls `accept` before that effect.
+  The insert is then complete, so its proposal from `authz::check_agent` needs no replay insert.
 
 ## The replay store
 
@@ -171,8 +177,8 @@ change the order of the fields, and change the case of their names. A proxy can 
 ## Errors
 
 Each `httpsig::Error` of a request has the recovery `Refuse`: the same request refuses again, and the agent signs a new
-request. `Full` has the recovery `Restart`: nothing committed, so the agent signs a new request later. `Transition`
-has the recovery of its `transition::Error`.
+request. `Full` has the recovery `Restart`: nothing committed, so the agent signs a new request later. `Grant` has
+the recovery of its `grant::Error`.
 
 | Error | Cause |
 | --- | --- |
@@ -193,7 +199,7 @@ has the recovery of its `transition::Error`.
 | `Replayed` | The replay store holds the signature: the request is a repetition |
 | `Floor` | The store has no replay floor of its current start, or the signature was created before the floor. Sign again |
 | `Full` | The capacity of the replay store, or the share of the agent key, is full. The recovery is `Restart`: sign again later |
-| `Transition(error)` | The proposal of the request cannot take the replay insert, for example at `Limits::dependencies` |
+| `Grant(error)` | The grant check of `checked.check_agent` refused ([Errors](grants.md#errors)) |
 
 ## Operations
 
@@ -210,10 +216,12 @@ has the recovery of its `transition::Error`.
 | `rsauthnz_http::verify_signature(&profile, &request, now)` | The `httpsig::Checked` signature of an `http::Request` |
 | `profile.verify(&request, now)` | The `httpsig::Checked` signature of an `httpsig::Request` |
 | `checked.accept(store).await` | The `Evidence` of the agent, after the replay insert |
-| `checked.evidence()` | The `Evidence` for the grant check of a request that commits |
-| `checked.include(store, &mut proposal).await` | Puts the replay insert in the commit of the request |
+| `checked.check_agent(&grants, store, &action, &resource, &policy, now).await` | The `httpsig::Pending` scope of a request that commits |
+| `pending.propose(operation, request, now)` | The `Granted` scope, and the proposal with the replay insert |
 
 The cost class of a draft is `Parse`, and of `finish` and a verification is `Verify`
 ([Admit rsauthnz work](admission.md)). A draft makes one SHA-256 digest of the body. A verification makes one SHA-256
-digest of the body and two composite signature checks. `accept` is one replay insert, of the class `Mutate`, and
-`include` is one keyed read of the replay floor.
+digest of the body and two composite signature checks. `accept` is one replay insert, of the class `Mutate`.
+`check_agent` is one keyed read of the replay floor and the check of `authz::check_agent`, of the class `Verify`.
+`propose` is of the class `Parse`. A proposal that cannot take the replay insert, for example at
+`Limits::dependencies`, refuses with its `transition::Error`.

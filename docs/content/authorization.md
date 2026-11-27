@@ -125,6 +125,8 @@ agent never asserts its own owner.
    budget)`. It gives the `Evidence`. For an HTTP request that the agent signs,
    `rsauthnz_http::verify_signature(&profile, &request, now)` verifies the credential and the signature, and the replay
    insert of the signature gives the same `Evidence` ([Sign the requests of an agent](http-signatures.md#verify-a-request)).
+   A signed request that commits a transition does step 2 with `checked.check_agent`, so its proposal holds the
+   replay insert.
 2. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`. It gives a
    `Granted` scope, or a `grant::Failure`.
 3. At each use, call `scope.enforce(store, &action, &resource, &policy, now).await`. For a streamed response, call it

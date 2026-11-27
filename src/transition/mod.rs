@@ -588,8 +588,9 @@ impl Proposal {
 
     /// Sets the deadline of the commit, as the time since the Unix epoch: the end of the authority that the decision
     /// read, such as the end of a one-use value, of a challenge, or of a checked scope. A proposal keeps its earliest
-    /// deadline. The commit driver reads a fresh clock reading just before the commit, and it refuses the commit with
-    /// [`Error::Expired`] when that reading can be at or after the deadline.
+    /// deadline. The binding reads its own clock in the atomic step of the commit
+    /// ([`Store::commit`](crate::store::Store::commit)). When that reading can be at or after the deadline, the commit
+    /// refuses with [`Error::Expired`].
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse).
     pub fn until(&mut self, deadline: Duration) {

@@ -538,35 +538,40 @@ fn a_full_share_or_store_refuses_and_a_forged_request_takes_no_room() {
     );
 }
 
-/// The commit of the operation `id` of the agent of `checked`, with its replay insert.
-fn commit(grantor: &mut Grantor, checked: Checked, id: &str) -> Result<Outcome, Error> {
+/// The commit of the operation `id` of the agent of `checked` at `seconds`, with the proposal of its pending scope.
+fn commit(grantor: &mut Grantor, checked: Checked, id: &str, seconds: u64) -> Result<Outcome, Error> {
     let (action, resource) = (action("repo.read"), resource("repo-x"));
-    let check = authz::check_agent(
+    let check = checked.check_agent(
         &grantor.grants,
         &mut grantor.world.site.node.memory,
-        checked.evidence(),
         &action,
         &resource,
         &grantor.policy,
-        at(41),
+        at(seconds),
     );
-    let scope = super::ready(check).map_err(super::refused).expect("the scope");
+    let pending = super::ready(check).map_err(refused)?;
     let operation = OperationId::new(id.as_bytes()).expect("an identity");
-    let mut proposal = scope.propose(operation, Value::Null, at(41)).expect("a proposal");
-    super::ready(checked.include(&mut grantor.world.site.node.memory, &mut proposal)).map_err(refused)?;
+    let (_scope, proposal) = pending
+        .propose(operation, Value::Null, at(seconds))
+        .expect("a proposal");
     Ok(grantor.world.commit((proposal, Plan::default())))
 }
 
 /// A request that commits a transition puts its replay insert in its own commit. The commit refuses a repetition, the
-/// replay store refuses it without a commit too, and a commit into a full share refuses with nothing written.
+/// replay store refuses it without a commit too, and a commit into a full share refuses with nothing written. After a
+/// restore from a snapshot before the commit, the floor refuses the captured request.
 #[test]
 fn a_request_that_commits_puts_its_replay_insert_in_its_commit() {
     let (mut grantor, credential, profile) = granted();
     let change = signed(&Sent::change(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
+    let snapshot = grantor.world.site.node.memory.snapshot();
     let first = verify(&profile, &change, 41).expect("a check");
-    assert!(matches!(commit(&mut grantor, first, "op-1"), Ok(Outcome::Accepted(_))));
+    assert!(matches!(
+        commit(&mut grantor, first, "op-1", 41),
+        Ok(Outcome::Accepted(_))
+    ));
     let again = verify(&profile, &change, 42).expect("a check");
-    assert!(matches!(commit(&mut grantor, again, "op-2"), Ok(Outcome::Conflict)));
+    assert!(matches!(commit(&mut grantor, again, "op-2", 42), Ok(Outcome::Conflict)));
     let memory = &mut grantor.world.site.node.memory;
     assert_eq!(accept(&profile, memory, &change, 42).err(), Some(Error::Replayed));
     let _full = memory.clone().with_capacity(Capacity {
@@ -583,7 +588,14 @@ fn a_request_that_commits_puts_its_replay_insert_in_its_commit() {
     );
     let checked = verify(&profile, &next, 41).expect("a check");
     assert!(matches!(
-        commit(&mut grantor, checked, "op-3"),
+        commit(&mut grantor, checked, "op-3", 41),
         Ok(Outcome::Refused(transition::Error::Full))
     ));
+
+    let node = &mut grantor.world.site.node;
+    node.memory.restore(&snapshot);
+    node.driver.restore(at(60)).expect("a restore");
+    node.run();
+    let captured = verify(&profile, &change, 61).expect("a check");
+    assert_eq!(commit(&mut grantor, captured, "op-4", 61).err(), Some(Error::Floor));
 }

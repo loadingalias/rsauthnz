@@ -1,7 +1,6 @@
 //! HTTP message signatures of an agent ([RFC 9421]). Each request carries the agent credential and a signature by its
 //! `cnf` key, so no bearer secret exists. The verifier keeps no state, and it gives the same [`Evidence`] as a proof of
-//! possession ([`credential::Verified::possession`]). Thus [`authz::check_agent`](crate::authz::check_agent) checks
-//! the grant of each request.
+//! possession ([`credential::Verified::possession`]). Thus [`authz::check_agent`] checks the grant of each request.
 //!
 //! The signature covers these components, in any order, each once:
 //!
@@ -25,8 +24,9 @@
 //! fields of the request ([`Signed`]).
 //!
 //! Verification has two steps too. [`Profile::verify`] checks a request with no state, and gives a [`Checked`]
-//! signature. The replay store of the audience then accepts each signature once: [`Checked::accept`] inserts its
-//! replay record and gives the [`Evidence`], or [`Checked::include`] puts the insert in the commit of the request. The
+//! signature. The replay store of the audience then accepts each signature once. For a request that commits nothing,
+//! [`Checked::accept`] inserts its replay record and gives the [`Evidence`]. For a request that commits a transition,
+//! [`Checked::check_agent`] checks the grant and gives a [`Pending`] scope, whose proposal carries the insert. The
 //! replay identity is the audience of the verifier, the `cnf` key of the agent, and the nonce, so one agent cannot use
 //! the nonce or the share of another.
 //!
@@ -49,14 +49,18 @@ use core::time::Duration;
 use rscodec::base64::Profile::{Standard, Url};
 
 use self::sf::{Bare, Item, Member, Parameters};
+use crate::authz::{self, Granted, Policy};
+use crate::cbor::Value;
 use crate::cose::{self, TrustedKey};
 use crate::credential::{self, SIGNATURE_BYTES_MAX};
 use crate::crypto;
 use crate::evidence::Evidence;
+use crate::grant::{self, Grants};
+use crate::id::{Action, AuthorityVersion, Id, Resource};
 use crate::limits::{Limit, Limits, SignatureBudget};
 use crate::store::{self, Insert, Inserted, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{self, Change, Dependency, Proposal, Recover, Recovery};
+use crate::transition::{self, Change, Dependency, OperationId, Proposal, Recover, Recovery};
 
 mod sf;
 #[cfg(test)]
@@ -307,8 +311,8 @@ impl Profile {
 
     /// Verifies the signature of `request` at the physical time `now`, and gives the [`Checked`] signature. Its
     /// evidence is that of [`credential::Verified::possession`]: the subject of the credential,
-    /// [`Method::KeyPossession`], and the credential with its claims. Only the replay store gives it
-    /// ([`Checked::accept`], [`Checked::include`]).
+    /// [`Method::KeyPossession`], and the credential with its claims. Only its replay insert gives it
+    /// ([`Checked::accept`], [`Checked::check_agent`]).
     ///
     /// The checks come in this order, and each signature check comes after each other check:
     ///
@@ -594,8 +598,8 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// A signature that [`Profile::verify`] checked, before its replay insert. The replay store of the audience of the
-/// verifier accepts it once: [`Checked::accept`] for a request that commits nothing, or [`Checked::include`] for a
-/// request that commits a transition.
+/// verifier accepts it once: [`Checked::accept`] for a request that commits nothing, or [`Checked::check_agent`] for a
+/// request that commits a transition. Neither path gives the evidence of the agent without the insert.
 #[derive(Debug)]
 #[must_use = "a signature gives its evidence only from its replay insert"]
 pub struct Checked {
@@ -608,9 +612,9 @@ pub type Failure<E> = store::Failure<Error, E>;
 
 impl Checked {
     /// Inserts the replay record of the signature into `store`, the replay store of the audience
-    /// ([`Store::insert_replay`]), and gives the evidence of the agent. Give it to
-    /// [`authz::check_agent`](crate::authz::check_agent). The insert is one atomic step with no audit record and no
-    /// commit driver, so the requests of many agents insert concurrently.
+    /// ([`Store::insert_replay`]), and gives the evidence of the agent. Give it to [`authz::check_agent`]. The insert
+    /// is one atomic step with no audit record and no commit driver, so the requests of many agents insert
+    /// concurrently.
     ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One replay insert.
     ///
@@ -630,52 +634,90 @@ impl Checked {
         }
     }
 
-    /// The evidence of the agent, for the grant check of a request that commits a transition. Then give the proposal of
-    /// that request to [`Checked::include`]: the evidence of a signature with no replay insert proves nothing about a
-    /// repetition.
-    pub const fn evidence(&self) -> &Evidence {
-        &self.evidence
-    }
-
-    /// Puts the replay insert of the signature in `proposal`, the commit of a request that commits a transition. The
-    /// commit then reads the replay floor of `store` at its version and the absence of the replay record, writes the
-    /// record, and ends at `expires` plus the skew. Thus a repetition conflicts, a full store refuses with
-    /// [`transition::Error::Full`], and a commit at or after that time refuses with [`transition::Error::Expired`].
+    /// Checks the grant of a request that commits a transition, as [`authz::check_agent`] does, and gives the scope with
+    /// the replay insert of the signature. The request takes its proposal from that scope ([`Pending::propose`]), so
+    /// its commit accepts the signature once. The check first reads the replay floor of `store`, the replay store of
+    /// the audience. Do each effect of the operation in that commit: for an effect outside the store, such as a call to
+    /// another service, call [`Checked::accept`] before the effect.
     ///
-    /// Cost class: [`Parse`](crate::limits::Class::Parse). One keyed read.
+    /// Cost class: [`Verify`](crate::limits::Class::Verify). One keyed read, then the cost of [`authz::check_agent`].
     ///
     /// # Errors
     ///
-    /// [`Error::Floor`] if the store has no replay floor, or the signature was created before it. [`Error::Transition`]
-    /// if the proposal cannot take the reads or the write. [`Failure::Store`] for a failed read.
-    pub async fn include<S: Store>(self, store: &mut S, proposal: &mut Proposal) -> Result<(), Failure<S::Error>> {
-        let floor_key = store::floor_key();
+    /// [`Error::Floor`] if the store has no replay floor, or the signature was created before it. [`Error::Grant`] if
+    /// the grant check refuses. [`Failure::Store`] for a failed read.
+    pub async fn check_agent<S: Store>(
+        self,
+        grants: &Grants,
+        store: &mut S,
+        action: &Id<Action>,
+        resource: &Id<Resource>,
+        policy: &impl Policy,
+        now: Reading,
+    ) -> Result<Pending, Failure<S::Error>> {
         let floor = store
-            .read(&floor_key)
+            .read(&store::floor_key())
             .await
             .map_err(Failure::Store)?
-            .ok_or(Failure::Refused(Error::Floor))?;
+            .ok_or(Error::Floor)?;
+        let end = store::driver::record::floor_end(&floor.data).ok_or(Error::Floor)?;
+        (self.insert.origin() > end).ok_or(Error::Floor)?;
+        let scope = authz::check_agent(grants, store, &self.evidence, action, resource, policy, now)
+            .await
+            .map_err(|failure| match failure {
+                store::Failure::Refused(error) => Failure::Refused(Error::Grant(error)),
+                store::Failure::Store(error) => Failure::Store(error),
+            })?;
+        Ok(Pending {
+            scope,
+            insert: self.insert,
+            floor: floor.version,
+        })
+    }
+}
+
+/// The scope of a signed request that commits a transition, with the replay insert of its signature
+/// ([`Checked::check_agent`]). The request takes its proposal from it.
+#[derive(Debug)]
+#[must_use = "a signed request that commits takes its proposal from its pending scope"]
+pub struct Pending {
+    scope: Granted,
+    insert: Insert,
+    /// The version of the replay floor record that the check read.
+    floor: AuthorityVersion,
+}
+
+impl Pending {
+    /// The scope of the request, and the proposal of [`Granted::propose`] with the replay insert of the signature. The
+    /// commit reads the replay floor at the version that the check read and the absence of the replay record, writes
+    /// the record, and ends at `expires` plus the skew. Thus a repetition conflicts, a full store refuses with
+    /// [`transition::Error::Full`], and a commit at or after that time refuses with [`transition::Error::Expired`]. Add
+    /// the changes of the operation to the proposal, and enforce the scope at each use ([`Granted::enforce`]).
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Granted::propose`], and a [`transition::Error`] if the proposal cannot take the replay insert.
+    pub fn propose(
+        self,
+        operation: OperationId,
+        request: Value<'_>,
+        now: Reading,
+    ) -> Result<(Granted, Proposal), transition::Error> {
+        let mut proposal = self.scope.propose(operation, request, now)?;
         // The read of the floor at its version fences a commit of another instance: each start writes the floor again.
-        let end = store::driver::record::floor_end(&floor.data).ok_or(Failure::Refused(Error::Floor))?;
-        (self.insert.origin() > end).ok_or(Failure::Refused(Error::Floor))?;
+        proposal.read(Dependency::Version(store::floor_key(), self.floor))?;
+        proposal.read(Dependency::Absent(self.insert.key().clone()))?;
         let record = self.insert.record();
-        let refused = |error| Failure::Refused(Error::Transition(error));
-        proposal
-            .read(Dependency::Version(floor_key, floor.version))
-            .map_err(refused)?;
-        proposal
-            .read(Dependency::Absent(self.insert.key().clone()))
-            .map_err(refused)?;
-        proposal
-            .change(Change::Write {
-                key: self.insert.key().clone(),
-                version: record.version,
-                end: record.end,
-                data: record.data,
-            })
-            .map_err(refused)?;
+        proposal.change(Change::Write {
+            key: self.insert.key().clone(),
+            version: record.version,
+            end: record.end,
+            data: record.data,
+        })?;
         proposal.until(self.insert.deadline());
-        Ok(())
+        Ok((self.scope, proposal))
     }
 }
 
@@ -738,8 +780,8 @@ pub enum Error {
     Floor,
     /// The replay store has no room: its capacity, or the share of the agent key, is full. Sign the request again later.
     Full,
-    /// The proposal of the request cannot take the replay insert.
-    Transition(transition::Error),
+    /// The grant check of a request that commits refused ([`Checked::check_agent`]).
+    Grant(grant::Error),
 }
 
 impl Recover for Error {
@@ -748,7 +790,7 @@ impl Recover for Error {
     fn recovery(&self) -> Recovery {
         match self {
             Self::Full => Recovery::Restart,
-            Self::Transition(error) => error.recovery(),
+            Self::Grant(error) => error.recovery(),
             _ => Recovery::Refuse,
         }
     }
@@ -782,7 +824,7 @@ impl fmt::Display for Error {
             Self::Replayed => f.write_str("the replay store holds the signature: the request is a repetition"),
             Self::Floor => f.write_str("the signature was created before the replay floor of the store"),
             Self::Full => f.write_str("the replay store has no room for the signature"),
-            Self::Transition(error) => write!(f, "the proposal refused the replay insert: {error}"),
+            Self::Grant(error) => write!(f, "the grant check refused: {error}"),
         }
     }
 }
