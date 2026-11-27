@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use rsauthnz::limits::Limits;
 use rsauthnz::store::driver;
-use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::store::{
+    Capacity, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store,
+};
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 
@@ -47,10 +49,15 @@ enum Defect {
     OpenRange,
     /// The commit reads no clock, so it writes a proposal after its deadline.
     NoDeadline,
+    /// The replay insert reads no clock, so a late insert writes the record of a signature again after expiry removed
+    /// it.
+    NoInsertClock,
+    /// The binding counts the capacity but no share, so one agent key fills the store.
+    NoShare,
 }
 
 impl Defect {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 12] = [
         Self::NoAtomicCheck,
         Self::LostOutcomes,
         Self::WriteSkew,
@@ -61,6 +68,8 @@ impl Defect {
         Self::NoRetention,
         Self::OpenRange,
         Self::NoDeadline,
+        Self::NoInsertClock,
+        Self::NoShare,
     ];
 
     /// The cases that name the defect. A commit with no atomic check is a check-then-write path, so two concurrent
@@ -76,6 +85,8 @@ impl Defect {
             Self::NoRetention => &[Case::Retention],
             Self::OpenRange => &[Case::Range],
             Self::NoDeadline => &[Case::Deadline],
+            Self::NoInsertClock => &[Case::ReplayInsert],
+            Self::NoShare => &[Case::ReplayCapacity],
         }
     }
 }
@@ -92,8 +103,20 @@ struct Broken {
 
 impl Broken {
     fn new(defect: Defect) -> Self {
+        let memory = Memory::new(Schedule::None);
+        let memory = match defect {
+            // One share can hold each record of the capacity, and the declaration states the share of a new binding.
+            Defect::NoShare => {
+                let records_max = memory.declaration().signatures.records_max;
+                memory.with_capacity(Capacity {
+                    records_max,
+                    share_max: records_max,
+                })
+            }
+            _ => memory,
+        };
         Self {
-            memory: Memory::new(Schedule::None),
+            memory,
             defect,
             counter: Arc::default(),
         }
@@ -104,7 +127,11 @@ impl Store for Broken {
     type Error = Error;
 
     fn declaration(&self) -> Declaration {
-        self.memory.declaration()
+        let mut declaration = self.memory.declaration();
+        if self.defect == Defect::NoShare {
+            declaration.signatures = Memory::new(Schedule::None).declaration().signatures;
+        }
+        declaration
     }
 
     async fn start(&mut self) -> Result<Instance, Error> {
@@ -167,11 +194,30 @@ impl Store for Broken {
             | Defect::NoJournal
             | Defect::RetriedSync
             | Defect::RestoredInstance
-            | Defect::OpenRange => {
+            | Defect::OpenRange
+            | Defect::NoInsertClock
+            | Defect::NoShare => {
                 return self.memory.commit(proposal, instance).await;
             }
         }
         self.memory.lock().commit(request, instance)
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
+        if self.defect != Defect::NoInsertClock {
+            return self.memory.insert_replay(insert).await;
+        }
+        // The same insert with no deadline: the key of a signature is its kind, the share, and the nonce.
+        let (share, nonce) = insert.key().as_bytes()[1..].split_at(32);
+        let end = insert.record().end.unwrap_or(Duration::MAX);
+        let timeless = Insert::new(
+            share.try_into().unwrap(),
+            nonce.try_into().unwrap(),
+            end,
+            Duration::MAX,
+            insert.origin(),
+        );
+        self.memory.insert_replay(&timeless).await
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
@@ -310,6 +356,10 @@ impl Store for Measured {
         let longest = writes.chain(records).max().unwrap_or(0);
         self.longest.fetch_max(longest, Ordering::Relaxed);
         self.memory.commit(proposal, instance).await
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
+        self.memory.insert_replay(insert).await
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

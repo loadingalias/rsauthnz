@@ -5,8 +5,7 @@ use core::time::Duration;
 use http::Request;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use rsauthnz::cose::TrustedKey;
-use rsauthnz::evidence::Evidence;
-use rsauthnz::httpsig::{self, Draft, Error, NONCE_BYTES, Profile, Signed};
+use rsauthnz::httpsig::{self, Checked, Draft, Error, NONCE_BYTES, Profile, Signed};
 use rsauthnz::time::Reading;
 
 /// The draft of the signature of the request `request` of an agent by its key `key`, the `cnf` key of `credential`,
@@ -42,8 +41,9 @@ pub fn add_signature(headers: &mut HeaderMap, signed: &Signed) {
 }
 
 /// Verifies the signature of the request `request` at the physical time `now` with `profile`
-/// ([`Profile::verify`]), and gives the evidence of the agent. It reads no authority, so a proxy can change `Host` or
-/// `:authority`. Read the body with the body limit of the framework first.
+/// ([`Profile::verify`]), and gives the [`Checked`] signature. Its replay insert gives the evidence of the agent
+/// ([`Checked::accept`], [`Checked::include`]). It reads no authority, so a proxy can change `Host` or `:authority`.
+/// Read the body with the body limit of the framework first.
 ///
 /// Cost class: [`Verify`](rsauthnz::limits::Class::Verify).
 ///
@@ -54,7 +54,7 @@ pub fn verify_signature<B: AsRef<[u8]>>(
     profile: &Profile,
     request: &Request<B>,
     now: Reading,
-) -> Result<Evidence, Error> {
+) -> Result<Checked, Error> {
     let fields = fields(request.headers());
     profile.verify(&parts(request, &fields), now)
 }

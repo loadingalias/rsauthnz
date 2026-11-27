@@ -22,7 +22,13 @@
 //!
 //! Signing has two steps, so the agent key stays in custody. [`Draft::new`] gives the signature base, and custody
 //! signs [`Draft::to_be_signed`]. [`Draft::finish`] verifies the signature with the agent key, and gives the four
-//! fields of the request ([`Signed`]). [`Profile::verify`] checks a request.
+//! fields of the request ([`Signed`]).
+//!
+//! Verification has two steps too. [`Profile::verify`] checks a request with no state, and gives a [`Checked`]
+//! signature. The replay store of the audience then accepts each signature once: [`Checked::accept`] inserts its
+//! replay record and gives the [`Evidence`], or [`Checked::include`] puts the insert in the commit of the request. The
+//! replay identity is the audience of the verifier, the `cnf` key of the agent, and the nonce, so one agent cannot use
+//! the nonce or the share of another.
 //!
 //! Each request carries one composite signature of 3,373 bytes and one credential of about 5.5 KB, in base64. A
 //! binding marks these fields sensitive, so an HTTP/2 or HTTP/3 encoder never indexes them, and each request sends
@@ -48,8 +54,9 @@ use crate::credential::{self, SIGNATURE_BYTES_MAX};
 use crate::crypto;
 use crate::evidence::Evidence;
 use crate::limits::{Limit, Limits, SignatureBudget};
+use crate::store::{self, Insert, Inserted, Store};
 use crate::time::{Reading, TimeError};
-use crate::transition::{Recover, Recovery};
+use crate::transition::{self, Change, Dependency, Proposal, Recover, Recovery};
 
 mod sf;
 #[cfg(test)]
@@ -78,6 +85,9 @@ pub const WINDOW_MAX_DEFAULT: Duration = Duration::from_secs(300);
 
 /// The clock skew of an agent that a verifier takes by default: `created` can be this much after its reading.
 pub const SKEW_DEFAULT: Duration = Duration::from_secs(30);
+
+/// The name of the form of the share of a replay identity: the audience of the verifier and the `cnf` key of the agent.
+const SHARE_FORM: &str = "rsauthnz.httpsig.share.1";
 
 /// The largest integer of a structured field (RFC 8941 section 3.3.1).
 const INTEGER_MAX: u64 = 999_999_999_999_999;
@@ -295,9 +305,10 @@ impl Profile {
         self
     }
 
-    /// Verifies the signature of `request` at the physical time `now`, and gives the evidence of the agent. The evidence
-    /// is that of [`credential::Verified::possession`]: the subject of the credential, [`Method::KeyPossession`], and
-    /// the credential with its claims. Give it to [`authz::check_agent`](crate::authz::check_agent).
+    /// Verifies the signature of `request` at the physical time `now`, and gives the [`Checked`] signature. Its
+    /// evidence is that of [`credential::Verified::possession`]: the subject of the credential,
+    /// [`Method::KeyPossession`], and the credential with its claims. Only the replay store gives it
+    /// ([`Checked::accept`], [`Checked::include`]).
     ///
     /// The checks come in this order, and each signature check comes after each other check:
     ///
@@ -311,7 +322,7 @@ impl Profile {
     ///    its audience, its purpose, and its validity.
     /// 6. The `cnf` key of the credential signed the signature base.
     ///
-    /// A replayed signature verifies again until its `expires`.
+    /// A replayed signature verifies again until its `expires`. Its replay insert refuses it.
     ///
     /// Cost class: [`Verify`](crate::limits::Class::Verify). One SHA-256 digest of the body, and two signature checks:
     /// the credential and the request, each with its own budget of [`Limits::signature_checks`].
@@ -325,7 +336,7 @@ impl Profile {
     /// [`Error::Limit`] for each check. [`Error::Field`] for a field of the profile that is missing, longer than
     /// [`Limits::bytes`], or not valid. [`Error::Value`] for a covered value that cannot go into the signature base.
     /// [`Error::Credential`] for a refused credential, and [`Error::Time`] for a reading with no bound.
-    pub fn verify(&self, request: &Request<'_>, now: Reading) -> Result<Evidence, Error> {
+    pub fn verify(&self, request: &Request<'_>, now: Reading) -> Result<Checked, Error> {
         let limits = self.credential.limits();
         let inputs = field(request, SIGNATURE_INPUT, Field::SignatureInput)?;
         let inputs = sf::dictionary(&inputs, &limits).map_err(|_| Error::Field(Field::SignatureInput))?;
@@ -336,7 +347,7 @@ impl Profile {
         });
         let (label, components, parameters) = tagged.next().ok_or(Error::Tag)?;
         tagged.next().is_none().ok_or(Error::Tag)?;
-        let (created, expires) = profile_parameters(parameters)?;
+        let (created, expires, nonce) = profile_parameters(parameters)?;
         covered(components, combined(request.fields, CONTENT_TYPE).is_some())?;
         self.window(created, expires, now)?;
         let signatures = field(request, SIGNATURE, Field::Signature)?;
@@ -356,9 +367,45 @@ impl Profile {
         let verified = self
             .credential
             .verify(&credential, now, &mut SignatureBudget::new(&limits))?;
-        verified.proved(now, |key| {
+        let evidence = verified.proved(now, |key| {
             check(key, &base, &signature, &mut SignatureBudget::new(&limits))
-        })
+        })?;
+        let insert = self.insert(&evidence, nonce, created, expires, now)?;
+        Ok(Checked { evidence, insert })
+    }
+
+    /// The replay insert of the signature of `evidence` with `nonce`, from `created` to `expires`, at `now`. Its record
+    /// ends at `expires` plus the skew and twice the bound of `now`, and it inserts only before `expires` plus the skew.
+    fn insert(
+        &self,
+        evidence: &Evidence,
+        nonce: &[u8],
+        created: u64,
+        expires: u64,
+        now: Reading,
+    ) -> Result<Insert, Error> {
+        let audience = self.credential.audience().to_string();
+        let audience_len = u32::try_from(audience.len()).map_err(|_| Error::Value)?;
+        let confirmation = evidence.artifact().ok_or(Error::Signature)?.confirmation;
+        let share = crypto::sha256(
+            &[
+                SHARE_FORM.as_bytes(),
+                &audience_len.to_be_bytes(),
+                audience.as_bytes(),
+                &confirmation,
+            ]
+            .concat(),
+        );
+        let deadline = Duration::from_secs(expires)
+            .checked_add(self.skew)
+            .ok_or(Error::Window)?;
+        let margin = now
+            .bound()
+            .ok_or(Error::Time(TimeError::UnknownBound))?
+            .saturating_mul(2);
+        let end = deadline.checked_add(margin).ok_or(Error::Window)?;
+        let origin = Duration::from_secs(created).saturating_sub(self.skew);
+        Ok(Insert::new(&share, &crypto::sha256(nonce), end, deadline, origin))
     }
 
     /// Checks that a signature from `created` to `expires` is in the window of the profile at `now`.
@@ -373,8 +420,9 @@ impl Profile {
     }
 }
 
-/// The `created` and `expires` of the parameters of a signature of the profile, after the checks of each parameter.
-fn profile_parameters(parameters: &Parameters<'_>) -> Result<(u64, u64), Error> {
+/// The `created`, the `expires`, and the nonce text of the parameters of a signature of the profile, after the checks
+/// of each parameter.
+fn profile_parameters<'a>(parameters: &Parameters<'a>) -> Result<(u64, u64, &'a [u8]), Error> {
     let (mut created, mut expires, mut nonce) = (None, None, None);
     // The parse refused a key twice, so each parameter has one value.
     for (key, value) in parameters {
@@ -396,7 +444,7 @@ fn profile_parameters(parameters: &Parameters<'_>) -> Result<(u64, u64), Error> 
         .contains(&nonce_bytes)
         .ok_or(Error::Nonce)?;
     Url.decode(nonce, &mut [0; NONCE_BYTES_MAX]).map_err(|_| Error::Nonce)?;
-    Ok((time(created)?, time(expires)?))
+    Ok((time(created)?, time(expires)?, nonce))
 }
 
 /// Checks that `components` are the components of the profile, with `content-type` when the request has it.
@@ -545,6 +593,92 @@ fn base64(bytes: &[u8]) -> String {
     String::from_utf8(text).expect("base64 is ASCII")
 }
 
+/// A signature that [`Profile::verify`] checked, before its replay insert. The replay store of the audience of the
+/// verifier accepts it once: [`Checked::accept`] for a request that commits nothing, or [`Checked::include`] for a
+/// request that commits a transition.
+#[derive(Debug)]
+#[must_use = "a signature gives its evidence only from its replay insert"]
+pub struct Checked {
+    evidence: Evidence,
+    insert: Insert,
+}
+
+/// The failure of a replay insert: a refusal, or a failed primitive of the binding.
+pub type Failure<E> = store::Failure<Error, E>;
+
+impl Checked {
+    /// Inserts the replay record of the signature into `store`, the replay store of the audience
+    /// ([`Store::insert_replay`]), and gives the evidence of the agent. Give it to
+    /// [`authz::check_agent`](crate::authz::check_agent). The insert is one atomic step with no audit record and no
+    /// commit driver, so the requests of many agents insert concurrently.
+    ///
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One replay insert.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Replayed`] for a repetition, [`Error::Floor`] for a signature created before the replay floor of the
+    /// store, [`Error::Full`] when the capacity or the share of the agent is full, and [`Error::Expired`] when the
+    /// clock of the store reached `expires` plus the skew. [`Failure::Store`] for an error of the binding: the outcome is
+    /// unknown, so refuse the request, and the agent signs a new one.
+    pub async fn accept<S: Store>(self, store: &mut S) -> Result<Evidence, Failure<S::Error>> {
+        match store.insert_replay(&self.insert).await.map_err(Failure::Store)? {
+            Inserted::Accepted => Ok(self.evidence),
+            Inserted::Present => Err(Failure::Refused(Error::Replayed)),
+            Inserted::Floor => Err(Failure::Refused(Error::Floor)),
+            Inserted::Full => Err(Failure::Refused(Error::Full)),
+            Inserted::Expired => Err(Failure::Refused(Error::Expired)),
+        }
+    }
+
+    /// The evidence of the agent, for the grant check of a request that commits a transition. Then give the proposal of
+    /// that request to [`Checked::include`]: the evidence of a signature with no replay insert proves nothing about a
+    /// repetition.
+    pub const fn evidence(&self) -> &Evidence {
+        &self.evidence
+    }
+
+    /// Puts the replay insert of the signature in `proposal`, the commit of a request that commits a transition. The
+    /// commit then reads the replay floor of `store` at its version and the absence of the replay record, writes the
+    /// record, and ends at `expires` plus the skew. Thus a repetition conflicts, a full store refuses with
+    /// [`transition::Error::Full`], and a commit at or after that time refuses with [`transition::Error::Expired`].
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). One keyed read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Floor`] if the store has no replay floor, or the signature was created before it. [`Error::Transition`]
+    /// if the proposal cannot take the reads or the write. [`Failure::Store`] for a failed read.
+    pub async fn include<S: Store>(self, store: &mut S, proposal: &mut Proposal) -> Result<(), Failure<S::Error>> {
+        let floor_key = store::floor_key();
+        let floor = store
+            .read(&floor_key)
+            .await
+            .map_err(Failure::Store)?
+            .ok_or(Failure::Refused(Error::Floor))?;
+        // The read of the floor at its version fences a commit of another instance: each start writes the floor again.
+        let end = store::driver::record::floor_end(&floor.data).ok_or(Failure::Refused(Error::Floor))?;
+        (self.insert.origin() > end).ok_or(Failure::Refused(Error::Floor))?;
+        let record = self.insert.record();
+        let refused = |error| Failure::Refused(Error::Transition(error));
+        proposal
+            .read(Dependency::Version(floor_key, floor.version))
+            .map_err(refused)?;
+        proposal
+            .read(Dependency::Absent(self.insert.key().clone()))
+            .map_err(refused)?;
+        proposal
+            .change(Change::Write {
+                key: self.insert.key().clone(),
+                version: record.version,
+                end: record.end,
+                data: record.data,
+            })
+            .map_err(refused)?;
+        proposal.until(self.insert.deadline());
+        Ok(())
+    }
+}
+
 /// A field of the profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -580,7 +714,8 @@ pub enum Error {
     Window,
     /// `created` is later than the time of the verifier plus the skew. Check the clock of the agent.
     Early,
-    /// The time of the verifier can be at or after `expires`. Sign the request again.
+    /// The time of the verifier can be at or after `expires`, or the time of the replay store at the insert can be at
+    /// or after `expires` plus the skew. Sign the request again.
     Expired,
     /// The `Content-Digest` has no `sha-256` member, or it is not the digest of the body.
     Digest,
@@ -595,12 +730,27 @@ pub enum Error {
     Limit(Limit),
     /// The reading of the time has no bound. Use a reading with a bound.
     Time(TimeError),
+    /// The replay store holds the replay record of the signature: the request is a repetition. The repetition does not
+    /// show whether the first request committed: the operation identity of the transition shows that.
+    Replayed,
+    /// The replay store has no replay floor of its current start, or the signature was created before the floor. A start
+    /// or a restore sets the floor, so a captured request cannot repeat after it. Sign the request again.
+    Floor,
+    /// The replay store has no room: its capacity, or the share of the agent key, is full. Sign the request again later.
+    Full,
+    /// The proposal of the request cannot take the replay insert.
+    Transition(transition::Error),
 }
 
 impl Recover for Error {
-    /// Refuse the request: it refuses again. The agent signs a new request.
+    /// Sign the request again later after [`Error::Full`]. Refuse each other request: it refuses again, and the agent
+    /// signs a new request.
     fn recovery(&self) -> Recovery {
-        Recovery::Refuse
+        match self {
+            Self::Full => Recovery::Restart,
+            Self::Transition(error) => error.recovery(),
+            _ => Recovery::Refuse,
+        }
     }
 }
 
@@ -629,6 +779,10 @@ impl fmt::Display for Error {
             Self::Signature => f.write_str("the signature does not verify with the key of the credential"),
             Self::Limit(limit) => write!(f, "the signature check exceeds {limit:?}"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
+            Self::Replayed => f.write_str("the replay store holds the signature: the request is a repetition"),
+            Self::Floor => f.write_str("the signature was created before the replay floor of the store"),
+            Self::Full => f.write_str("the replay store has no room for the signature"),
+            Self::Transition(error) => write!(f, "the proposal refused the replay insert: {error}"),
         }
     }
 }

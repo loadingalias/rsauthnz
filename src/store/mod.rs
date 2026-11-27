@@ -126,7 +126,7 @@ pub enum Kind {
     Grant = 13,
     /// A one-use approval of an operation. Its consumption pays for no anchor.
     Approval = 14,
-    /// The replay record of one accepted signature, or of the challenge of one passkey sign-in.
+    /// The replay record of the challenge of one passkey sign-in.
     Replay = 15,
     /// The replay floor of the store. Each replay insert reads it.
     ReplayFloor = 16,
@@ -158,6 +158,9 @@ pub enum Kind {
     AccountState = 26,
     /// A pending enrollment request of an agent ([`crate::agent`]). Its consumption pays for no anchor.
     AgentEnrollment = 27,
+    /// The replay record of one accepted HTTP message signature of an agent ([`crate::httpsig`]). Its key is
+    /// [`Insert::key`], and [`Declaration::signatures`] bounds the records of this kind.
+    Signature = 28,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -172,7 +175,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -200,6 +203,7 @@ impl Kind {
         Self::Removal,
         Self::AccountState,
         Self::AgentEnrollment,
+        Self::Signature,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -230,7 +234,8 @@ impl Kind {
             | Self::Issuer
             | Self::Workload
             | Self::Removal
-            | Self::AccountState => None,
+            | Self::AccountState
+            | Self::Signature => None,
         }
     }
 
@@ -327,6 +332,144 @@ impl fmt::Debug for Record {
     }
 }
 
+/// The declared capacity of the replay records of HTTP message signatures ([`Kind::Signature`]). An insert or a commit
+/// that does not fit refuses ([`Inserted::Full`], [`Commit::Full`]), and the binding never removes a live record to make
+/// space. The share bounds the records of one agent key in one audience, so one agent cannot fill the capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Capacity {
+    /// The most records of the kind in the store.
+    pub records_max: usize,
+    /// The most records of one share ([`share`]). At least one, and at most `records_max`.
+    pub share_max: usize,
+}
+
+impl Capacity {
+    /// Whether one more record fits a store that holds `records` records of the kind, `share` of them in the share of
+    /// the new record.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub const fn admits(&self, records: usize, share: usize) -> bool {
+        records < self.records_max && share < self.share_max
+    }
+}
+
+/// The bytes of the share of a key of [`Kind::Signature`]: the number of the kind and the digest of the share.
+const SHARE_BYTES: usize = 33;
+
+/// The share of `key`, a key of [`Kind::Signature`]: its first 33 bytes, the same for each signature of one agent key in
+/// one audience. `None` for a key of another kind.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn share(key: &Key) -> Option<&[u8]> {
+    (Kind::of(key) == Some(Kind::Signature))
+        .then(|| key.as_bytes().get(..SHARE_BYTES))
+        .flatten()
+}
+
+/// The key of the replay floor record ([`Kind::ReplayFloor`]), which the commit driver writes at each start and each
+/// restore. [`Store::insert_replay`] reads it.
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn floor_key() -> Key {
+    Kind::ReplayFloor.key(&[]).expect("a key of one byte is valid")
+}
+
+/// The insert of the replay record of one HTTP message signature ([`Store::insert_replay`]). Its key is the replay
+/// identity: the digest of the share, which names the audience and the agent key, and the digest of the nonce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Insert {
+    key: Key,
+    end: Duration,
+    deadline: Duration,
+    origin: Duration,
+}
+
+impl Insert {
+    /// The insert of the replay identity of `share` and `nonce`, two SHA-256 digests. Its record ends at `end`, and it
+    /// inserts only before `deadline`. `origin` is the earliest time at which the signature can have been created: its
+    /// `created` less the skew of an agent. [`crate::httpsig`] makes each insert of a verifier.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse).
+    #[must_use]
+    pub fn new(share: &[u8; 32], nonce: &[u8; 32], end: Duration, deadline: Duration, origin: Duration) -> Self {
+        let key = Kind::Signature
+            .key(&[&share[..], nonce].concat())
+            .expect("a key of 65 bytes is valid");
+        Self {
+            key,
+            end,
+            deadline,
+            origin,
+        }
+    }
+
+    /// The key of the record: a key of [`Kind::Signature`].
+    #[must_use]
+    pub const fn key(&self) -> &Key {
+        &self.key
+    }
+
+    /// The share of the key ([`share`]).
+    #[must_use]
+    pub fn share(&self) -> &[u8] {
+        share(&self.key).expect("the key of an insert is a key of a signature")
+    }
+
+    /// The earliest time at which the signature can have been created: its `created` less the skew of an agent.
+    #[must_use]
+    pub const fn origin(&self) -> Duration {
+        self.origin
+    }
+
+    /// The time before which the reading of the clock of the binding must be: the `expires` of the signature plus the
+    /// skew of an agent.
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// The record that the insert writes: no data, and the end of its retention.
+    #[must_use]
+    pub fn record(&self) -> Record {
+        Record {
+            version: written_once("signature"),
+            end: Some(self.end),
+            data: Box::default(),
+        }
+    }
+
+    /// Whether the replay floor record `floor` admits the signature at the store instance number `instance`: the floor
+    /// is of the start of `instance`, and the signature was created after the time of the floor. A store with no floor
+    /// of its current instance admits no signature, so no insert lands between a start and the write of its floor.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). One decode of the floor record.
+    #[must_use]
+    pub fn admits(&self, floor: Option<&Record>, instance: Instance) -> bool {
+        floor
+            .and_then(|record| driver::record::Floor::read(&record.data))
+            .is_some_and(|floor| floor.instance == instance && floor.end().is_some_and(|end| self.origin > end))
+    }
+}
+
+/// The result of a replay insert ([`Store::insert_replay`]). Each result except `Accepted` writes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Inserted {
+    /// The binding wrote the record.
+    Accepted,
+    /// The store has no replay floor of its current instance, or the signature was created before the time of the
+    /// floor ([`Insert::admits`]).
+    Floor,
+    /// A record has the key: the signature is a repetition.
+    Present,
+    /// The record does not fit the capacity of the binding ([`Capacity::admits`]).
+    Full,
+    /// The reading of the clock of the binding can be at or after the deadline, or has no bound ([`expired`]).
+    Expired,
+}
+
 /// Whether a commit with the deadline `deadline` refuses at the reading `now` of the clock of the binding: `now` can be
 /// at or after the deadline, or it has no bound. A commit with no deadline never expires. A binding calls it in the
 /// atomic step of its commit ([`Store::commit`]).
@@ -344,6 +487,10 @@ pub enum Commit {
     Accepted,
     /// A dependency or the instance number did not hold, so the commit wrote nothing.
     Conflict,
+    /// A write of a new record of [`Kind::Signature`] does not fit the capacity of the binding
+    /// ([`Declaration::signatures`]), so the commit wrote nothing. The binding never removes a live record to make
+    /// space.
+    Full,
     /// The proposal has a deadline, and the reading of the clock of the binding at the commit can be at or after it, or
     /// has no bound ([`expired`]). The commit wrote nothing.
     Expired,
@@ -381,6 +528,21 @@ pub trait Store {
     /// or repeated key. Use one indexed query or hold one read lock across both lookups.
     fn read_pair(&mut self, keys: [&Key; 2]) -> impl Future<Output = Result<[Option<Record>; 2], Self::Error>>;
 
+    /// The atomic insert of the replay record of one HTTP message signature, in one step, with no audit record and no
+    /// outcome record. In that step, in this order:
+    ///
+    /// 1. Read the replay floor record ([`floor_key`]). When [`Insert::admits`] does not hold for it and the current
+    ///    store instance number, give [`Inserted::Floor`].
+    /// 2. When a record has [`Insert::key`], give [`Inserted::Present`].
+    /// 3. Count the records of [`Kind::Signature`] and the records of [`Insert::share`]. When [`Capacity::admits`] of
+    ///    [`Declaration::signatures`] does not hold for the counts, give [`Inserted::Full`].
+    /// 4. Read the clock of the binding. When [`expired`] holds for [`Insert::deadline`] and the reading, give
+    ///    [`Inserted::Expired`].
+    /// 5. Write [`Insert::record`] at [`Insert::key`], make it durable, and give [`Inserted::Accepted`].
+    ///
+    /// An error is a crash, with an unknown outcome: the verifier refuses the request, and the agent signs a new one.
+    fn insert_replay(&mut self, insert: &Insert) -> impl Future<Output = Result<Inserted, Self::Error>>;
+
     /// The conditional atomic commit of `proposal`, in one serializable step, or in one equivalent atomic step that
     /// checks the complete dependency set.
     ///
@@ -395,6 +557,9 @@ pub trait Store {
     ///
     /// An outcome record of the operation identity gives [`Commit::Recorded`], also when a dependency does not hold: a
     /// second submission of a commit never finds its own dependencies.
+    ///
+    /// A write of a record of [`Kind::Signature`] that no record has yet takes room. When [`Capacity::admits`] does not
+    /// hold for the count of these records and the count of its share ([`share`]), the commit gives [`Commit::Full`].
     ///
     /// For a proposal with a deadline ([`Proposal::deadline`]), the commit also reads the clock of the binding in the
     /// same step, after the checks of the outcome record and of the dependencies. It gives [`Commit::Expired`] when
@@ -469,6 +634,8 @@ pub struct Declaration {
     pub restore: Restore,
     /// The most bytes in a key that the binding stores. It must be at least [`Key::BYTES_MAX`].
     pub key_bytes_max: usize,
+    /// The capacity of the replay records of HTTP message signatures ([`Kind::Signature`]).
+    pub signatures: Capacity,
     /// The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit
     /// record, or an outcome record. A proposal with a larger one refuses before the commit ([`Profile::admit`]):
     /// [`driver::Driver::submit`] refuses it, so the binding never gets it.
@@ -532,13 +699,15 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::Isolation`] for [`Isolation::Weaker`], and [`Error::KeyBound`] for a key bound below
-    /// [`Key::BYTES_MAX`].
+    /// [`Error::Isolation`] for [`Isolation::Weaker`], [`Error::KeyBound`] for a key bound below [`Key::BYTES_MAX`],
+    /// and [`Error::Capacity`] for a share of no record or of more records than the capacity.
     pub fn new(declaration: Declaration) -> Result<Self, Error> {
         if declaration.isolation == Isolation::Weaker {
             return Err(Error::Isolation);
         }
         (declaration.key_bytes_max >= Key::BYTES_MAX).ok_or(Error::KeyBound)?;
+        let capacity = declaration.signatures;
+        (capacity.share_max > 0 && capacity.share_max <= capacity.records_max).ok_or(Error::Capacity)?;
         Ok(Self(declaration))
     }
 
@@ -581,6 +750,8 @@ pub enum Error {
     /// A record that the commit of the proposal writes is longer than the record bound of the binding. Refuse the
     /// request.
     RecordBytes,
+    /// The capacity of the replay records of signatures has a share of no record, or of more records than the capacity.
+    Capacity,
 }
 
 impl fmt::Display for Error {
@@ -589,6 +760,7 @@ impl fmt::Display for Error {
             Self::Isolation => "the commit of the binding is not atomic over its dependencies",
             Self::KeyBound => "the binding cannot store each key of the core",
             Self::RecordBytes => "a record is larger than the record bound of the binding",
+            Self::Capacity => "the share of the capacity of signature records is empty or larger than the capacity",
         })
     }
 }

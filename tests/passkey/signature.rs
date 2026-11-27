@@ -1,18 +1,27 @@
 //! The HTTP message signatures of an agent (RFC 9421). Each request carries the agent credential and a signature by its
 //! key over the method, the target, the body, and the credential, which is the grant reference and names the audience.
-//! The verifier gives the evidence that the grant check takes. A change of each covered part refuses, and so does a
-//! verifier of another audience.
+//! The replay store of the audience accepts each signature once, and its insert gives the evidence that the grant check
+//! takes. A change of each covered part refuses, and so does a verifier of another audience.
 
 use core::time::Duration;
 
+use core::num::NonZeroUsize;
+
 use rsauthnz::authz;
+use rsauthnz::cbor::Value;
 use rsauthnz::cose::{self, PublicKey};
 use rsauthnz::credential::{self, Released};
-use rsauthnz::httpsig::{Draft, Error, Field, LIFETIME_DEFAULT, Profile, Request, Signed};
+use rsauthnz::evidence::Evidence;
+use rsauthnz::httpsig::{Checked, Draft, Error, Failure, Field, LIFETIME_DEFAULT, Profile, Request, Signed};
+use rsauthnz::store::driver::Plan;
+use rsauthnz::store::{self, Capacity, Progress};
 use rsauthnz::time::{Reading, ReadingSource};
+use rsauthnz::transition::{self, OperationId, Outcome};
+use rsauthnz_conformance::memory::Memory;
+use rsauthnz_conformance::suite::Subject as _;
 use rscodec::base64::Profile::Standard;
 
-use super::{API, Grantor, action, at, audience, budget, key, keypair, permission, refused, resource, time, trusted};
+use super::{API, Grantor, action, at, audience, budget, key, keypair, permission, resource, time, trusted};
 
 /// The nonce of each signature of the tests that needs no other one.
 const NONCE: [u8; 16] = [9; 16];
@@ -117,9 +126,14 @@ fn granted() -> (Grantor, Released, Profile) {
 
 /// `sent` signed by the key of `holder` with `credential`, `lifetime`, and the nonce [`NONCE`] at `seconds`.
 fn signed(sent: &Sent, holder: u8, credential: &[u8], lifetime: Duration, seconds: u64) -> Sent {
+    signed_with(sent, holder, credential, &NONCE, lifetime, seconds)
+}
+
+/// `sent` signed by the key of `holder` with `credential`, `nonce`, and `lifetime` at `seconds`.
+fn signed_with(sent: &Sent, holder: u8, credential: &[u8], nonce: &[u8; 16], lifetime: Duration, seconds: u64) -> Sent {
     let fields = view(&sent.fields);
     let key = trusted(PublicKey::MlDsa65Ed25519(&key(holder)));
-    let draft = Draft::new(&key, credential, &sent.with(&fields), &NONCE, lifetime, at(seconds)).expect("a draft");
+    let draft = Draft::new(&key, credential, &sent.with(&fields), nonce, lifetime, at(seconds)).expect("a draft");
     let signature = keypair(holder)
         .1
         .sign_deterministic(draft.to_be_signed(), &[])
@@ -131,8 +145,21 @@ fn signed(sent: &Sent, holder: u8, credential: &[u8], lifetime: Duration, second
 }
 
 /// The verification of `sent` by `profile` at `seconds`.
-fn verify(profile: &Profile, sent: &Sent, seconds: u64) -> Result<rsauthnz::evidence::Evidence, Error> {
+fn verify(profile: &Profile, sent: &Sent, seconds: u64) -> Result<Checked, Error> {
     profile.verify(&sent.with(&view(&sent.fields)), at(seconds))
+}
+
+/// The refusal of a failure of the memory binding, which fails no primitive.
+fn refused(failure: Failure<rsauthnz_conformance::memory::Error>) -> Error {
+    match failure {
+        Failure::Refused(error) => error,
+        Failure::Store(error) => panic!("the insert failed: {error:?}"),
+    }
+}
+
+/// The verification of `sent` by `profile` at `seconds`, then its replay insert into `memory`.
+fn accept(profile: &Profile, memory: &mut Memory, sent: &Sent, seconds: u64) -> Result<Evidence, Error> {
+    super::ready(verify(profile, sent, seconds)?.accept(memory)).map_err(refused)
 }
 
 /// A signed read gives the evidence of the agent, and the grant check of that evidence gives the scope of alice. A
@@ -142,7 +169,7 @@ fn verify(profile: &Profile, sent: &Sent, seconds: u64) -> Result<rsauthnz::evid
 fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
     let (mut grantor, credential, profile) = granted();
     let read = signed(&Sent::read(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
-    let evidence = verify(&profile, &read, 41).expect("the evidence");
+    let evidence = accept(&profile, &mut grantor.world.site.node.memory, &read, 41).expect("the evidence");
     let (action, resource) = (action("repo.read"), resource("repo-x"));
     let check = authz::check_agent(
         &grantor.grants,
@@ -153,12 +180,12 @@ fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
         &grantor.policy,
         at(41),
     );
-    let scope = super::ready(check).map_err(refused).expect("the scope");
+    let scope = super::ready(check).map_err(super::refused).expect("the scope");
     assert_eq!(*scope.owner(), super::alice());
     assert_eq!(scope.agent(), &grantor.agent.started.agent);
 
     let change = signed(&Sent::change(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
-    verify(&profile, &change, 41).unwrap();
+    let _checked = verify(&profile, &change, 41).expect("a check");
     // The signature of a proxy, with no tag of the profile, is in the same two fields.
     let mut proxied = change;
     proxied
@@ -176,7 +203,7 @@ fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_slice()))
         .collect();
-    profile.verify(&proxied.with(&fields), at(41)).unwrap();
+    let _checked = profile.verify(&proxied.with(&fields), at(41)).expect("a check");
 }
 
 /// Each change of a covered part of a signed request refuses: the method, the path, the query, the body, the media type,
@@ -186,7 +213,7 @@ fn a_signed_request_gives_the_evidence_that_the_grant_check_takes() {
 fn a_changed_method_target_body_or_grant_reference_or_another_audience_refuses() {
     let (mut grantor, credential, profile) = granted();
     let sent = signed(&Sent::change(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
-    verify(&profile, &sent, 41).unwrap();
+    let _checked = verify(&profile, &sent, 41).expect("a check");
     // A second credential of the same agent and grant: another serial, so other bytes.
     let other = grantor.issued(2, API, None, 35).expect("a credential");
     let body = br#"{"label":"merged"}"#;
@@ -254,19 +281,15 @@ fn a_signature_outside_its_window_refuses() {
     let credential = credential.as_bytes();
     let sent = signed(&Sent::read(), 2, credential, LIFETIME_DEFAULT, 40);
     // Expires at 100: the reading at 98 is at 99 at the latest, and the reading at 99 can be at 100.
-    verify(&profile, &sent, 98).unwrap();
+    let _checked = verify(&profile, &sent, 98).expect("a check");
     assert_eq!(verify(&profile, &sent, 99).err(), Some(Error::Expired));
     // The clock of the agent is ahead. The reading at 41 is at 40 at the earliest, and the skew is 30 seconds.
-    verify(
-        &profile,
-        &signed(&Sent::read(), 2, credential, LIFETIME_DEFAULT, 70),
-        41,
-    )
-    .unwrap();
+    let ahead = signed(&Sent::read(), 2, credential, LIFETIME_DEFAULT, 70);
+    let _checked = verify(&profile, &ahead, 41).expect("a check");
     let early = signed(&Sent::read(), 2, credential, LIFETIME_DEFAULT, 71);
     assert_eq!(verify(&profile, &early, 41).err(), Some(Error::Early));
     let longest = signed(&Sent::read(), 2, credential, Duration::from_secs(300), 40);
-    verify(&profile, &longest, 41).unwrap();
+    let _checked = verify(&profile, &longest, 41).expect("a check");
     let long = signed(&Sent::read(), 2, credential, Duration::from_secs(301), 40);
     assert_eq!(verify(&profile, &long, 41).err(), Some(Error::Window));
     let unbounded = Reading::new(time(41), None, ReadingSource::Caller);
@@ -377,4 +400,190 @@ fn valid(created: u64, expires: u64) -> String {
         r#";created={created};expires={expires};nonce="{}";tag="rsauthnz-agent""#,
         nonce(16)
     )
+}
+
+/// A second agent of alice, with the key of seed 3, a grant of the read of `repo-x` at [`API`] from 32, and its
+/// credential from 33.
+fn second(grantor: &mut Grantor) -> Released {
+    let (_, fresh) = grantor.world.session();
+    let mut agent = grantor.world.enrolled_at(3, 31);
+    core::mem::swap(&mut grantor.agent, &mut agent);
+    grantor.issue(&fresh, &[permission("repo-x", "repo.read")], time(3600), 32);
+    let credential = grantor.issued(3, API, None, 33).expect("a credential");
+    core::mem::swap(&mut grantor.agent, &mut agent);
+    credential
+}
+
+/// The replay store accepts a signature once in its audience: a repetition refuses at the same verifier and at a
+/// second verifier of the audience. Another agent can use the same nonce, because the replay identity names the key of
+/// the agent.
+#[test]
+fn a_repeated_signature_refuses_also_at_a_second_verifier_and_another_agent_keeps_its_nonce() {
+    let (mut grantor, credential, profile) = granted();
+    let other = second(&mut grantor);
+    let again = grantor
+        .grants
+        .profile(grantor.issuer.key(), &audience(API))
+        .expect("a profile");
+    let again = Profile::new(again);
+    let memory = &mut grantor.world.site.node.memory;
+    let read = signed(&Sent::read(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
+    accept(&profile, memory, &read, 41).unwrap();
+    assert_eq!(accept(&profile, memory, &read, 42).err(), Some(Error::Replayed));
+    assert_eq!(accept(&again, memory, &read, 42).err(), Some(Error::Replayed));
+    let theirs = signed(&Sent::read(), 3, other.as_bytes(), LIFETIME_DEFAULT, 40);
+    assert!(
+        accept(&profile, memory, &theirs, 41).is_ok(),
+        "the nonce of another agent"
+    );
+}
+
+/// A captured signature cannot repeat after a restart of a memory store, which loses its records, or after a restore
+/// from a snapshot before its insert. Each start and each restore sets the replay floor, and between a restore and its
+/// floor no insert lands. A signature created later than the floor plus the skew of an agent verifies.
+#[test]
+fn a_captured_signature_refuses_after_a_restart_and_after_a_restore() {
+    let (mut grantor, credential, profile) = granted();
+    let ours = credential.as_bytes();
+    let read = signed(&Sent::read(), 2, ours, LIFETIME_DEFAULT, 40);
+    let node = &mut grantor.world.site.node;
+    accept(&profile, &mut node.memory, &read, 41).unwrap();
+    // The store loses its records, so its start refuses, and a restore from its journal activates it. The floor of the
+    // restore at 50 ends at 52, and the skew is 30 seconds: `created` at 82 refuses, and at 83 verifies.
+    node.memory.restart();
+    node.driver.start(at(50));
+    node.run();
+    node.driver.restore(at(50)).expect("a restore");
+    node.run();
+    assert_eq!(accept(&profile, &mut node.memory, &read, 51).err(), Some(Error::Floor));
+    let early = signed_with(&Sent::read(), 2, ours, &[1; 16], LIFETIME_DEFAULT, 82);
+    assert_eq!(accept(&profile, &mut node.memory, &early, 83).err(), Some(Error::Floor));
+    let late = signed_with(&Sent::read(), 2, ours, &[2; 16], LIFETIME_DEFAULT, 83);
+    accept(&profile, &mut node.memory, &late, 84).unwrap();
+
+    let (mut grantor, credential, profile) = granted();
+    let ours = credential.as_bytes();
+    let read = signed(&Sent::read(), 2, ours, LIFETIME_DEFAULT, 40);
+    let node = &mut grantor.world.site.node;
+    let snapshot = node.memory.snapshot();
+    accept(&profile, &mut node.memory, &read, 41).unwrap();
+    node.memory.restore(&snapshot);
+    let between = signed_with(&Sent::read(), 2, ours, &[3; 16], LIFETIME_DEFAULT, 45);
+    assert_eq!(
+        accept(&profile, &mut node.memory, &between, 46).err(),
+        Some(Error::Floor),
+        "an insert before the floor of the restore"
+    );
+    node.driver.restore(at(60)).expect("a restore");
+    node.run();
+    assert_eq!(accept(&profile, &mut node.memory, &read, 61).err(), Some(Error::Floor));
+    let after = signed_with(&Sent::read(), 2, ours, &[4; 16], LIFETIME_DEFAULT, 93);
+    accept(&profile, &mut node.memory, &after, 94).unwrap();
+}
+
+/// A verifier that waits past the retention of a replay record, between its check and its insert, cannot accept the
+/// signature twice: the store refuses the insert once its own clock reaches `expires` plus the skew.
+#[test]
+fn an_insert_at_or_after_the_expiry_and_skew_of_its_signature_refuses() {
+    let (mut grantor, credential, profile) = granted();
+    // Expires at 100: the insert ends at 130, and the record at 132.
+    let read = signed(&Sent::read(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
+    let memory = &mut grantor.world.site.node.memory;
+    accept(&profile, memory, &read, 41).unwrap();
+    let waiting = verify(&profile, &read, 98).expect("a check in the window");
+    memory.set_clock(at(140));
+    while super::ready(store::expire(memory, at(140), NonZeroUsize::MIN)).expect("an expiry pass") == Progress::More {}
+    // The record is gone, so only the clock of the store refuses the insert.
+    assert_eq!(
+        super::ready(waiting.accept(memory)).map_err(refused).err(),
+        Some(Error::Expired)
+    );
+}
+
+/// The store admits records within its capacity and the share of each agent key. A full share or a full store refuses
+/// with a retryable overload, and writes no record. A forged request with the credential of an agent takes no room in
+/// its share, because a request that fails its check inserts nothing.
+#[test]
+fn a_full_share_or_store_refuses_and_a_forged_request_takes_no_room() {
+    let (mut grantor, credential, profile) = granted();
+    let other = second(&mut grantor);
+    let capacity = Capacity {
+        records_max: 3,
+        share_max: 2,
+    };
+    let mut memory = grantor.world.site.node.memory.clone().with_capacity(capacity);
+    let ours = credential.as_bytes();
+    for nonce in [[1; 16], [2; 16]] {
+        // The key of seed 3 signs with the credential of the key of seed 2.
+        let forged = signed_with(&Sent::read(), 3, ours, &nonce, LIFETIME_DEFAULT, 40);
+        assert_eq!(accept(&profile, &mut memory, &forged, 41).err(), Some(Error::Signature));
+    }
+    for nonce in [[1; 16], [2; 16]] {
+        let read = signed_with(&Sent::read(), 2, ours, &nonce, LIFETIME_DEFAULT, 40);
+        assert!(accept(&profile, &mut memory, &read, 41).is_ok(), "{nonce:?}");
+    }
+    let third = signed_with(&Sent::read(), 2, ours, &[3; 16], LIFETIME_DEFAULT, 40);
+    assert_eq!(accept(&profile, &mut memory, &third, 41).err(), Some(Error::Full));
+    // A refusal wrote no record, so the same signature is not a repetition.
+    assert_eq!(accept(&profile, &mut memory, &third, 41).err(), Some(Error::Full));
+    let theirs = |nonce| signed_with(&Sent::read(), 3, other.as_bytes(), &nonce, LIFETIME_DEFAULT, 40);
+    assert!(
+        accept(&profile, &mut memory, &theirs([1; 16]), 41).is_ok(),
+        "another share"
+    );
+    assert_eq!(
+        accept(&profile, &mut memory, &theirs([2; 16]), 41).err(),
+        Some(Error::Full),
+        "the capacity"
+    );
+}
+
+/// The commit of the operation `id` of the agent of `checked`, with its replay insert.
+fn commit(grantor: &mut Grantor, checked: Checked, id: &str) -> Result<Outcome, Error> {
+    let (action, resource) = (action("repo.read"), resource("repo-x"));
+    let check = authz::check_agent(
+        &grantor.grants,
+        &mut grantor.world.site.node.memory,
+        checked.evidence(),
+        &action,
+        &resource,
+        &grantor.policy,
+        at(41),
+    );
+    let scope = super::ready(check).map_err(super::refused).expect("the scope");
+    let operation = OperationId::new(id.as_bytes()).expect("an identity");
+    let mut proposal = scope.propose(operation, Value::Null, at(41)).expect("a proposal");
+    super::ready(checked.include(&mut grantor.world.site.node.memory, &mut proposal)).map_err(refused)?;
+    Ok(grantor.world.commit((proposal, Plan::default())))
+}
+
+/// A request that commits a transition puts its replay insert in its own commit. The commit refuses a repetition, the
+/// replay store refuses it without a commit too, and a commit into a full share refuses with nothing written.
+#[test]
+fn a_request_that_commits_puts_its_replay_insert_in_its_commit() {
+    let (mut grantor, credential, profile) = granted();
+    let change = signed(&Sent::change(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
+    let first = verify(&profile, &change, 41).expect("a check");
+    assert!(matches!(commit(&mut grantor, first, "op-1"), Ok(Outcome::Accepted(_))));
+    let again = verify(&profile, &change, 42).expect("a check");
+    assert!(matches!(commit(&mut grantor, again, "op-2"), Ok(Outcome::Conflict)));
+    let memory = &mut grantor.world.site.node.memory;
+    assert_eq!(accept(&profile, memory, &change, 42).err(), Some(Error::Replayed));
+    let _full = memory.clone().with_capacity(Capacity {
+        records_max: 1,
+        share_max: 1,
+    });
+    let next = signed_with(
+        &Sent::change(),
+        2,
+        credential.as_bytes(),
+        &[1; 16],
+        LIFETIME_DEFAULT,
+        40,
+    );
+    let checked = verify(&profile, &next, 41).expect("a check");
+    assert!(matches!(
+        commit(&mut grantor, checked, "op-3"),
+        Ok(Outcome::Refused(transition::Error::Full))
+    ));
 }

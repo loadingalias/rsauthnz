@@ -124,7 +124,7 @@ profile of `rsauthnz::httpsig` to `http::Request` values ([Sign the requests of 
 | --- | --- |
 | `signature_draft(&key, &credential, &request, &nonce, lifetime, now)` | The agent: the draft of the signature of a request |
 | `add_signature(request.headers_mut(), &signed)` | The agent: adds the four fields of the signature, each marked sensitive |
-| `verify_signature(&profile, &request, now)` | The server: the `Evidence` of the agent. It reads no authority, so a proxy can change `Host` |
+| `verify_signature(&profile, &request, now)` | The server: the `httpsig::Checked` signature, whose replay insert gives the `Evidence` of the agent. It reads no authority, so a proxy can change `Host` |
 
 `?` converts each refusal into a problem with the recovery `Refuse` ([Return a problem](#return-a-problem)).
 

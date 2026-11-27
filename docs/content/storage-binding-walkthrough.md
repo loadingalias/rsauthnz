@@ -68,6 +68,7 @@ durable.
 | `crash_injection` | `CrashInjection::Supported` | The binding implements `Subject::inject` |
 | `restore` | The argument | `Restore::Journal` names the journal directory in `location`. `Restore::Unsupported` gives a binding without a journal |
 | `key_bytes_max` | `Key::BYTES_MAX` | The binding stores each key as opaque bytes |
+| `signatures` | `CAPACITY`: 256 replay records of signatures, 32 of one agent key | Small, so that the conformance suite fills it with few syncs |
 | `record_bytes_max` | `RECORD_BYTES_MAX`, 1 MiB | It is above `record_bytes_min` of the default `Limits`, 131,377 bytes |
 
 ### 2. Keep the store instance number
@@ -92,8 +93,13 @@ this map. The binding stores the records of each kind in the same way, the mark 
 3. It checks each dependency in the map. A dependency that does not hold gives `Commit::Conflict`.
 4. For a proposal with a deadline, it reads the system clock, with a bound of one second, while it holds the lock. A
    reading that can be at or after the deadline gives `Commit::Expired`.
-5. It appends one frame with each change, the audit record, each intent record, and the outcome record.
-6. It syncs the store log, applies the writes to the map, and gives `Commit::Accepted`.
+5. For each write of a new replay record of a signature, it counts the keys of the kind and of the share in the map,
+   which keeps the keys in order. When `CAPACITY.admits(records, share)` does not hold, it gives `Commit::Full`.
+6. It appends one frame with each change, the audit record, each intent record, and the outcome record.
+7. It syncs the store log, applies the writes to the map, and gives `Commit::Accepted`.
+
+`Store::insert_replay` holds the same lock. It checks the floor of the current instance, the key, the capacity, and
+the system clock, in that order, then appends one frame with the record and syncs it.
 
 ### 5. Keep audit and outcome records for their retention
 

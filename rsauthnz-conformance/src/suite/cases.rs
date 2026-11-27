@@ -5,7 +5,9 @@ use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use rsauthnz::store::journal::{self, Body, End, History};
-use rsauthnz::store::{Commit, CrashLoss, Entry, Instance, intent_records, outcome_record, policy_key};
+use rsauthnz::store::{
+    Commit, CrashLoss, Entry, Insert, Inserted, Instance, intent_records, outcome_record, policy_key,
+};
 use rsauthnz::time::{Reading, ReadingSource};
 
 use super::{
@@ -188,6 +190,110 @@ async fn expires<S: Subject>(
     ensure(
         unrecorded(binding, proposal).await? && !holds(binding, written).await?,
         &format!("a commit that expired {when} wrote a record"),
+    )
+}
+
+/// The result of the replay insert of `insert`.
+async fn inserted<S: Subject>(binding: &mut S, insert: &Insert) -> Result<Inserted, String> {
+    binding.insert_replay(insert).await.map_err(failed("replay insert"))
+}
+
+/// The replay insert of the nonce `nonce` of the share `share`, of a signature created after the replay floor of a
+/// start at `now`. Its deadline is 1,200 seconds, after the clock of the case, and its record ends at 1,300 seconds.
+fn replay(share: u64, nonce: u64) -> Insert {
+    let (mut share_digest, mut nonce_digest) = ([0; 32], [0; 32]);
+    share_digest[..8].copy_from_slice(&share.to_be_bytes());
+    nonce_digest[..8].copy_from_slice(&nonce.to_be_bytes());
+    Insert::new(
+        &share_digest,
+        &nonce_digest,
+        Duration::from_secs(1_300),
+        Duration::from_secs(1_200),
+        Duration::from_secs(1_100),
+    )
+}
+
+pub(super) async fn replay_insert<S: Subject>(binding: S) -> Checked {
+    // The driver starts at `now` and writes the replay floor of the instance.
+    let mut run = Run::seeded(binding).await?;
+    let first = replay(0, 0);
+    ensure(
+        inserted(&mut run.binding, &first).await? == Inserted::Accepted,
+        "a replay insert after the floor, before its deadline, and within the capacity refused",
+    )?;
+    let stored = Store::read(&mut run.binding, first.key())
+        .await
+        .map_err(failed("read"))?;
+    ensure(
+        stored.is_some_and(|record| record.end == first.record().end),
+        "a replay insert did not write its record with its end",
+    )?;
+    ensure(
+        inserted(&mut run.binding, &first).await? == Inserted::Present,
+        "a second replay insert of a key did not find its record",
+    )?;
+    // The clock passes the end of the record, so expiry removes it, and the deadline of the insert.
+    run.binding.set_clock(Reading::new(
+        Duration::from_secs(1_400),
+        Some(Duration::from_secs(1)),
+        ReadingSource::Caller,
+    ));
+    let removed = run
+        .binding
+        .expire(Kind::Signature, Duration::from_secs(1_399), NonZeroUsize::MIN)
+        .await
+        .map_err(failed("expire"))?;
+    ensure(
+        removed == 1 && !holds(&mut run.binding, first.key()).await?,
+        "expiry did not remove an ended replay record",
+    )?;
+    ensure(
+        inserted(&mut run.binding, &first).await? == Inserted::Expired,
+        "a replay insert after its deadline did not refuse: a late insert accepts a signature twice",
+    )?;
+    ensure(
+        !holds(&mut run.binding, first.key()).await?,
+        "a replay insert after its deadline wrote its record",
+    )?;
+    run.binding.set_clock(now());
+    // A start of the store, before the driver writes the replay floor of the new instance.
+    start(&mut run.binding).await?;
+    ensure(
+        inserted(&mut run.binding, &replay(0, 1)).await? == Inserted::Floor,
+        "a replay insert landed before the replay floor of its start",
+    )
+}
+
+pub(super) async fn replay_capacity<S: Subject>(binding: S) -> Checked {
+    let capacity = binding.declaration().signatures;
+    let (share_max, records_max) = (
+        u64::try_from(capacity.share_max).map_err(|_| "the share of the capacity has no 64-bit count")?,
+        u64::try_from(capacity.records_max).map_err(|_| "the capacity has no 64-bit count")?,
+    );
+    let mut run = Run::seeded(binding).await?;
+    // Each share holds `share_max` records, up to the capacity: the last share can hold fewer.
+    let mut held = 0;
+    let mut share = 0;
+    while held < records_max {
+        let records = share_max.min(records_max.saturating_sub(held));
+        for nonce in 0..records {
+            ensure(
+                inserted(&mut run.binding, &replay(share, nonce)).await? == Inserted::Accepted,
+                "a replay insert within the share and the capacity refused",
+            )?;
+        }
+        if share == 0 {
+            ensure(
+                inserted(&mut run.binding, &replay(0, share_max)).await? == Inserted::Full,
+                "a replay insert past the share of its key did not refuse",
+            )?;
+        }
+        held = held.saturating_add(records);
+        share = share.saturating_add(1);
+    }
+    ensure(
+        inserted(&mut run.binding, &replay(share, 0)).await? == Inserted::Full,
+        "a replay insert past the capacity did not refuse",
     )
 }
 

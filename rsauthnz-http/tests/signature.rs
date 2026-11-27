@@ -163,10 +163,10 @@ fn a_signed_request_verifies_over_each_http_version_and_after_a_proxy_changes_it
         request
     };
     let http1 = received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &["api.example"]);
-    let evidence = verify_signature(&profile, &http1, now).unwrap();
-    assert_eq!(evidence.method(), Method::KeyPossession);
+    let checked = verify_signature(&profile, &http1, now).unwrap();
+    assert_eq!(checked.evidence().method(), Method::KeyPossession);
     let http2 = received("https://api.example/repos/repo-x/labels?ref=main", Version::HTTP_2, &[]);
-    verify_signature(&profile, &http2, now).unwrap();
+    let _checked = verify_signature(&profile, &http2, now).expect("a check");
 
     let proxied = [
         received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &["backend:8080"]),
@@ -178,7 +178,7 @@ fn a_signed_request_verifies_over_each_http_version_and_after_a_proxy_changes_it
         received("/repos/repo-x/labels?ref=main", Version::HTTP_11, &[]),
     ];
     for request in &proxied {
-        verify_signature(&profile, request, now).unwrap();
+        let _checked = verify_signature(&profile, request, now).expect("a check");
     }
     let other_path = received("/repos/repo-x/labels?ref=dev", Version::HTTP_11, &["api.example"]);
     assert_eq!(

@@ -27,8 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::store::{
-    self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
-    Sequence, Store, audit_record, intent_records, outcome_of, outcome_record, policy_key,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
+    Journal, Kind, Record, Restore, Sequence, Store, audit_record, intent_records, outcome_of, outcome_record,
+    policy_key,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
@@ -50,6 +51,12 @@ pub const INSTANCE_FILE: &str = "instance";
 
 /// The name of the lock file in the store directory.
 pub const LOCK_FILE: &str = "lock";
+
+/// The capacity of the replay records of signatures: small, so that the conformance suite fills it.
+const CAPACITY: Capacity = Capacity {
+    records_max: 256,
+    share_max: 32,
+};
 
 /// A reading of the system clock with a bound of one second (guide step 10), which each commit with a deadline reads
 /// in its step. A clock before the Unix epoch reads as the epoch with no bound, so each deadline refuses.
@@ -198,6 +205,7 @@ impl Files {
             crash_injection: CrashInjection::Supported,
             restore,
             key_bytes_max: Key::BYTES_MAX,
+            signatures: CAPACITY,
             record_bytes_max: RECORD_BYTES_MAX,
         };
         let inner = Inner {
@@ -299,6 +307,24 @@ impl Open {
         self.journal.as_mut().ok_or(Error::NoJournal)
     }
 
+    /// The replay insert of `insert` at the reading `now` (guide step 4), in the step that the lock of the binding holds.
+    fn insert(&mut self, insert: &Insert, now: Reading) -> Result<Inserted, Error> {
+        if !insert.admits(self.records.by_key.get(&store::floor_key()), self.instance) {
+            return Ok(Inserted::Floor);
+        }
+        if self.records.by_key.contains_key(insert.key()) {
+            return Ok(Inserted::Present);
+        }
+        if !self.records.room(insert.key()) {
+            return Ok(Inserted::Full);
+        }
+        if store::expired(Some(insert.deadline()), now) {
+            return Ok(Inserted::Expired);
+        }
+        self.write(vec![(insert.key().clone(), Some(insert.record()))], None)?;
+        Ok(Inserted::Accepted)
+    }
+
     /// The commit of `proposal` (guide steps 4 and 5). Each fault gives an error. With [`Fault::LostResponse`], the
     /// commit is durable first.
     fn commit(
@@ -337,7 +363,14 @@ impl Open {
             return Ok(Some(Commit::Conflict));
         }
         // The lock of the binding holds the step, so no commit lands between the reading and the write.
-        Ok(store::expired(proposal.deadline(), now).then_some(Commit::Expired))
+        if store::expired(proposal.deadline(), now) {
+            return Ok(Some(Commit::Expired));
+        }
+        let fits = proposal.changes().iter().all(|change| match change {
+            Change::Write { key, .. } => self.records.room(key),
+            Change::End(_) => true,
+        });
+        Ok((!fits).then_some(Commit::Full))
     }
 
     /// Appends `writes` to the store log as one frame, syncs the file, and applies them. With
@@ -409,6 +442,25 @@ impl Records {
             self.ends.entry(kind).or_default().insert((end, key.clone()));
         }
         self.by_key.insert(key, record);
+    }
+
+    /// Whether a new record at `key` fits [`CAPACITY`]. A key of another kind than [`Kind::Signature`], and a key that a
+    /// record has, need no room.
+    fn room(&self, key: &Key) -> bool {
+        let Some(share) = store::share(key) else {
+            return true;
+        };
+        // The keys of a prefix are adjacent in the order of the map, so each count reads only the keys of its prefix.
+        let count = |prefix: &[u8]| {
+            let start = Kind::Signature
+                .key(prefix.get(1..).unwrap_or_default())
+                .expect("a prefix of a key is a valid key");
+            self.by_key
+                .range(start..)
+                .take_while(|(key, _)| key.as_bytes().starts_with(prefix))
+                .count()
+        };
+        self.by_key.contains_key(key) || CAPACITY.admits(count(&[Kind::Signature as u8]), count(share))
     }
 
     /// Whether `dependency` holds (guide step 4.3).
@@ -534,6 +586,12 @@ impl Store for Files {
     async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
         self.lock()?
             .serve(|open| Ok(keys.map(|key| open.records.by_key.get(key).cloned())))
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
+        let mut inner = self.lock()?;
+        let now = inner.clock.unwrap_or_else(clock);
+        inner.serve(|open| open.insert(insert, now))
     }
 
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {

@@ -11,7 +11,7 @@ use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{Link, Mark};
-use crate::store::{Kind, Record, Sequence, audit_record};
+use crate::store::{Instance, Kind, Record, Sequence, audit_record, floor_key};
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{Audit, Change, Dependency, Key, OperationId, Proposal};
 
@@ -84,11 +84,6 @@ impl Default for State {
 /// The key of the mark record.
 pub(super) fn mark_key() -> Key {
     Kind::Mark.key(&[]).expect("a key of one byte is valid")
-}
-
-/// The key of the replay floor record.
-pub(crate) fn floor_key() -> Key {
-    Kind::ReplayFloor.key(&[]).expect("a key of one byte is valid")
 }
 
 impl State {
@@ -180,49 +175,89 @@ impl State {
     }
 }
 
-/// The time after which a value that the replay floor record `data` admits was created: the estimate of the floor plus
-/// twice its bound. `None` if the floor has an unknown bound, which admits no value, or no valid form.
-pub(crate) fn floor_end(data: &[u8], limits: Limits) -> Option<Duration> {
-    let duration = |value: &Value<'_>| match value {
-        Value::Array(parts) => match parts.as_slice() {
-            [Value::Unsigned(seconds), Value::Unsigned(nanos)] => Some(Duration::new(
-                *seconds,
-                u32::try_from(*nanos).ok().filter(|&nanos| nanos < 1_000_000_000)?,
-            )),
-            _ => None,
-        },
-        _ => None,
-    };
-    let Ok(Value::Array(items)) = cbor::decode(data, limits) else {
-        return None;
-    };
-    let [estimate, bound] = items.as_slice() else {
-        return None;
-    };
-    duration(estimate)?.checked_add(duration(bound)?.checked_mul(2)?)
+/// A replay floor: the reading of the start or the restore that set it, and the store instance number of the start
+/// that wrote it. A replay insert of another instance refuses ([`Insert::admits`](crate::store::Insert::admits)), so
+/// no insert lands between a start and the write of its floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Floor {
+    /// The estimate of the reading.
+    pub(crate) estimate: Duration,
+    /// The bound of the reading, or `None` when it is unknown.
+    pub(crate) bound: Option<Duration>,
+    /// The store instance number of the start that wrote the floor.
+    pub(crate) instance: Instance,
 }
 
-/// The commit that writes the replay floor record: the reading `now` of a start or a restore, as the CBOR array
-/// `[estimate, bound]`, each as `[seconds, nanoseconds]` and the bound `null` when it is unknown. A replay insert
-/// refuses each signature whose `created` is not later than this reading plus the skew and twice the bound. `None` as
-/// for [`State::write`].
+impl Floor {
+    /// The floor of the record form `data`, or `None` for another form.
+    pub(crate) fn read(data: &[u8]) -> Option<Self> {
+        let duration = |value: &Value<'_>| match value {
+            Value::Array(parts) => match parts.as_slice() {
+                [Value::Unsigned(seconds), Value::Unsigned(nanos)] => Some(Duration::new(
+                    *seconds,
+                    u32::try_from(*nanos).ok().filter(|&nanos| nanos < 1_000_000_000)?,
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Ok(Value::Array(items)) = cbor::decode(data, Limits::default()) else {
+            return None;
+        };
+        let [estimate, bound, Value::Unsigned(instance)] = items.as_slice() else {
+            return None;
+        };
+        let bound = match bound {
+            Value::Null => None,
+            bound => Some(duration(bound)?),
+        };
+        Some(Self {
+            estimate: duration(estimate)?,
+            bound,
+            instance: Instance(*instance),
+        })
+    }
+
+    /// The time after which a value that the floor admits was created: the estimate plus twice the bound. `None` for
+    /// an unknown bound, which admits no value.
+    pub(crate) fn end(&self) -> Option<Duration> {
+        self.estimate.checked_add(self.bound?.checked_mul(2)?)
+    }
+
+    /// The record form: the CBOR array `[estimate, bound, instance]`, each time as `[seconds, nanoseconds]` and the bound
+    /// `null` when it is unknown.
+    fn form(&self) -> Vec<u8> {
+        let duration = |duration: Duration| {
+            Value::Array(vec![
+                Value::Unsigned(duration.as_secs()),
+                Value::Unsigned(u64::from(duration.subsec_nanos())),
+            ])
+        };
+        let form = Value::Array(vec![
+            duration(self.estimate),
+            self.bound.map_or(Value::Null, duration),
+            Value::Unsigned(self.instance.0),
+        ]);
+        cbor::encode(&form, Limits::FORM).expect("the floor form has no map and no simple value")
+    }
+}
+
+/// The time after which a value that the replay floor record `data` admits was created ([`Floor::end`]). `None` if the
+/// floor has an unknown bound, which admits no value, or no valid form.
+pub(crate) fn floor_end(data: &[u8]) -> Option<Duration> {
+    Floor::read(data)?.end()
+}
+
+/// The commit at `now` that writes the replay floor record `floor` in place of the record at `version`. A replay
+/// insert refuses each signature whose `created` is not later than the reading of the floor plus the skew and twice the
+/// bound. `None` as for [`State::write`].
 pub(super) fn replay_floor(
     id: OperationId,
     now: Reading,
+    floor: Floor,
     limits: Limits,
     version: Option<&AuthorityVersion>,
 ) -> Option<Proposal> {
-    let duration = |duration: Duration| {
-        Value::Array(vec![
-            Value::Unsigned(duration.as_secs()),
-            Value::Unsigned(u64::from(duration.subsec_nanos())),
-        ])
-    };
-    let form = Value::Array(vec![
-        duration(now.estimate()),
-        now.bound().map_or(Value::Null, duration),
-    ]);
-    let data = cbor::encode(&form, Limits::FORM).expect("the floor form has no map and no simple value");
     replace(
         id,
         REPLAY_FLOOR,
@@ -230,7 +265,7 @@ pub(super) fn replay_floor(
         limits,
         &floor_key(),
         version,
-        data.into_boxed_slice(),
+        floor.form().into_boxed_slice(),
     )
     .map(|(proposal, _)| proposal)
 }

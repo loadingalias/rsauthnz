@@ -33,7 +33,9 @@ use rsauthnz::id::{Action, AuthorityVersion, Id, Principal, Resource};
 use rsauthnz::limits::{Limit, Limits, SignatureBudget};
 use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Offer, Status};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
-use rsauthnz::store::{self, Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::store::{
+    self, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store,
+};
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
 use rsauthnz::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{self, Memory, Schedule, Snapshot};
@@ -1114,6 +1116,10 @@ impl Store for Defective {
             _ => instance,
         };
         self.memory.commit(proposal, instance).await
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, memory::Error> {
+        self.memory.insert_replay(insert).await
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, memory::Error> {

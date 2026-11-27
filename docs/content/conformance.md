@@ -85,6 +85,8 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | --- | --- | --- | --- |
 | `Commit` | A commit writes its changes, its intents, its audit record, and its outcome record together. A read of the `Kind::Audit` record of the operation gives the audit, and a second submission gets the outcome record | — | — |
 | `DependencyConflict` | A commit conflicts and writes nothing when a policy version, a record version, or an absence does not hold. A commit whose dependencies hold commits | — | — |
+| `ReplayInsert` | A replay insert writes its record with its end once, and a second insert of the key finds it. After expiry removed the record, an insert whose deadline the clock of the binding passed refuses, so a late insert never accepts a signature twice. After a start, an insert refuses until the replay floor of the new instance exists | — | `NoDoubleAccept` |
+| `ReplayCapacity` | A replay insert refuses with `Inserted::Full` past the share of its key and past the capacity, while another share still has room | — | — |
 | `Deadline` | A commit with a deadline reads the clock of the binding in its atomic step. A deadline after the latest time of the reading commits. A deadline at that latest time, or a reading with no bound, gives `Commit::Expired` and writes nothing. A second submission of a commit that landed gets its outcome record, also after its deadline | — | — |
 | `ConcurrentConsumption` | Two consumptions of one value at the same time give one commit and one conflict | — | `OneUse`, `PendExact` |
 | `AbsenceRace` | A grant change and a revocation race. The revocation writes its record, and the change reads its absence. Only one commits | — | — |
@@ -119,4 +121,5 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 - The suite has no case of entries that commit out of their sequence order. The driver runs one operation at a time,
   so each commit follows the order of its journal entries. The replay of the entries gives one state in each order,
   and the permutation test of the journal rules checks it.
-- A later transition adds its own cases, for example the replay insert of HTTP signatures.
+- `ReplayCapacity` inserts each record of the declared capacity. Declare a small capacity for the suite, such as the
+  256 records of the file example binding.

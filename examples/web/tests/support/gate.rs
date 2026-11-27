@@ -7,7 +7,7 @@ use core::task::{Poll, Waker};
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use rsauthnz::store::{Commit, Declaration, Entry, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::store::{Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store};
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Key, Proposal};
 use rsauthnz_conformance::memory::{Error, Memory, Snapshot};
@@ -98,6 +98,11 @@ impl Store for Gated {
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
         self.pass().await;
         self.memory.commit(proposal, instance).await
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
+        self.pass().await;
+        self.memory.insert_replay(insert).await
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

@@ -15,7 +15,7 @@ use rsauthnz::recovery::{Attempt, CODE_CHARS, Code, Passkeys};
 use rsauthnz::session::{self, Check, Identifier, Opened};
 use rsauthnz::store::driver::{Answer, Lookup, Plan};
 use rsauthnz::store::journal::Role;
-use rsauthnz::store::{Commit, Declaration, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::store::{Commit, Declaration, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{self, Memory};
 use rsauthnz_conformance::suite::{Fault, Subject as _};
@@ -230,6 +230,10 @@ impl Store for Counting<'_> {
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, memory::Error> {
         self.commits += 1;
         self.memory.commit(proposal, instance).await
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, memory::Error> {
+        self.memory.insert_replay(insert).await
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, memory::Error> {

@@ -122,9 +122,9 @@ agent never asserts its own owner.
 
 1. Verify the credential with the profile of the audience, `grants.profile(issuer_key, &audience)?.verify(&credential,
    now, &mut budget)`, and check the proof of the agent with `verified.possession(&proof, &challenge, now, &mut
-   budget)`. It gives the `Evidence`. For an HTTP request that the agent signs, `rsauthnz_http::verify_signature(&profile,
-   &request, now)` verifies the credential and the signature, and gives the same `Evidence`
-   ([Sign the requests of an agent](http-signatures.md)).
+   budget)`. It gives the `Evidence`. For an HTTP request that the agent signs,
+   `rsauthnz_http::verify_signature(&profile, &request, now)` verifies the credential and the signature, and the replay
+   insert of the signature gives the same `Evidence` ([Sign the requests of an agent](http-signatures.md#verify-a-request)).
 2. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`. It gives a
    `Granted` scope, or a `grant::Failure`.
 3. At each use, call `scope.enforce(store, &action, &resource, &policy, now).await`. For a streamed response, call it

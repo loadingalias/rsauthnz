@@ -440,7 +440,7 @@ impl Driver {
                 now: Reading::new(Duration::ZERO, None, crate::time::ReadingSource::Caller),
                 commits: 0,
                 mark_key: record::mark_key(),
-                floor_key: record::floor_key(),
+                floor_key: super::floor_key(),
                 intent_prefix: Kind::Intent.key(&[]).expect("a key of one byte is valid"),
                 advanced: 0,
             },
@@ -899,6 +899,8 @@ struct Fetching {
     keys: VecDeque<Key>,
     operations: VecDeque<(OperationId, Key)>,
     reads: Reads,
+    /// The replay floor of the reads, when they read it and the store has it.
+    floor: Option<record::Floor>,
 }
 
 impl Fetching {
@@ -917,6 +919,7 @@ impl Fetching {
                 })
                 .collect(),
             reads: Reads::default(),
+            floor: None,
         }
     }
 
@@ -932,6 +935,11 @@ impl Fetching {
             return Err(Error::Binding);
         };
         if let Some(key) = self.keys.pop_front() {
+            if Kind::of(&key) == Some(Kind::ReplayFloor)
+                && let Some(record) = &record
+            {
+                self.floor = Some(record::Floor::read(&record.data).ok_or(Error::Record)?);
+            }
             self.reads.records.insert(key, record.map(|record| record.version));
         } else if let Some((operation, _)) = self.operations.pop_front() {
             let found = record.is_some_and(|record| outcome_of(&operation, &record).is_some());
@@ -1192,6 +1200,7 @@ impl Submitted {
                     self.outcome = Some(match result {
                         Commit::Recorded(stored) => stored.answer(&self.operation),
                         Commit::Expired => Outcome::Refused(transition::Error::Expired),
+                        Commit::Full => Outcome::Refused(transition::Error::Full),
                         Commit::Conflict | Commit::Accepted => Outcome::Conflict,
                     });
                     match self.end {
@@ -1224,6 +1233,8 @@ struct Start {
     reads: Reads,
     /// The restore decision, for a restore.
     activation: Option<journal::Activation>,
+    /// The replay floor that the store holds.
+    floor: Option<record::Floor>,
 }
 
 #[derive(Debug)]
@@ -1265,6 +1276,7 @@ impl Start {
             owed: Vec::new(),
             reads: Reads::default(),
             activation: None,
+            floor: None,
         }
     }
 
@@ -1313,7 +1325,7 @@ impl Start {
                         done: false,
                     })
                 } else {
-                    StartPhase::Reads(Fetching::new(core.loses.then(|| core.floor_key.clone()), []))
+                    StartPhase::Reads(Fetching::new([core.floor_key.clone()], []))
                 };
                 Ok(())
             }
@@ -1363,6 +1375,7 @@ impl Start {
                 }
                 StartPhase::Reads(reading) => {
                     self.reads = reading.reads;
+                    self.floor = reading.floor;
                     if !core.journal {
                         self.close(core)?
                     } else if self.begin == Begin::Restore {
@@ -1397,6 +1410,7 @@ impl Start {
                 StartPhase::Complete(_) => StartPhase::Recheck(self.reading(core)),
                 StartPhase::Recheck(reading) => {
                     self.reads = reading.reads;
+                    self.floor = reading.floor;
                     self.reconcile(core)?
                 }
                 StartPhase::Reconcile(_) => {
@@ -1501,9 +1515,15 @@ impl Start {
                 proposals.push_back(proposal);
             }
         }
-        let floor = records.get(&core.floor_key).cloned().flatten();
+        let version = records.get(&core.floor_key).cloned().flatten();
+        let floor = record::Floor {
+            estimate: core.now.estimate(),
+            bound: core.now.bound(),
+            instance: core.instance,
+        };
         let id = core.operation();
-        proposals.push_back(record::replay_floor(id, core.now, core.limits, floor.as_ref()).ok_or(Error::Record)?);
+        proposals
+            .push_back(record::replay_floor(id, core.now, floor, core.limits, version.as_ref()).ok_or(Error::Record)?);
         Ok(proposals)
     }
 
@@ -1586,14 +1606,27 @@ impl Start {
     }
 
     /// The last commits of a start: the mark record, with no completion owed, then the floor entry of its write, and
-    /// the replay floor of a binding that loses its state.
+    /// the replay floor of the new instance. A start of a binding that loses its state sets the floor at its reading.
+    /// Another start keeps the reading of the floor, or of no floor, which admits each value. A restore wrote its floor
+    /// already.
     fn close(&self, core: &mut Core) -> Result<StartPhase, Error> {
         core.record.owed.clear();
         let mut floor = None;
-        if core.loses && self.begin == Begin::Start {
+        if self.begin == Begin::Start {
+            let (estimate, bound) = match self.floor {
+                _ if core.loses => (core.now.estimate(), core.now.bound()),
+                Some(kept) => (kept.estimate, kept.bound),
+                None => (Duration::ZERO, Some(Duration::ZERO)),
+            };
             let version = self.reads.records.get(&core.floor_key).cloned().flatten();
+            let written = record::Floor {
+                estimate,
+                bound,
+                instance: core.instance,
+            };
             let id = core.operation();
-            floor = Some(record::replay_floor(id, core.now, core.limits, version.as_ref()).ok_or(Error::Record)?);
+            floor =
+                Some(record::replay_floor(id, core.now, written, core.limits, version.as_ref()).ok_or(Error::Record)?);
         }
         Ok(StartPhase::Close(core.marking(floor)?))
     }

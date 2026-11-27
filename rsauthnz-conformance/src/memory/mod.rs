@@ -81,8 +81,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::store::{
-    self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
-    Sequence, Store,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
+    Journal, Kind, Record, Restore, Sequence, Store,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
@@ -200,7 +200,32 @@ struct State {
 /// proposal plus the retention, which saturates at `Duration::MAX`. [`Memory::with_retention`] sets another one.
 const RETENTION: Duration = Duration::MAX;
 
+/// The capacity of the replay records of signatures of a new binding. [`Memory::with_capacity`] sets another one.
+const CAPACITY: Capacity = Capacity {
+    records_max: 4_096,
+    share_max: 256,
+};
+
 impl State {
+    /// Whether a new record at `key` fits `capacity`. A key of another kind than [`Kind::Signature`], and a key that a
+    /// record has, need no room.
+    fn room(&self, key: &Key, capacity: Capacity) -> bool {
+        let Some(share) = store::share(key) else {
+            return true;
+        };
+        // The keys of a prefix are adjacent in the order of the map, so each count reads only the keys of its prefix.
+        let count = |prefix: &[u8]| {
+            let start = Kind::Signature
+                .key(prefix.get(1..).unwrap_or_default())
+                .expect("a prefix of a key is a valid key");
+            self.records
+                .range(start..)
+                .take_while(|(key, _)| key.as_bytes().starts_with(prefix))
+                .count()
+        };
+        self.records.contains_key(key) || capacity.admits(count(&[Kind::Signature as u8]), count(share))
+    }
+
     /// Whether `dependency` holds in the current state.
     fn holds(&self, dependency: &Dependency) -> bool {
         let at = |key: &Key, version: &AuthorityVersion| {
@@ -297,6 +322,8 @@ struct Binding {
     clock: Clock,
     /// The outcome retention of the declaration.
     retention: Duration,
+    /// The capacity of the replay records of signatures of the declaration.
+    capacity: Capacity,
 }
 
 impl Binding {
@@ -381,6 +408,14 @@ impl Binding {
         if store::expired(request.deadline, (self.clock.0)()) {
             return Commit::Expired;
         }
+        let capacity = self.capacity;
+        let fits = request.changes.iter().all(|change| match change {
+            Change::Write { key, .. } => state.room(key, capacity),
+            Change::End(_) => true,
+        });
+        if !fits {
+            return Commit::Full;
+        }
         for change in request.changes {
             match change {
                 Change::Write {
@@ -394,6 +429,25 @@ impl Binding {
         }
         state.records.extend(request.records);
         Commit::Accepted
+    }
+
+    /// The atomic replay insert of `insert` ([`Store::insert_replay`]).
+    fn insert(&mut self, insert: &Insert) -> Inserted {
+        let state = &mut self.store;
+        if !insert.admits(state.records.get(&store::floor_key()), self.instance) {
+            return Inserted::Floor;
+        }
+        if state.records.contains_key(insert.key()) {
+            return Inserted::Present;
+        }
+        if !state.room(insert.key(), self.capacity) {
+            return Inserted::Full;
+        }
+        if store::expired(Some(insert.deadline()), (self.clock.0)()) {
+            return Inserted::Expired;
+        }
+        state.records.insert(insert.key().clone(), insert.record());
+        Inserted::Accepted
     }
 }
 
@@ -428,6 +482,7 @@ impl Memory {
                 ReadingSource::Caller,
             )),
             retention: RETENTION,
+            capacity: CAPACITY,
         })))
     }
 
@@ -437,6 +492,14 @@ impl Memory {
     #[must_use]
     pub fn with_retention(self, retention: Duration) -> Self {
         self.lock().retention = retention;
+        self
+    }
+
+    /// The binding with the capacity `capacity` of the replay records of signatures. Set it before the first insert, so
+    /// that the declaration holds for each record.
+    #[must_use]
+    pub fn with_capacity(self, capacity: Capacity) -> Self {
+        self.lock().capacity = capacity;
         self
     }
 
@@ -503,16 +566,18 @@ impl Store for Memory {
     type Error = Error;
 
     fn declaration(&self) -> Declaration {
+        let binding = self.lock();
         Declaration {
             isolation: Isolation::Serializable,
             crash_loss: CrashLoss::Everything,
-            outcome_retention: self.lock().retention,
+            outcome_retention: binding.retention,
             crash_injection: CrashInjection::Supported,
             restore: Restore::Journal {
                 location: "the memory of the process".into(),
                 failure_domain: "a simulated domain apart from the store and from its snapshots".into(),
             },
             key_bytes_max: Key::BYTES_MAX,
+            signatures: binding.capacity,
             record_bytes_max: usize::MAX,
         }
     }
@@ -544,6 +609,12 @@ impl Store for Memory {
         let mut binding = self.lock();
         let request = Request::new(proposal, binding.retention);
         binding.commit(request, instance)
+    }
+
+    async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
+        let mut binding = self.lock();
+        binding.serving()?;
+        Ok(binding.insert(insert))
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

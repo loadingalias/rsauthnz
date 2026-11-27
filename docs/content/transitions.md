@@ -200,7 +200,8 @@ operation stays in doubt, so the client never starts it again as a new operation
 | `Reuse` | The operation identity has the outcome record of another request | `Refuse` |
 | `LastAnchor` | The change ends the last sign-in method of an account, or the last administrator binding, that the restore journal records as live | `Refuse` |
 | `Prepared` | The proposal has an artifact, or no change writes the issuance record of the artifact at its version | `Refuse` |
-| `Expired` | The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound. Nothing committed | `Refuse` |
+| `Expired` | The reading of the clock of the binding at the commit can be at or after the deadline of the proposal, or it has no bound. Nothing committed | `Refuse` |
+| `Full` | The replay record of a signature that the proposal writes does not fit the capacity of the store. Nothing committed: sign the request again later | `Restart` |
 | `Agent` | The actor of `Proposal::new` is an agent. Take the proposal from the scope of the request of the agent | `Refuse` |
 
 ## Limits

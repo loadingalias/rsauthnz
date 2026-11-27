@@ -357,7 +357,7 @@ still fails under it ([FP Design Models]):
 | `NoDoubtServing` | Authority | The store serves only after each in-doubt consumption completes or stays consumed | `RestoreCompletions` |
 | `Recovers` | AuthorityRecovery | After crashes stop, weakly fair recovery work returns the store to service | `Restart`, `CrashPoints` |
 | `NoStaleCommit` | Fencing | A delayed commit from an earlier instance refuses after the new instance write | `Fencing` |
-| `NoDoubleAccept` | Replay | Replay record insert; an insert after `expires` plus the skew refuses; restart and restore floor | None yet: the replay insert is a later transition (A409). `RestoreJournal` checks that a restore sets the replay floor |
+| `NoDoubleAccept` | Replay | Replay record insert; an insert after `expires` plus the skew refuses; restart and restore floor | `ReplayInsert`: a repetition finds its record, a late insert after expiry refuses, and no insert lands before the floor of a start. `RestoreJournal` checks that a restore sets the replay floor |
 | `NoLiveRemoved` | Replay | Incremental expiry | `Expiry` |
 
 ## Decisions

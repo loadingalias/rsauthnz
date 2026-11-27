@@ -23,6 +23,7 @@ driver takes only an accepted `Profile` (`Driver::new(profile, limits)`), so no 
 | `crash_injection` | `CrashInjection::Supported` when the binding injects a crash at each commit point, or `Unsupported` | — |
 | `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects. [Restore journal](restore.md) gives what the journal keeps | — |
 | `key_bytes_max` | The most bytes in a key that the binding stores | `Error::KeyBound` below 2048 (`transition::Key::BYTES_MAX`), the longest key of the core |
+| `signatures` | The `Capacity` of the replay records of HTTP signatures (`Kind::Signature`): `records_max`, the most records, and `share_max`, the most records of one agent key in one audience | `Error::Capacity` for a `share_max` of 0 or above `records_max` |
 | `record_bytes_max` | The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit record, or an outcome record. The audit record holds the key of each change | `Driver::new(profile, limits)` gives `driver::Error::RecordBound(least)` below `driver::record_bytes_min(limits)`, the longest record that the driver writes for itself. `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer record. `driver.submit` calls it and refuses with `driver::Error::RecordBytes`, so the binding never gets the proposal |
 
 ## Primitives
@@ -40,6 +41,7 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Store::read(&key)` | Gives the current `Record` of the key (`version`, `end`, and `data`), or `None`. It is a keyed read: it never scans other records |
 | `Store::read_pair([&first, &second])` | Looks up both keys in one store state. Returns two results in request order. Each absent key gives `None`. A repeated key gives the same result twice |
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
+| `Store::insert_replay(&insert)` | The atomic insert of the replay record of one HTTP signature, with no audit record. See [The replay insert](#the-replay-insert) |
 | `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
 | `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |
 | `Store::range(&prefix, after, limit)` | Gives the first `limit` records whose key starts with `prefix` and comes after `after`, in key order, or from the prefix for `None`. It gives fewer only when no more remain, and never a record of another prefix. See [Range reads](#range-reads) |
@@ -65,6 +67,9 @@ serializable step, or in one equivalent atomic step, it checks that:
    its clock in the step, after the checks of the dependencies, and gives `Commit::Expired` when
    `store::expired(proposal.deadline(), reading)` holds. A reading before the step is not sufficient: the time from
    that reading to the write has no bound.
+5. Each write of a new record of `Kind::Signature` fits the capacity: `signatures.admits(records, share)` holds for
+   the count of these records and the count of its share (`store::share(&key)`). Otherwise the commit gives
+   `Commit::Full`.
 
 Then it writes each change of `proposal.changes()`, the audit record of `store::audit_record(&proposal)`, each intent
 record of `store::intent_records(&proposal)`, and the outcome record of `store::outcome_record(&proposal)` together.
@@ -74,6 +79,8 @@ Otherwise it writes nothing.
 | --- | --- |
 | `Accepted` | The commit wrote everything. It is durable when it returns |
 | `Conflict` | A dependency or the instance number did not hold |
+| `Expired` | The proposal has a deadline, and the clock of the binding can be at or after it, or has no bound. The driver gives `Refused(Error::Expired)` |
+| `Full` | A new replay record of a signature does not fit the capacity. The driver gives `Refused(Error::Full)`, with the recovery `Restart` |
 | `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). The commit driver gives the outcome from it: the receipt of the first commit for the same request, or `Error::Reuse` |
 
 An error of the commit is a crash with an unknown outcome. The commit takes a proposal, so state changes cannot
@@ -101,8 +108,8 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Agent` | An agent identity: its owner, its public key, its name, and the verified workload of a hosted agent ([Enroll an agent](agent-enrollment.md)) | `None` |
 | `Grant` | The grant of an agent at its current revision: its owner, audiences, permissions, deadline, and policy version. The last use of the grant is at the key of the grant with one more byte, 0: its revision and the start of its window ([Grant an agent access](grants.md#record-last-use)) | `None` |
 | `Approval` | A one-use approval of an operation | `Pays::Nothing` |
-| `Replay` | The replay record of one accepted signature, or of the challenge of one passkey sign-in | `None` |
-| `ReplayFloor` | The replay floor of the store. Each replay insert reads it as a dependency | `None` |
+| `Replay` | The replay record of the challenge of one passkey sign-in | `None` |
+| `ReplayFloor` | The replay floor of the store: the reading of the start or restore that set it, and the instance number of the start that wrote it. The driver writes it at each start and each restore. A sign-in reads it as a dependency, and a replay insert reads it in its step | `None` |
 | `Audit` | The audit record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Intent` | An effect intent that the application did not end yet | `None` |
@@ -114,6 +121,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Removal` | The removal mark of a passkey, at the identifier of its credential key. It ends after 400 days, and a restore can lose it: a sign-in then refuses, which is safe ([Remove a passkey](accounts.md#remove-a-passkey)) | `None` |
 | `AccountState` | The newest recovery revision or enrollment revision of an account | `None` |
 | `AgentEnrollment` | A pending enrollment request of an agent, which its owner approves in a browser ([Enroll an agent](agent-enrollment.md)) | `Pays::Nothing` |
+| `Signature` | The replay record of one accepted HTTP signature of an agent: the share of the agent key in its audience, then the digest of the nonce ([Sign the requests of an agent](http-signatures.md#the-replay-store)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for
@@ -193,6 +201,24 @@ Full recovery selects a new passkey prefix. Stored public keys under an earlier 
 A store that partitions its keys can use the first 33 bytes of a key as its partition key. A shorter key is its own
 partition key. Then each range read of the core reads one partition, except the read of the sessions of an account:
 its prefix has 17 bytes, and each session key has 33, so it reads the partitions of each session of the account.
+
+## The replay insert
+
+`Store::insert_replay(&insert)` accepts the signature of one HTTP request once ([Sign the requests of an
+agent](http-signatures.md#the-replay-store)). It is one atomic step, with no audit record, no outcome record, and no
+commit driver, so the requests of many agents insert at the same time. In that step, in this order, the binding:
+
+1. Reads the replay floor record (`store::floor_key()`). When `insert.admits(floor, instance)` does not hold for it and
+   the current instance number, it gives `Inserted::Floor`. Thus no insert lands between a start or a restore and the
+   write of its floor.
+2. Gives `Inserted::Present` when a record has `insert.key()`: the signature is a repetition.
+3. Counts the records of `Kind::Signature` and the records of `insert.share()`. When `signatures.admits(records,
+   share)` does not hold, it gives `Inserted::Full`.
+4. Reads its clock. When `store::expired(Some(insert.deadline()), reading)` holds, it gives `Inserted::Expired`.
+5. Writes `insert.record()` at `insert.key()`, makes it durable, and gives `Inserted::Accepted`.
+
+Each result except `Accepted` writes nothing. An error is a crash with an unknown outcome: the verifier refuses the
+request, and the agent signs a new one.
 
 ## Expiry
 

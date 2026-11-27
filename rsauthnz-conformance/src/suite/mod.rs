@@ -127,6 +127,15 @@ pub enum Case {
     /// [`Commit::Expired`](rsauthnz::store::Commit::Expired) and writes nothing. A second submission of a commit that landed gets its outcome record,
     /// also after its deadline.
     Deadline,
+    /// A replay insert ([`Store::insert_replay`]) writes its record with its end once, and a second insert of the key
+    /// finds it. After expiry removed the record, an insert whose deadline the clock of the binding passed refuses:
+    /// a late insert never accepts a signature twice. After a start, an insert refuses until the replay floor of the
+    /// new instance exists.
+    ReplayInsert,
+    /// A replay insert refuses with [`Inserted::Full`](rsauthnz::store::Inserted::Full) past the share of its key, and
+    /// past the capacity of the declaration, while another share still has room. Declare a small capacity for the
+    /// suite: the case inserts each record of the capacity.
+    ReplayCapacity,
     /// Two concurrent consumptions of one value give one commit and one conflict. Properties: `OneUse`, `PendExact`.
     ConcurrentConsumption,
     /// A grant change and a revocation of the grant race. The revocation writes the revocation record, and the change
@@ -200,10 +209,12 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::Deadline,
+        Self::ReplayInsert,
+        Self::ReplayCapacity,
         Self::ConcurrentConsumption,
         Self::AbsenceRace,
         Self::Expiry,
@@ -233,6 +244,8 @@ impl Case {
             Self::Commit
             | Self::DependencyConflict
             | Self::Deadline
+            | Self::ReplayInsert
+            | Self::ReplayCapacity
             | Self::ConcurrentConsumption
             | Self::AbsenceRace
             | Self::Expiry
@@ -259,6 +272,8 @@ impl Case {
             Self::Commit => cases::commit(make()).await,
             Self::DependencyConflict => cases::dependency_conflict(make()).await,
             Self::Deadline => cases::deadline(make()).await,
+            Self::ReplayInsert => cases::replay_insert(make()).await,
+            Self::ReplayCapacity => cases::replay_capacity(make()).await,
             Self::ConcurrentConsumption => cases::concurrent_consumption(make()).await,
             Self::AbsenceRace => cases::absence_race(make()).await,
             Self::Expiry => cases::expiry(make()).await,

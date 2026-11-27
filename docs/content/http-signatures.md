@@ -2,9 +2,9 @@
 
 An agent signs each HTTP request with its own key, as [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) defines. The
 request carries the agent credential and the signature, so no bearer secret exists: a captured request gives no key.
-The server verifies the request with no state of its own, and gets the same evidence as a proof of possession. Then
-the grant check gives the scope of the request. Module `rsauthnz::httpsig` gives the profile, and `rsauthnz-http`
-maps it to `http::Request` values.
+The server checks the request with no state of its own. Then its replay store accepts each signature once, and gives
+the same evidence as a proof of possession. Then the grant check gives the scope of the request. Module
+`rsauthnz::httpsig` gives the profile, and `rsauthnz-http` maps it to `http::Request` values.
 
 Use this profile for an HTTP API that verifies with rsauthnz, also behind a proxy that ends TLS or changes `Host`.
 Each request pays for one composite signature and one credential: about 12 KB of fields
@@ -60,9 +60,8 @@ signatures: the signatures of RFC 9421 Appendix B.2.6 and B.3 verify over their 
 - At the server: the public key of the issuer of the authority, and the audience of the server, such as `acme:api`.
 - The body of the request in memory, which the framework read within its body limit. The content digest needs each
   byte of the body before the operation runs.
-- A verifier accepts one signed request again until its `expires`. No replay store refuses a repeated signature yet.
-  Keep the lifetime short, and give each operation that commits an operation identity
-  ([Make a transition](transitions.md)), so that a repeated request commits nothing new.
+- The store of the authority of the server, which is the replay store of its audience ([The replay
+  store](#the-replay-store)). Each server of the audience uses the same store.
 
 ## Sign a request
 
@@ -89,18 +88,53 @@ signed with a credential of the key that a rotation replaced refuses at the gran
    (`WINDOW_MAX_DEFAULT`), and the clock skew of an agent is 30 seconds (`SKEW_DEFAULT`). Change them with
    `profile.with_window(window_max, skew)`.
 2. For each request, call `rsauthnz_http::verify_signature(&profile, &request, now)`. It reads the method, the path,
-   the query, the fields, and the body, and no authority. It gives the `Evidence` of the agent.
-3. Call `authz::check_agent(&grants, store, &evidence, &action, &resource, &policy, now).await`, and use the `Granted`
-   scope ([Check the request of an agent](authorization.md#check-the-request-of-an-agent)).
+   the query, the fields, and the body, and no authority. It gives the `httpsig::Checked` signature, and no evidence
+   yet.
+3. For a request that commits nothing, such as a read, call `checked.accept(store).await`. The replay store inserts the
+   replay record of the signature, and gives the `Evidence` of the agent. Then call `authz::check_agent(&grants, store,
+   &evidence, &action, &resource, &policy, now).await`, and use the `Granted` scope ([Check the request of an
+   agent](authorization.md#check-the-request-of-an-agent)).
+4. For a request that commits a transition, call `authz::check_agent` with `checked.evidence()`. Make the proposal
+   with `scope.propose(operation, request, now)` and the changes of the operation. Then call
+   `checked.include(store, &mut proposal).await`, and commit the proposal. The replay insert is a condition of that
+   commit, so the operation and the replay record commit together or not at all.
 
 A host with no `http` values builds an `httpsig::Request`: the method, the path, the query, each field as a name and
 a value, and the body. The agent signs it with `httpsig::Draft::new`, and the server verifies it with
 `profile.verify(&request, now)`.
 
 `verify` runs each cheap check first. The two signature checks come last: the credential, then the request, each with
-its own budget of `Limits::signature_checks`. A handler that returns `Result<Response<Vec<u8>>, Problem>` converts
-each `httpsig::Error` with `?` into `403 Forbidden` and `{"recovery":"refuse"}`
-([Return a problem](http-binding.md#return-a-problem)).
+its own budget of `Limits::signature_checks`. A request that fails a check inserts no replay record, so a forged
+request takes no room in the share of the agent. A handler that returns `Result<Response<Vec<u8>>, Problem>` converts
+each refusal with `?` ([Return a problem](http-binding.md#return-a-problem)).
+
+Use the evidence of `checked.evidence()` only for a request whose commit includes the insert. The evidence of a
+signature with no replay insert does not show that the request is not a repetition.
+
+## The replay store
+
+A captured request stays valid until its `expires`, but the replay store accepts its signature once. The replay
+identity is the audience of the server, the `cnf` key of the agent, and the nonce. Thus one agent cannot use the
+nonce, or the room, of another agent.
+
+- **One store for each audience.** Each server that verifies the requests of one audience uses one store, with one
+  atomic insert. rsauthnz cannot detect two servers of one audience with two stores: a request repeats once at each
+  store. If two services need separate stores, give each service its own audience.
+- **The insert.** One atomic step, with no audit record and no commit driver, so the requests of many agents insert
+  at the same time ([The replay insert](storage.md#the-replay-insert)). It refuses once the clock of the store reaches
+  `expires` plus the skew, also for a verifier that waited after its check.
+- **Retention.** A replay record ends at `expires` plus the skew and twice the bound of the reading of the verifier.
+  Run the expiry pass of the store ([Expiry](storage.md#expiry)), which removes each ended record.
+- **Restart and restore.** A store that loses its records, such as the memory binding, sets a replay floor at each
+  start, and each restore sets one. A signature created before the floor plus the skew refuses with `Floor`, so a
+  captured request cannot repeat after a restart. For that short time, a new signature refuses too: the agent signs
+  again.
+- **Capacity.** The store declares the most replay records, and the most records of one agent key
+  (`Declaration::signatures`). A full store or a full share refuses with `Full`. The store never removes a live record
+  to make room.
+
+A refused repetition does not show whether the first request committed. The operation identity of the transition
+shows it ([Make a transition](transitions.md)).
 
 ## Size of a request
 
@@ -137,7 +171,8 @@ change the order of the fields, and change the case of their names. A proxy can 
 ## Errors
 
 Each `httpsig::Error` of a request has the recovery `Refuse`: the same request refuses again, and the agent signs a new
-request.
+request. `Full` has the recovery `Restart`: nothing committed, so the agent signs a new request later. `Transition`
+has the recovery of its `transition::Error`.
 
 | Error | Cause |
 | --- | --- |
@@ -148,13 +183,17 @@ request.
 | `Nonce` | The nonce is not the base64url of 16 to 32 bytes |
 | `Window` | `expires` is not after `created`, or the window is longer than the longest window. A draft with a lifetime under one second |
 | `Early` | `created` is later than the earliest time of the verifier plus the skew. Check the clock of the agent |
-| `Expired` | The latest time of the verifier can be at or after `expires` |
+| `Expired` | The latest time of the verifier can be at or after `expires`, or the clock of the replay store reached `expires` plus the skew at the insert |
 | `Digest` | `Content-Digest` has no `sha-256` member, or it is not the digest of the body |
 | `Value` | A covered value has a byte that is not visible ASCII, or a derived value is empty |
 | `Credential(error)` | The credential refused ([Errors](credential-format.md#errors)). A credential of another audience refuses with `credential::Error::Cose(cose::Error::Audience)` |
 | `Signature` | The `cnf` key of the credential did not sign the request, or a covered component changed |
 | `Limit(limit)` | A signature check costs more than its budget |
 | `Time(error)` | The reading of the time has no bound |
+| `Replayed` | The replay store holds the signature: the request is a repetition |
+| `Floor` | The store has no replay floor of its current start, or the signature was created before the floor. Sign again |
+| `Full` | The capacity of the replay store, or the share of the agent key, is full. The recovery is `Restart`: sign again later |
+| `Transition(error)` | The proposal of the request cannot take the replay insert, for example at `Limits::dependencies` |
 
 ## Operations
 
@@ -168,9 +207,13 @@ request.
 | `signed.fields()` | Each field: its name and its value |
 | `httpsig::Profile::new(credential_profile)` | The verifier of the audience of the credential profile |
 | `profile.with_window(window_max, skew)` | The verifier with another window and skew |
-| `rsauthnz_http::verify_signature(&profile, &request, now)` | The `Evidence` of the agent of an `http::Request` |
-| `profile.verify(&request, now)` | The `Evidence` of the agent of an `httpsig::Request` |
+| `rsauthnz_http::verify_signature(&profile, &request, now)` | The `httpsig::Checked` signature of an `http::Request` |
+| `profile.verify(&request, now)` | The `httpsig::Checked` signature of an `httpsig::Request` |
+| `checked.accept(store).await` | The `Evidence` of the agent, after the replay insert |
+| `checked.evidence()` | The `Evidence` for the grant check of a request that commits |
+| `checked.include(store, &mut proposal).await` | Puts the replay insert in the commit of the request |
 
 The cost class of a draft is `Parse`, and of `finish` and a verification is `Verify`
 ([Admit rsauthnz work](admission.md)). A draft makes one SHA-256 digest of the body. A verification makes one SHA-256
-digest of the body and two composite signature checks.
+digest of the body and two composite signature checks. `accept` is one replay insert, of the class `Mutate`, and
+`include` is one keyed read of the replay floor.

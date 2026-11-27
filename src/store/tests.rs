@@ -8,8 +8,8 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use super::{
-    Commit, CrashInjection, CrashLoss, Declaration, Error, ExpiryError, Instance, Isolation, Kind, Profile, Progress,
-    Record, Restore, Store, audit_record, expire, intent_records, outcome_record,
+    Capacity, Commit, CrashInjection, CrashLoss, Declaration, Error, ExpiryError, Insert, Inserted, Instance,
+    Isolation, Kind, Profile, Progress, Record, Restore, Store, audit_record, expire, intent_records, outcome_record,
 };
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
@@ -41,12 +41,17 @@ fn declaration() -> Declaration {
         crash_injection: CrashInjection::Unsupported,
         restore: Restore::Unsupported,
         key_bytes_max: Key::BYTES_MAX,
+        signatures: Capacity {
+            records_max: 2,
+            share_max: 1,
+        },
         record_bytes_max: 4,
     }
 }
 
-/// A binding with snapshot isolation permits write skew on an absence, and one with a smaller key bound cannot store
-/// each key of the core. The profile refuses both at its construction.
+/// A binding with snapshot isolation permits write skew on an absence, one with a smaller key bound cannot store each
+/// key of the core, and one whose share of signature records is empty or larger than its capacity refuses each
+/// signature or lets one agent fill the store. The profile refuses each at its construction.
 #[test]
 fn a_declaration_without_an_atomic_commit_refuses_its_profile() {
     for isolation in [Isolation::Serializable, Isolation::AtomicConditional] {
@@ -70,6 +75,16 @@ fn a_declaration_without_an_atomic_commit_refuses_its_profile() {
         }),
         Err(Error::KeyBound)
     );
+    for (records_max, share_max) in [(2, 0), (2, 3)] {
+        assert_eq!(
+            Profile::new(Declaration {
+                signatures: Capacity { records_max, share_max },
+                ..declaration()
+            }),
+            Err(Error::Capacity),
+            "{share_max} of {records_max}"
+        );
+    }
 }
 
 /// The bound of the binding applies to each record that the commit writes, before the commit: the record form of a
@@ -189,6 +204,10 @@ impl Store for Ended {
         Ok(Commit::Conflict)
     }
 
+    async fn insert_replay(&mut self, _: &Insert) -> Result<Inserted, !> {
+        Ok(Inserted::Floor)
+    }
+
     async fn range(&mut self, _: &Key, _: Option<&Key>, _: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {
         Ok(Vec::new())
     }
@@ -276,6 +295,10 @@ impl Store for Records {
         self.0.extend(intent_records(proposal).unwrap());
         self.0.extend([audit_record(proposal), outcome_record(proposal)]);
         Ok(Commit::Accepted)
+    }
+
+    async fn insert_replay(&mut self, _: &Insert) -> Result<Inserted, !> {
+        Ok(Inserted::Floor)
     }
 
     async fn range(&mut self, prefix: &Key, after: Option<&Key>, limit: NonZeroUsize) -> Result<Vec<(Key, Record)>, !> {

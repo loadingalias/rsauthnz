@@ -51,6 +51,7 @@ declaration that cannot keep the contract, and the driver takes only a [`Profile
 | `crash_injection` | [`CrashInjection::Supported`] when the binding implements [`Subject::inject`] ([step 11](#11-implement-the-test-controls)) |
 | `restore` | [`Restore::Journal`] with the location and the failure domain of the journal, or [`Restore::Unsupported`] |
 | `key_bytes_max` | At least [`Key::BYTES_MAX`] |
+| `signatures` | The [`Capacity`] of the replay records of HTTP signatures: the most records, and the most records of one share ([step 4](#the-replay-insert)). Declare a small capacity for the suite, which fills it |
 | `record_bytes_max` | The most bytes in one record that the store keeps: the record form of a write, an intent record, an audit record, or an outcome record. Give at least [`record_bytes_min`] of the [`Limits`] of the driver, which grows with the changes of one proposal. [`Driver::new`] refuses a smaller bound with [`driver::Error::RecordBound`]. [`Driver::submit`] refuses a proposal with a larger record, so the binding never gets it |
 
 The declaration selects the suite cases. A binding without crash injection skips the crash cases, and a binding
@@ -127,8 +128,8 @@ the driver writes for itself: the mark record ([`Kind::Mark`]) and the replay fl
 
 ## 4. Commit a proposal
 
-Implement [`Store::commit`]. It is the only primitive that writes state, audit, or an outcome record. Do all of
-this in one atomic step:
+Implement [`Store::commit`]. It is the only primitive that writes audit or an outcome record. Do all of this in one
+atomic step:
 
 1. Compare the instance number of the call with the number of the latest start. When they differ, give
    [`Commit::Conflict`].
@@ -142,16 +143,18 @@ this in one atomic step:
    time source. When [`store::expired`] holds for the reading, give [`Commit::Expired`]. Read the clock in the step,
    after the checks of the dependencies. A reading before the step is not sufficient: the time from that reading to
    the write has no bound.
-5. Write each [`Change`] of [`Proposal::changes`], the record of [`audit_record`], each record of
+5. For each write of a new record of [`Kind::Signature`], count the records of the kind and the records of its share
+   ([`store::share`]). When [`Capacity::admits`] does not hold for the counts, give [`Commit::Full`].
+6. Write each [`Change`] of [`Proposal::changes`], the record of [`audit_record`], each record of
    [`intent_records`], and the record of [`outcome_record`]. `Change::End` removes its record.
-6. Make the writes durable, then give [`Commit::Accepted`].
+7. Make the writes durable, then give [`Commit::Accepted`].
 
-A conflict and an expiry write nothing. Give an error only when the outcome is unknown, for example after a lost connection or a
-timeout. An error is a crash ([step 9](#9-stop-at-each-error)).
+A conflict, an expiry, and a full capacity write nothing. Give an error only when the outcome is unknown, for example
+after a lost connection or a timeout. An error is a crash ([step 9](#9-stop-at-each-error)).
 
 Map the commit to the store:
 
-- **Transactional database.** Run steps 1 to 6 in one transaction at serializable isolation. Read the clock in the
+- **Transactional database.** Run steps 1 to 7 in one transaction at serializable isolation. Read the clock in the
   transaction, after the reads of the dependencies: the clock of the database, or the clock of the binding while the
   transaction is open. A transaction that the database aborts, for example at a serialization failure, wrote
   nothing: give [`Commit::Conflict`].
@@ -163,7 +166,39 @@ Map the commit to the store:
   first check above that fails. A store whose conditions cannot read the time of the server cannot read a clock in the
   step, so it cannot commit a proposal with a deadline.
 
+### The replay insert
+
+Implement [`Store::insert_replay`]. It accepts the signature of one HTTP request once, with no audit record and no
+outcome record. Do all of this in one atomic step, as for a commit:
+
+1. Read the replay floor record ([`floor_key`]). When [`Insert::admits`] does not hold for it and the current
+   instance number, give [`Inserted::Floor`].
+2. When a record has [`Insert::key`], give [`Inserted::Present`].
+3. Count the records of [`Kind::Signature`] and the records of [`Insert::share`]. When [`Capacity::admits`] does not
+   hold for the counts, give [`Inserted::Full`]. Keep the keys in order, so that each count reads only the keys of
+   its prefix, or keep a count of each share in the same step.
+4. Read the clock of the binding. When [`store::expired`] holds for [`Insert::deadline`] and the reading, give
+   [`Inserted::Expired`].
+5. Write [`Insert::record`] at [`Insert::key`], make it durable, and give [`Inserted::Accepted`].
+
 [`Store::commit`]: rsauthnz::store::Store::commit
+[`Store::insert_replay`]: rsauthnz::store::Store::insert_replay
+[`floor_key`]: rsauthnz::store::floor_key
+[`Insert::admits`]: rsauthnz::store::Insert::admits
+[`Insert::key`]: rsauthnz::store::Insert::key
+[`Insert::share`]: rsauthnz::store::Insert::share
+[`Insert::deadline`]: rsauthnz::store::Insert::deadline
+[`Insert::record`]: rsauthnz::store::Insert::record
+[`Inserted::Floor`]: rsauthnz::store::Inserted::Floor
+[`Inserted::Present`]: rsauthnz::store::Inserted::Present
+[`Inserted::Full`]: rsauthnz::store::Inserted::Full
+[`Inserted::Expired`]: rsauthnz::store::Inserted::Expired
+[`Inserted::Accepted`]: rsauthnz::store::Inserted::Accepted
+[`Kind::Signature`]: rsauthnz::store::Kind::Signature
+[`Capacity`]: rsauthnz::store::Capacity
+[`Capacity::admits`]: rsauthnz::store::Capacity::admits
+[`store::share`]: rsauthnz::store::share
+[`Commit::Full`]: rsauthnz::store::Commit::Full
 [`Commit::Conflict`]: rsauthnz::store::Commit::Conflict
 [`Commit::Expired`]: rsauthnz::store::Commit::Expired
 [`Proposal::deadline`]: rsauthnz::transition::Proposal::deadline
@@ -412,6 +447,8 @@ step. This table gives the step that each case checks first:
 | `Commit` | [4](#4-commit-a-proposal), [3](#3-read-one-record) |
 | `DependencyConflict` | [4](#4-commit-a-proposal) |
 | `Deadline` | [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
+| `ReplayInsert` | [4](#the-replay-insert), [6](#6-expire-ended-records), [11](#11-implement-the-test-controls) |
+| `ReplayCapacity` | [4](#the-replay-insert), [1](#1-declare-the-guarantees) |
 | `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `Expiry` | [6](#6-expire-ended-records) |

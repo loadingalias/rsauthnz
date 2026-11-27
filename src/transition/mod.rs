@@ -769,9 +769,12 @@ pub enum Error {
     LastAnchor,
     /// The proposal has an artifact, or no change writes the issuance record of the artifact at its version.
     Prepared,
-    /// The clock reading just before the commit can be at or after the deadline of the proposal, or it has no bound.
-    /// Nothing committed.
+    /// The reading of the clock of the binding at the commit can be at or after the deadline of the proposal, or it has
+    /// no bound. Nothing committed.
     Expired,
+    /// The replay record of a signature that the proposal writes does not fit the capacity of the store
+    /// ([`Commit::Full`](crate::store::Commit::Full)). Nothing committed: sign the request again later.
+    Full,
     /// The actor of the audit is an agent. An agent acts only under the grant of its owner: take the proposal from the
     /// scope of the request ([`Granted::propose`](crate::authz::Granted::propose)).
     Agent,
@@ -786,10 +789,11 @@ pub trait Recover {
 }
 
 impl Recover for Error {
-    /// The recovery of the caller: propose again after [`Error::Changed`], and refuse each other request.
+    /// The recovery of the caller: propose again after [`Error::Changed`] and [`Error::Full`], and refuse each other
+    /// request.
     fn recovery(&self) -> Recovery {
         match self {
-            Self::Changed => Recovery::Restart,
+            Self::Changed | Self::Full => Recovery::Restart,
             Self::OperationId
             | Self::Key
             | Self::Request(_)
@@ -821,6 +825,7 @@ impl fmt::Display for Error {
             Self::LastAnchor => f.write_str("the change ends the last sign-in method or administrator binding"),
             Self::Prepared => f.write_str("the proposal does not write the issuance record of the artifact"),
             Self::Expired => f.write_str("the commit can be at or after the deadline of the proposal"),
+            Self::Full => f.write_str("the replay record of the signature does not fit the capacity of the store"),
             Self::Agent => f.write_str("the actor is an agent, which acts only under the scope of its grant"),
         }
     }

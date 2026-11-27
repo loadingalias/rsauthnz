@@ -11,8 +11,8 @@ use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{self, Anchor, Body, Mark, Role};
 use crate::store::{
-    self, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, Kind, Profile, Record, Restore,
-    Sequence, audit_record, intent_records, outcome_of, outcome_record,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, Kind, Profile, Record,
+    Restore, Sequence, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{
@@ -81,6 +81,10 @@ fn declaration(journal: bool) -> Declaration {
             Restore::Unsupported
         },
         key_bytes_max: Key::BYTES_MAX,
+        signatures: Capacity {
+            records_max: 1,
+            share_max: 1,
+        },
         record_bytes_max: usize::MAX,
     }
 }
@@ -927,12 +931,13 @@ fn a_start_on_a_rolled_back_store_refuses_and_a_crashed_start_does_not() {
                 harness.driver.start(now());
                 let mut commits = 0;
                 let after = matches!(between, Between::CrashAfterMark);
+                // The first commit of a start writes the mark record, and its journal entry comes after the commits
+                // of the start: the mark and the replay floor.
                 harness.run(once(
                     |event| {
                         commits += usize::from(matches!(event, Event::Commit(..)));
-                        commits == 1
-                            && (!after && matches!(event, Event::Commit(..))
-                                || after && matches!(event, Event::Append(..)))
+                        !after && commits == 1 && matches!(event, Event::Commit(..))
+                            || after && commits >= 1 && matches!(event, Event::Append(..))
                     },
                     Fault::Fail,
                 ));

@@ -168,7 +168,7 @@ use crate::limits::{Limits, SignatureBudget};
 use crate::session::{self, Access, Opening, Sessions};
 use crate::store::driver::{self, Driver, Plan, record};
 use crate::store::journal::Role;
-use crate::store::{Kind, Record, Store};
+use crate::store::{self, Kind, Record, Store};
 use crate::time::{Reading, TimeError};
 use crate::transition::{self, Audit, Change, Dependency, OperationId, Prepared, Proposal, Recover, Recovery};
 
@@ -696,10 +696,10 @@ impl RelyingParty {
     ///
     /// Returns [`Error::Record`] for an invalid or unbounded floor and [`Failure::Store`] for a failed read.
     pub async fn sign_in_not_before<S: Store>(&self, store: &mut S) -> Result<Duration, Failure<S::Error>> {
-        let Some(floor) = store.read(&record::floor_key()).await.map_err(Failure::Store)? else {
+        let Some(floor) = store.read(&store::floor_key()).await.map_err(Failure::Store)? else {
             return Ok(Duration::ZERO);
         };
-        Ok(record::floor_end(&floor.data, self.limits)
+        Ok(record::floor_end(&floor.data)
             .and_then(|end| end.checked_add(Duration::from_nanos(1)))
             .ok_or(Error::Record)?)
     }
@@ -805,14 +805,14 @@ impl RelyingParty {
                 Error::Credential
             }));
         };
-        let floor_key = record::floor_key();
+        let floor_key = store::floor_key();
         let replay = Kind::Replay
             .key(&crypto::sha256(&[SIGN_IN_FORM.as_bytes(), challenge].concat()))
             .expect("a key of 33 bytes is valid");
         let [floor, used] = store.read_pair([&floor_key, &replay]).await.map_err(Failure::Store)?;
         let floor = match floor {
             Some(floor) => {
-                let end = record::floor_end(&floor.data, self.limits).ok_or(Error::Record)?;
+                let end = record::floor_end(&floor.data).ok_or(Error::Record)?;
                 (created > end).ok_or(Error::Challenge)?;
                 Dependency::Version(floor_key, floor.version)
             }

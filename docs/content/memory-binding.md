@@ -119,6 +119,7 @@ These operations are the methods of `rsauthnz_conformance::suite::Subject`, the 
 | `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, then writes the next instance number. The store takes commits at once, and refuses each commit of an earlier start. The appends after the last sync are lost. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
 | `memory.set_clock(reading)` | Each commit with a deadline reads `reading` in its step, until the next call. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time. Set a later reading to test a commit after its deadline |
+| `memory.with_capacity(capacity)` | The binding with the `Capacity` of the replay records of signatures, in place of 4,096 records and 256 of one agent key. Set it before the first insert |
 | `memory.with_clock(clock)` | The binding whose commits read `clock`, an `Arc<dyn Fn() -> Reading + Send + Sync>`: the clock of the host, such as the system clock with its bound. The web example and the native CLI example give it |
 
 A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start and each restore writes a larger
@@ -143,4 +144,5 @@ of one key give one commit and one conflict.
 | `crash_injection` | `CrashInjection::Supported` |
 | `restore` | `Restore::Journal`, in the memory of the process, in a simulated domain apart from the store and its snapshots |
 | `key_bytes_max` | 2048 (`transition::Key::BYTES_MAX`) |
+| `signatures` | 4,096 replay records of signatures, 256 of one agent key, or the value of `with_capacity`. Each count reads only the keys of its prefix |
 | `record_bytes_max` | `usize::MAX`: the binding keeps a record of each length in the memory of the process |
