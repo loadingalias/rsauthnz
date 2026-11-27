@@ -37,7 +37,7 @@ use rsauthnz::local;
 use rsauthnz::passkey::{self, Assertion, Decision, RelyingParty, User, UserHandle};
 use rsauthnz::recovery::{Code, Passkeys};
 use rsauthnz::session::{self, Access, Check, Revoker, Sessions};
-use rsauthnz::store::driver::{Answer, Driver, Effect, Lookup, Output, Plan};
+use rsauthnz::store::driver::{Answer, Driver, Lookup, Plan};
 use rsauthnz::store::{self, Profile};
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Proposal, Receipt, Recovery};
@@ -97,7 +97,7 @@ const SESSION_POLICY: session::Policy = session::Policy {
 const INVITATION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The clock of the host: a time reading with a known bound.
-pub type Clock = Box<dyn Fn() -> Reading + Send + Sync>;
+pub type Clock = Arc<dyn Fn() -> Reading + Send + Sync>;
 
 /// The waiting sign-ins of each credential ID. An entry lives while a sign-in of its credential waits, so the map has
 /// at most [`PENDING_MAX`] entries. The map is ordered, so an ID of a peer selects no hash.
@@ -168,7 +168,6 @@ impl<S: Subject + Send + 'static> App<S> {
         mut random: ChaCha20Rng,
         directory: &std::path::Path,
     ) -> Result<Self, String> {
-        let clock: Arc<dyn Fn() -> Reading + Send + Sync> = Arc::from(clock);
         let issuer = keys::Keys::open(directory, "issuer", &mut random)
             .map_err(|error| format!("the CLI issuer key: {error}"))?;
         let site = Site::new(origin).map_err(|error| format!("the origin: {error}"))?;
@@ -189,7 +188,7 @@ impl<S: Subject + Send + 'static> App<S> {
         let mut driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
         let now = clock();
         driver.start(now);
-        settle(&mut store, &mut driver, now);
+        settle(&mut store, &mut driver);
         let grant = local::HostGrant {
             owner: id("owner"),
             origin: id("app"),
@@ -630,13 +629,10 @@ struct State<S> {
     policy: Invitations,
 }
 
-/// Gives each effect of the driver to the store, with the time of this request as the clock.
-fn settle<S: Subject>(store: &mut S, driver: &mut Driver, now: Reading) {
+/// Gives each effect of the driver to the store. The store reads its own clock for each commit with a deadline.
+fn settle<S: Subject>(store: &mut S, driver: &mut Driver) {
     while let Some(effect) = driver.effect() {
-        let output = match effect {
-            Effect::Clock => Output::Clock(now),
-            effect => wait(suite::execute(store, effect)),
-        };
+        let output = wait(suite::execute(store, effect));
         if driver.give(output).is_err() {
             break;
         }
@@ -676,7 +672,7 @@ impl<S: Subject> State<S> {
     /// A start of the driver on the store: after a crash, and after a response that the store lost.
     fn start(&mut self, now: Reading) -> Result<(), Problem> {
         self.driver.start(now);
-        settle(&mut self.store, &mut self.driver, now);
+        settle(&mut self.store, &mut self.driver);
         self.not_before()
     }
 
@@ -697,7 +693,7 @@ impl<S: Subject> State<S> {
         self.commit_next = next;
         let operation = proposal.operation().clone();
         let ticket = self.driver.submit(proposal, plan)?;
-        settle(&mut self.store, &mut self.driver, now);
+        settle(&mut self.store, &mut self.driver);
         match self.driver.take(ticket) {
             Some(Answer::Outcome(Outcome::Accepted(receipt))) => return Ok(receipt),
             Some(Answer::Outcome(Outcome::Unknown(_))) => {}
@@ -708,7 +704,7 @@ impl<S: Subject> State<S> {
         }
         self.start(now)?;
         let ticket = self.driver.lookup(operation)?;
-        settle(&mut self.store, &mut self.driver, now);
+        settle(&mut self.store, &mut self.driver);
         match self.driver.take(ticket) {
             Some(Answer::Lookup(Lookup::Committed(receipt))) => Ok(receipt),
             Some(Answer::Lookup(Lookup::Absent)) => Err(Problem::Recovery(Recovery::Restart)),

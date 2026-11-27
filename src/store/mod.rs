@@ -327,6 +327,16 @@ impl fmt::Debug for Record {
     }
 }
 
+/// Whether a commit with the deadline `deadline` refuses at the reading `now` of the clock of the binding: `now` can be
+/// at or after the deadline, or it has no bound. A commit with no deadline never expires. A binding calls it in the
+/// atomic step of its commit ([`Store::commit`]).
+///
+/// Cost class: [`Parse`](crate::limits::Class::Parse).
+#[must_use]
+pub fn expired(deadline: Option<Duration>, now: Reading) -> bool {
+    deadline.is_some_and(|deadline| !now.latest().is_ok_and(|latest| latest < deadline))
+}
+
 /// The result of a conditional commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Commit {
@@ -334,6 +344,9 @@ pub enum Commit {
     Accepted,
     /// A dependency or the instance number did not hold, so the commit wrote nothing.
     Conflict,
+    /// The proposal has a deadline, and the reading of the clock of the binding at the commit can be at or after it, or
+    /// has no bound ([`expired`]). The commit wrote nothing.
+    Expired,
     /// The store has an outcome record of the operation identity ([`outcome_of`]), so the commit wrote nothing. The
     /// commit driver answers the proposal from the record: the receipt of the first commit for the same request, and
     /// [`Error::Reuse`](crate::transition::Error::Reuse) for another one.
@@ -382,6 +395,10 @@ pub trait Store {
     ///
     /// An outcome record of the operation identity gives [`Commit::Recorded`], also when a dependency does not hold: a
     /// second submission of a commit never finds its own dependencies.
+    ///
+    /// For a proposal with a deadline ([`Proposal::deadline`]), the commit also reads the clock of the binding in the
+    /// same step, after the checks of the outcome record and of the dependencies. It gives [`Commit::Expired`] when
+    /// [`expired`] holds for that reading. A reading before the step does not do this: the time from that reading to the commit has no bound.
     fn commit(&mut self, proposal: &Proposal, instance: Instance) -> impl Future<Output = Result<Commit, Self::Error>>;
 
     /// The outcome record of the operation identity `id`, or `None` when the store has none. It reads the record of

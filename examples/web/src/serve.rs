@@ -59,8 +59,11 @@ pub(crate) fn run(
         Ok::<_, !>(())
     });
     let origin = transport.origin();
-    let store = Memory::new(Schedule::None).with_retention(web::RETENTION);
-    let app = Arc::new(web::App::new(origin, store, Box::new(clock), random, directory)?);
+    let clock: web::Clock = Arc::new(clock);
+    let store = Memory::new(Schedule::None)
+        .with_retention(web::RETENTION)
+        .with_clock(Arc::clone(&clock));
+    let app = Arc::new(web::App::new(origin, store, clock, random, directory)?);
     let router = web::router(Arc::clone(&app)).merge(routes);
     let (port, router) = match transport {
         Transport::Http => (8080, router),

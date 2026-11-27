@@ -236,6 +236,8 @@ struct Request {
     changes: Vec<Change>,
     /// The intent records, the audit record, and the outcome record.
     records: Vec<(Key, Record)>,
+    /// The deadline of the proposal, which the clock of the binding checks when the commit applies.
+    deadline: Option<Duration>,
 }
 
 impl Request {
@@ -253,7 +255,18 @@ impl Request {
             dependencies: proposal.dependencies().to_vec(),
             changes: proposal.changes().to_vec(),
             records,
+            deadline: proposal.deadline(),
         }
+    }
+}
+
+/// The clock of a binding: the reading of [`Memory::set_clock`], or the clock of the host of [`Memory::with_clock`].
+#[derive(Clone)]
+struct Clock(Arc<dyn Fn() -> Reading + Send + Sync>);
+
+impl fmt::Debug for Clock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Clock")
     }
 }
 
@@ -280,8 +293,8 @@ struct Binding {
     injected: Option<Fault>,
     /// The number of calls of each primitive that can take a fault, in the order of [`Primitive`].
     calls: [u64; 3],
-    /// The reading of [`Subject::clock`].
-    clock: Reading,
+    /// The clock of [`Memory::set_clock`] or [`Memory::with_clock`], which each commit with a deadline reads.
+    clock: Clock,
     /// The outcome retention of the declaration.
     retention: Duration,
 }
@@ -365,6 +378,9 @@ impl Binding {
         if !request.dependencies.iter().all(|dependency| state.holds(dependency)) {
             return Commit::Conflict;
         }
+        if store::expired(request.deadline, (self.clock.0)()) {
+            return Commit::Expired;
+        }
         for change in request.changes {
             match change {
                 Change::Write {
@@ -379,6 +395,11 @@ impl Binding {
         state.records.extend(request.records);
         Commit::Accepted
     }
+}
+
+/// The clock that gives `now` at each reading.
+fn fixed(now: Reading) -> Clock {
+    Clock(Arc::new(move || now))
 }
 
 /// A handle of one memory binding. Its clones share the binding.
@@ -401,7 +422,11 @@ impl Memory {
             schedule,
             injected: None,
             calls: [0; 3],
-            clock: Reading::new(Duration::ZERO, Some(Duration::ZERO), ReadingSource::Caller),
+            clock: fixed(Reading::new(
+                Duration::ZERO,
+                Some(Duration::ZERO),
+                ReadingSource::Caller,
+            )),
             retention: RETENTION,
         })))
     }
@@ -415,11 +440,18 @@ impl Memory {
         self
     }
 
-    /// Sets the reading of the clock that the binding gives for [`Effect::Clock`](rsauthnz::store::driver::Effect):
-    /// the controlled clock of a test. The first reading is the start of the Unix epoch, before each deadline of a
-    /// test at a fixed time.
+    /// Sets the reading of the clock of the binding, which each commit with a deadline reads: the controlled clock of a
+    /// test. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time.
     pub fn set_clock(&self, now: Reading) {
-        self.lock().clock = now;
+        self.lock().clock = fixed(now);
+    }
+
+    /// The binding whose clock is `clock`, the clock of the host, such as a reading of the system clock with its bound.
+    /// Each commit with a deadline reads it in its atomic step.
+    #[must_use]
+    pub fn with_clock(self, clock: Arc<dyn Fn() -> Reading + Send + Sync>) -> Self {
+        self.lock().clock = Clock(clock);
+        self
     }
 
     /// The shared state. No step of the binding panics while it holds the lock, so a poisoned lock holds a
@@ -462,9 +494,8 @@ impl Subject for Memory {
         self.lock().journal.retain(|sequence, _| !sequences.contains(sequence));
     }
 
-    /// The reading of [`Memory::set_clock`].
-    fn clock(&self) -> Reading {
-        self.lock().clock
+    fn set_clock(&self, now: Reading) {
+        Self::set_clock(self, now);
     }
 }
 

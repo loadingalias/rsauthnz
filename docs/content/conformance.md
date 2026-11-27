@@ -62,7 +62,7 @@ commit with two clones at the same time. Each control acts on the binding of all
 | `snapshot()` | Gives a snapshot of the state of the store | Only when the declaration states `Restore::Journal` |
 | `restore(&snapshot)` | Restores the state of the store from the snapshot, and writes a fresh store instance number as its last step. The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync | Only when the declaration states `Restore::Journal` |
 | `lose(sequences)` | Removes the durable journal entries with a sequence in the range. A later append does not get the sequence of a removed entry | Only when the declaration states `Restore::Journal` |
-| `clock()` | Gives the reading of the clock of the host, which `suite::execute` gives for `Effect::Clock`. A binding for production reads the system clock with its bound | Never: the suite gives the clock of its own fixed times |
+| `set_clock(now)` | Each commit reads `now` in place of the clock of the binding, until the next call. A binding for production reads the system clock with its bound | For each case: the suite sets the fixed time of the case |
 
 The fault is a `rsauthnz_conformance::suite::Fault`, one of four:
 
@@ -85,6 +85,7 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | --- | --- | --- | --- |
 | `Commit` | A commit writes its changes, its intents, its audit record, and its outcome record together. A read of the `Kind::Audit` record of the operation gives the audit, and a second submission gets the outcome record | — | — |
 | `DependencyConflict` | A commit conflicts and writes nothing when a policy version, a record version, or an absence does not hold. A commit whose dependencies hold commits | — | — |
+| `Deadline` | A commit with a deadline reads the clock of the binding in its atomic step. A deadline after the latest time of the reading commits. A deadline at that latest time, or a reading with no bound, gives `Commit::Expired` and writes nothing. A second submission of a commit that landed gets its outcome record, also after its deadline | — | — |
 | `ConcurrentConsumption` | Two consumptions of one value at the same time give one commit and one conflict | — | `OneUse`, `PendExact` |
 | `AbsenceRace` | A grant change and a revocation race. The revocation writes its record, and the change reads its absence. Only one commits | — | — |
 | `Expiry` | Expiry removes at most its limit of ended records of its kind, and no other record | — | `NoLiveRemoved` |

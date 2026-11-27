@@ -90,8 +90,10 @@ this map. The binding stores the records of each kind in the same way, the mark 
 1. It compares the instance number. A different number gives `Commit::Conflict`.
 2. It looks up the outcome record. A record gives `Commit::Recorded`.
 3. It checks each dependency in the map. A dependency that does not hold gives `Commit::Conflict`.
-4. It appends one frame with each change, the audit record, each intent record, and the outcome record.
-5. It syncs the store log, applies the writes to the map, and gives `Commit::Accepted`.
+4. For a proposal with a deadline, it reads the system clock, with a bound of one second, while it holds the lock. A
+   reading that can be at or after the deadline gives `Commit::Expired`.
+5. It appends one frame with each change, the audit record, each intent record, and the outcome record.
+6. It syncs the store log, applies the writes to the map, and gives `Commit::Accepted`.
 
 ### 5. Keep audit and outcome records for their retention
 
@@ -124,8 +126,7 @@ drops each write after the durable lengths, so a write whose sync failed does no
 ### 10. Run the commit driver
 
 The binding needs no code for this step. The measurement program `examples/journal_cost.rs` of the example has the
-`execute` function and the loop of the guide. It answers `Effect::Clock` with its own fixed reading, as a measurement
-needs. A host answers it with the system clock, as the guide does.
+`execute` function and the loop of the guide.
 
 ### 11. Implement the test controls
 
@@ -141,7 +142,7 @@ Each fault of the suite takes a real failure path of the binding:
 - `Subject::restart` stops the binding, as a crash does.
 - `Subject::snapshot` gives the store log of the current records.
 - `Subject::restore` writes a snapshot as the store log, then opens the files as a start does.
-- `Subject::clock` reads the system clock with a bound of one second.
+- `Subject::set_clock` gives each later commit the reading of the suite in place of the system clock.
 - `Subject::lose` writes the journal again without the lost entries. Each entry keeps its sequence in its frame, so no
   sequence is used again while later entries remain. A loss of the last entries followed by a start gives their
   sequences again, because the file cannot tell a lost entry from a torn append. The suite never makes this sequence

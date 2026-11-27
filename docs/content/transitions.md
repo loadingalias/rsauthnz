@@ -154,11 +154,11 @@ the memory of the artifact is cleared when the receipt drops. Read it in place, 
 ## Deadlines
 
 A decision can read authority with an end: a one-use value, a challenge, the credential of evidence, or a checked
-scope (`authz::Checked::deadline`). `proposal.until(deadline)` gives the proposal that end. The commit driver asks
-the executor for a fresh reading of the clock just before the commit (`Effect::Clock`, [The commit driver](restore.md#the-commit-driver)).
-When the reading can be at or after the deadline, or has no bound, the commit does not run: the outcome is
-`Refused(Error::Expired)`, and the driver voids the end entry of the proposal before the answer. A proposal with no
-deadline gets no clock effect.
+scope (`authz::Checked::deadline`). `proposal.until(deadline)` gives the proposal that end. The binding reads its own
+clock in the atomic step of the commit ([Commit](storage.md#commit)). When the reading can be at or after the
+deadline, or has no bound, the commit writes nothing: the outcome is `Refused(Error::Expired)`, and the driver voids
+the end entry of the proposal before the answer. A reading before the commit is not sufficient, because the time
+from that reading to the commit has no bound.
 
 ## Effect intents
 

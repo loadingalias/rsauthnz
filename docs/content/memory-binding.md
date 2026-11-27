@@ -118,7 +118,8 @@ These operations are the methods of `rsauthnz_conformance::suite::Subject`, the 
 | `memory.snapshot()` | Gives a `Snapshot` of the state of the store. The mark record of the store (`Kind::Mark`) holds its low-water mark, so the snapshot holds it too ([Restore journal](restore.md)) |
 | `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, then writes the next instance number. The store takes commits at once, and refuses each commit of an earlier start. The appends after the last sync are lost. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
-| `memory.clock()` | Gives the reading of `memory.set_clock(reading)`, which `suite::execute` gives the driver for `Effect::Clock`. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time. Set a later reading to test a commit after its deadline |
+| `memory.set_clock(reading)` | Each commit with a deadline reads `reading` in its step, until the next call. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time. Set a later reading to test a commit after its deadline |
+| `memory.with_clock(clock)` | The binding whose commits read `clock`, an `Arc<dyn Fn() -> Reading + Send + Sync>`: the clock of the host, such as the system clock with its bound. The web example and the native CLI example give it |
 
 A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start and each restore writes a larger
 instance number for the life of the binding. Thus a commit from each earlier start refuses, also between a restore

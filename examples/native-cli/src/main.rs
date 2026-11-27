@@ -28,6 +28,7 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::random::SystemRng;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
@@ -39,7 +40,7 @@ use rsauthnz::custody::{Custody, FileCustody, Isolation, KeyId};
 use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
 use rsauthnz::local::{self, Authority, Bootstrap, HostGrant, Offer};
-use rsauthnz::store::driver::{Answer, Driver, Effect, Output, Plan};
+use rsauthnz::store::driver::{Answer, Driver, Plan};
 use rsauthnz::store::{Kind, Profile, Store as _};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
@@ -71,27 +72,23 @@ fn ready<F: Future>(future: F) -> F::Output {
     .expect("the memory binding does no I/O")
 }
 
-/// Gives each effect of the driver to the memory binding, until the driver waits. The clock of a commit is a fresh
-/// reading of the system clock.
+/// Gives each effect of the driver to the memory binding, until the driver waits. The binding reads the system clock
+/// for each commit with a deadline.
 fn settle(memory: &mut Memory, driver: &mut Driver) -> Result<(), Failure> {
     while let Some(effect) = driver.effect() {
-        let output = match effect {
-            Effect::Clock => Output::Clock(clock()?),
-            effect => ready(execute(memory, effect)),
-        };
+        let output = ready(execute(memory, effect));
         driver.give(output)?;
     }
     Ok(())
 }
 
-/// A reading of the system clock, with the bound of its time source: here one second.
-fn clock() -> Result<Reading, Failure> {
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    Ok(Reading::new(
-        since_epoch,
-        Some(Duration::from_secs(1)),
-        ReadingSource::SystemClock,
-    ))
+/// A reading of the system clock, with the bound of its time source: here one second. A clock before the Unix epoch
+/// reads as the epoch with no bound, so each check of a time refuses.
+fn clock() -> Reading {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => Reading::new(since, Some(Duration::from_secs(1)), ReadingSource::SystemClock),
+        Err(_) => Reading::new(Duration::ZERO, None, ReadingSource::SystemClock),
+    }
 }
 
 /// The outcome of the commit of `proposal` with `plan`.
@@ -134,12 +131,12 @@ fn journey(dir: PathBuf, random: ChaCha20Rng) -> Result<(), Failure> {
 #[expect(clippy::print_stdout, reason = "the example prints each step of its journey")]
 fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
     // A host reads its clock for each request, with the bound of its time source. This journey takes one reading for
-    // its requests, and a fresh one for each commit.
-    let now = clock()?;
+    // its requests, and the store reads the clock for each commit with a deadline.
+    let now = clock();
     let limits = Limits::default();
 
     let custody = FileCustody::open(dir, Isolation::User)?;
-    let mut memory = Memory::new(Schedule::None);
+    let mut memory = Memory::new(Schedule::None).with_clock(Arc::new(clock));
     let mut driver = Driver::new(Profile::new(memory.declaration())?, limits)?;
     driver.start(now);
     settle(&mut memory, &mut driver)?;

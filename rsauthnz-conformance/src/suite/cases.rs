@@ -6,6 +6,7 @@ use core::time::Duration;
 
 use rsauthnz::store::journal::{self, Body, End, History};
 use rsauthnz::store::{Commit, CrashLoss, Entry, Instance, intent_records, outcome_record, policy_key};
+use rsauthnz::time::{Reading, ReadingSource};
 
 use super::{
     Answer, Build, Checked, DATA, EFFECTS_MAX, Effect, Fault, Journal, Key, Kind, Lookup, Next, Outcome, PAGE, Plan,
@@ -136,6 +137,57 @@ pub(super) async fn dependency_conflict<S: Subject>(mut binding: S) -> Checked {
     ensure(
         committed(&mut binding, &holding, instance).await? == Commit::Accepted,
         "a commit whose policy and version dependencies hold refused",
+    )
+}
+
+pub(super) async fn deadline<S: Subject>(mut binding: S) -> Checked {
+    let instance = start(&mut binding).await?;
+    // The clock of the case reads `now`: 1,000 seconds with a bound of one second, so its latest time is 1,001.
+    let latest = Duration::from_secs(1_001);
+    let (first, second, third) = (
+        key(Kind::Session, "t-1"),
+        key(Kind::Session, "t-2"),
+        key(Kind::Session, "t-3"),
+    );
+    let before = Build::new("t-1")
+        .writes(&first, 1)
+        .until(Duration::new(1_001, 1))
+        .done();
+    ensure(
+        committed(&mut binding, &before, instance).await? == Commit::Accepted,
+        "a commit before its deadline refused",
+    )?;
+    let at = Build::new("t-2").writes(&second, 1).until(latest).done();
+    expires(&mut binding, &at, &second, instance, "at its deadline").await?;
+    binding.set_clock(Reading::new(Duration::from_secs(1_000), None, ReadingSource::Caller));
+    let unbounded = Build::new("t-3")
+        .writes(&third, 1)
+        .until(Duration::from_secs(3_600))
+        .done();
+    expires(&mut binding, &unbounded, &third, instance, "at a reading with no bound").await?;
+    binding.set_clock(now());
+    let again = Build::new("t-1").writes(&first, 1).until(latest).done();
+    ensure(
+        matches!(committed(&mut binding, &again, instance).await?, Commit::Recorded(_)),
+        "a second submission after its deadline did not get its outcome record",
+    )
+}
+
+/// Checks that the commit of `proposal`, which writes `written`, expires `when` and writes nothing.
+async fn expires<S: Subject>(
+    binding: &mut S,
+    proposal: &Proposal,
+    written: &Key,
+    instance: Instance,
+    when: &str,
+) -> Checked {
+    ensure(
+        committed(binding, proposal, instance).await? == Commit::Expired,
+        &format!("a commit {when} did not expire"),
+    )?;
+    ensure(
+        unrecorded(binding, proposal).await? && !holds(binding, written).await?,
+        &format!("a commit that expired {when} wrote a record"),
     )
 }
 

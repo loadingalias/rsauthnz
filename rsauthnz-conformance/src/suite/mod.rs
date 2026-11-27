@@ -91,10 +91,11 @@ pub trait Subject: Store + Journal + Clone {
     /// only of a binding that declares [`Restore::Journal`].
     fn lose(&self, sequences: impl RangeBounds<Sequence>);
 
-    /// The reading of the clock of the host, which [`execute`] gives to the driver for [`Effect::Clock`]: the fresh
-    /// reading just before a commit with a deadline. A binding for production reads the system clock with its bound.
-    /// The suite gives the clock of its own fixed times, so it does not read this one.
-    fn clock(&self) -> Reading;
+    /// Sets the clock of the binding, which each commit with a deadline reads in its atomic step ([`Store::commit`]):
+    /// each reading gives `now` until the next call. A binding for production reads the system clock with its bound,
+    /// and its subject gives the controlled clock of the suite in place of it. The suite sets the clock of each case to
+    /// the fixed time of the case.
+    fn set_clock(&self, now: Reading);
 }
 
 /// A fault that the suite gives to one primitive of a binding with [`Subject::inject`]. Each fault is a crash: after
@@ -121,6 +122,11 @@ pub enum Case {
     /// A commit conflicts and writes nothing when a dependency of each kind does not hold: a policy version, a record
     /// version, or an absence. A commit whose dependencies hold commits.
     DependencyConflict,
+    /// A commit with a deadline reads the clock of the binding in its atomic step ([`Store::commit`]). A deadline after
+    /// the latest time of the reading commits. A deadline at that latest time, or a reading with no bound, gives
+    /// [`Commit::Expired`](rsauthnz::store::Commit::Expired) and writes nothing. A second submission of a commit that landed gets its outcome record,
+    /// also after its deadline.
+    Deadline,
     /// Two concurrent consumptions of one value give one commit and one conflict. Properties: `OneUse`, `PendExact`.
     ConcurrentConsumption,
     /// A grant change and a revocation of the grant race. The revocation writes the revocation record, and the change
@@ -194,9 +200,10 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Commit,
         Self::DependencyConflict,
+        Self::Deadline,
         Self::ConcurrentConsumption,
         Self::AbsenceRace,
         Self::Expiry,
@@ -225,6 +232,7 @@ impl Case {
         match self {
             Self::Commit
             | Self::DependencyConflict
+            | Self::Deadline
             | Self::ConcurrentConsumption
             | Self::AbsenceRace
             | Self::Expiry
@@ -250,6 +258,7 @@ impl Case {
         match self {
             Self::Commit => cases::commit(make()).await,
             Self::DependencyConflict => cases::dependency_conflict(make()).await,
+            Self::Deadline => cases::deadline(make()).await,
             Self::ConcurrentConsumption => cases::concurrent_consumption(make()).await,
             Self::AbsenceRace => cases::absence_race(make()).await,
             Self::Expiry => cases::expiry(make()).await,
@@ -324,6 +333,11 @@ pub async fn run<S: Subject>(mut make: impl FnMut() -> S) -> Report {
     let declaration = make().declaration();
     let profile = Profile::new(declaration.clone());
     let mut report = Report::default();
+    let mut make = || {
+        let binding = make();
+        binding.set_clock(now());
+        binding
+    };
     for case in Case::ALL {
         if !case.selected(&declaration) {
             report.skipped.push(case);
@@ -466,6 +480,12 @@ impl Build {
         self
     }
 
+    /// Commits only before `deadline` ([`Proposal::until`]).
+    fn until(mut self, deadline: Duration) -> Self {
+        self.0.until(deadline);
+        self
+    }
+
     /// Reads the policy at version `at`.
     fn policy(self, at: u64) -> Self {
         self.read(Dependency::Policy(version(at)))
@@ -586,7 +606,6 @@ pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output 
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
-        Effect::Clock => Output::Clock(binding.clock()),
     }
 }
 
@@ -698,11 +717,7 @@ impl<S: Subject> Run<S> {
         if let Some(fault) = fault {
             self.binding.inject(fault);
         }
-        // The cases run at the fixed time of `now`, so the clock of a commit is that time.
-        let output = match effect {
-            Effect::Clock => Output::Clock(now()),
-            effect => execute(&mut self.binding, effect).await,
-        };
+        let output = execute(&mut self.binding, effect).await;
         self.driver
             .give(output)
             .map_err(|error| format!("the driver refused an output of the binding: {error}"))?;

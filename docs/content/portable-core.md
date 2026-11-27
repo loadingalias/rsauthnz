@@ -165,13 +165,13 @@ the seed or the time of the host.
 | `local authority bootstrap and call` | one administrator, an ML-DSA-65 + Ed25519 credential, and one admitted call |
 | `local authority refusals` | another origin, a reused value, an altered credential, and each invalid composite half refuse |
 | `local authority missing host inputs` | a time with no bound, no signature, and the signature of another key commit nothing |
-| `conformance memory binding` | 22 cases pass |
+| `conformance memory binding` | 23 cases pass |
 | `conformance lost outcome reads` | fails LostResponse |
 | `conformance no instance check` | fails Fencing |
 
 The conformance suite runs on the memory binding. The two defects are the positive control of the suite in the
 browser: a wrapper of the memory binding gives no outcome record, or gives each commit the instance number of its last
-start, and each one must fail the case that names its defect. The nine broken bindings of the memory binding change
+start, and each one must fail the case that names its defect. The ten broken bindings of the memory binding change
 its private state, so they run only in the native tests ([Run the conformance suite](conformance.md)).
 
 ## The closure

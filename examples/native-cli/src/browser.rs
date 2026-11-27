@@ -460,7 +460,7 @@ async fn status(
         credential,
         &Id::new("web", "app")?,
         &call,
-        clock()?,
+        clock(),
         random,
     )?;
     let response = client

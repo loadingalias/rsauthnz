@@ -61,6 +61,10 @@ serializable step, or in one equivalent atomic step, it checks that:
    records](#policy-records)). `Absent(key)` holds when no record has the key.
 3. No outcome record has the operation identity of the proposal: no record has the key of
    `store::outcome_record(&proposal)`.
+4. For a proposal with a deadline (`proposal.deadline()`), the clock of the binding is before it. The binding reads
+   its clock in the step, after the checks of the dependencies, and gives `Commit::Expired` when
+   `store::expired(proposal.deadline(), reading)` holds. A reading before the step is not sufficient: the time from
+   that reading to the write has no bound.
 
 Then it writes each change of `proposal.changes()`, the audit record of `store::audit_record(&proposal)`, each intent
 record of `store::intent_records(&proposal)`, and the outcome record of `store::outcome_record(&proposal)` together.

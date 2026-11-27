@@ -158,7 +158,7 @@ impl Subject for Gated {
         self.memory.lose(sequences);
     }
 
-    fn clock(&self) -> Reading {
-        self.memory.clock()
+    fn set_clock(&self, now: Reading) {
+        self.memory.set_clock(now);
     }
 }

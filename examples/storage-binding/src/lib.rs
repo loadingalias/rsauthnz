@@ -23,12 +23,14 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::store::{
-    Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
+    self, Commit, CrashInjection, CrashLoss, Declaration, Entry, Instance, Isolation, Journal, Kind, Record, Restore,
     Sequence, Store, audit_record, intent_records, outcome_of, outcome_record, policy_key,
 };
+use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
 use rsauthnz_conformance::suite::Fault;
 
@@ -49,6 +51,15 @@ pub const INSTANCE_FILE: &str = "instance";
 /// The name of the lock file in the store directory.
 pub const LOCK_FILE: &str = "lock";
 
+/// A reading of the system clock with a bound of one second (guide step 10), which each commit with a deadline reads
+/// in its step. A clock before the Unix epoch reads as the epoch with no bound, so each deadline refuses.
+fn clock() -> Reading {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => Reading::new(since, Some(Duration::from_secs(1)), ReadingSource::SystemClock),
+        Err(_) => Reading::new(Duration::ZERO, None, ReadingSource::SystemClock),
+    }
+}
+
 /// A handle of a file binding. The clones of a handle are handles of one binding.
 #[derive(Clone, Debug)]
 pub struct Files {
@@ -63,6 +74,8 @@ struct Inner {
     state: State,
     /// The fault that the next call of its primitive takes.
     fault: Option<Fault>,
+    /// The reading that each commit takes in place of the system clock: the controlled clock of the suite.
+    clock: Option<Reading>,
 }
 
 #[derive(Debug)]
@@ -190,6 +203,7 @@ impl Files {
         let inner = Inner {
             state: State::Stopped(Durable::UNKNOWN),
             fault: None,
+            clock: None,
         };
         Self {
             store,
@@ -293,8 +307,9 @@ impl Open {
         instance: Instance,
         retention: Duration,
         fault: Option<Fault>,
+        now: Reading,
     ) -> Result<Commit, Error> {
-        let answer = match self.answer(proposal, instance)? {
+        let answer = match self.answer(proposal, instance, now)? {
             Some(answer) => answer,
             None => {
                 self.write(writes(proposal, retention)?, fault)?;
@@ -304,8 +319,8 @@ impl Open {
         fault.map_or(Ok(answer), |fault| Err(Error::Fault(fault)))
     }
 
-    /// The answer of a commit of `proposal` that writes nothing, or `None` for a commit that writes.
-    fn answer(&self, proposal: &Proposal, instance: Instance) -> Result<Option<Commit>, Error> {
+    /// The answer of a commit of `proposal` at the reading `now` that writes nothing, or `None` for a commit that writes.
+    fn answer(&self, proposal: &Proposal, instance: Instance, now: Reading) -> Result<Option<Commit>, Error> {
         if instance != self.instance {
             return Ok(Some(Commit::Conflict));
         }
@@ -318,7 +333,11 @@ impl Open {
             .dependencies()
             .iter()
             .all(|dependency| self.records.holds(dependency));
-        Ok((!holds).then_some(Commit::Conflict))
+        if !holds {
+            return Ok(Some(Commit::Conflict));
+        }
+        // The lock of the binding holds the step, so no commit lands between the reading and the write.
+        Ok(store::expired(proposal.deadline(), now).then_some(Commit::Expired))
     }
 
     /// Appends `writes` to the store log as one frame, syncs the file, and applies them. With
@@ -523,7 +542,8 @@ impl Store for Files {
         let fault = inner
             .fault
             .take_if(|fault| matches!(fault, Fault::CrashBeforeCommit | Fault::LostResponse));
-        inner.serve(|open| open.commit(proposal, instance, retention, fault))
+        let now = inner.clock.unwrap_or_else(clock);
+        inner.serve(|open| open.commit(proposal, instance, retention, fault, now))
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {

@@ -172,15 +172,14 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Append(entry)` | `Journal::append` | `Appended(sequence)` |
 | `Sync` | `Journal::sync` | `Synced` |
 | `ReadJournal(after, limit)` | `Journal::read` | `Journal(entries)` |
-| `Clock` | A fresh reading of the clock of the host, with the bound of its time source | `Clock(reading)` |
 
 `Debug` of an effect and of an output shows the length of a journal entry (`Append`, `store::Entry`) and of record
 data, and never their bytes, because they hold record forms such as the claims of a CLI credential. Thus an executor
 can log each effect.
 
-`Effect::Clock` comes just before the commit of a proposal with a deadline (`proposal.until`). A production executor
-reads the system clock. A test gives a controlled clock: the memory binding gives the reading of
-`memory.set_clock(reading)` through `Subject::clock`.
+The binding reads its own clock for the commit of a proposal with a deadline (`proposal.until`), in the atomic step
+of the commit ([Commit](storage.md#commit)). The driver reads no clock for it. A test gives a controlled clock:
+`memory.set_clock(reading)`, or `Subject::set_clock` of the conformance suite.
 
 Give `Output::Failed` when a primitive fails. It is a crash: the driver stops (`Status::Down`), gives an unknown
 outcome to the operation in progress, and serves again only after `driver.start(now)`. Do not retry the primitive.

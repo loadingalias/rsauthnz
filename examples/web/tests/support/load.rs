@@ -14,7 +14,6 @@ use http::{Request, StatusCode};
 use rsauthnz::store::{Kind, Store as _};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz_conformance::memory::Memory;
-use rsauthnz_conformance::suite::Subject;
 use rscrypto::ChaCha20Rng;
 use tokio::sync::oneshot;
 
@@ -32,17 +31,18 @@ pub(crate) struct Host {
 
 impl Host {
     /// Starts the example on `store`.
-    pub(crate) fn start<S: Subject + Send + 'static>(store: S) -> Self {
+    pub(crate) fn start(store: Memory) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let issuer_dir = std::env::temp_dir().join(format!(
             "rsauthnz-web-load-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let clock = Box::new(|| {
+        let clock: web::Clock = Arc::new(|| {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("a time after 1970");
             Reading::new(now, Some(Duration::from_secs(1)), ReadingSource::SystemClock)
         });
+        let store = store.with_clock(Arc::clone(&clock));
         let app = web::App::new(ORIGIN, store, clock, ChaCha20Rng::from_seed([5; 32]), &issuer_dir).expect("the app");
         let app = Arc::new(app);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");

@@ -45,10 +45,12 @@ enum Defect {
     NoRetention,
     /// A range read has no end at its prefix: it also gives the records of the keys after the prefix.
     OpenRange,
+    /// The commit reads no clock, so it writes a proposal after its deadline.
+    NoDeadline,
 }
 
 impl Defect {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::NoAtomicCheck,
         Self::LostOutcomes,
         Self::WriteSkew,
@@ -58,6 +60,7 @@ impl Defect {
         Self::RestoredInstance,
         Self::NoRetention,
         Self::OpenRange,
+        Self::NoDeadline,
     ];
 
     /// The cases that name the defect. A commit with no atomic check is a check-then-write path, so two concurrent
@@ -72,6 +75,7 @@ impl Defect {
             Self::NoInstanceCheck | Self::RestoredInstance => &[Case::Fencing],
             Self::NoRetention => &[Case::Retention],
             Self::OpenRange => &[Case::Range],
+            Self::NoDeadline => &[Case::Deadline],
         }
     }
 }
@@ -151,6 +155,7 @@ impl Store for Broken {
                 let current = binding.instance;
                 return binding.commit(request, current);
             }
+            Defect::NoDeadline => request.deadline = None,
             Defect::NoRetention => {
                 for (key, record) in &mut request.records {
                     if matches!(Kind::of(key), Some(Kind::Audit | Kind::Outcome)) {
@@ -262,8 +267,8 @@ impl Subject for Broken {
         self.memory.lose(sequences);
     }
 
-    fn clock(&self) -> Reading {
-        self.memory.clock()
+    fn set_clock(&self, now: Reading) {
+        self.memory.set_clock(now);
     }
 }
 
@@ -360,8 +365,8 @@ impl Subject for Measured {
         self.memory.lose(sequences);
     }
 
-    fn clock(&self) -> Reading {
-        self.memory.clock()
+    fn set_clock(&self, now: Reading) {
+        self.memory.set_clock(now);
     }
 }
 

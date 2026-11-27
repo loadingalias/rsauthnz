@@ -302,7 +302,6 @@ async fn execute(binding: &mut Files, effect: Effect<'_>) -> Output {
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
-        Effect::Clock => Output::Clock(now()),
     }
 }
 

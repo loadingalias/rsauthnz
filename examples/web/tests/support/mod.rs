@@ -61,13 +61,15 @@ impl Site {
     ) -> (Self, Arc<web::App<S>>) {
         let seconds = Arc::new(AtomicU64::new(start));
         let clock = Arc::clone(&seconds);
-        let clock = Box::new(move || {
+        let clock: web::Clock = Arc::new(move || {
             Reading::new(
                 Duration::from_secs(clock.load(Ordering::SeqCst)),
                 Some(Duration::from_secs(1)),
                 ReadingSource::Caller,
             )
         });
+        // The store reads the clock of the site for each commit with a deadline.
+        let memory = memory.with_clock(Arc::clone(&clock));
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let issuer_dir = std::env::temp_dir().join(format!(
             "rsauthnz-web-test-{}-{}",

@@ -138,26 +138,36 @@ this in one atomic step:
 3. Check each [`Dependency`] of [`Proposal::dependencies`]. `Version(key, version)` holds when the record of `key`
    has that version. `Policy(version)` holds when the record of [`policy_key`] of its owner has that version.
    `Absent(key)` holds when no record has `key`. When one does not hold, give [`Commit::Conflict`].
-4. Write each [`Change`] of [`Proposal::changes`], the record of [`audit_record`], each record of
+4. When the proposal has a deadline ([`Proposal::deadline`]), read the clock of the binding, with the bound of its
+   time source. When [`store::expired`] holds for the reading, give [`Commit::Expired`]. Read the clock in the step,
+   after the checks of the dependencies. A reading before the step is not sufficient: the time from that reading to
+   the write has no bound.
+5. Write each [`Change`] of [`Proposal::changes`], the record of [`audit_record`], each record of
    [`intent_records`], and the record of [`outcome_record`]. `Change::End` removes its record.
-5. Make the writes durable, then give [`Commit::Accepted`].
+6. Make the writes durable, then give [`Commit::Accepted`].
 
-A conflict writes nothing. Give an error only when the outcome is unknown, for example after a lost connection or a
+A conflict and an expiry write nothing. Give an error only when the outcome is unknown, for example after a lost connection or a
 timeout. An error is a crash ([step 9](#9-stop-at-each-error)).
 
 Map the commit to the store:
 
-- **Transactional database.** Run steps 1 to 5 in one transaction at serializable isolation. A
-  transaction that the database aborts, for example at a serialization failure, wrote nothing: give
-  [`Commit::Conflict`].
-- **Store with a single writer.** Hold the writer for the checks and the writes. Write all records in one batch, and
-  make the batch durable before you give the result.
-- **Atomic conditional write.** Put a condition for the instance number, for the absence of the outcome record, and
-  for each dependency in the write. When a condition fails, read the instance number and the outcome record. Give
-  the result of the first check above that fails.
+- **Transactional database.** Run steps 1 to 6 in one transaction at serializable isolation. Read the clock in the
+  transaction, after the reads of the dependencies: the clock of the database, or the clock of the binding while the
+  transaction is open. A transaction that the database aborts, for example at a serialization failure, wrote
+  nothing: give [`Commit::Conflict`].
+- **Store with a single writer.** Hold the writer for the checks, the reading of the clock, and the writes. Write all
+  records in one batch, and make the batch durable before you give the result.
+- **Atomic conditional write.** Put a condition for the instance number, for the absence of the outcome record, for
+  each dependency, and for a deadline in the write. The condition of a deadline compares it with the time of the
+  store server. When a condition fails, read the instance number and the outcome record. Give the result of the
+  first check above that fails. A store whose conditions cannot read the time of the server cannot read a clock in the
+  step, so it cannot commit a proposal with a deadline.
 
 [`Store::commit`]: rsauthnz::store::Store::commit
 [`Commit::Conflict`]: rsauthnz::store::Commit::Conflict
+[`Commit::Expired`]: rsauthnz::store::Commit::Expired
+[`Proposal::deadline`]: rsauthnz::transition::Proposal::deadline
+[`store::expired`]: rsauthnz::store::expired
 [`Commit::Recorded`]: rsauthnz::store::Commit::Recorded
 [`Commit::Accepted`]: rsauthnz::store::Commit::Accepted
 [`outcome_record`]: rsauthnz::store::outcome_record
@@ -269,17 +279,11 @@ result that the contract names: a conflict is [`Commit::Conflict`], not an error
 
 The application drives the binding with [`Driver`]. [`Driver::effect`] gives the next primitive call, an [`Effect`].
 Execute it on the binding, and give the [`Output`] to [`Driver::give`]. Give [`Output::Failed`] for an error. Do not
-retry the primitive. [`Effect::Clock`] asks for a fresh reading of the clock of the host, just before the commit of a
-proposal with a deadline: give the system clock with the bound of its time source. This function is the same for
-each binding, and `cargo xtask test` compiles it:
+retry the primitive. This function is the same for each binding, and `cargo xtask test` compiles it:
 
 ```rust
-use core::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rsauthnz::store::driver::{self, Driver, Effect, Output};
 use rsauthnz::store::{Journal, Store};
-use rsauthnz::time::{Reading, ReadingSource};
 
 /// The output of the primitive call `effect` on `binding`. A failed primitive gives `Output::Failed`.
 async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Output {
@@ -303,16 +307,6 @@ async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Out
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
-        Effect::Clock => Output::Clock(clock()),
-    }
-}
-
-/// A fresh reading of the system clock, with a bound of one second for its time source. A clock before the Unix epoch
-/// gives a reading with no bound, so the commit of each proposal with a deadline refuses.
-fn clock() -> Reading {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(since) => Reading::new(since, Some(Duration::from_secs(1)), ReadingSource::SystemClock),
-        Err(_) => Reading::new(Duration::ZERO, None, ReadingSource::SystemClock),
     }
 }
 
@@ -350,7 +344,6 @@ The documentation of the [`driver`] module gives each operation of the driver an
 [`Status::Serving`]: rsauthnz::store::driver::Status::Serving
 [`Plan`]: rsauthnz::store::driver::Plan
 [`Effect`]: rsauthnz::store::driver::Effect
-[`Effect::Clock`]: rsauthnz::store::driver::Effect::Clock
 [`Output`]: rsauthnz::store::driver::Output
 [`Output::Failed`]: rsauthnz::store::driver::Output::Failed
 
@@ -366,6 +359,7 @@ handles of one binding, and each control acts on all of them. Two cases commit f
 | [`Subject::snapshot`] | It gives a consistent copy of the complete state of the store, the mark record included. The copy holds no journal entry |
 | [`Subject::restore`] | The state of the store is the copy again, with a fresh instance number ([step 2](#2-keep-the-store-instance-number)). The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync |
 | [`Subject::lose`] | The durable entries with a sequence in the range are gone. The next append still gets the sequence after the last durable entry before the loss, so no entry gets a lost sequence again |
+| [`Subject::set_clock`] | Each commit reads the reading in place of the clock of the binding ([step 4](#4-commit-a-proposal)), until the next call. The suite sets the fixed time of each case |
 
 ### Faults
 
@@ -385,6 +379,7 @@ cannot inject them declares [`CrashInjection::Unsupported`], and carries its own
 
 [`Subject`]: crate::suite::Subject
 [`Subject::restart`]: crate::suite::Subject::restart
+[`Subject::set_clock`]: crate::suite::Subject::set_clock
 [`Subject::snapshot`]: crate::suite::Subject::snapshot
 [`Subject::restore`]: crate::suite::Subject::restore
 [`Subject::lose`]: crate::suite::Subject::lose
@@ -416,6 +411,7 @@ step. This table gives the step that each case checks first:
 | --- | --- |
 | `Commit` | [4](#4-commit-a-proposal), [3](#3-read-one-record) |
 | `DependencyConflict` | [4](#4-commit-a-proposal) |
+| `Deadline` | [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
 | `ConcurrentConsumption` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `AbsenceRace` | [4](#4-commit-a-proposal), [1](#1-declare-the-guarantees), [11](#11-implement-the-test-controls) |
 | `Expiry` | [6](#6-expire-ended-records) |
