@@ -8,7 +8,9 @@ The [account recovery model](../../models/account-recovery/README.md) covers onl
 recovery commit and generation checks after restore.
 
 The [replica commit model](../../models/replica-commit/README.md) checks the design for several application servers on one store.
-It covers a peer restart, competing passkey removals, and an acknowledged revocation after restore. The current driver serves one process per store.
+It covers peer restarts, competing passkey removals, and an acknowledged revocation after restore.
+Its [shared recovery checks](../../models/replica-commit/README.md#shared-recovery) cover abandoned commits, delayed journal writes, snapshot marks, and counter reservations.
+The current Rust driver serves one process per store.
 
 The authority models check that after crashes, restarts, and restores from an older snapshot,
 nothing that a committed change ended is valid again: no revoked passkey, no consumed one-use value,
@@ -83,6 +85,7 @@ cargo xtask model authority-restore                              # every authori
 cargo xtask model grant-approval                                 # every grant profile
 cargo xtask model account-recovery                               # five recovery profiles
 cargo xtask model replica-commit                                 # application server restart and store restore
+cargo xtask model replica-commit/SharedTurns.cfg                 # owner turns, outcome lookup, and journal replay
 cargo xtask model authority-restore/AuthorityCached.cfg          # a full TLC search
 cargo xtask model authority-restore/AuthorityInd.Step.apalache   # a complete inductive step
 ```

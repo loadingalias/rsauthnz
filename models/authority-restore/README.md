@@ -11,6 +11,9 @@ closed ([Decisions](#decisions)). A lookup promised the anchor set of the operat
 commit, not of the outcome record that it found. `AnchorKept` excused an anchor that an operation
 planned to end before that operation wrote its end entry.
 
+The [shared recovery model](../replica-commit/README.md#shared-recovery) checks owner turns and journal writes across application servers.
+It checks the separate destination fences that establish the crash boundary used here.
+
 ## Promise
 
 - **Authority and restore** (`Authority.tla`). After any sequence of crashes, restarts, and
