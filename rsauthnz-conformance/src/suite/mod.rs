@@ -152,9 +152,8 @@ pub enum Case {
     Fencing,
     /// Two writers can extend one predecessor only once. An old instance cannot append or confirm a sync.
     JournalFence,
-    /// An audit record and an outcome record end at their retention end: the estimate of the audit time of the
-    /// proposal plus [`Declaration::outcome_retention`], rounded up by at most one second. An expire before that end
-    /// removes neither, so a retried operation learns its outcome.
+    /// Audit and outcome records last through the audit time plus [`Declaration::outcome_retention`], rounded up by at most one second.
+    /// A status read before the commit leaves it open. After expiry, the credential still exists and its outcome is unknown.
     Retention,
     /// A commit whose response is lost landed: after the next start, its outcome record and its audit are readable.
     /// A commit that crashes before it lands writes nothing. Property: `MissingOutcomeUnknown`.
@@ -710,8 +709,8 @@ struct Run<S> {
 }
 
 impl<S: Subject> Run<S> {
-    /// A driver that started on `binding`, and that committed the records of [`seed`].
-    async fn seeded(binding: S) -> Result<Self, String> {
+    /// A driver that started on `binding`.
+    async fn started(binding: S) -> Result<Self, String> {
         let profile = Profile::new(binding.declaration())
             .map_err(|error| format!("the profile refuses the declaration: {error}"))?;
         let driver = Driver::new(profile, Limits::default())
@@ -722,6 +721,12 @@ impl<S: Subject> Run<S> {
             audits: BTreeMap::new(),
         };
         run.start().await?;
+        Ok(run)
+    }
+
+    /// A driver that started on `binding` and committed the records of [`seed`].
+    async fn seeded(binding: S) -> Result<Self, String> {
+        let mut run = Self::started(binding).await?;
         let (proposal, plan) = seed();
         run.commit(proposal, plan, "the seed").await?;
         Ok(run)

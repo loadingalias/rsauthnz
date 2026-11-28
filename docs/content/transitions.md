@@ -139,8 +139,9 @@ The commit of a proposal has one of four outcomes. `outcome.recovery()` gives th
 | `Refused(error)` | The commit refused the proposal. Nothing committed, and the refusal stays true | `error.recovery()` |
 | `Unknown(operation)` | The commit can have occurred: its response was lost, or a restore lost its outcome record | `Lookup`: look up the outcome of the same operation identity |
 
-Never submit the request of an unknown outcome as a new operation. The first attempt can have committed, so a
-new operation can, for example, issue a second grant. A lookup of the same identity gives the first commit.
+Keep the original operation after an unknown outcome. A new operation can issue a second grant if the first one committed.
+A lookup with the same identity and request binding returns the retained receipt. A missing receipt leaves the outcome unknown.
+When upgrading from an alpha with `Lookup::Absent`, remove its restart branch and handle a missing receipt with `Lookup::Unknown`.
 On a site, the server looks up an unknown outcome itself, because the browser does not know the operation.
 `rsauthnz_http::problem(recovery)` gives the response of each recovery to the browser ([Lost
 responses](http-binding.md#lost-responses)). No outcome gives `Recovery::Verify`: only the gate of a sensitive change

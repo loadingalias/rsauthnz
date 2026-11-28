@@ -195,8 +195,9 @@ outcome to the operation in progress, and serves again only after `driver.start(
    holds, the writes that replace a dead version, and the role of each new anchor. Take the answer with
    `driver.take(ticket)`. A proposal with a record longer than `record_bytes_max` refuses with
    `Error::RecordBytes`, and the binding never gets it.
-4. Look up a lost outcome with `driver.lookup(operation)`. The result is `Lookup::Committed`, `Refused`, `Absent`,
-   or `Unknown`. `Unknown` is for a missing outcome record after a restore.
+4. Look up a lost outcome with `driver.lookup(operation)`. A matching record gives `Lookup::Committed`.
+   A request binding mismatch gives `Lookup::Refused`. A missing record gives `Lookup::Unknown`, including after expiry or restore.
+   This read leaves the original request open.
 
 A journal write can return `JournalWrite::Conflict` when the instance or expected head changes.
 The driver stops with `Error::Superseded`. Recover the pending operation under its original identity.

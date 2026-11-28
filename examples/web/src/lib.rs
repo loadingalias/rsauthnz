@@ -707,7 +707,6 @@ impl<S: Subject> State<S> {
         settle(&mut self.store, &mut self.driver);
         match self.driver.take(ticket) {
             Some(Answer::Lookup(Lookup::Committed(receipt))) => Ok(receipt),
-            Some(Answer::Lookup(Lookup::Absent)) => Err(Problem::Recovery(Recovery::Restart)),
             Some(Answer::Lookup(Lookup::Refused(error))) => Err(error.into()),
             _ => Err(Problem::Recovery(Recovery::Lookup)),
         }

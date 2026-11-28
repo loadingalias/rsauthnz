@@ -234,19 +234,30 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
 }
 
 #[tokio::test]
-async fn a_sign_in_whose_commit_response_is_lost_gets_its_session_from_the_lookup_of_the_server() {
+async fn a_lost_sign_in_reply_gives_a_session_only_when_the_server_finds_its_receipt() {
     let site = Site::new();
-    let mut browser = Browser::default();
     let passkey = Passkey::new(Algorithm::Ed25519, -8, 1);
     let ceremony = ("/sign-up/options", "/sign-up/finish");
     let handle = site
-        .register(&mut browser, ceremony, br#"{"name":"alice"}"#, &passkey)
+        .register(&mut Browser::default(), ceremony, br#"{"name":"alice"}"#, &passkey)
         .await;
-    let options = site.post(&mut browser, "/sign-in/options", b"{}").await;
-    let json = Get::new(&passkey, RP_ID, ORIGIN, authenticator::challenge(&options), handle).json();
-    site.memory.inject(Fault::LostResponse);
-    site.post(&mut browser, "/sign-in/finish", &json).await;
-    assert_eq!(site.account(&mut browser).await.status, StatusCode::OK);
+    let mut browser = Browser::default();
+    for fault in [Fault::CrashBeforeCommit, Fault::LostResponse] {
+        let options = site.post(&mut browser, "/sign-in/options", b"{}").await;
+        let json = Get::new(&passkey, RP_ID, ORIGIN, authenticator::challenge(&options), handle).json();
+        site.memory.inject(fault);
+        let reply = site.send(&mut browser, "POST", "/sign-in/finish", &json).await;
+        if fault == Fault::CrashBeforeCommit {
+            assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(reply.body, r#"{"recovery":"check"}"#);
+            assert!(browser.cookie.is_none());
+            assert_eq!(site.account(&mut browser).await.status, StatusCode::FORBIDDEN);
+            site.advance(4);
+        } else {
+            assert_eq!(reply.status, StatusCode::OK);
+            assert_eq!(site.account(&mut browser).await.status, StatusCode::OK);
+        }
+    }
 }
 
 #[tokio::test]

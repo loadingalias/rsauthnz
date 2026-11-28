@@ -57,7 +57,7 @@ pub(super) struct State {
     pub(super) version: Option<AuthorityVersion>,
     /// The low-water mark of the store state.
     pub(super) mark: Mark,
-    /// A restore made the store state, so a missing outcome record is unknown.
+    /// A snapshot restore made this store state. This field is part of the persisted mark.
     pub(super) restored: bool,
     /// The number of this write of the record. After each write, the driver appends a floor entry of
     /// [`Kind::Mark`] with it, so a journal with a higher number shows a store state older than its journal.

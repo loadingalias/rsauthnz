@@ -176,9 +176,7 @@ pub enum Lookup {
     Committed(Receipt),
     /// The store has the outcome record of another request with the identity.
     Refused(transition::Error),
-    /// No commit has the identity: no restore made the store state, so the operation did not commit.
-    Absent,
-    /// The store has no outcome record, but a restore made its state, so the operation can have committed.
+    /// No retained outcome establishes the result. Keep the original operation in doubt.
     Unknown,
 }
 
@@ -587,7 +585,8 @@ impl Driver {
         Ok(ticket)
     }
 
-    /// Looks up the outcome of `operation`: its identity and its request binding, as [`Outcome::Unknown`] gave them.
+    /// Reads the outcome of the original operation and request binding from [`Outcome::Unknown`].
+    /// A missing receipt gives [`Lookup::Unknown`]. The read leaves the original operation open.
     ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate). The lookup is a keyed read.
     ///
@@ -783,8 +782,7 @@ impl Work {
                         Outcome::Accepted(receipt) => Lookup::Committed(receipt),
                         _ => Lookup::Refused(transition::Error::Reuse),
                     },
-                    None if core.record.restored => Lookup::Unknown,
-                    None => Lookup::Absent,
+                    None => Lookup::Unknown,
                 }))
             })),
             Self::Advance(advance) => advance.settle(core),

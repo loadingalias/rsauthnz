@@ -496,22 +496,27 @@ pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
 /// The most that a store rounds up the end of an audit or outcome record: a store that keeps whole seconds.
 const PRECISION_MAX: Duration = Duration::from_secs(1);
 
-pub(super) async fn retention<S: Subject>(mut binding: S) -> Checked {
-    let instance = start(&mut binding).await?;
-    let proposal = Build::new("t-1").writes(&key(Kind::Credential, "t-1"), 1).done();
+pub(super) async fn retention<S: Subject>(binding: S) -> Checked {
+    let mut run = Run::started(binding).await?;
+    let credential = key(Kind::Credential, "t-1");
+    let proposal = Build::new("t-1").writes(&credential, 1).done();
+    let operation = proposal.operation().clone();
     ensure(
-        committed(&mut binding, &proposal, instance).await? == Commit::Accepted,
-        "a commit whose dependencies hold refused",
+        matches!(run.lookup(&operation).await?, Lookup::Unknown),
+        "a status read reported a decision before the first write",
     )?;
     let end = proposal
         .audit()
         .time
         .estimate()
-        .saturating_add(binding.declaration().outcome_retention);
+        .saturating_add(run.binding.declaration().outcome_retention);
     let latest = end.saturating_add(PRECISION_MAX);
     let (audit_key, audit) = audit_record(&proposal);
-    for (key, what) in [(&audit_key, "audit"), (&outcome_record(&proposal).0, "outcome")] {
-        let stored = Store::read(&mut binding, key).await.map_err(failed("read"))?;
+    let outcome_key = outcome_record(&proposal).0;
+    run.commit(proposal, Plan::default(), "the credential after a status read")
+        .await?;
+    for (key, what) in [(&audit_key, "audit"), (&outcome_key, "outcome")] {
+        let stored = Store::read(&mut run.binding, key).await.map_err(failed("read"))?;
         ensure(
             stored.is_some_and(|record| record.end.is_some_and(|stored| end <= stored && stored <= latest)),
             &format!(
@@ -521,21 +526,34 @@ pub(super) async fn retention<S: Subject>(mut binding: S) -> Checked {
         )?;
     }
     for kind in [Kind::Audit, Kind::Outcome] {
-        binding.expire(kind, end, PAGE).await.map_err(failed("expire"))?;
+        run.binding.expire(kind, end, PAGE).await.map_err(failed("expire"))?;
     }
-    let stored = Store::read(&mut binding, &audit_key).await.map_err(failed("read"))?;
+    let stored = Store::read(&mut run.binding, &audit_key)
+        .await
+        .map_err(failed("read"))?;
     ensure(
         same(stored.as_ref(), &audit),
         "an expire before the retention end removed the audit record",
     )?;
-    let outcome = binding
-        .outcome(&proposal.operation().id)
-        .await
-        .map_err(failed("read"))?;
     ensure(
-        outcome.as_ref() == Some(proposal.operation()),
-        "an expire before the retention end removed the outcome record, so a retried operation cannot learn its outcome",
-    )
+        matches!(run.lookup(&operation).await?, Lookup::Committed(receipt) if receipt.operation() == &operation.id),
+        "a lookup lost the committed receipt at its retention end",
+    )?;
+    if let Some(after) = latest.checked_add(Duration::from_nanos(1)) {
+        run.binding
+            .expire(Kind::Outcome, after, PAGE)
+            .await
+            .map_err(failed("expire"))?;
+        ensure(
+            !run.holds(&outcome_key).await? && run.holds(&credential).await?,
+            "expiry did not remove the receipt and keep the issued credential",
+        )?;
+        ensure(
+            matches!(run.lookup(&operation).await?, Lookup::Unknown),
+            "a missing receipt gave a definite answer for a committed credential",
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) async fn lost_response<S: Subject>(mut binding: S) -> Checked {
@@ -799,8 +817,8 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
     let history = run.history().await?;
     ensure(!ended(&history), "cChecked: an end entry whose sync failed is durable")?;
     ensure(
-        matches!(run.lookup(&operation).await?, Lookup::Absent),
-        "cChecked: a lookup of an operation with no commit is not absent",
+        matches!(run.lookup(&operation).await?, Lookup::Unknown),
+        "cChecked: a status read with no receipt reported a decision",
     )?;
 
     // cJournaled: a crash before the commit, after the durable end entry. The start voids the entry.
@@ -815,7 +833,7 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
         "cJournaled: the start did not void an end entry whose commit did not land",
     )?;
     ensure(
-        matches!(run.lookup(&operation).await?, Lookup::Absent) && run.holds(&reg).await? && !run.holds(&a1s).await?,
+        matches!(run.lookup(&operation).await?, Lookup::Unknown) && run.holds(&reg).await? && !run.holds(&a1s).await?,
         "cJournaled: a commit that crashed before it landed changed the store",
     )?;
 

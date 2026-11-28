@@ -550,7 +550,7 @@ fn each_crash_point_gives_the_model_outcome_after_the_next_start() {
         if commits {
             assert_matches!(found, Some(Answer::Lookup(Lookup::Committed(_))), "{point}");
         } else {
-            assert_matches!(found, Some(Answer::Lookup(Lookup::Absent)), "{point}");
+            assert_matches!(found, Some(Answer::Lookup(Lookup::Unknown)), "{point}");
         }
         if name == "e-1" {
             assert_eq!(harness.holds(&a1s), commits, "{point}");

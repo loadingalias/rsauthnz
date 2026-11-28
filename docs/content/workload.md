@@ -270,14 +270,14 @@ longest time that a revocation needs to reach it. Choose the lifetime with that 
 `awaiting.release` gives `Release::Unknown(operation)` when the commit can have occurred. The workload gets no
 credential. rsauthnz does not try the operation again.
 
-1. Look up the operation with `driver.lookup(operation)`.
-2. For `Lookup::Absent`, nothing committed. Ask again, with the same operation identity or a new one.
-3. For `Lookup::Committed` or `Lookup::Unknown`, the credential of that operation did not reach the workload, and no
-   one has its bytes. Ask for a credential as a new operation, with a new `OperationId`.
+1. Keep the original operation and look it up with `driver.lookup(operation)`.
+2. For `Lookup::Committed`, record that the operation succeeded. A receipt contains no credential bytes.
+3. For `Lookup::Unknown`, keep the operation unresolved. A missing receipt can mean an unfinished write, expiry, or restore.
+4. For `Lookup::Refused`, follow the error. A request binding mismatch means that another request owns the identity.
 
-A new proposal of the same request under the same identity, after its first commit, commits nothing. Its release
-gives `Release::Committed`. After a lost recovery that committed, recover again as a new operation: its commit also
-ends the credential that no one received. A revocation and an issuer rotation follow the same lookup.
+If a confirmed issuance lost its credential bytes, the operator can request a replacement as a new operation.
+If a confirmed workload recovery lost its credential bytes, a new recovery also ends the credential from the earlier recovery.
+Use the same lookup for a revocation or an issuer rotation. A missing receipt gives no instruction to repeat either change.
 
 ## After a restore
 

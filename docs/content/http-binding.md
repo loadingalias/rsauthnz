@@ -235,9 +235,8 @@ the result of the lookup:
 | `Lookup` | Response |
 | --- | --- |
 | `Committed(receipt)` | The response of the commit, such as the session cookie of `opening.release(&Outcome::Accepted(receipt))` |
-| `Absent` | `problem(Recovery::Restart)`: nothing committed |
 | `Refused(error)` | `problem(error.recovery())` |
-| `Unknown`, or the driver does not serve in time | `problem(Recovery::Lookup)` |
+| `Unknown`, or the driver does not serve in time | `problem(Recovery::Lookup)` gives `{"recovery":"check"}` |
 
-After `{"recovery":"check"}`, the current state shows what committed. For a sign-in, the user is not signed in, and
-signs in again with a new challenge.
+After `{"recovery":"check"}`, load the current state. For a sign-in, check the account page with the browser's existing cookie.
+Keep the original operation unresolved if its receipt is missing. Never send its one-use request again.

@@ -19,7 +19,7 @@ driver takes only an accepted `Profile` (`Driver::new(profile, limits)`), so no 
 | --- | --- | --- |
 | `isolation` | `Isolation::Serializable`, `Isolation::AtomicConditional` (one atomic step that checks the complete dependency set, absences included), or `Isolation::Weaker` (snapshot isolation or weaker) | `Error::Isolation` for `Weaker`: it permits write skew on an absence |
 | `crash_loss` | `CrashLoss::Unsynced`: a crash loses only the writes whose commit or sync did not return. `CrashLoss::Everything`: the store is in the memory of the process | — |
-| `outcome_retention` | The least time after the audit time of its proposal for which the binding keeps an audit and an outcome record. A lookup after it gives an unknown outcome | — |
+| `outcome_retention` | The minimum time after the proposal's audit time that the binding keeps its audit and outcome records. A lookup after removal gives `Lookup::Unknown` | — |
 | `crash_injection` | `CrashInjection::Supported` when the binding injects a crash at each commit point, or `Unsupported` | — |
 | `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects. [Restore journal](restore.md) gives what the journal keeps | — |
 | `key_bytes_max` | The most bytes in a key that the binding stores | `Error::KeyBound` below 2048 (`transition::Key::BYTES_MAX`), the longest key of the core |
