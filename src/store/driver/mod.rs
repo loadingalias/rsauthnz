@@ -45,6 +45,7 @@ use core::fmt;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 
+pub use super::journal::AlphaSource;
 use super::journal::{self, Anchor, Body, Entries, History, Mark, Reads, Role};
 use super::{
     Commit, Expiry, Instance, JournalWrite, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of,
@@ -57,6 +58,7 @@ use crate::transition::{
     self, Change, Dependency, Effect as Call, Intent, Key, Operation, OperationId, Outcome, Proposal, Receipt, Recover,
     Recovery,
 };
+use record::RestoreMark;
 
 /// The most journal entries after the mark that the driver reads or keeps. A start refuses a longer journal with
 /// [`Error::Long`]. The driver moves the mark before it keeps more ([`ADVANCE_AT`]).
@@ -228,8 +230,16 @@ pub enum Error {
     Superseded,
     /// The binding returned an unexpected output or refused an internal commit.
     Binding,
-    /// The mark record of the store has no valid form.
+    /// A storage record has an invalid form or version.
     Record,
+    /// The alpha journal and primary need operator review at `sequence`. Admission stays closed.
+    /// Pass `instance` to [`Driver::resolve_alpha`] after verifying the origin of the primary.
+    AlphaReview {
+        /// The storage instance that fenced writes for this review.
+        instance: Instance,
+        /// The verified journal entry to inspect.
+        sequence: Sequence,
+    },
     /// The store state is older than its journal: a restore made it. Call [`Driver::restore`], not
     /// [`Driver::start`].
     Restored,
@@ -254,6 +264,7 @@ impl Recover for Error {
             | Self::Superseded
             | Self::Binding
             | Self::Record
+            | Self::AlphaReview { .. }
             | Self::Restored => Recovery::Refuse,
         }
     }
@@ -293,7 +304,12 @@ impl fmt::Display for Error {
             Self::Overflow => f.write_str("a counter is past its largest value"),
             Self::Superseded => f.write_str("the storage instance or journal head changed"),
             Self::Binding => f.write_str("the binding gave an output that the driver did not ask for"),
-            Self::Record => f.write_str("the mark record of the store has no valid form"),
+            Self::Record => f.write_str("a storage record has an invalid form or version"),
+            Self::AlphaReview { instance, sequence } => write!(
+                f,
+                "review alpha journal entry {} for storage instance {} before opening admission",
+                sequence.0, instance.0
+            ),
             Self::Restored => f.write_str("the store state is older than its journal: call restore, not start"),
         }
     }
@@ -497,6 +513,23 @@ impl Driver {
     pub fn restore(&mut self, now: Reading) -> Result<(), Error> {
         self.core.journal.ok_or(Error::Unsupported)?;
         self.begin(now, Begin::Restore);
+        Ok(())
+    }
+
+    /// Continue the alpha upgrade after an operator verifies the origin of this primary.
+    /// Use the instance from [`Error::AlphaReview`]. The driver checks the records again in that instance.
+    ///
+    /// Cost class: [`Mutate`](crate::limits::Class::Mutate). One activation in the fenced instance.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Superseded`] if this review has ended or another activation is scheduled.
+    /// Observe [`Driver::status`] after running the effects for the result of verification.
+    pub fn resolve_alpha(&mut self, instance: Instance, source: AlphaSource, now: Reading) -> Result<(), Error> {
+        let current = matches!(self.core.status, Status::Refused(Error::AlphaReview { instance: reviewed, .. }) if reviewed == instance);
+        let starting = self.queue.iter().any(|job| matches!(job.work, Work::Start(_)));
+        (current && !starting).ok_or(Error::Superseded)?;
+        self.begin(now, Begin::Reviewed(source));
         Ok(())
     }
 
@@ -977,7 +1010,13 @@ impl Fetching {
             }
             self.reads.records.insert(key, record.map(|record| record.version));
         } else if let Some((operation, _)) = self.operations.pop_front() {
-            let found = record.is_some_and(|record| outcome_of(&operation, &record).is_some());
+            let found = match record {
+                None => false,
+                Some(record) => {
+                    outcome_of(&operation, &record).ok_or(Error::Record)?;
+                    true
+                }
+            };
             self.reads.outcomes.insert(operation, found);
         } else {
             return Err(Error::Binding);
@@ -1257,6 +1296,17 @@ impl Submitted {
 enum Begin {
     Start,
     Restore,
+    Reviewed(AlphaSource),
+}
+
+impl Begin {
+    fn source(self) -> Option<AlphaSource> {
+        match self {
+            Self::Start => None,
+            Self::Restore => Some(AlphaSource::Snapshot),
+            Self::Reviewed(source) => Some(source),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1310,7 +1360,10 @@ impl Start {
     fn new(begin: Begin) -> Self {
         Self {
             begin,
-            phase: StartPhase::Instance,
+            phase: match begin {
+                Begin::Reviewed(_) => StartPhase::Mark,
+                _ => StartPhase::Instance,
+            },
             owed: Vec::new(),
             reads: Reads::default(),
             activation: None,
@@ -1358,8 +1411,11 @@ impl Start {
                 };
                 core.record = match record {
                     None => record::State::default(),
-                    Some(record) => record::State::read(&record, core.limits, self.begin).ok_or(Error::Record)?,
+                    Some(record) => record::State::read(&record, core.limits).ok_or(Error::Record)?,
                 };
+                if matches!(self.begin, Begin::Reviewed(_)) && !core.record.ambiguous() {
+                    return Err(Error::Superseded);
+                }
                 self.phase = if core.journal {
                     StartPhase::Journal(Paging {
                         history: History::new(core.record.mark),
@@ -1372,7 +1428,20 @@ impl Start {
             }
             StartPhase::Journal(paging) => paging.give(core.limits, output),
             StartPhase::Intents(scanning) => scanning.give(core.limits, output),
-            StartPhase::Reads(reading) | StartPhase::Recheck(reading) => reading.give(output),
+            StartPhase::Reads(reading) => {
+                if core.journal
+                    && core.record.ambiguous()
+                    && let (Some(key), Output::Read(record)) = (reading.keys.front(), &output)
+                    && let Some(sequence) = core.history.alpha_dispute(key, record.as_ref(), self.begin.source())?
+                {
+                    return Err(Error::AlphaReview {
+                        instance: core.instance,
+                        sequence,
+                    });
+                }
+                reading.give(output)
+            }
+            StartPhase::Recheck(reading) => reading.give(output),
             StartPhase::Record(committing)
             | StartPhase::Apply(committing)
             | StartPhase::Release(committing)
@@ -1422,34 +1491,7 @@ impl Start {
                 StartPhase::Reads(reading) => {
                     self.reads = reading.reads;
                     self.floor = reading.floor;
-                    if !core.journal {
-                        Self::close(core)?
-                    } else if self.begin == Begin::Restore {
-                        let activation = journal::restore(&core.history, &self.reads)?;
-                        core.record.restoring = Some(core.instance);
-                        core.record.owed = activation
-                            .completions
-                            .iter()
-                            .map(|completion| completion.sequence)
-                            .collect();
-                        self.activation = Some(activation);
-                        StartPhase::Record(core.marking()?)
-                    } else {
-                        if self
-                            .floor
-                            .is_some_and(|floor| Some(floor.instance) == core.record.restoring)
-                        {
-                            core.record.restoring = None;
-                        }
-                        self.check(core)?;
-                        if !core.record.needs_restore() {
-                            self.reconcile(core)?
-                        } else {
-                            // A crash stopped a restore: apply it again, and complete what it still owes.
-                            self.activation = Some(journal::restore(&core.history, &self.reads)?);
-                            StartPhase::Apply(Committing::new(self.apply(core)?))
-                        }
-                    }
+                    self.prepare(core)?
                 }
                 StartPhase::Record(_) => StartPhase::Apply(Committing::new(self.apply(core)?)),
                 StartPhase::Apply(_) => StartPhase::Ends(
@@ -1478,13 +1520,13 @@ impl Start {
                 }
                 StartPhase::Release(_) => {
                     if self.activation.is_some() {
-                        core.record.restoring = Some(core.instance);
+                        core.record.restore = RestoreMark::Instance(core.instance);
                     }
                     Self::close(core)?
                 }
                 StartPhase::Close(_) => self.open(core)?,
                 StartPhase::Open(_) => {
-                    core.record.restoring = None;
+                    core.record.restore = RestoreMark::Settled;
                     let state = core.history.state()?;
                     core.counters.clear();
                     let journaled = state.floors().map(|floor| (floor.kind, floor.value));
@@ -1504,6 +1546,51 @@ impl Start {
         }
     }
 
+    /// Select ordinary reconciliation, a recorded restore, or the one-time alpha cleanup from durable evidence.
+    fn prepare(&mut self, core: &mut Core) -> Result<StartPhase, Error> {
+        if self
+            .floor
+            .is_some_and(|floor| core.record.restore == RestoreMark::Instance(floor.instance))
+        {
+            core.record.restore = RestoreMark::Settled;
+        }
+        if !core.journal {
+            (core.record.restore == RestoreMark::Settled).ok_or(Error::Unsupported)?;
+            return Self::close(core);
+        }
+        let snapshot = self.begin.source() == Some(AlphaSource::Snapshot);
+        if !snapshot {
+            self.check(core)?;
+            if core.record.restore == RestoreMark::Settled || self.begin == Begin::Reviewed(AlphaSource::Intact) {
+                return self.reconcile(core);
+            }
+        }
+        let activation = journal::restore(&core.history, &self.reads)?;
+        let ambiguous = core.record.ambiguous();
+        if ambiguous
+            && !snapshot
+            && let Some(first) = activation.completions.first()
+        {
+            return Err(Error::AlphaReview {
+                instance: core.instance,
+                sequence: first.sequence,
+            });
+        }
+        if snapshot || ambiguous {
+            core.record.restore = RestoreMark::Instance(core.instance);
+            core.record.owed = activation
+                .completions
+                .iter()
+                .map(|completion| completion.sequence)
+                .collect();
+            self.activation = Some(activation);
+            Ok(StartPhase::Record(core.marking()?))
+        } else {
+            self.activation = Some(activation);
+            Ok(StartPhase::Apply(Committing::new(self.apply(core)?)))
+        }
+    }
+
     /// The reads of each key and outcome record that the rules read: those of the journal after the mark, those of
     /// the journal intents, and the replay floor.
     fn reading(&self, core: &Core) -> Fetching {
@@ -1514,9 +1601,16 @@ impl Start {
             .cloned()
             .chain([core.floor_key.clone()])
             .collect();
-        let operations: Vec<OperationId> = core
-            .history
-            .operations()
+        let mut outcomes = core.history.operations();
+        if self.begin == Begin::Reviewed(AlphaSource::Intact) {
+            outcomes.extend(
+                core.history
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| matches!(entry.body, Body::End(_)).then_some(&entry.operation)),
+            );
+        }
+        let operations: Vec<OperationId> = outcomes
             .into_iter()
             .cloned()
             .chain(self.owed.iter().map(|owed| owed.operation.clone()))
@@ -1621,13 +1715,26 @@ impl Start {
     }
 
     /// The missing creation entries and the voids of reconciliation.
-    fn reconcile(&self, core: &Core) -> Result<StartPhase, Error> {
+    fn reconcile(&self, core: &mut Core) -> Result<StartPhase, Error> {
         let candidates: Vec<(OperationId, Vec<Anchor>)> = self
             .owed
             .iter()
             .map(|owed| (owed.operation.clone(), owed.anchors.clone()))
             .collect();
         let decision = journal::reconcile(&core.history, &self.reads, &candidates)?;
+        if self.begin == Begin::Reviewed(AlphaSource::Intact) {
+            let state = core.history.state()?;
+            for (operation, sequence) in &decision.voids {
+                let committed = self.reads.outcomes.get(operation).ok_or(journal::Error::Unread)?;
+                if *committed || state.acknowledges([operation]) {
+                    return Err(Error::AlphaReview {
+                        instance: core.instance,
+                        sequence: *sequence,
+                    });
+                }
+            }
+            core.record.restore = RestoreMark::Settled;
+        }
         let creations = decision
             .creations
             .into_iter()
@@ -1645,7 +1752,7 @@ impl Start {
     fn check(&self, core: &mut Core) -> Result<(), Error> {
         let state = core.history.state()?;
         (written(state) <= core.record.written).ok_or(Error::Restored)?;
-        if !core.record.needs_restore() {
+        if core.record.restore == RestoreMark::Settled {
             for anchor in state.anchors().filter(|anchor| anchor.end.is_none()) {
                 let held = self.reads.records.get(&anchor.key).is_some_and(Option::is_some);
                 (held || state.ends(&anchor.key, &anchor.version)?).ok_or(Error::Restored)?;

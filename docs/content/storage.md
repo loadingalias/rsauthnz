@@ -115,7 +115,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `Outcome` | The outcome record of a commit. Its key is the operation identity ([Audit and outcome records](#audit-and-outcome-records)) | `None` |
 | `Intent` | An effect intent that the application did not end yet | `None` |
 | `Policy` | The current policy version of an owner ([Policy records](#policy-records)) | `None` |
-| `Mark` | The journal mark of the store: the low-water mark of its state, whether a restore made the state, the number of its write, and the completions that a restore still owes. The commit driver writes it ([Restore journal](restore.md)) | `None` |
+| `Mark` | The low-water mark, its write number, the restore instance, and the consumptions that still need completion. The driver also reads earlier mark formats. [Upgrade an alpha store](restore.md#upgrade-an-alpha-store) | `None` |
 | `Local` | The record of a [local authority](local-authority.md): its host grant, its issuer key, and the log of its bootstrap values | `None` |
 | `Issuer` | An issuer of workload credentials: its authority, its current key and its previous key, its audiences, and its ceiling ([Issue and manage workload credentials](workload.md)) | `None` |
 | `Workload` | The registration of a workload: the workload, its registered proof key, and its generation | `None` |

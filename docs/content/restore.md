@@ -146,6 +146,30 @@ check it. After a restore, an outcome lookup that finds no record gives an unkno
 
 The history holds each entry after the mark in memory, so the cost of a restore is linear in those entries.
 
+## Upgrade an alpha store
+
+Call `driver.start(now)` on the existing store. The driver reads the alpha mark and its journal.
+An older mark can say that a restore started and still leave its completion unknown.
+When the primary and journal agree on authority, the driver ends pending sign-in challenges, CLI call challenges, and operation approvals once.
+It then opens replay admission. People can restart a pending sign-in or approval. Clients can sign again after the new replay floor.
+
+If the store needs review, the driver returns `Status::Refused(Error::AlphaReview { instance, sequence })`.
+Admission stays closed. The primary records and journal entries remain available for inspection.
+
+1. Inspect the journal entry at `sequence` and the primary record it concerns.
+2. Check the storage recovery history to establish which primary the binding opened.
+3. Give the verified history to the same driver with `driver.resolve_alpha(instance, source, now)`.
+4. Run its storage effects. Resume service only when `driver.status()` returns `Status::Serving`.
+
+| Verified storage history | Value of `source` | Result |
+| --- | --- | --- |
+| The primary kept every committed write. Its last restore finished before the interruption. | `AlphaSource::Intact` | Ordinary reconciliation can cancel an uncommitted removal. Live challenges survive. A retained receipt or creation entry that proves the removal committed keeps the store closed. |
+| The binding installed a snapshot. | `AlphaSource::Snapshot` | Restore applies the journal, finishes eligible consumptions, clears pending ceremonies, and sets the replay floor. |
+
+Import `AlphaSource` from `rsauthnz::store::driver`. If the storage history is unknown, leave admission closed.
+Conflicting record contents at the same credential version need a trustworthy store copy. Either selection keeps that conflict closed.
+After `Error::Superseded`, obtain a current review before acting. A decision belongs to the storage instance that requested it.
+
 ## The commit driver
 
 `rsauthnz::store::driver::Driver` is the one sequencer of the protocol. It gives the binding one effect at a time,

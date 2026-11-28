@@ -64,12 +64,21 @@ pub use rules::{
     Activation, Completion, Entries, Reconciliation, entries, keeps_anchor, low_water, reconcile, restore,
 };
 
-use super::{Kind, Sequence};
+use super::{Kind, Record, Sequence};
 use crate::cbor;
 use crate::crypto;
 use crate::id::{Authority, AuthorityVersion, Human, Id};
 use crate::limits::Limits;
 use crate::transition::{Key, OperationId};
+
+/// The origin that an operator verified for an ambiguous alpha store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaSource {
+    /// The primary retained every committed write. Its last restore finished before the interruption.
+    Intact,
+    /// The binding installed a snapshot that can predate a journal entry.
+    Snapshot,
+}
 
 /// The link of an entry: the SHA-256 digest of its stored form. Each entry holds the link of the entry before it, so
 /// a changed or removed entry breaks the chain at the entry after it.
@@ -485,6 +494,59 @@ impl History {
         }
         self.replayed.count = self.entries.len();
         Ok(&self.replayed.state)
+    }
+
+    /// Locate a disputed authority record in the verified alpha journal. The normal read supplies its bytes.
+    /// A confirmed snapshot can restore a missing or older anchor. One version must always name the same record.
+    pub(super) fn alpha_dispute(
+        &mut self,
+        key: &Key,
+        held: Option<&Record>,
+        source: Option<AlphaSource>,
+    ) -> Result<Option<Sequence>, Error> {
+        self.state()?;
+        let state = &self.replayed.state;
+        let dead = state.dead.get(key).filter(|dead| {
+            held.is_some_and(|record| match record.version.compare(dead) {
+                Ok(Ordering::Greater) => false,
+                Ok(_) => source.is_none(),
+                Err(_) => true,
+            })
+        });
+        let mut missing = None;
+        if let Some(anchor) = state.anchors.get(key)
+            && !state.ends(key, &anchor.version)?
+        {
+            let agrees = match held.map(|record| (record, record.version.compare(&anchor.version))) {
+                Some((_, Ok(Ordering::Greater))) => true,
+                Some((record, Ok(Ordering::Equal))) => record.data == anchor.data && record.end == anchor.end,
+                None | Some((_, Ok(Ordering::Less))) => source == Some(AlphaSource::Snapshot),
+                Some((_, Err(_))) => false,
+            };
+            if !agrees {
+                missing = Some(&anchor.version);
+            }
+        }
+        if dead.is_none() && missing.is_none() {
+            return Ok(None);
+        }
+        // Only a refusal needs the source entry. Keep coordinates and record contents out of the diagnostic.
+        self.entries
+            .iter()
+            .rev()
+            .filter(|entry| !self.replayed.voided.contains(&entry.sequence))
+            .find(|entry| match &entry.body {
+                Body::End(end) => end
+                    .facts
+                    .iter()
+                    .any(|fact| &fact.key == key && Some(&fact.version) == dead),
+                Body::Creation(anchors) => anchors
+                    .iter()
+                    .any(|anchor| &anchor.key == key && Some(&anchor.version) == missing),
+                _ => false,
+            })
+            .map(|entry| Some(entry.sequence))
+            .ok_or(Error::Unread)
     }
 
     /// The mark before the entry at `index`.

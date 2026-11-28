@@ -192,6 +192,8 @@ pub enum Case {
     RestoreEnds,
     /// A normal start after a restore voids no entry that the restore applied. Property: `NothingEndedValid`.
     StartAfterRestore,
+    /// A stored alpha mark triggers automatic cleanup or a fenced review of the disputed journal entry.
+    AlphaUpgrade,
     /// The local authority ([`rsauthnz::local`]) on the binding: a bootstrap value of one authority refuses at another,
     /// and after its end. Two concurrent uses of one value give one commit and one conflict or refusal, and a used
     /// value refuses. A remote call is admitted only for a live administrator binding. An owner re-bootstrap gives a
@@ -209,7 +211,7 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::Deadline,
@@ -234,6 +236,7 @@ impl Case {
         Self::RestoreCompletions,
         Self::RestoreEnds,
         Self::StartAfterRestore,
+        Self::AlphaUpgrade,
         Self::Bootstrap,
         Self::Rebootstrap,
     ];
@@ -264,6 +267,7 @@ impl Case {
             | Self::RestoreAnchors
             | Self::RestoreEnds
             | Self::StartAfterRestore
+            | Self::AlphaUpgrade
             | Self::Rebootstrap => journal,
             Self::FailedSync | Self::CrashPoints | Self::RestoreCompletions => crash && journal,
         }
@@ -295,6 +299,7 @@ impl Case {
             Self::RestoreCompletions => cases::restore_completions(make()).await,
             Self::RestoreEnds => cases::restore_ends(make()).await,
             Self::StartAfterRestore => cases::start_after_restore(make()).await,
+            Self::AlphaUpgrade => cases::alpha_upgrade(make).await,
             Self::Bootstrap => bootstrap::bootstrap(make).await,
             Self::Rebootstrap => bootstrap::rebootstrap(make()).await,
         }

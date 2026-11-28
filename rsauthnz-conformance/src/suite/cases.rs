@@ -1492,3 +1492,101 @@ pub(super) async fn start_after_restore<S: Subject>(binding: S) -> Checked {
         "a second restore made the passkey of an unlink valid again",
     )
 }
+
+pub(super) async fn alpha_upgrade<S: Subject>(make: &mut impl FnMut() -> S) -> Checked {
+    use rsauthnz::cbor::{self, Value};
+    use rsauthnz::id::{AuthorityVersion, Id};
+    use rsauthnz::store::driver::AlphaSource;
+    use rsauthnz::transition::Change;
+
+    let mark = key(Kind::Mark, "");
+    let passkey = key(Kind::Credential, "alpha-passkey");
+    let approval = key(Kind::Approval, "alpha-approval");
+    let form = Value::Array(vec![
+        Value::Text("rsauthnz.store.mark.1"),
+        Value::Unsigned(0),
+        Value::Bytes(&[0; 32]),
+        Value::Bool(true),
+        Value::Unsigned(1),
+        Value::Array(vec![]),
+        Value::Array(vec![]),
+    ]);
+    let bytes = cbor::encode(&form, Limits::default()).map_err(failed("alpha mark"))?;
+    let owner = Id::new("rsauthnz", "driver").map_err(failed("mark owner"))?;
+    let first = AuthorityVersion::new(owner, &1u64.to_be_bytes()).map_err(failed("mark version"))?;
+    let seed = Build::new("alpha-seed")
+        .lacks(&mark)
+        .change(Change::Write {
+            key: mark.clone(),
+            version: first,
+            end: None,
+            data: bytes.into_boxed_slice(),
+        })
+        .writes(&passkey, 1)
+        .writes_until(&approval, 1, Some(super::LATER))
+        .done();
+    let unlink = Build::new("alpha-unlink").ends(&passkey, 1).done();
+    let end = journal::entries(&unlink, &[], &[])
+        .map_err(failed("unlink entry"))?
+        .end
+        .ok_or("missing unlink entry")?;
+    let append = Mark::EMPTY
+        .next(&unlink.operation().id, &Body::End(end), Limits::default())
+        .map_err(failed("unlink entry"))?;
+
+    for source in [None, Some(AlphaSource::Intact), Some(AlphaSource::Snapshot)] {
+        let mut run = Run::new(make())?;
+        let initial = start(&mut run.binding).await?;
+        ensure(
+            committed(&mut run.binding, &seed, initial).await? == Commit::Accepted,
+            "alpha setup refused",
+        )?;
+        if source.is_some() {
+            ensure(
+                run.binding.append(&append, initial).await.map_err(failed("append"))? == JournalWrite::Accepted,
+                "alpha journal append refused",
+            )?;
+            ensure(
+                run.binding.sync(initial).await.map_err(failed("sync"))? == JournalWrite::Accepted,
+                "alpha journal sync refused",
+            )?;
+        }
+        run.driver.start(now());
+        run.settle().await?;
+        if let Some(source) = source {
+            let Status::Refused(driver::Error::AlphaReview {
+                instance,
+                sequence: Sequence(1),
+            }) = run.driver.status()
+            else {
+                return Err("the upgrade did not identify the disputed unlink".into());
+            };
+            ensure(
+                run.holds(&passkey).await? && run.holds(&approval).await?,
+                "review changed the credential or approval",
+            )?;
+            ensure(
+                inserted(&mut run.binding, &replay(1, 0)).await? == Inserted::Floor,
+                "review admitted a signed request",
+            )?;
+            run.driver
+                .resolve_alpha(instance, source, now())
+                .map_err(failed("alpha review"))?;
+            run.settle().await?;
+        }
+        run.serving()?;
+        ensure(
+            run.holds(&passkey).await? == (source != Some(AlphaSource::Snapshot)),
+            "upgrade applied the wrong credential decision",
+        )?;
+        ensure(
+            run.holds(&approval).await? == (source == Some(AlphaSource::Intact)),
+            "upgrade applied the wrong ceremony cleanup",
+        )?;
+        ensure(
+            inserted(&mut run.binding, &replay(1, 0)).await? == Inserted::Accepted,
+            "the upgraded store did not reopen replay admission",
+        )?;
+    }
+    Ok(())
+}

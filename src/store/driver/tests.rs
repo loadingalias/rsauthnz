@@ -5,14 +5,16 @@ use alloc::vec::Vec;
 use core::assert_matches;
 use core::time::Duration;
 
-use super::{Answer, Begin, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min};
+use super::{
+    AlphaSource, Answer, Begin, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min,
+};
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{self, Anchor, Body, Mark, Role};
 use crate::store::{
     self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Expiry, Instance, Isolation, JournalWrite, Kind,
-    Profile, Record, Restore, audit_record, intent_records, outcome_of, outcome_record,
+    Profile, Record, Restore, Sequence, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{
@@ -764,6 +766,24 @@ fn in_doubt() -> Double {
     double
 }
 
+/// The original alpha form. A restore sets its flag even when it owes zero consumptions.
+fn alpha_mark(owed: Option<&[u64]>) -> Record {
+    let form = Value::Array(vec![
+        Value::Text("rsauthnz.store.mark.1"),
+        Value::Unsigned(0),
+        Value::Bytes(&[0; 32]),
+        Value::Bool(owed.is_some()),
+        Value::Unsigned(1),
+        Value::Array(owed.unwrap_or_default().iter().copied().map(Value::Unsigned).collect()),
+        Value::Array(vec![]),
+    ]);
+    Record {
+        version: AuthorityVersion::new(Id::new("rsauthnz", "driver").unwrap(), &1u64.to_be_bytes()).unwrap(),
+        end: None,
+        data: cbor::encode(&form, Limits::default()).unwrap().into_boxed_slice(),
+    }
+}
+
 /// An alpha mark can identify an ordinary start or list the consumptions of an unfinished restore.
 #[test]
 fn an_alpha_store_keeps_a_live_challenge_or_completes_its_recorded_consumptions() {
@@ -773,23 +793,9 @@ fn an_alpha_store_keeps_a_live_challenge_or_completes_its_recorded_consumptions(
         (Begin::Start, true, vec![1, 2], in_doubt()),
         (Begin::Restore, true, vec![], in_doubt()),
     ] {
-        let form = Value::Array(vec![
-            Value::Text("rsauthnz.store.mark.1"),
-            Value::Unsigned(0),
-            Value::Bytes(&[0; 32]),
-            Value::Bool(restored),
-            Value::Unsigned(1),
-            Value::Array(owed.into_iter().map(Value::Unsigned).collect()),
-            Value::Array(vec![]),
-        ]);
-        double.records.insert(
-            key(Kind::Mark, ""),
-            Record {
-                version: AuthorityVersion::new(Id::new("rsauthnz", "driver").unwrap(), &1u64.to_be_bytes()).unwrap(),
-                end: None,
-                data: cbor::encode(&form, Limits::default()).unwrap().into_boxed_slice(),
-            },
-        );
+        double
+            .records
+            .insert(key(Kind::Mark, ""), alpha_mark(restored.then_some(&owed)));
         double.records.insert(
             challenge.clone(),
             Record {
@@ -798,9 +804,10 @@ fn an_alpha_store_keeps_a_live_challenge_or_completes_its_recorded_consumptions(
             },
         );
         let mut harness = Harness::new(declaration(true), double);
-        match begin {
-            Begin::Start => harness.driver.start(now()),
-            Begin::Restore => harness.driver.restore(now()).unwrap(),
+        if begin == Begin::Restore {
+            harness.driver.restore(now()).unwrap();
+        } else {
+            harness.driver.start(now());
         }
         harness.run(|_| None);
         assert_eq!(harness.driver.status(), Status::Serving);
@@ -810,6 +817,186 @@ fn an_alpha_store_keeps_a_live_challenge_or_completes_its_recorded_consumptions(
             assert!(harness.holds(&key(Kind::Administrator, "adm1")));
         }
     }
+}
+
+/// A consistent alpha store keeps its authority and ends pending ceremonies once, even if cleanup loses its worker.
+#[test]
+fn an_ambiguous_alpha_upgrade_cleans_up_once_when_authority_agrees() {
+    let mut double = Double::new();
+    let passkey = key(Kind::Credential, "a1p");
+    let grant = key(Kind::Grant, "revised");
+    let approval = key(Kind::Approval, "pending");
+    let pending = Record {
+        end: Some(Duration::from_secs(2_000)),
+        ..record(1)
+    };
+    double.records.insert(key(Kind::Mark, ""), alpha_mark(Some(&[])));
+    double.records.insert(approval.clone(), pending.clone());
+    double.records.insert(grant.clone(), record(2));
+    let cancel = proposal("cancelled", &[&passkey], &[]);
+    let revision = proposal("revision", &[&grant], &[]);
+    double.write(&[
+        (op("enrolled"), Body::Creation(vec![anchor(&passkey, sign_in("a1"))])),
+        (
+            op("cancelled"),
+            Body::End(journal::entries(&cancel, &[], &[]).unwrap().end.unwrap()),
+        ),
+        (op("cancelled"), Body::Void(Sequence(2))),
+        (
+            op("revision"),
+            Body::End(journal::entries(&revision, &[], &[]).unwrap().end.unwrap()),
+        ),
+    ]);
+    let mut harness = Harness::new(declaration(true), double);
+    harness.driver.start(now());
+    harness.run(once(|event| *event == Event::Expire(Kind::SignIn), Fault::Fail));
+    assert_eq!(harness.driver.status(), Status::Down);
+    harness.driver.start(now());
+    harness.run(|_| None);
+    assert_eq!(harness.driver.status(), Status::Serving);
+    assert_eq!(harness.double.records.get(&passkey), Some(&record(1)));
+    assert_eq!(harness.double.records.get(&grant), Some(&record(2)));
+    assert!(!harness.holds(&approval));
+
+    harness.double.records.insert(approval.clone(), pending);
+    harness.driver.start(now());
+    harness.run(|_| None);
+    assert_eq!(harness.driver.status(), Status::Serving);
+    assert!(harness.holds(&approval));
+}
+
+/// Begin an ordinary upgrade. The refusal identifies the entry and leaves both durable stores intact.
+fn alpha_review(double: &Double, entry: u64) -> Harness {
+    let mut harness = Harness::new(declaration(true), double.clone());
+    harness.driver.start(now());
+    harness.run(|_| None);
+    assert_eq!(
+        harness.driver.status(),
+        Status::Refused(Error::AlphaReview {
+            instance: Instance(1),
+            sequence: Sequence(entry),
+        })
+    );
+    assert_eq!(harness.double.records, double.records);
+    assert_eq!(harness.double.journal, double.journal);
+    harness
+}
+
+/// Give the verified source to the same driver and run its storage effects.
+fn resolve_alpha(harness: &mut Harness, source: AlphaSource) -> Status {
+    let Status::Refused(Error::AlphaReview { instance, .. }) = harness.driver.status() else {
+        panic!("the upgrade must request review");
+    };
+    harness.driver.resolve_alpha(instance, source, now()).unwrap();
+    harness.run(|_| None);
+    harness.driver.status()
+}
+
+/// An unresolved removal has two possible histories. The operator verifies the primary before choosing one.
+#[test]
+fn a_reviewed_alpha_removal_follows_the_verified_source_in_its_original_instance() {
+    let passkey = key(Kind::Credential, "a1p");
+    let mut double = Double::new();
+    double.records.insert(key(Kind::Mark, ""), alpha_mark(Some(&[])));
+    let unlink = proposal("unlink", &[&passkey], &[]);
+    let end = journal::entries(&unlink, &[], &[]).unwrap().end.unwrap();
+    double.write(&[
+        (op("enrolled"), Body::Creation(vec![anchor(&passkey, sign_in("a1"))])),
+        (op("unlink"), Body::End(end)),
+    ]);
+    for source in [AlphaSource::Intact, AlphaSource::Snapshot] {
+        let mut harness = alpha_review(&double, 2);
+        assert_eq!(
+            harness.driver.resolve_alpha(Instance(0), source, now()),
+            Err(Error::Superseded)
+        );
+        assert_eq!(resolve_alpha(&mut harness, source), Status::Serving);
+        assert_eq!(harness.driver.instance(), Ok(Instance(1)));
+        assert_eq!(harness.holds(&passkey), source == AlphaSource::Intact);
+        assert_eq!(
+            harness.has(&appended(Written::Void, "unlink")),
+            source == AlphaSource::Intact
+        );
+    }
+    // A peer takes a new instance while the review is open. The old decision cannot write its void.
+    let mut harness = alpha_review(&double, 2);
+    assert_matches!(
+        harness.double.execute(Effect::Start, None),
+        Output::Started(Instance(2))
+    );
+    assert_eq!(
+        resolve_alpha(&mut harness, AlphaSource::Intact),
+        Status::Refused(Error::Superseded)
+    );
+    assert_eq!(harness.double.records, double.records);
+    assert_eq!(harness.double.journal, double.journal);
+}
+
+/// A receipt proves a removal committed. A declaration that the primary is intact cannot cancel it.
+#[test]
+fn review_of_an_alpha_grant_cannot_void_a_committed_revocation() {
+    let grant = key(Kind::Grant, "g-1");
+    let revoked = proposal("revoke", &[&grant], &[]);
+    let mut double = Double::new();
+    double.records.insert(grant.clone(), record(1));
+    double.records.insert(key(Kind::Mark, ""), alpha_mark(Some(&[])));
+    double.records.extend([outcome_record(&revoked)]);
+    double.write(&[(
+        op("revoke"),
+        Body::End(journal::entries(&revoked, &[], &[]).unwrap().end.unwrap()),
+    )]);
+    let mut harness = alpha_review(&double, 1);
+    let review = harness.driver.status();
+    assert_eq!(resolve_alpha(&mut harness, AlphaSource::Intact), review);
+    assert_eq!(harness.double.records, double.records);
+    assert_eq!(harness.double.journal, double.journal);
+    assert_eq!(resolve_alpha(&mut harness, AlphaSource::Snapshot), Status::Serving);
+    assert!(!harness.holds(&grant));
+}
+
+/// A missing credential needs a verified snapshot. Conflicting bytes at one version need a trustworthy store copy.
+#[test]
+fn an_alpha_upgrade_checks_the_record_of_a_live_credential() {
+    let passkey = key(Kind::Credential, "a1p");
+    for held in [
+        None,
+        Some(Record {
+            data: Box::new(*b"different"),
+            ..record(1)
+        }),
+    ] {
+        let mut double = Double::new();
+        double.records.remove(&passkey);
+        double
+            .records
+            .extend(held.clone().map(|record| (passkey.clone(), record)));
+        double.records.insert(key(Kind::Mark, ""), alpha_mark(Some(&[])));
+        double.write(&[(op("enrolled"), Body::Creation(vec![anchor(&passkey, sign_in("a1"))]))]);
+        let mut harness = alpha_review(&double, 1);
+        let review = harness.driver.status();
+        assert_eq!(resolve_alpha(&mut harness, AlphaSource::Intact), review);
+        let resolved = resolve_alpha(&mut harness, AlphaSource::Snapshot);
+        if held.is_some() {
+            assert_eq!(resolved, review);
+            assert_eq!(harness.double.records, double.records);
+            assert_eq!(harness.double.journal, double.journal);
+        } else {
+            assert_eq!(resolved, Status::Serving);
+            assert_eq!(harness.double.records.get(&passkey), Some(&record(1)));
+        }
+    }
+}
+
+/// A spent recovery value with a missing outcome can still create a credential during snapshot restore.
+#[test]
+fn an_alpha_upgrade_pauses_before_completing_an_uncertain_credential() {
+    let mut double = in_doubt();
+    double.records.remove(&key(Kind::Recovery, "a2c"));
+    double.records.remove(&key(Kind::Bootstrap, "b-1"));
+    double.records.insert(key(Kind::Mark, ""), alpha_mark(Some(&[])));
+    let mut harness = alpha_review(&double, 1);
+    assert_eq!(resolve_alpha(&mut harness, AlphaSource::Intact), Status::Serving);
+    assert!(!harness.holds(&key(Kind::Credential, "a2n")));
 }
 
 /// The in-doubt consumptions that a restore owes stay in the mark record: after a crash during the completions, the

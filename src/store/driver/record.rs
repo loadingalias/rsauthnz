@@ -7,7 +7,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::Begin;
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Id, Principal};
 use crate::limits::Limits;
@@ -52,6 +51,15 @@ pub(super) fn bytes_max(limits: Limits) -> usize {
     limits.bytes.max(base.saturating_add(8).saturating_add(keys))
 }
 
+/// A current restore finishes when its replay floor names the same instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RestoreMark {
+    Settled,
+    Instance(Instance),
+    /// The original alpha format recorded that a restore started. It kept that flag after cleanup.
+    Alpha,
+}
+
 /// The state of the mark record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct State {
@@ -59,8 +67,7 @@ pub(super) struct State {
     pub(super) version: Option<AuthorityVersion>,
     /// The low-water mark of the store state.
     pub(super) mark: Mark,
-    /// A restore finishes when the replay floor names this instance.
-    pub(super) restoring: Option<Instance>,
+    pub(super) restore: RestoreMark,
     /// The number of this write of the record. After each write, the driver appends a floor entry of
     /// [`Kind::Mark`] with it, so a journal with a higher number shows a store state older than its journal.
     pub(super) written: u64,
@@ -75,7 +82,7 @@ impl Default for State {
         Self {
             version: None,
             mark: Mark::EMPTY,
-            restoring: None,
+            restore: RestoreMark::Settled,
             written: 0,
             owed: Vec::new(),
             floors: BTreeMap::new(),
@@ -89,13 +96,13 @@ pub(super) fn mark_key() -> Key {
 }
 
 impl State {
-    /// Cleanup can remain after the last consumption. Older marks record only the consumptions.
-    pub(super) fn needs_restore(&self) -> bool {
-        self.restoring.is_some() || !self.owed.is_empty()
+    /// An empty alpha list can describe a settled store or an interrupted restore.
+    pub(super) fn ambiguous(&self) -> bool {
+        self.restore == RestoreMark::Alpha && self.owed.is_empty()
     }
 
     /// The state of the stored mark record, or `None` for another form within `limits`.
-    pub(super) fn read(record: &Record, limits: Limits, begin: Begin) -> Option<Self> {
+    pub(super) fn read(record: &Record, limits: Limits) -> Option<Self> {
         let Value::Array(items) = cbor::decode(&record.data, limits).ok()? else {
             return None;
         };
@@ -111,10 +118,10 @@ impl State {
         else {
             return None;
         };
-        let restoring = match (*form, phase) {
-            (FORM, Value::Unsigned(instance)) => Some(Instance(*instance)),
-            (FORM, Value::Null) | (FIRST_FORM, Value::Bool(false)) if owed.is_empty() => None,
-            (FIRST_FORM, Value::Bool(true)) if !owed.is_empty() || begin == Begin::Restore => None,
+        let restore = match (*form, phase) {
+            (FORM, Value::Unsigned(instance)) => RestoreMark::Instance(Instance(*instance)),
+            (FORM, Value::Null) | (FIRST_FORM, Value::Bool(false)) if owed.is_empty() => RestoreMark::Settled,
+            (FIRST_FORM, Value::Bool(true)) => RestoreMark::Alpha,
             _ => return None,
         };
         let owed = owed
@@ -145,7 +152,7 @@ impl State {
                 sequence: Sequence(*sequence),
                 link: Link(<[u8; 32]>::try_from(*link).ok()?),
             },
-            restoring,
+            restore,
             written: *written,
             owed,
             floors,
@@ -160,8 +167,11 @@ impl State {
             Value::Text(FORM),
             Value::Unsigned(self.mark.sequence.0),
             Value::Bytes(&self.mark.link.0),
-            self.restoring
-                .map_or(Value::Null, |instance| Value::Unsigned(instance.0)),
+            match self.restore {
+                RestoreMark::Settled => Value::Null,
+                RestoreMark::Instance(instance) => Value::Unsigned(instance.0),
+                RestoreMark::Alpha => return None,
+            },
             Value::Unsigned(self.written),
             Value::Array(self.owed.iter().map(|sequence| Value::Unsigned(sequence.0)).collect()),
             Value::Array(

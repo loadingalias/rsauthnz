@@ -387,6 +387,7 @@ The documentation of the [`driver`] module gives each operation of the driver an
 [`Driver::start`]: rsauthnz::store::driver::Driver::start
 [`Driver::status`]: rsauthnz::store::driver::Driver::status
 [`Driver::restore`]: rsauthnz::store::driver::Driver::restore
+[`Driver::resolve_alpha`]: rsauthnz::store::driver::Driver::resolve_alpha
 [`Driver::submit`]: rsauthnz::store::driver::Driver::submit
 [`Driver::take`]: rsauthnz::store::driver::Driver::take
 [`Driver::lookup`]: rsauthnz::store::driver::Driver::lookup
@@ -480,6 +481,7 @@ step. This table gives the step that each case checks first:
 | `RestoreAnchors` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreCompletions` | [4](#4-commit-a-proposal), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `RestoreEnds` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
+| `AlphaUpgrade` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `StartAfterRestore` | [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
 | `Bootstrap` | [4](#4-commit-a-proposal), [3](#3-read-one-record), [7](#7-read-one-key-prefix) |
 | `Rebootstrap` | [4](#4-commit-a-proposal), [7](#7-read-one-key-prefix), [8](#8-keep-the-restore-journal), [11](#11-implement-the-test-controls) |
@@ -503,6 +505,8 @@ The failure messages of the cases name these effects of the driver on the primit
   ends each record that a fact ends, writes each anchor that a creation entry made, raises each floor, and ends each
   pending sign-in challenge and approval. A replacement resumes recorded cleanup even when zero consumptions need completion.
   The driver publishes the replay floor after the final journal sync. Until then, the binding returns [`Inserted::Floor`].
+  During an alpha upgrade, the binding runs the ordinary start effects. If the driver requests review, keep both destinations in the reviewed instance.
+  The operator supplies the verified source with [`Driver::resolve_alpha`].
 - **The completion of in-doubt consumptions.** A consumption that pays for an anchor, such as an enrollment, is in
   doubt after a restore when the snapshot has no outcome record of it. The driver commits it again under its
   operation identity before the store serves.
