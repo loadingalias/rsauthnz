@@ -24,10 +24,9 @@
 //! time, and each one keeps the turn of its owner from its first effect to its last.
 //!
 //! An error of a primitive ([`Output::Failed`]) is a crash: the driver stops, gives an unknown outcome to the
-//! operation in progress, and serves again only after a start. The driver keeps its durable state in the mark record
-//! of the store ([`Kind::Mark`]): the low-water mark of the store state, whether a restore made the state, and the
-//! completions that a restore still owes. So the state rolls back with a snapshot, and a start after a crash during a
-//! restore completes the rest before it serves.
+//! operation in progress, and serves again only after a start. The mark record ([`Kind::Mark`]) holds the low-water
+//! mark, the restore instance, and the consumptions that still need completion. The replay floor names the restore
+//! instance only after recovery finishes. Until then, the next start resumes cleanup and completion.
 //!
 //! After a restore of a snapshot, call [`Driver::restore`], never [`Driver::start`]: a start voids the entries that a
 //! restore applies. A start refuses with [`Error::Restored`] when the journal shows a commit that the store lost: a
@@ -358,9 +357,8 @@ impl Core {
         OperationId::new(&id).expect("an identity of 32 bytes is valid")
     }
 
-    /// The commits that write the mark record, with `others` after it, and then the floor entry of the write, which
-    /// shows each later start that the store state has this write.
-    fn marking(&mut self, others: impl IntoIterator<Item = Proposal>) -> Result<Committing, Error> {
+    /// Write the mark record. Then sync its write number to the journal so a later start can detect rollback.
+    fn marking(&mut self) -> Result<Committing, Error> {
         let journaled = written(self.history.state()?);
         self.record.written = self
             .record
@@ -370,7 +368,7 @@ impl Core {
             .ok_or(Error::Overflow)?;
         let id = self.operation();
         let record = self.record.write(id, self.now, self.limits).ok_or(Error::Record)?;
-        let mut committing = Committing::new([record].into_iter().chain(others));
+        let mut committing = Committing::new([record]);
         if self.journal {
             let floor = journal::Floor {
                 kind: Kind::Mark,
@@ -1198,7 +1196,7 @@ impl Submitted {
                         core.record
                             .floors
                             .extend(floors.iter().map(|floor| (floor.kind, floor.value)));
-                        CommitPhase::Floor(core.marking([])?)
+                        CommitPhase::Floor(core.marking()?)
                     }
                 }
                 CommitPhase::Floor(_) => CommitPhase::Commit,
@@ -1289,7 +1287,7 @@ enum StartPhase {
     Reads(Fetching),
     /// The mark record with the completions that the restore owes, before the restore applies anything.
     Record(Committing),
-    /// The facts, the anchors, and the replay floor of a restore.
+    /// The facts and anchors of a restore.
     Apply(Committing),
     /// The end of the pending records of the kinds that pay for no anchor.
     Ends(VecDeque<Kind>),
@@ -1301,8 +1299,10 @@ enum StartPhase {
     Reconcile(Writing),
     /// The end of the journal intents.
     Release(Committing),
-    /// The mark record with no completion owed, and the replay floor of a binding that loses its state.
+    /// The final mark and its journal sync.
     Close(Committing),
+    /// The replay floor that admits work for this instance.
+    Open(Committing),
     Done,
 }
 
@@ -1328,7 +1328,8 @@ impl Start {
             StartPhase::Record(committing)
             | StartPhase::Apply(committing)
             | StartPhase::Release(committing)
-            | StartPhase::Close(committing) => committing.effect(core),
+            | StartPhase::Close(committing)
+            | StartPhase::Open(committing) => committing.effect(core),
             StartPhase::Ends(kinds) => kinds
                 .front()
                 .map(|kind| Effect::Expire(*kind, Duration::MAX, PAGE, core.instance)),
@@ -1357,7 +1358,7 @@ impl Start {
                 };
                 core.record = match record {
                     None => record::State::default(),
-                    Some(record) => record::State::read(&record, core.limits).ok_or(Error::Record)?,
+                    Some(record) => record::State::read(&record, core.limits, self.begin).ok_or(Error::Record)?,
                 };
                 self.phase = if core.journal {
                     StartPhase::Journal(Paging {
@@ -1375,7 +1376,8 @@ impl Start {
             StartPhase::Record(committing)
             | StartPhase::Apply(committing)
             | StartPhase::Release(committing)
-            | StartPhase::Close(committing) => committing.give(core, output),
+            | StartPhase::Close(committing)
+            | StartPhase::Open(committing) => committing.give(core, output),
             StartPhase::Ends(kinds) => {
                 let removed = match output {
                     Output::Expired(Expiry::Removed(removed)) => removed,
@@ -1421,20 +1423,26 @@ impl Start {
                     self.reads = reading.reads;
                     self.floor = reading.floor;
                     if !core.journal {
-                        self.close(core)?
+                        Self::close(core)?
                     } else if self.begin == Begin::Restore {
                         let activation = journal::restore(&core.history, &self.reads)?;
-                        core.record.restored = true;
+                        core.record.restoring = Some(core.instance);
                         core.record.owed = activation
                             .completions
                             .iter()
                             .map(|completion| completion.sequence)
                             .collect();
                         self.activation = Some(activation);
-                        StartPhase::Record(core.marking([])?)
+                        StartPhase::Record(core.marking()?)
                     } else {
+                        if self
+                            .floor
+                            .is_some_and(|floor| Some(floor.instance) == core.record.restoring)
+                        {
+                            core.record.restoring = None;
+                        }
                         self.check(core)?;
-                        if core.record.owed.is_empty() {
+                        if !core.record.needs_restore() {
                             self.reconcile(core)?
                         } else {
                             // A crash stopped a restore: apply it again, and complete what it still owes.
@@ -1468,8 +1476,15 @@ impl Start {
                     }
                     StartPhase::Release(Committing::new(releases))
                 }
-                StartPhase::Release(_) => self.close(core)?,
-                StartPhase::Close(_) => {
+                StartPhase::Release(_) => {
+                    if self.activation.is_some() {
+                        core.record.restoring = Some(core.instance);
+                    }
+                    Self::close(core)?
+                }
+                StartPhase::Close(_) => self.open(core)?,
+                StartPhase::Open(_) => {
+                    core.record.restoring = None;
                     let state = core.history.state()?;
                     core.counters.clear();
                     let journaled = state.floors().map(|floor| (floor.kind, floor.value));
@@ -1509,9 +1524,8 @@ impl Start {
         Fetching::new(keys, operations)
     }
 
-    /// The commits of a restore: the end of each record at or below the version of its fact, the anchors that a
-    /// creation entry made, and the replay floor. Each one reads the store first, so a second run after a crash
-    /// commits only what the first did not.
+    /// End each record at or below its fact. Restore each anchor from its creation entry.
+    /// A second run reads each affected key and applies the changes that remain.
     fn apply(&self, core: &mut Core) -> Result<VecDeque<Proposal>, Error> {
         let activation = self.activation.as_ref().ok_or(Error::Record)?;
         let records = &self.reads.records;
@@ -1559,15 +1573,6 @@ impl Start {
                 proposals.push_back(proposal);
             }
         }
-        let version = records.get(&core.floor_key).cloned().flatten();
-        let floor = record::Floor {
-            estimate: core.now.estimate(),
-            bound: core.now.bound(),
-            instance: core.instance,
-        };
-        let id = core.operation();
-        proposals
-            .push_back(record::replay_floor(id, core.now, floor, core.limits, version.as_ref()).ok_or(Error::Record)?);
         Ok(proposals)
     }
 
@@ -1640,7 +1645,7 @@ impl Start {
     fn check(&self, core: &mut Core) -> Result<(), Error> {
         let state = core.history.state()?;
         (written(state) <= core.record.written).ok_or(Error::Restored)?;
-        if core.record.owed.is_empty() {
+        if !core.record.needs_restore() {
             for anchor in state.anchors().filter(|anchor| anchor.end.is_none()) {
                 let held = self.reads.records.get(&anchor.key).is_some_and(Option::is_some);
                 (held || state.ends(&anchor.key, &anchor.version)?).ok_or(Error::Restored)?;
@@ -1649,30 +1654,28 @@ impl Start {
         Ok(())
     }
 
-    /// The last commits of a start: the mark record, with no completion owed, then the floor entry of its write, and
-    /// the replay floor of the new instance. A start of a binding that loses its state sets the floor at its reading.
-    /// Another start keeps the reading of the floor, or of no floor, which admits each value. A restore wrote its floor
-    /// already.
-    fn close(&self, core: &mut Core) -> Result<StartPhase, Error> {
+    /// Keep the restore instance in the final mark until its replay floor is durable.
+    fn close(core: &mut Core) -> Result<StartPhase, Error> {
         core.record.owed.clear();
-        let mut floor = None;
-        if self.begin == Begin::Start {
-            let (estimate, bound) = match self.floor {
-                _ if core.loses => (core.now.estimate(), core.now.bound()),
-                Some(kept) => (kept.estimate, kept.bound),
-                None => (Duration::ZERO, Some(Duration::ZERO)),
-            };
-            let version = self.reads.records.get(&core.floor_key).cloned().flatten();
-            let written = record::Floor {
-                estimate,
-                bound,
-                instance: core.instance,
-            };
-            let id = core.operation();
-            floor =
-                Some(record::replay_floor(id, core.now, written, core.limits, version.as_ref()).ok_or(Error::Record)?);
-        }
-        Ok(StartPhase::Close(core.marking(floor)?))
+        Ok(StartPhase::Close(core.marking()?))
+    }
+
+    /// Publish the replay floor after the mark and journal are durable. A durable store keeps its floor on an ordinary start.
+    fn open(&self, core: &mut Core) -> Result<StartPhase, Error> {
+        let (estimate, bound) = match self.floor {
+            _ if self.activation.is_some() || core.loses => (core.now.estimate(), core.now.bound()),
+            Some(kept) => (kept.estimate, kept.bound),
+            None => (Duration::ZERO, Some(Duration::ZERO)),
+        };
+        let version = self.reads.records.get(&core.floor_key).and_then(Option::as_ref);
+        let floor = record::Floor {
+            estimate,
+            bound,
+            instance: core.instance,
+        };
+        let id = core.operation();
+        let proposal = record::replay_floor(id, core.now, floor, core.limits, version).ok_or(Error::Record)?;
+        Ok(StartPhase::Open(Committing::new([proposal])))
     }
 }
 
@@ -1756,7 +1759,7 @@ impl Advance {
             return Ok(Self::Done);
         }
         core.record.mark = mark;
-        Ok(Self::Write(core.marking([])?, mark))
+        Ok(Self::Write(core.marking()?, mark))
     }
 }
 

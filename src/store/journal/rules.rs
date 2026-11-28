@@ -309,7 +309,7 @@ pub struct Activation {
     /// Raise the counter of each floor past its value.
     pub floors: Vec<Floor>,
     /// End each pending record of these kinds: a ceremony or a short-lived one-use value whose consumption pays for
-    /// no anchor. Then set the replay floor as a start does.
+    /// no anchor. The driver publishes the replay floor after reconciliation.
     pub ends: Vec<Kind>,
     /// Commit each in-doubt consumption again under its operation identity, in this order, which is journal order.
     /// Each commit writes the outcome record, and reconciliation then writes its creation entry.

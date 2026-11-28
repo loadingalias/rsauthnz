@@ -1081,7 +1081,52 @@ pub(super) async fn restore_journal<S: Subject>(binding: S) -> Checked {
     run.commit(revocation, Plan::default(), "a revocation of an invitation")
         .await?;
 
-    run.restore(&snapshot).await?;
+    run.binding.restore(&snapshot);
+    run.driver.restore(now()).map_err(failed("restore"))?;
+    let mut cleanup = false;
+    let mut closing = false;
+    run.steps(|effect| {
+        match effect {
+            Effect::Expire(..) => cleanup = true,
+            Effect::Commit(proposal, _) if cleanup && proposal.audit().action.value() == "store.mark" => closing = true,
+            Effect::Sync(_) if closing => return Next::Stop,
+            _ => {}
+        }
+        Next::Run(None)
+    })
+    .await?;
+    ensure(
+        matches!(run.driver.effect(), Some(Effect::Sync(_))),
+        "restore did not reach its final journal sync",
+    )?;
+    let signature = replay(1, 2);
+    ensure(
+        inserted(&mut run.binding, &signature).await? == Inserted::Floor,
+        "a signed request committed before the final journal sync of a restore",
+    )?;
+    run.step(&mut |_| Next::Run(None)).await?;
+    let mut replacement = Run::started(run.binding.clone()).await?;
+    run.settle().await?;
+    ensure(
+        run.driver.status() == Status::Refused(driver::Error::Superseded),
+        "the old restore opened admission after its replacement started",
+    )?;
+    let earlier = Insert::new(
+        &[1; 32],
+        &[2; 32],
+        Duration::from_secs(1_300),
+        signature.deadline(),
+        now().estimate(),
+    );
+    ensure(
+        inserted(&mut replacement.binding, &earlier).await? == Inserted::Floor,
+        "the replacement admitted a signature from before recovery",
+    )?;
+    ensure(
+        inserted(&mut replacement.binding, &signature).await? == Inserted::Accepted,
+        "the replacement did not open admission after recovery",
+    )?;
+    let mut run = replacement;
     for (key, what) in [
         (&a1q, "the passkey of an unlink"),
         (&session, "a revoked session"),
@@ -1339,14 +1384,14 @@ pub(super) async fn restore_completions<S: Subject>(binding: S) -> Checked {
 pub(super) async fn restore_ends<S: Subject>(binding: S) -> Checked {
     let mut run = Run::seeded(binding).await?;
     let (challenge, approval) = (key(Kind::SignIn, "ch-1"), key(Kind::Approval, "ap-1"));
+    let (proposal, plan_e) = enrollment("e-1");
+    run.commit(proposal, plan_e, "an enrollment").await?;
     let snapshot = run.binding.snapshot();
     let sign_in_commit = Build::new("s-in")
         .ends(&challenge, 1)
         .writes(&key(Kind::Session, "s-2"), 1)
         .done();
     run.commit(sign_in_commit, Plan::default(), "a sign-in").await?;
-    let (proposal, plan_e) = enrollment("e-1");
-    run.commit(proposal, plan_e, "an enrollment").await?;
     let history = run.history().await?;
     ensure(
         !has(&history, "s-in", |_| true),
@@ -1375,8 +1420,16 @@ pub(super) async fn restore_ends<S: Subject>(binding: S) -> Checked {
         matches!(run.driver.effect(), Some(Effect::Expire(Kind::SignIn, ..))),
         "restore did not request sign-in cleanup",
     )?;
-    let mut replacement = Run::new(run.binding.clone())?;
-    replacement.restore(&snapshot).await?;
+    let signature = replay(0, 1);
+    ensure(
+        inserted(&mut run.binding, &signature).await? == Inserted::Floor,
+        "a signed request committed while old sign-in challenges still awaited cleanup",
+    )?;
+    let mut replacement = Run::started(run.binding.clone()).await?;
+    ensure(
+        inserted(&mut replacement.binding, &signature).await? == Inserted::Accepted,
+        "a signed request that waited for recovery could not commit after admission opened",
+    )?;
     let fresh = key(Kind::SignIn, "new-challenge");
     let proposal = Build::new("fresh-challenge")
         .writes_until(&fresh, 1, Some(Duration::from_secs(2_000)))
@@ -1402,7 +1455,11 @@ pub(super) async fn restore_ends<S: Subject>(binding: S) -> Checked {
             "after a restore, a pending sign-in challenge or approval from the snapshot did not refuse",
         )?;
     }
-    Ok(())
+    replacement.start().await?;
+    ensure(
+        replacement.holds(&fresh).await?,
+        "an ordinary start after recovery removed a fresh sign-in challenge",
+    )
 }
 
 pub(super) async fn start_after_restore<S: Subject>(binding: S) -> Checked {

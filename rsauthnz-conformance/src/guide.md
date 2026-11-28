@@ -501,7 +501,8 @@ The failure messages of the cases name these effects of the driver on the primit
   whose commit did not land.
 - **Restore.** [`Driver::restore`] applies each entry after the mark of the snapshot before the store serves. It
   ends each record that a fact ends, writes each anchor that a creation entry made, raises each floor, and ends each
-  pending sign-in challenge and approval. Then it sets the replay floor.
+  pending sign-in challenge and approval. A replacement resumes recorded cleanup even when zero consumptions need completion.
+  The driver publishes the replay floor after the final journal sync. Until then, the binding returns [`Inserted::Floor`].
 - **The completion of in-doubt consumptions.** A consumption that pays for an anchor, such as an enrollment, is in
   doubt after a restore when the snapshot has no outcome record of it. The driver commits it again under its
   operation identity before the store serves.

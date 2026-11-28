@@ -129,10 +129,12 @@ applies an entry. The activation states what the restored store applies before i
 2. Write each anchor that a creation entry made after the snapshot, and that no fact ends (`anchors`).
 3. Raise the counter of each floor past its value (`floors`).
 4. End each pending record of a kind whose consumption pays for no anchor: a sign-in challenge, the challenge of a
-   CLI call, or an operation approval (`ends`). Then set the replay floor as a start does.
+   CLI call, or an operation approval (`ends`).
 5. Commit each in-doubt consumption again under its operation identity, in journal order (`completions`). Keep
    the list until each one commits, so that a crash before that does not end the restore. The driver keeps it in
    the mark record.
+6. Finish reconciliation and sync the final mark to the journal. Publish the replay floor for the current instance.
+   Signed requests can now pass the replay check.
 
 A consumption entry is in doubt when the snapshot has no outcome record of its operation, and the history has no
 creation entry of it. A known commit of the same value excludes it. A candidate completes when no earlier completion
@@ -187,10 +189,11 @@ outcome to the operation in progress, and serves again only after `driver.start(
 1. Call `driver.start(now)` at first, and after each crash. It writes a new store instance number, reads the mark
    record and the journal after its mark, writes the missing creation entries and the voids of reconciliation, and
    then serves.
-2. After a restore of a snapshot, call `driver.restore(now)`, never `start`: a start voids the entries that a restore
-   applies. Exclude writers from earlier instances at both destinations before installing the snapshot. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
-   applies the activation and completes each in-doubt consumption. A start after a crash during the restore
-   completes the rest before it serves.
+2. Exclude earlier writers at both destinations before installing a snapshot. After installation, call `driver.restore(now)`.
+   A binding without a journal returns `Error::Unsupported`.
+   The driver records the restore instance before it applies the journal or deletes pending challenges and approvals.
+   After that record is durable, an ordinary start resumes an interrupted restore, even when zero consumptions need completion.
+   A matching replay floor confirms that recovery finished. A later start keeps challenges issued after recovery.
 3. Submit a commit with `driver.submit(proposal, plan)`. The `Plan` gives the anchors of the owners that the store
    holds, the writes that replace a dead version, and the role of each new anchor. Take the answer with
    `driver.take(ticket)`. A proposal with a record longer than `record_bytes_max` refuses with

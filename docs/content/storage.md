@@ -210,8 +210,7 @@ agent](http-signatures.md#the-replay-store)). It is one atomic step, with no aud
 commit driver, so the requests of many agents insert at the same time. In that step, in this order, the binding:
 
 1. Reads the replay floor record (`store::floor_key()`). When `insert.admits(floor, instance)` does not hold for it and
-   the current instance number, it gives `Inserted::Floor`. Thus no insert lands between a start or a restore and the
-   write of its floor.
+   the current instance number, it gives `Inserted::Floor`. The driver publishes that floor after cleanup, reconciliation, and the final journal sync.
 2. Gives `Inserted::Present` when a record has `insert.key()`: the signature is a repetition.
 3. Counts the records of `Kind::Signature` and the records of `insert.share()`. When `signatures.admits(records,
    share)` does not hold, it gives `Inserted::Full`.

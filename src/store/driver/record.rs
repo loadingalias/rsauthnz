@@ -7,6 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use super::Begin;
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Id, Principal};
 use crate::limits::Limits;
@@ -16,7 +17,8 @@ use crate::time::{Reading, ReadingSource};
 use crate::transition::{Audit, Change, Dependency, Key, OperationId, Proposal};
 
 /// The first item of the CBOR form of the mark record. Its number changes with the form.
-const FORM: &str = "rsauthnz.store.mark.1";
+const FORM: &str = "rsauthnz.store.mark.2";
+const FIRST_FORM: &str = "rsauthnz.store.mark.1";
 
 /// The action of the commit that writes the mark record.
 pub(super) const MARK: &str = "store.mark";
@@ -57,8 +59,8 @@ pub(super) struct State {
     pub(super) version: Option<AuthorityVersion>,
     /// The low-water mark of the store state.
     pub(super) mark: Mark,
-    /// A snapshot restore made this store state. This field is part of the persisted mark.
-    pub(super) restored: bool,
+    /// A restore finishes when the replay floor names this instance.
+    pub(super) restoring: Option<Instance>,
     /// The number of this write of the record. After each write, the driver appends a floor entry of
     /// [`Kind::Mark`] with it, so a journal with a higher number shows a store state older than its journal.
     pub(super) written: u64,
@@ -73,7 +75,7 @@ impl Default for State {
         Self {
             version: None,
             mark: Mark::EMPTY,
-            restored: false,
+            restoring: None,
             written: 0,
             owed: Vec::new(),
             floors: BTreeMap::new(),
@@ -87,22 +89,33 @@ pub(super) fn mark_key() -> Key {
 }
 
 impl State {
+    /// Cleanup can remain after the last consumption. Older marks record only the consumptions.
+    pub(super) fn needs_restore(&self) -> bool {
+        self.restoring.is_some() || !self.owed.is_empty()
+    }
+
     /// The state of the stored mark record, or `None` for another form within `limits`.
-    pub(super) fn read(record: &Record, limits: Limits) -> Option<Self> {
+    pub(super) fn read(record: &Record, limits: Limits, begin: Begin) -> Option<Self> {
         let Value::Array(items) = cbor::decode(&record.data, limits).ok()? else {
             return None;
         };
         let [
-            Value::Text(FORM),
+            Value::Text(form),
             Value::Unsigned(sequence),
             Value::Bytes(link),
-            Value::Bool(restored),
+            phase,
             Value::Unsigned(written),
             Value::Array(owed),
             Value::Array(floors),
         ] = items.as_slice()
         else {
             return None;
+        };
+        let restoring = match (*form, phase) {
+            (FORM, Value::Unsigned(instance)) => Some(Instance(*instance)),
+            (FORM, Value::Null) | (FIRST_FORM, Value::Bool(false)) if owed.is_empty() => None,
+            (FIRST_FORM, Value::Bool(true)) if !owed.is_empty() || begin == Begin::Restore => None,
+            _ => return None,
         };
         let owed = owed
             .iter()
@@ -132,7 +145,7 @@ impl State {
                 sequence: Sequence(*sequence),
                 link: Link(<[u8; 32]>::try_from(*link).ok()?),
             },
-            restored: *restored,
+            restoring,
             written: *written,
             owed,
             floors,
@@ -147,7 +160,8 @@ impl State {
             Value::Text(FORM),
             Value::Unsigned(self.mark.sequence.0),
             Value::Bytes(&self.mark.link.0),
-            Value::Bool(self.restored),
+            self.restoring
+                .map_or(Value::Null, |instance| Value::Unsigned(instance.0)),
             Value::Unsigned(self.written),
             Value::Array(self.owed.iter().map(|sequence| Value::Unsigned(sequence.0)).collect()),
             Value::Array(

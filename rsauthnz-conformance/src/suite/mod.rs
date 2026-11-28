@@ -172,8 +172,8 @@ pub enum Case {
     /// refusal and its void, the outcome is unknown. Properties: `AnchorKept`, `RefusalHolds`.
     RefusalVoid,
     /// A restore from an old snapshot applies the journal: no unlinked passkey, revoked session, replaced grant
-    /// revision, or revoked one-use value is valid again. It sets the replay floor, and a lookup of a lost outcome is
-    /// unknown. Properties: `NothingEndedValid`, `MissingOutcomeUnknown`.
+    /// revision, or revoked one-use value is valid again. Replay waits through the final journal sync.
+    /// A missing outcome remains unknown. Properties: `NothingEndedValid`, `MissingOutcomeUnknown`.
     RestoreJournal,
     /// A restore raises each allocation floor above each released value, also from a snapshot of an abandoned
     /// history. Property: `NoCounterReuse`.
@@ -187,7 +187,7 @@ pub enum Case {
     /// serves, also after a crash during the completions. Properties: `AccountKeepsAnchorP`, `AdminKeptP`,
     /// `NoDoubtServing`, `OneUse`.
     RestoreCompletions,
-    /// Restore ends the old challenges and approvals. A delayed restore worker cannot delete a new challenge.
+    /// An ordinary start finishes interrupted cleanup. Fresh challenges survive a delayed worker and the next start.
     /// Only a consumption that pays for an anchor writes a journal entry.
     RestoreEnds,
     /// A normal start after a restore voids no entry that the restore applied. Property: `NothingEndedValid`.

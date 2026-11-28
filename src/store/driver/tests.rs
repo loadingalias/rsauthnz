@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::assert_matches;
 use core::time::Duration;
 
-use super::{Answer, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min};
+use super::{Answer, Begin, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min};
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
@@ -764,6 +764,54 @@ fn in_doubt() -> Double {
     double
 }
 
+/// An alpha mark can identify an ordinary start or list the consumptions of an unfinished restore.
+#[test]
+fn an_alpha_store_keeps_a_live_challenge_or_completes_its_recorded_consumptions() {
+    let challenge = key(Kind::SignIn, "pending");
+    for (begin, restored, owed, mut double) in [
+        (Begin::Start, false, vec![], Double::new()),
+        (Begin::Start, true, vec![1, 2], in_doubt()),
+        (Begin::Restore, true, vec![], in_doubt()),
+    ] {
+        let form = Value::Array(vec![
+            Value::Text("rsauthnz.store.mark.1"),
+            Value::Unsigned(0),
+            Value::Bytes(&[0; 32]),
+            Value::Bool(restored),
+            Value::Unsigned(1),
+            Value::Array(owed.into_iter().map(Value::Unsigned).collect()),
+            Value::Array(vec![]),
+        ]);
+        double.records.insert(
+            key(Kind::Mark, ""),
+            Record {
+                version: AuthorityVersion::new(Id::new("rsauthnz", "driver").unwrap(), &1u64.to_be_bytes()).unwrap(),
+                end: None,
+                data: cbor::encode(&form, Limits::default()).unwrap().into_boxed_slice(),
+            },
+        );
+        double.records.insert(
+            challenge.clone(),
+            Record {
+                end: Some(Duration::from_secs(2_000)),
+                ..record(1)
+            },
+        );
+        let mut harness = Harness::new(declaration(true), double);
+        match begin {
+            Begin::Start => harness.driver.start(now()),
+            Begin::Restore => harness.driver.restore(now()).unwrap(),
+        }
+        harness.run(|_| None);
+        assert_eq!(harness.driver.status(), Status::Serving);
+        assert_eq!(harness.holds(&challenge), !restored);
+        if restored {
+            assert!(harness.holds(&key(Kind::Credential, "a2n")));
+            assert!(harness.holds(&key(Kind::Administrator, "adm1")));
+        }
+    }
+}
+
 /// The in-doubt consumptions that a restore owes stay in the mark record: after a crash during the completions, the
 /// next start completes the rest before it serves. A second restore decision would find the bootstrap value ended.
 #[test]
@@ -942,8 +990,7 @@ fn a_start_on_a_rolled_back_store_refuses_and_a_crashed_start_does_not() {
                 harness.driver.start(now());
                 let mut commits = 0;
                 let after = matches!(between, Between::CrashAfterMark);
-                // The first commit of a start writes the mark record, and its journal entry comes after the commits
-                // of the start: the mark and the replay floor.
+                // The mark commit precedes its journal entry. The replay floor opens after that entry is durable.
                 harness.run(once(
                     |event| {
                         commits += usize::from(matches!(event, Event::Commit(..)));
