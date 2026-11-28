@@ -680,7 +680,8 @@ fn an_ended_binding_counts_as_no_administrator_and_the_owner_rebinds_it() {
     }
     assert_matches!(world.issue(&auth, "zoe", ended), Err(Error::Full));
     let limit = core::num::NonZeroUsize::new(16).unwrap();
-    while ready(store::expire(&mut world.memory, ended, limit)).unwrap() == store::Progress::More {}
+    let instance = world.driver.instance().unwrap();
+    while ready(store::expire(&mut world.memory, ended, limit, instance)).unwrap() == store::Progress::More {}
     world.issue(&auth, "zoe", ended).unwrap();
 }
 

@@ -47,7 +47,9 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 
 use super::journal::{self, Anchor, Body, Entries, History, Mark, Reads, Role};
-use super::{Commit, Instance, JournalWrite, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of};
+use super::{
+    Commit, Expiry, Instance, JournalWrite, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of,
+};
 use crate::cbor;
 use crate::id::AuthorityVersion;
 use crate::limits::Limits;
@@ -97,7 +99,7 @@ pub enum Effect<'a> {
     /// [`Store::commit`](super::Store::commit) of the proposal with the instance number. Give [`Output::Committed`].
     Commit(&'a Proposal, Instance),
     /// [`Store::expire`](super::Store::expire). Give [`Output::Expired`].
-    Expire(Kind, Duration, NonZeroUsize),
+    Expire(Kind, Duration, NonZeroUsize, Instance),
     /// [`Store::range`](super::Store::range) of the prefix after the key. Give [`Output::Range`].
     Range(&'a Key, Option<&'a Key>, NonZeroUsize),
     /// [`Journal::append`](super::Journal::append) of the entry. Give [`Output::Appended`].
@@ -115,7 +117,13 @@ impl fmt::Debug for Effect<'_> {
             Self::Start => f.write_str("Start"),
             Self::Read(key) => f.debug_tuple("Read").field(key).finish(),
             Self::Commit(proposal, instance) => f.debug_tuple("Commit").field(proposal).field(instance).finish(),
-            Self::Expire(kind, now, limit) => f.debug_tuple("Expire").field(kind).field(now).field(limit).finish(),
+            Self::Expire(kind, now, limit, instance) => f
+                .debug_tuple("Expire")
+                .field(kind)
+                .field(now)
+                .field(limit)
+                .field(instance)
+                .finish(),
             Self::Range(prefix, after, limit) => {
                 f.debug_tuple("Range").field(prefix).field(after).field(limit).finish()
             }
@@ -135,8 +143,8 @@ pub enum Output {
     Read(Option<Record>),
     /// The result of the commit.
     Committed(Commit),
-    /// The number of removed records.
-    Expired(usize),
+    /// The deletion result for the requested instance.
+    Expired(Expiry),
     /// The records of the range.
     Range(Vec<(Key, Record)>),
     /// The journal's conditional append result.
@@ -217,7 +225,7 @@ pub enum Error {
     Down,
     /// A counter is past its largest value.
     Overflow,
-    /// The journal refused the instance or the predecessor. Reconcile before serving more work.
+    /// A destination refused the instance or journal predecessor. Reconcile before serving more work.
     Superseded,
     /// The binding returned an unexpected output or refused an internal commit.
     Binding,
@@ -284,7 +292,7 @@ impl fmt::Display for Error {
             Self::RecordBytes => f.write_str("a record of the proposal is larger than the record bound of the binding"),
             Self::Down => f.write_str("the driver serves no operation yet"),
             Self::Overflow => f.write_str("a counter is past its largest value"),
-            Self::Superseded => f.write_str("the journal instance or head changed"),
+            Self::Superseded => f.write_str("the storage instance or journal head changed"),
             Self::Binding => f.write_str("the binding gave an output that the driver did not ask for"),
             Self::Record => f.write_str("the mark record of the store has no valid form"),
             Self::Restored => f.write_str("the store state is older than its journal: call restore, not start"),
@@ -459,6 +467,19 @@ impl Driver {
         self.core.status
     }
 
+    /// The serving instance. Capture it when scheduling an expiry pass.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). One status check.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Down`] if the driver cannot serve work.
+    pub fn instance(&self) -> Result<Instance, Error> {
+        (self.core.status == Status::Serving)
+            .then_some(self.core.instance)
+            .ok_or(Error::Down)
+    }
+
     /// Starts the store at `now`: a new instance number, then reconciliation, then service. Call it at first, and after
     /// each crash. Never call it after a restore of the store: call [`Driver::restore`].
     ///
@@ -483,12 +504,28 @@ impl Driver {
 
     fn begin(&mut self, now: Reading, begin: Begin) {
         self.core.now = now;
-        self.queue
-            .retain(|job| !matches!(job.work, Work::Start(_) | Work::Advance(_)));
+        self.retire_queue();
         self.queue.push_front(Job {
             ticket: None,
             cancelled: false,
             work: Work::Start(Box::new(Start::new(begin))),
+        });
+    }
+
+    /// A new activation admits new submissions. Only status reads carry over from the old queue.
+    fn retire_queue(&mut self) {
+        self.queue.retain(|job| match &job.work {
+            Work::Lookup(_) => true,
+            Work::Commit(submitted) => {
+                if let Some(ticket) = job.ticket
+                    && !job.cancelled
+                {
+                    self.answers
+                        .insert(ticket, Answer::Outcome(Outcome::Unknown(submitted.operation.clone())));
+                }
+                false
+            }
+            Work::Start(_) | Work::Advance(_) => false,
         });
     }
 
@@ -522,7 +559,7 @@ impl Driver {
 
     /// Submits the commit of `proposal`, with the anchors and the roles of `plan`. The driver checks the last
     /// anchor of each owner, writes the journal entries, commits, writes the creation entry, and then answers with
-    /// an [`Outcome`].
+    /// an [`Outcome`]. A queued proposal that crosses a new start or restore returns [`Outcome::Unknown`] under its original identity.
     ///
     /// Cost class: [`Mutate`](crate::limits::Class::Mutate).
     ///
@@ -678,7 +715,9 @@ impl Driver {
                 self.answers.insert(ticket, answer);
             }
         }
-        self.queue.retain(|job| !matches!(job.work, Work::Advance(_)));
+        if !self.queue.iter().any(|job| matches!(job.work, Work::Start(_))) {
+            self.retire_queue();
+        }
     }
 
     /// Brings the driver to its next effect: it takes the next operation, and it ends each operation that needs no
@@ -885,6 +924,7 @@ impl Committing {
                 self.proposals.pop_front();
                 Ok(())
             }
+            Output::Committed(Commit::Superseded) => Err(Error::Superseded),
             _ => Err(Error::Binding),
         }
     }
@@ -1196,6 +1236,7 @@ impl Submitted {
                 CommitPhase::Result(result) => {
                     self.outcome = Some(match result {
                         Commit::Recorded(stored) => stored.answer(&self.operation),
+                        Commit::Superseded => return Err(Error::Superseded),
                         Commit::Expired => Outcome::Refused(transition::Error::Expired),
                         Commit::Full => Outcome::Refused(transition::Error::Full),
                         Commit::Conflict | Commit::Accepted => Outcome::Conflict,
@@ -1288,7 +1329,9 @@ impl Start {
             | StartPhase::Apply(committing)
             | StartPhase::Release(committing)
             | StartPhase::Close(committing) => committing.effect(core),
-            StartPhase::Ends(kinds) => kinds.front().map(|kind| Effect::Expire(*kind, Duration::MAX, PAGE)),
+            StartPhase::Ends(kinds) => kinds
+                .front()
+                .map(|kind| Effect::Expire(*kind, Duration::MAX, PAGE, core.instance)),
             StartPhase::Complete(proposals) => proposals
                 .front()
                 .map(|proposal| Effect::Commit(proposal, core.instance)),
@@ -1334,8 +1377,10 @@ impl Start {
             | StartPhase::Release(committing)
             | StartPhase::Close(committing) => committing.give(core, output),
             StartPhase::Ends(kinds) => {
-                let Output::Expired(removed) = output else {
-                    return Err(Error::Binding);
+                let removed = match output {
+                    Output::Expired(Expiry::Removed(removed)) => removed,
+                    Output::Expired(Expiry::Superseded) => return Err(Error::Superseded),
+                    _ => return Err(Error::Binding),
                 };
                 if removed < PAGE.get() {
                     kinds.pop_front();
@@ -1345,9 +1390,11 @@ impl Start {
             StartPhase::Complete(proposals) => {
                 // A completion that does not commit leaves its value consumed. One that the store recorded
                 // completed before a crash.
-                let Output::Committed(_) = output else {
-                    return Err(Error::Binding);
-                };
+                match output {
+                    Output::Committed(Commit::Superseded) => return Err(Error::Superseded),
+                    Output::Committed(_) => {}
+                    _ => return Err(Error::Binding),
+                }
                 proposals.pop_front();
                 Ok(())
             }

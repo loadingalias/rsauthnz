@@ -487,8 +487,10 @@ pub fn expired(deadline: Option<Duration>, now: Reading) -> bool {
 pub enum Commit {
     /// Each dependency held, and the commit wrote the changes, the audit, the intents, and the outcome record.
     Accepted,
-    /// A dependency or the instance number did not hold, so the commit wrote nothing.
+    /// A dependency changed. The commit wrote nothing.
     Conflict,
+    /// A newer instance owns the store. This request wrote nothing. Stop this writer.
+    Superseded,
     /// A write of a new record of [`Kind::Signature`] does not fit the capacity of the binding
     /// ([`Declaration::signatures`]), so the commit wrote nothing. The binding never removes a live record to make
     /// space.
@@ -582,14 +584,15 @@ pub trait Store {
         }
     }
 
-    /// Removes at most `limit` records of `kind` whose end is before `before`, and gives their number. The binding
-    /// sets the end of each audit and outcome record from its retention.
+    /// Removes at most `limit` records of `kind` whose current end is before `before`.
+    /// Compare `instance` and the record's end in the deletion step. A stale instance gives [`Expiry::Superseded`].
     fn expire(
         &mut self,
         kind: Kind,
         before: Duration,
         limit: NonZeroUsize,
-    ) -> impl Future<Output = Result<usize, Self::Error>>;
+        instance: Instance,
+    ) -> impl Future<Output = Result<Expiry, Self::Error>>;
 
     /// Reads the first `limit` records whose key starts with `prefix` and comes after `after`, in key order. With
     /// `None`, it starts at the first key of the prefix. It gives fewer only when no more remain, and never a record of
@@ -784,6 +787,15 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// The result of one bounded expiry call at the primary store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// The store removed this many records in the supplied instance.
+    Removed(usize),
+    /// A newer instance owns the store. This call removed nothing.
+    Superseded,
+}
+
 /// The progress of an expiry pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Progress {
@@ -798,6 +810,8 @@ pub enum Progress {
 pub enum ExpiryError<E> {
     /// The reading has no known bound, so no record expires.
     Time(TimeError),
+    /// The store changed instance during the pass. Stop this pass. Earlier deletions can have committed.
+    Superseded,
     /// The binding failed.
     Store(E),
 }
@@ -954,20 +968,21 @@ pub fn intent_records(proposal: &Proposal) -> Result<Vec<(Key, Record)>, transit
 ///
 /// # Errors
 ///
-/// [`ExpiryError::Time`] if `now` has no known bound, and [`ExpiryError::Store`] if a call fails.
+/// [`ExpiryError::Time`] if `now` has no known bound. [`ExpiryError::Superseded`] if the store replaced `instance`.
+/// [`ExpiryError::Store`] if a call fails. Earlier deletions in the pass can have committed.
 ///
 /// ```
 /// use core::num::NonZeroUsize;
 ///
-/// use rsauthnz::store::{self, ExpiryError, Progress, Store};
+/// use rsauthnz::store::{self, ExpiryError, Instance, Progress, Store};
 /// use rsauthnz::time::Reading;
 ///
 /// /// At most 100 records of each kind in one pass.
 /// const LIMIT: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 ///
 /// /// Removes each ended record, one bounded pass after the other.
-/// async fn expire_all<S: Store>(binding: &mut S, now: Reading) -> Result<(), ExpiryError<S::Error>> {
-///     while store::expire(binding, now, LIMIT).await? == Progress::More {}
+/// async fn expire_all<S: Store>(binding: &mut S, now: Reading, instance: Instance) -> Result<(), ExpiryError<S::Error>> {
+///     while store::expire(binding, now, LIMIT, instance).await? == Progress::More {}
 ///     Ok(())
 /// }
 /// ```
@@ -975,11 +990,18 @@ pub async fn expire<S: Store>(
     store: &mut S,
     now: Reading,
     limit: NonZeroUsize,
+    instance: Instance,
 ) -> Result<Progress, ExpiryError<S::Error>> {
     let before = now.earliest().map_err(ExpiryError::Time)?;
     let mut progress = Progress::Done;
     for kind in Kind::ALL.into_iter().filter(Kind::ends) {
-        let removed = store.expire(kind, before, limit).await.map_err(ExpiryError::Store)?;
+        let Expiry::Removed(removed) = store
+            .expire(kind, before, limit, instance)
+            .await
+            .map_err(ExpiryError::Store)?
+        else {
+            return Err(ExpiryError::Superseded);
+        };
         if removed >= limit.get() {
             progress = Progress::More;
         }

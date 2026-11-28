@@ -16,8 +16,8 @@ use rsauthnz::limits::Limits;
 use rsauthnz::store::driver;
 use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
-    Capacity, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence,
-    Store,
+    Capacity, Commit, Declaration, Entry, Expiry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record,
+    Sequence, Store,
 };
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
@@ -222,8 +222,14 @@ impl Store for Broken {
         self.memory.insert_replay(&timeless).await
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
-        self.memory.expire(kind, before, limit).await
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, Error> {
+        self.memory.expire(kind, before, limit, instance).await
     }
 
     async fn range(
@@ -365,8 +371,14 @@ impl Store for Measured {
         self.memory.insert_replay(insert).await
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
-        self.memory.expire(kind, before, limit).await
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, Error> {
+        self.memory.expire(kind, before, limit, instance).await
     }
 
     async fn range(

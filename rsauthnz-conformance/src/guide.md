@@ -129,7 +129,7 @@ Implement [`Store::commit`]. It is the only primitive that writes audit or an ou
 atomic step:
 
 1. Compare the instance number of the call with the number of the latest start. When they differ, give
-   [`Commit::Conflict`].
+   [`Commit::Superseded`].
 2. Read the outcome record of the operation identity: the key of [`outcome_record`]. When it exists, give
    [`Commit::Recorded`] with the operation of [`outcome_of`]. Give it also when a dependency no longer holds: a
    second submission of a commit never finds its own dependencies.
@@ -205,6 +205,7 @@ The insert can already be durable. A later read of the key cannot identify which
 [`store::share`]: rsauthnz::store::share
 [`Commit::Full`]: rsauthnz::store::Commit::Full
 [`Commit::Conflict`]: rsauthnz::store::Commit::Conflict
+[`Commit::Superseded`]: rsauthnz::store::Commit::Superseded
 [`Commit::Expired`]: rsauthnz::store::Commit::Expired
 [`Proposal::deadline`]: rsauthnz::transition::Proposal::deadline
 [`store::expired`]: rsauthnz::store::expired
@@ -243,13 +244,12 @@ for it. A lookup after the retention gives an unknown outcome.
 
 ## 6. Expire ended records
 
-Implement [`Store::expire`]. It removes at most `limit` records of one kind whose end is before `before`, and it
-gives their number. It removes no record of another kind, no record with no end, and no record whose end is at
-`before` or later. Keep an index of the ends of each kind, so that the cost of a call follows `limit`, not the size
-of the store.
+Implement [`Store::expire`]. Compare the supplied instance at the primary. A mismatch gives `Expiry::Superseded` without a deletion.
+Use an index of ends to find candidates. In the deletion step, check the instance, kind, and current end.
+Remove up to `limit` records whose current end is before `before`. Return `Expiry::Removed(count)`.
 
-The application runs [`store::expire`] in bounded passes. It calls [`Store::expire`] only for each kind that
-[`Kind::ends`] names.
+The application captures `driver.instance()?` when it schedules cleanup. It passes that instance to [`store::expire`] for each bounded pass.
+Each pass calls [`Store::expire`] for the kinds that [`Kind::ends`] names.
 
 [`Store::expire`]: rsauthnz::store::Store::expire
 [`store::expire`]: rsauthnz::store::expire
@@ -340,8 +340,8 @@ async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Out
             .commit(proposal, instance)
             .await
             .map_or(Output::Failed, Output::Committed),
-        Effect::Expire(kind, before, limit) => binding
-            .expire(kind, before, limit)
+        Effect::Expire(kind, before, limit, instance) => binding
+            .expire(kind, before, limit, instance)
             .await
             .map_or(Output::Failed, Output::Expired),
         Effect::Range(prefix, after, limit) => binding

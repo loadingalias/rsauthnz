@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use rsauthnz::store::journal::Append;
 use rsauthnz::store::{
-    Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence, Store,
+    Commit, Declaration, Entry, Expiry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence,
+    Store,
 };
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Key, Proposal};
@@ -108,9 +109,15 @@ impl Store for Gated {
         self.memory.insert_replay(insert).await
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, Error> {
         self.pass().await;
-        self.memory.expire(kind, before, limit).await
+        self.memory.expire(kind, before, limit, instance).await
     }
 
     async fn range(

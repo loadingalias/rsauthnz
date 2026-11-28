@@ -289,8 +289,8 @@ async fn execute(binding: &mut Files, effect: Effect<'_>) -> Output {
             .commit(proposal, instance)
             .await
             .map_or(Output::Failed, Output::Committed),
-        Effect::Expire(kind, before, limit) => binding
-            .expire(kind, before, limit)
+        Effect::Expire(kind, before, limit, instance) => binding
+            .expire(kind, before, limit, instance)
             .await
             .map_or(Output::Failed, Output::Expired),
         Effect::Range(prefix, after, limit) => binding

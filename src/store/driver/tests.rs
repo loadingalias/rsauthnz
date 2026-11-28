@@ -11,8 +11,8 @@ use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{self, Anchor, Body, Mark, Role};
 use crate::store::{
-    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, JournalWrite, Kind, Profile,
-    Record, Restore, audit_record, intent_records, outcome_of, outcome_record,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Expiry, Instance, Isolation, JournalWrite, Kind,
+    Profile, Record, Restore, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{
@@ -273,7 +273,10 @@ impl Double {
             }
             Effect::Read(key) => Output::Read(self.records.get(key).cloned()),
             Effect::Commit(proposal, instance) => Output::Committed(self.commit(proposal, instance)),
-            Effect::Expire(kind, before, limit) => {
+            Effect::Expire(kind, before, limit, instance) => {
+                if instance.0 != self.instance {
+                    return Output::Expired(Expiry::Superseded);
+                }
                 let ended: Vec<Key> = self
                     .records
                     .iter()
@@ -284,7 +287,7 @@ impl Double {
                 for key in &ended {
                     self.records.remove(key);
                 }
-                Output::Expired(ended.len())
+                Output::Expired(Expiry::Removed(ended.len()))
             }
             Effect::Range(prefix, after, limit) => Output::Range(
                 self.records
@@ -332,7 +335,7 @@ impl Double {
 
     fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Commit {
         if instance.0 != self.instance {
-            return Commit::Conflict;
+            return Commit::Superseded;
         }
         let (outcome, stored) = outcome_record(proposal);
         if let Some(earlier) = self.records.get(&outcome) {
@@ -919,7 +922,12 @@ fn a_start_on_a_rolled_back_store_refuses_and_a_crashed_start_does_not() {
         let snapshot = harness.double.records.clone();
         match between {
             Between::StartThenRollback => {
-                harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
+                let unlink = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
+                harness.run(|_| None);
+                assert_matches!(
+                    harness.answers.remove(&unlink),
+                    Some(Answer::Outcome(Outcome::Accepted(_)))
+                );
                 harness.driver.start(now());
                 harness.run(|_| None);
                 harness.double.records = snapshot;
@@ -957,7 +965,12 @@ fn a_start_on_a_rolled_back_store_refuses_and_a_crashed_start_does_not() {
     // The restore of the same store state serves, and applies the unlink.
     let mut harness = Harness::serving(true);
     let snapshot = harness.double.records.clone();
-    harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
+    let unlink = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&unlink),
+        Some(Answer::Outcome(Outcome::Accepted(_)))
+    );
     harness.driver.start(now());
     harness.run(|_| None);
     harness.double.records = snapshot;

@@ -90,7 +90,7 @@ this map. The binding stores the records of each kind in the same way, the mark 
 
 `Store::commit` holds the lock for each check and for the write:
 
-1. It compares the instance number. A different number gives `Commit::Conflict`.
+1. It compares the instance number. A different number gives `Commit::Superseded` and stops the old driver.
 2. It looks up the outcome record. A record gives `Commit::Recorded`.
 3. It checks each dependency in the map. A dependency that does not hold gives `Commit::Conflict`.
 4. For a proposal with a deadline, it reads the system clock, with a bound of one second, while it holds the lock. A
@@ -110,8 +110,9 @@ retention. A sum past the largest `Duration` gives `Duration::MAX`.
 
 ### 6. Expire ended records
 
-The binding keeps an index of the ends of each kind: a `BTreeSet` of end and key. `Store::expire` reads the index in
-the order of the ends, so it reads only the records that it removes. It removes them in one frame, and syncs the log.
+The binding keeps a `BTreeSet` of end and key for each kind. Under the write lock, expiry first checks the supplied instance.
+It reads eligible records in end order, removes them in one frame, and syncs the log.
+A delayed restore worker receives `Expiry::Superseded` before it can delete a new ceremony.
 
 ### 7. Read one key prefix
 

@@ -662,10 +662,12 @@ impl<S: Subject> State<S> {
 
     /// One expiry pass, if one is due at `now`: it removes at most [`EXPIRY_BATCH`] ended records of each kind.
     fn expire(&mut self, now: Reading) {
-        if now.estimate() >= self.expiry_next {
+        if now.estimate() >= self.expiry_next
+            && let Ok(instance) = self.driver.instance()
+        {
             self.expiry_next = now.estimate().saturating_add(EXPIRY_INTERVAL);
-            // A pass that fails removes nothing, and the next pass tries again.
-            let _pass = wait(store::expire(&mut self.store, now, EXPIRY_BATCH));
+            // Each scheduled pass uses the instance that serves it.
+            let _pass = wait(store::expire(&mut self.store, now, EXPIRY_BATCH, instance));
         }
     }
 

@@ -29,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
-    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
-    Journal, JournalWrite, Kind, Record, Restore, Sequence, Store, audit_record, intent_records, outcome_of,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Expiry, Insert, Inserted, Instance,
+    Isolation, Journal, JournalWrite, Kind, Record, Restore, Sequence, Store, audit_record, intent_records, outcome_of,
     outcome_record, policy_key,
 };
 use rsauthnz::time::{Reading, ReadingSource};
@@ -360,7 +360,7 @@ impl Open {
     /// The answer of a commit of `proposal` at the reading `now` that writes nothing, or `None` for a commit that writes.
     fn answer(&self, proposal: &Proposal, instance: Instance, now: Reading) -> Result<Option<Commit>, Error> {
         if instance != self.instance {
-            return Ok(Some(Commit::Conflict));
+            return Ok(Some(Commit::Superseded));
         }
         let (key, _) = outcome_record(proposal);
         if let Some(record) = self.records.by_key.get(&key) {
@@ -622,8 +622,17 @@ impl Store for Files {
         inner.serve(|open| open.commit(proposal, instance, retention, fault, now))
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, Error> {
         self.lock()?.serve(|open| {
+            if instance != open.instance {
+                return Ok(Expiry::Superseded);
+            }
             let ended: Vec<_> = open
                 .records
                 .ends
@@ -638,7 +647,7 @@ impl Store for Files {
             if removed > 0 {
                 open.write(ended, None)?;
             }
-            Ok(removed)
+            Ok(Expiry::Removed(removed))
         })
     }
 

@@ -167,7 +167,7 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Start` | `Store::start` | `Started(instance)` |
 | `Read(key)` | `Store::read` | `Read(record)` |
 | `Commit(proposal, instance)` | `Store::commit` | `Committed(commit)` |
-| `Expire(kind, before, limit)` | `Store::expire` | `Expired(count)` |
+| `Expire(kind, before, limit, instance)` | `Store::expire` | `Expired(Expiry::Removed(count))` or `Expired(Expiry::Superseded)` |
 | `Range(prefix, after, limit)` | `Store::range` | `Range(records)` |
 | `Append(append, instance)` | `Journal::append` | `Appended(result)` |
 | `Sync(instance)` | `Journal::sync` | `Synced(result)` |
@@ -199,8 +199,10 @@ outcome to the operation in progress, and serves again only after `driver.start(
    A request binding mismatch gives `Lookup::Refused`. A missing record gives `Lookup::Unknown`, including after expiry or restore.
    This read leaves the original request open.
 
-A journal write can return `JournalWrite::Conflict` when the instance or expected head changes.
-The driver stops with `Error::Superseded`. Recover the pending operation under its original identity.
+A stale primary commit or expiry returns `Superseded`. A journal write returns `JournalWrite::Conflict` if the instance or expected head changes.
+The driver stops with `Error::Superseded`. Keep the original identity of each uncertain operation.
+A queued submission receives `Outcome::Unknown` when a new start or restore retires its queue.
+Submissions made after that request wait for the new activation. Status reads can cross activation.
 
 The driver runs one operation at a time, a start first. A commit goes through these effects:
 

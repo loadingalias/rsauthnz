@@ -531,7 +531,10 @@ fn an_insert_at_or_after_the_expiry_and_skew_of_its_signature_refuses() {
     accept(&profile, memory, &read, 41).unwrap();
     let waiting = verify(&profile, &read, 98).expect("a check in the window");
     memory.set_clock(at(140));
-    while super::ready(store::expire(memory, at(140), NonZeroUsize::MIN)).expect("an expiry pass") == Progress::More {}
+    let instance = grantor.world.site.node.driver.instance().expect("the serving instance");
+    while super::ready(store::expire(memory, at(140), NonZeroUsize::MIN, instance)).expect("an expiry pass")
+        == Progress::More
+    {}
     // The record is gone, so only the clock of the store refuses the insert.
     assert_eq!(
         super::ready(waiting.accept(memory)).map_err(refused).err(),

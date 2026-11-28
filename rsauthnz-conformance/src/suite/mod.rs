@@ -141,7 +141,7 @@ pub enum Case {
     /// reads its absence, so only the check of that absence refuses the later one. Snapshot isolation permits this
     /// write skew.
     AbsenceRace,
-    /// Expiry removes at most its limit of ended records of its kind, and no other record. Property: `NoLiveRemoved`.
+    /// A stale expiry pass stops. Current expiry removes at most its limit of eligible records of its kind.
     Expiry,
     /// A range read gives the records of its prefix after its key, in key order, up to its limit. It gives no record of
     /// another prefix, such as the administrator binding of another authority.
@@ -187,8 +187,8 @@ pub enum Case {
     /// serves, also after a crash during the completions. Properties: `AccountKeepsAnchorP`, `AdminKeptP`,
     /// `NoDoubtServing`, `OneUse`.
     RestoreCompletions,
-    /// After a restore, each pending sign-in challenge and approval refuses. Their consumptions write no journal
-    /// entry, and a consumption that pays for an anchor writes one.
+    /// Restore ends the old challenges and approvals. A delayed restore worker cannot delete a new challenge.
+    /// Only a consumption that pays for an anchor writes a journal entry.
     RestoreEnds,
     /// A normal start after a restore voids no entry that the restore applied. Property: `NothingEndedValid`.
     StartAfterRestore,
@@ -611,8 +611,8 @@ pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output 
             .commit(proposal, instance)
             .await
             .map_or(Output::Failed, Output::Committed),
-        Effect::Expire(kind, before, limit) => binding
-            .expire(kind, before, limit)
+        Effect::Expire(kind, before, limit, instance) => binding
+            .expire(kind, before, limit, instance)
             .await
             .map_or(Output::Failed, Output::Expired),
         Effect::Range(prefix, after, limit) => binding
@@ -709,17 +709,22 @@ struct Run<S> {
 }
 
 impl<S: Subject> Run<S> {
-    /// A driver that started on `binding`.
-    async fn started(binding: S) -> Result<Self, String> {
+    /// An independent driver before its first start or restore.
+    fn new(binding: S) -> Result<Self, String> {
         let profile = Profile::new(binding.declaration())
             .map_err(|error| format!("the profile refuses the declaration: {error}"))?;
         let driver = Driver::new(profile, Limits::default())
             .map_err(|error| format!("the driver refuses the binding: {error}"))?;
-        let mut run = Self {
+        Ok(Self {
             binding,
             driver,
             audits: BTreeMap::new(),
-        };
+        })
+    }
+
+    /// A driver that started on `binding`.
+    async fn started(binding: S) -> Result<Self, String> {
+        let mut run = Self::new(binding)?;
         run.start().await?;
         Ok(run)
     }

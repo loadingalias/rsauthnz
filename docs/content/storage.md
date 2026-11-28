@@ -42,7 +42,7 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Store::read_pair([&first, &second])` | Looks up both keys in one store state. Returns two results in request order. Each absent key gives `None`. A repeated key gives the same result twice |
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
 | `Store::insert_replay(&insert)` | The atomic insert of the replay record of one HTTP signature, with no audit record. See [The replay insert](#the-replay-insert) |
-| `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
+| `Store::expire(kind, before, limit, instance)` | Checks the instance in the deletion step. Returns `Expiry::Removed(count)` for up to `limit` eligible records, or `Expiry::Superseded` |
 | `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |
 | `Store::range(&prefix, after, limit)` | Gives the first `limit` records whose key starts with `prefix` and comes after `after`, in key order, or from the prefix for `None`. It gives fewer only when no more remain, and never a record of another prefix. See [Range reads](#range-reads) |
 | `Journal::append(&append, instance)` | Compares the instance and the full head at the journal. Stores the entry and its new head in one write. A failed comparison gives `JournalWrite::Conflict` |
@@ -78,7 +78,8 @@ Otherwise it writes nothing.
 | `Commit` | Meaning |
 | --- | --- |
 | `Accepted` | The commit wrote everything. It is durable when it returns |
-| `Conflict` | A dependency or the instance number did not hold |
+| `Conflict` | An authority dependency changed. The caller can prepare a new proposal |
+| `Superseded` | A newer store instance owns the write. Stop the old driver and keep each uncertain operation identity |
 | `Expired` | The proposal has a deadline, and the clock of the binding can be at or after it, or has no bound. The driver gives `Refused(Error::Expired)` |
 | `Full` | A new replay record of a signature does not fit the capacity. The driver gives `Refused(Error::Full)`, with the recovery `Restart` |
 | `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). The commit driver gives the outcome from it: the receipt of the first commit for the same request, or `Error::Reuse` |
@@ -230,20 +231,23 @@ and outcome record from its retention. Expiry goes forward in bounded passes. Th
 ```rust
 use core::num::NonZeroUsize;
 
-use rsauthnz::store::{self, ExpiryError, Progress, Store};
+use rsauthnz::store::{self, ExpiryError, Instance, Progress, Store};
 use rsauthnz::time::Reading;
 
 /// At most 100 records of each kind in one pass.
 const LIMIT: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Removes each ended record, one bounded pass after the other.
-async fn expire_all<S: Store>(binding: &mut S, now: Reading) -> Result<(), ExpiryError<S::Error>> {
-    while store::expire(binding, now, LIMIT).await? == Progress::More {}
+async fn expire_all<S: Store>(binding: &mut S, now: Reading, instance: Instance) -> Result<(), ExpiryError<S::Error>> {
+    while store::expire(binding, now, LIMIT, instance).await? == Progress::More {}
     Ok(())
 }
 ```
 
-One pass of `store::expire(binding, now, limit)` makes one `Store::expire` call for each kind that can end
+Capture `driver.instance()?` when scheduling cleanup. Pass that instance through every page of the job.
+If a pass returns `ExpiryError::Superseded`, stop the job. Earlier pages can have completed.
+
+One pass of `store::expire(binding, now, limit, instance)` makes one `Store::expire` call for each kind that can end
 (`kind.ends()`). No call goes to the provider links, administrator bindings, agent identities, the replay floor, the
 intents, the policy records, the mark record, the records of local authorities, the issuers, or the workload
 registrations, because their records have no end. Each call removes

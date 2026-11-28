@@ -10,7 +10,7 @@ use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Id, Principal};
 use rsauthnz::limits::Limits;
 use rsauthnz::store::journal::{Append, Body, Floor, Mark};
-use rsauthnz::store::{Commit, Entry, Instance, Journal, JournalWrite, Kind, Sequence, Store};
+use rsauthnz::store::{Commit, Entry, Expiry, Instance, Journal, JournalWrite, Kind, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Proposal};
 
@@ -242,7 +242,11 @@ fn an_expiry_pass_removes_the_audit_and_outcome_records_only_after_the_finite_re
     let page = NonZeroUsize::new(16).unwrap();
     let end = Duration::from_secs(4_600);
     for kind in [Kind::Audit, Kind::Outcome] {
-        assert_eq!(ready(memory.expire(kind, end, page)), Ok(0), "{kind:?} at its end");
+        assert_eq!(
+            ready(memory.expire(kind, end, page, instance)),
+            Ok(Expiry::Removed(0)),
+            "{kind:?} at its end"
+        );
     }
     assert_eq!(
         ready(memory.outcome(&proposal.operation().id)).unwrap().as_ref(),
@@ -250,8 +254,8 @@ fn an_expiry_pass_removes_the_audit_and_outcome_records_only_after_the_finite_re
     );
     for kind in [Kind::Audit, Kind::Outcome] {
         assert_eq!(
-            ready(memory.expire(kind, end + Duration::from_nanos(1), page)),
-            Ok(1),
+            ready(memory.expire(kind, end + Duration::from_nanos(1), page, instance)),
+            Ok(Expiry::Removed(1)),
             "{kind:?} after its end"
         );
     }

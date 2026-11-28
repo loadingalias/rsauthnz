@@ -82,8 +82,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use rsauthnz::id::AuthorityVersion;
 use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
-    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
-    Journal, JournalWrite, Kind, Record, Restore, Sequence, Store,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Expiry, Insert, Inserted, Instance,
+    Isolation, Journal, JournalWrite, Kind, Record, Restore, Sequence, Store,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
@@ -414,7 +414,7 @@ impl Binding {
     fn apply(&mut self, request: Request, instance: Instance) -> Commit {
         let state = &mut self.store;
         if instance != self.instance {
-            return Commit::Conflict;
+            return Commit::Superseded;
         }
         if let Some(operation) = state
             .records
@@ -639,9 +639,18 @@ impl Store for Memory {
         Ok(binding.insert(insert))
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, Error> {
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, Error> {
         let mut binding = self.lock();
         binding.serving()?;
+        if instance != binding.instance {
+            return Ok(Expiry::Superseded);
+        }
         let prefix = kind.key(&[]).expect("a key of one byte is valid");
         let ended: Vec<Key> = binding
             .store
@@ -653,7 +662,7 @@ impl Store for Memory {
         for key in &ended {
             binding.store.records.remove(key);
         }
-        Ok(ended.len())
+        Ok(Expiry::Removed(ended.len()))
     }
 
     async fn range(

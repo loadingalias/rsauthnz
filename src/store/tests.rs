@@ -8,7 +8,7 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use super::{
-    Capacity, Commit, CrashInjection, CrashLoss, Declaration, Error, ExpiryError, Insert, Inserted, Instance,
+    Capacity, Commit, CrashInjection, CrashLoss, Declaration, Error, Expiry, ExpiryError, Insert, Inserted, Instance,
     Isolation, Kind, Profile, Progress, Record, Restore, Store, audit_record, expire, intent_records, outcome_record,
 };
 use crate::cbor::{self, Value};
@@ -212,7 +212,16 @@ impl Store for Ended {
         Ok(Vec::new())
     }
 
-    async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, !> {
+    async fn expire(
+        &mut self,
+        kind: Kind,
+        before: Duration,
+        limit: NonZeroUsize,
+        instance: Instance,
+    ) -> Result<Expiry, !> {
+        if instance != Instance(1) {
+            return Ok(Expiry::Superseded);
+        }
         self.calls.push((kind, before, limit.get()));
         let mut removed = 0;
         self.records.retain(|&(record, end)| {
@@ -220,7 +229,7 @@ impl Store for Ended {
             removed += usize::from(remove);
             !remove
         });
-        Ok(removed)
+        Ok(Expiry::Removed(removed))
     }
 }
 
@@ -241,7 +250,7 @@ fn expiry_runs_in_bounded_steps_that_keep_each_record_that_a_check_can_accept() 
 
     let mut passes = Vec::new();
     loop {
-        let progress = ready(expire(&mut store, reading(1_000), limit)).unwrap();
+        let progress = ready(expire(&mut store, reading(1_000), limit, Instance(1))).unwrap();
         passes.push(progress);
         if progress == Progress::Done {
             break;
@@ -262,7 +271,7 @@ fn expiry_runs_in_bounded_steps_that_keep_each_record_that_a_check_can_accept() 
     let unknown = Reading::new(Duration::from_secs(1_000), None, ReadingSource::SystemClock);
     let calls = store.calls.len();
     assert_matches!(
-        ready(expire(&mut store, unknown, limit)),
+        ready(expire(&mut store, unknown, limit, Instance(1))),
         Err(ExpiryError::Time(TimeError::UnknownBound))
     );
     assert_eq!(store.calls.len(), calls);
@@ -312,8 +321,8 @@ impl Store for Records {
             .collect())
     }
 
-    async fn expire(&mut self, _: Kind, _: Duration, _: NonZeroUsize) -> Result<usize, !> {
-        Ok(0)
+    async fn expire(&mut self, _: Kind, _: Duration, _: NonZeroUsize, _: Instance) -> Result<Expiry, !> {
+        Ok(Expiry::Removed(0))
     }
 }
 

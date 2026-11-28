@@ -78,8 +78,7 @@ A fault is a crash. After it, each primitive except `Store::start` gives an erro
 ## Cases
 
 The declaration selects the cases. A case that injects a fault needs `CrashInjection::Supported`, and a case that uses
-the journal needs `Restore::Journal`. The properties are those of the authority-restore
-[design model](design-models.md) that the case checks.
+the journal needs `Restore::Journal`. Each property names the rule exercised by that case. [Design models](design-models.md)
 
 | `Case` | Contract | Needs | Properties |
 | --- | --- | --- | --- |
@@ -90,9 +89,9 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | `Deadline` | A commit with a deadline reads the clock of the binding in its atomic step. A deadline after the latest time of the reading commits. A deadline at that latest time, or a reading with no bound, gives `Commit::Expired` and writes nothing. A second submission of a commit that landed gets its outcome record, also after its deadline | — | — |
 | `ConcurrentConsumption` | Two consumptions of one value at the same time give one commit and one conflict | — | `OneUse`, `PendExact` |
 | `AbsenceRace` | A grant change and a revocation race. The revocation writes its record, and the change reads its absence. Only one commits | — | — |
-| `Expiry` | Expiry removes at most its limit of ended records of its kind, and no other record | — | `NoLiveRemoved` |
+| `Expiry` | A stale expiry pass stops. Current expiry removes at most its limit of eligible records of its kind | — | `NoLiveRemoved` |
 | `Range` | A range read gives the records of its prefix after its key, in key order, up to its limit. It gives no record of another prefix, such as the administrator binding of another authority | — | — |
-| `Fencing` | A commit with the instance number of an earlier start refuses after a start, after a restart, and after a restore. Between a restore and the next start, a commit with the instance number at the snapshot, or of a start after it, refuses too | — | `NoStaleCommit` |
+| `Fencing` | An earlier instance cannot commit across a start, restart, or restore. A replaced driver preserves the original identities of in-flight and queued requests. A fresh writer can commit | — | `NoStaleCommit`, `PrimaryFence` |
 | `JournalFence` | Two requests for one head produce one successor. A different link at the same sequence refuses. An earlier instance cannot append or confirm durability | Journal | — |
 | `Retention` | A status read leaves the original request open. Audit and outcome records last through their declared end, rounded up by at most one second. After expiry removes the receipt, the issued credential still exists and lookup reports `Unknown` | — | `PassiveStatus` |
 | `LostResponse` | A commit whose response is lost landed: after the next start, its outcome record and its audit are readable. A commit that crashed before it landed wrote nothing | Crash | `MissingOutcomeUnknown` |
@@ -105,7 +104,7 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | `RestoreRefusal` | A restore refuses a journal that has a gap, or that does not reach back to the mark of the snapshot | Journal | — |
 | `RestoreAnchors` | A restore keeps each anchor that an acknowledged commit saw, so an account keeps a sign-in method. It adds no anchor whose commit did not land | Journal | `AnchorKept`, `AccountKeepsAnchorP`, `NoUncommittedAnchor` |
 | `RestoreCompletions` | A restore completes an in-doubt bootstrap, recovery, invitation activation, and enrollment once, before it serves, also after a crash during the completions | Crash, journal | `AccountKeepsAnchorP`, `AdminKeptP`, `NoDoubtServing`, `OneUse` |
-| `RestoreEnds` | After a restore, each pending sign-in challenge and approval refuses. Their consumptions write no journal entry, and a consumption that pays for an anchor writes one | Journal | — |
+| `RestoreEnds` | Restore ends old sign-in challenges and approvals. A replacement can issue a new challenge while the previous worker's cleanup is in flight. The new challenge survives | Journal | `PrimaryFence` |
 | `StartAfterRestore` | A normal start after a restore voids no entry that the restore applied | Journal | `NothingEndedValid` |
 | `Bootstrap` | The [local authority](local-authority.md) on the binding: a bootstrap value of one authority refuses at another, and after its end. Two concurrent uses of one value give one commit and one conflict or refusal, and a used value refuses. A remote call is admitted only for a live administrator binding, with a proof over the pending challenge of the binding. An owner re-bootstrap gives a new administrator, which ends the earlier binding with an unlink. Two concurrent unlinks of the last two administrators give one commit, also when the mark of the journal passes the first one, and the last binding stays. The report gives each issue and each consumption | — | `OneUse`, `OneBootValid`, `AdminKeptP` |
 | `Rebootstrap` | An owner re-bootstrap of the local authority ends the earlier value. A restore from a snapshot before it does not make the ended value valid again, and loses the new value. After a restore, the report gives the live binding of an issue after the snapshot, and that administrator unlinks an earlier one. The unlink of the last administrator still refuses. A lookup of a lost re-bootstrap shows its commit and no value, and the next issue ends that value. A restore completes an in-doubt bootstrap only when the snapshot holds its value and no re-bootstrap ended it, and its client then proves the possession of its key | Journal; the lost responses and the in-doubt bootstraps need crash | `OneBootValid`, `NothingEndedValid`, `AdminKeptP` |

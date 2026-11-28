@@ -75,7 +75,7 @@ futures in an executor gets the same results.
 
 1. Make the binding with `Memory::new(schedule)`. A new binding is stopped. To give each audit and outcome record an
    end, add `.with_retention(retention)` before the first commit.
-2. Call `Store::start` to get the store instance number (`Instance`). Give it to each commit.
+2. For direct primitive calls, take the instance from `Store::start`. Give it to each commit and expiry call.
 3. Call the primitives. After an error, call `Store::start` again, then check the state.
 
 ## Inject faults

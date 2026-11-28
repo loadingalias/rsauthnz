@@ -7,7 +7,7 @@ use core::time::Duration;
 use rsauthnz::limits::Limits;
 use rsauthnz::store::journal::{self, Append, Body, End, Floor, History, Mark};
 use rsauthnz::store::{
-    Commit, CrashLoss, Insert, Inserted, Instance, JournalWrite, intent_records, outcome_record, policy_key,
+    Commit, CrashLoss, Expiry, Insert, Inserted, Instance, JournalWrite, intent_records, outcome_record, policy_key,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 
@@ -241,11 +241,16 @@ pub(super) async fn replay_insert<S: Subject>(binding: S) -> Checked {
     ));
     let removed = run
         .binding
-        .expire(Kind::Signature, Duration::from_secs(1_399), NonZeroUsize::MIN)
+        .expire(
+            Kind::Signature,
+            Duration::from_secs(1_399),
+            NonZeroUsize::MIN,
+            run.driver.instance().map_err(failed("serving instance"))?,
+        )
         .await
         .map_err(failed("expire"))?;
     ensure(
-        removed == 1 && !holds(&mut run.binding, first.key()).await?,
+        removed == Expiry::Removed(1) && !holds(&mut run.binding, first.key()).await?,
         "expiry did not remove an ended replay record",
     )?;
     ensure(
@@ -355,6 +360,7 @@ pub(super) async fn absence_race<S: Subject>(mut binding: S) -> Checked {
 }
 
 pub(super) async fn expiry<S: Subject>(mut binding: S) -> Checked {
+    let previous = start(&mut binding).await?;
     let instance = start(&mut binding).await?;
     let seconds = |s: u64| Some(Duration::from_secs(s));
     let rows = [
@@ -373,11 +379,21 @@ pub(super) async fn expiry<S: Subject>(mut binding: S) -> Checked {
         "a commit whose dependencies hold refused",
     )?;
     let mut removed = Vec::new();
+    ensure(
+        matches!(
+            rsauthnz::store::expire(&mut binding, now(), PAGE, previous).await,
+            Err(rsauthnz::store::ExpiryError::Superseded)
+        ),
+        "a delayed expiry passed the new storage instance",
+    )?;
     for _ in 0..4 {
         let count = binding
-            .expire(Kind::Session, Duration::from_secs(25), NonZeroUsize::MIN)
+            .expire(Kind::Session, Duration::from_secs(25), NonZeroUsize::MIN, instance)
             .await
             .map_err(failed("expire"))?;
+        let Expiry::Removed(count) = count else {
+            return Err("expiry refused the current instance".into());
+        };
         removed.push(count);
     }
     ensure(
@@ -445,9 +461,9 @@ pub(super) async fn range<S: Subject>(mut binding: S) -> Checked {
     )
 }
 
-/// Whether the commit of `proposal` with `instance` conflicted and wrote nothing.
+/// Whether the store refused the old instance and wrote nothing.
 async fn fenced<S: Subject>(binding: &mut S, proposal: &Proposal, instance: Instance) -> Result<bool, String> {
-    Ok(committed(binding, proposal, instance).await? == Commit::Conflict && unrecorded(binding, proposal).await?)
+    Ok(committed(binding, proposal, instance).await? == Commit::Superseded && unrecorded(binding, proposal).await?)
 }
 
 pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
@@ -490,7 +506,46 @@ pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
     ensure(
         committed(&mut binding, &proposal("f-current"), current).await? == Commit::Accepted,
         "a commit with the instance number of the latest start refused",
-    )
+    )?;
+
+    let mut old = Run::started(binding).await?;
+    let first = proposal("f-first");
+    let first_op = first.operation().clone();
+    let in_flight = old.submit(first, Plan::default())?;
+    old.until_commit("f-first").await?;
+    let second = proposal("f-queued");
+    let second_op = second.operation().clone();
+    let queued = old.submit(second, Plan::default())?;
+    let mut replacement = Run::started(old.binding.clone()).await?;
+    old.settle().await?;
+    ensure(
+        old.driver.status() == Status::Refused(driver::Error::Superseded),
+        "a stale primary write kept its driver in service",
+    )?;
+    for (ticket, original) in [(in_flight, first_op), (queued, second_op)] {
+        ensure(
+            matches!(old.outcome(ticket).await?, Outcome::Unknown(op) if op == original),
+            "a superseded driver lost the original operation identity",
+        )?;
+    }
+    replacement
+        .commit(proposal("f-new"), Plan::default(), "the replacement writer")
+        .await?;
+    let before = proposal("f-before-start");
+    let original = before.operation().clone();
+    let queued = replacement.submit(before, Plan::default())?;
+    replacement.start().await?;
+    ensure(
+        matches!(replacement.outcome(queued).await?, Outcome::Unknown(op) if op == original),
+        "a queued operation crossed a requested start",
+    )?;
+    for name in ["f-first", "f-queued", "f-before-start"] {
+        ensure(
+            !replacement.holds(&key(Kind::Credential, name)).await?,
+            "a stale operation wrote a credential after a new start",
+        )?;
+    }
+    Ok(())
 }
 
 /// The most that a store rounds up the end of an audit or outcome record: a store that keeps whole seconds.
@@ -498,6 +553,7 @@ const PRECISION_MAX: Duration = Duration::from_secs(1);
 
 pub(super) async fn retention<S: Subject>(binding: S) -> Checked {
     let mut run = Run::started(binding).await?;
+    let instance = run.driver.instance().map_err(failed("serving instance"))?;
     let credential = key(Kind::Credential, "t-1");
     let proposal = Build::new("t-1").writes(&credential, 1).done();
     let operation = proposal.operation().clone();
@@ -526,7 +582,10 @@ pub(super) async fn retention<S: Subject>(binding: S) -> Checked {
         )?;
     }
     for kind in [Kind::Audit, Kind::Outcome] {
-        run.binding.expire(kind, end, PAGE).await.map_err(failed("expire"))?;
+        run.binding
+            .expire(kind, end, PAGE, instance)
+            .await
+            .map_err(failed("expire"))?;
     }
     let stored = Store::read(&mut run.binding, &audit_key)
         .await
@@ -541,7 +600,7 @@ pub(super) async fn retention<S: Subject>(binding: S) -> Checked {
     )?;
     if let Some(after) = latest.checked_add(Duration::from_nanos(1)) {
         run.binding
-            .expire(Kind::Outcome, after, PAGE)
+            .expire(Kind::Outcome, after, PAGE, instance)
             .await
             .map_err(failed("expire"))?;
         ensure(
@@ -1305,17 +1364,41 @@ pub(super) async fn restore_ends<S: Subject>(binding: S) -> Checked {
         }),
         "an enrollment that consumes its ceremony wrote no consumption entry",
     )?;
-    run.restore(&snapshot).await?;
+    run.binding.restore(&snapshot);
+    run.driver.restore(now()).map_err(failed("restore"))?;
+    run.steps(|effect| match effect {
+        Effect::Expire(Kind::SignIn, ..) => Next::Stop,
+        _ => Next::Run(None),
+    })
+    .await?;
+    ensure(
+        matches!(run.driver.effect(), Some(Effect::Expire(Kind::SignIn, ..))),
+        "restore did not request sign-in cleanup",
+    )?;
+    let mut replacement = Run::new(run.binding.clone())?;
+    replacement.restore(&snapshot).await?;
+    let fresh = key(Kind::SignIn, "new-challenge");
+    let proposal = Build::new("fresh-challenge")
+        .writes_until(&fresh, 1, Some(Duration::from_secs(2_000)))
+        .done();
+    replacement
+        .commit(proposal, Plan::default(), "a sign-in challenge after restore")
+        .await?;
+    run.settle().await?;
+    ensure(
+        run.driver.status() == Status::Refused(driver::Error::Superseded) && replacement.holds(&fresh).await?,
+        "a replaced restore worker continued or removed the new sign-in challenge",
+    )?;
     for (index, value) in [challenge, approval].iter().enumerate() {
         let name = format!("p-{index}");
         let proposal = Build::new(&name)
             .ends(value, 1)
             .writes(&key(Kind::Session, &name), 1)
             .done();
-        let ticket = run.submit(proposal, Plan::default())?;
-        run.settle().await?;
+        let ticket = replacement.submit(proposal, Plan::default())?;
+        replacement.settle().await?;
         ensure(
-            matches!(run.outcome(ticket).await?, Outcome::Conflict),
+            matches!(replacement.outcome(ticket).await?, Outcome::Conflict),
             "after a restore, a pending sign-in challenge or approval from the snapshot did not refuse",
         )?;
     }
