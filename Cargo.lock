@@ -617,8 +617,8 @@ dependencies = [
 
 [[package]]
 name = "rscodec"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/loadingalias/rscodec?branch=main#e2708865e2e7abe75d72e765ee0e5abc7871edbe"
+version = "0.1.0"
+source = "git+https://github.com/loadingalias/rscodec?branch=main#4d652b312a1d792f006763a1edcec084e3f58377"
 
 [[package]]
 name = "rscrypto"

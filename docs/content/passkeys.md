@@ -27,7 +27,8 @@ additional passkey, the rename and the removal of a passkey, and the fresh user 
   handle and the account revision at the start. Its key is the SHA-256 digest of the CBOR form `["rsauthnz.passkey.registration.2", authority, relying
   party ID, challenge]`, with a challenge of 32 random bytes. It ends after `REGISTRATION_LIFETIME` (300 seconds). The
   record never holds the challenge. The response is not signed, so the challenge is the only proof that the response
-  comes from the ceremony of the account.
+  comes from the ceremony of the account. Thus the options encode the challenge, and the check decodes it, with the
+  base64url kernels of rscodec that have data-independent timing.
 - The **credential record** is a record of the kind `Kind::Credential` at `rp.credential_key(&mut store, &handle, id).await?`.
   Its key combines the kind, the current passkey prefix, and the SHA-256 digest of the credential ID.
   The initial prefix is the digest of `["rsauthnz.passkey.credential.2", authority, relying party ID, user handle]`.
@@ -349,7 +350,7 @@ gives its recovery, and `?` in a handler gives the `rsauthnz_http::Problem` of i
 | `Authorization(refusal)` | The policy refuses the issue of an invitation ([Authorize an operation](authorization.md)) | `Refuse` |
 | `RecoveryKey` | The relying party has no recovery key ([Recover an account](recovery.md)) | `Refuse` |
 | `Code` | The text is not a recovery code, or the account has no recovery code with the value | `Refuse` |
-| `Dit` | This build on this CPU cannot handle a recovery code with data-independent timing | `Refuse` |
+| `Dit` | This build on this CPU cannot handle a recovery code or a challenge with data-independent timing, as on Windows aarch64 without `-C target-feature=+dit` | `Refuse` |
 
 `finish` and `sign_in_read` read the store, so they return `passkey::Failure`: `Refused(error)`, or `Store(error)` for
 a failed read, which is a crash of the binding. `records.verify()` and `sign_in.open` read no store, so they return
@@ -372,5 +373,6 @@ published assertions of ES256, EdDSA, and RS256 of WebAuthn Level 3, and the cas
 makes ML-DSA-65, EdDSA, and ES256 passkeys with rscrypto. The published EdDSA registration case has no UV flag, so the
 profile refuses it. With only the UV bit set, it passes each other check. That is a derived case: the UV bit changes
 the authenticator data, so its attestation signature no longer verifies. rscodec's JSON reader reads each response,
-and its fuzz campaign is not complete. No real browser or authenticator has run a registration or a sign-in of
-rsauthnz yet.
+and its fuzz campaign is not complete. The reader has public-data timing, so it finds the challenge in
+`clientDataJSON` with that timing before the secret decoder decodes it. No real browser or authenticator has run a
+registration or a sign-in of rsauthnz yet.

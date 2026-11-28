@@ -360,7 +360,8 @@ impl RelyingParty {
     /// [`Error::Name`] if a name of `user` is empty or longer than [`NAME_BYTES_MAX`](crate::passkey::NAME_BYTES_MAX).
     /// [`Error::RecoveryKey`] if the relying party has no recovery key. [`Error::Code`] if the account of `user` has no
     /// code with the value. [`Error::Record`] if the record has no valid form, and [`Error::Time`] if `now` has no
-    /// bound. [`Failure::Store`] if the read fails.
+    /// bound. [`Error::Dit`] if this build on this CPU cannot encode the challenge with data-independent timing.
+    /// [`Failure::Store`] if the read fails.
     pub async fn recovery_options<S: Store>(
         &self,
         store: &mut S,
@@ -380,7 +381,7 @@ impl RelyingParty {
         let version = <&[u8; 8]>::try_from(record.version.coordinate()).map_err(|_| Error::Record)?;
         let bound = [&key.as_bytes()[1..], version].concat();
         let challenge = self.bound_challenge(CHALLENGE_FORM, &bound, now, random)?;
-        Ok(self.options(user, &challenge, &[]))
+        Ok(self.options(user, &challenge, &[])?)
     }
 
     /// Checks the registration `response` of a recovery, and gives the [`Attempt`]. The check refuses a challenge that

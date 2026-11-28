@@ -16,8 +16,9 @@ makes no administrator call.
   grant, so it cannot issue a value.
 - The **issuer key** is a composite key in [custody](custody.md). It signs each CLI credential of the authority.
 - A **bootstrap value** (`Bootstrap`) is 32 random bytes. Its text is `rsauthnz-bootstrap-1-` and 64 lowercase
-  hexadecimal digits. It names one administrator, it is valid for `LIFETIME` (15 minutes), and one bootstrap consumes
-  it. At most one value of an authority is valid: each issue ends the earlier value that is not consumed.
+  hexadecimal digits. The hex kernels of rscodec that have data-independent timing encode and decode the text. It
+  names one administrator, it is valid for `LIFETIME` (15 minutes), and one bootstrap consumes it. At most one value
+  of an authority is valid: each issue ends the earlier value that is not consumed.
 - An **administrator binding** is the record of one administrator. It holds the issue of the value that the bootstrap
   consumed, the owner, the origin, and the issuer key that bound it, and the CLI credential without its signature. It
   is an authority anchor: a restore keeps it, and the unlink of the last one refuses. It ends with its CLI credential,
@@ -261,6 +262,7 @@ administrator is one range read of its prefix, and it gives at most `ADMINISTRAT
 | `Error` | Cause | Recovery |
 | --- | --- | --- |
 | `Form` | The text is not `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits | Refuse it |
+| `Dit` | This build on this CPU cannot encode or decode a bootstrap value with data-independent timing, as on Windows aarch64 without `-C target-feature=+dit` | Build with `-C target-feature=+dit` |
 | `Grant` | The host grant has another owner or origin than the authority or its bindings | Open the authority with its grant |
 | `Issuer` | The custody key is not the issuer key of the authority or of its bindings | Open the authority with its issuer key |
 | `Unknown` | No valid record of the value: it is consumed or ended, or it is a value of another authority or issuer key | Ask the owner to issue a new value |

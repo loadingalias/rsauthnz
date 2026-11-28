@@ -7,7 +7,7 @@ use super::{Bootstrap, Error};
 #[test]
 fn only_the_exact_text_of_a_value_reads_back() {
     let value = Bootstrap(SecretBytes::new([0xa7; 32]));
-    let text = String::from_utf8(value.text()).unwrap();
+    let text = String::from_utf8(value.text().unwrap()).unwrap();
     assert_eq!(text, format!("rsauthnz-bootstrap-1-{}", "a7".repeat(32)));
     assert_eq!(Bootstrap::parse(&text).map(|value| *value.0.as_bytes()), Ok([0xa7; 32]));
     let (hex, short) = ("a7".repeat(32), "a7".repeat(31));

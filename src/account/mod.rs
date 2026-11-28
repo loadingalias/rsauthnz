@@ -403,7 +403,8 @@ impl RelyingParty {
     /// [`passkey::Error::Invitation`] if the store has no open invitation with the value, also after its end or its activation.
     /// [`passkey::Error::Recipient`] if the invitation is for another account, and [`passkey::Error::Activated`] if the account has a
     /// passkey: an authenticator would replace it. [`passkey::Error::Record`] if a record has no valid form, and
-    /// [`passkey::Error::Time`] if `now` has no bound. [`Failure::Store`] if a read fails.
+    /// [`passkey::Error::Time`] if `now` has no bound. [`passkey::Error::Dit`] if this build on this CPU cannot encode the
+    /// challenge with data-independent timing. [`Failure::Store`] if a read fails.
     pub async fn activation_options<S: Store>(
         &self,
         store: &mut S,
@@ -427,7 +428,7 @@ impl RelyingParty {
             name: invitee.name,
             display_name: invitee.display_name,
         };
-        Ok(self.options(&user, &challenge, &[]))
+        Ok(self.options(&user, &challenge, &[])?)
     }
 
     /// Checks the registration `response` of an activation for `recipient`, and gives the [`Activation`]. The check

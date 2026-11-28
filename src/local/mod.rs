@@ -166,6 +166,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 use core::time::Duration;
 
+use rscodec::hex;
 use rscrypto::{ChaCha20Rng, SecretBytes};
 
 use crate::cbor::{self, Value};
@@ -241,18 +242,15 @@ impl Bootstrap {
     ///
     /// # Errors
     ///
-    /// [`Error::Form`] if `text` is not `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits.
+    /// [`Error::Form`] if `text` is not `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits. [`Error::Dit`] if
+    /// this build on this CPU cannot decode the value with data-independent timing.
     pub fn parse(text: &str) -> Result<Self, Error> {
-        let hex = text.strip_prefix(PREFIX).ok_or(Error::Form)?;
-        let (pairs, []) = hex.as_bytes().as_chunks::<2>() else {
-            return Err(Error::Form);
-        };
-        (pairs.len() == 32).ok_or(Error::Form)?;
+        let digits = text.strip_prefix(PREFIX).ok_or(Error::Form)?.as_bytes();
+        (digits.len() == 64).ok_or(Error::Form)?;
         SecretBytes::try_fill_with(|secret| {
-            for (byte, [high, low]) in secret.iter_mut().zip(pairs) {
-                *byte = (digit(*high)? << 4) | digit(*low)?;
-            }
-            Ok(())
+            rscodec::with_dit(|dit| hex::decode_secret(dit, digits, secret).map(drop))
+                .map_err(|_| Error::Dit)?
+                .map_err(|_| Error::Form)
         })
         .map(Self)
     }
@@ -267,29 +265,21 @@ impl Bootstrap {
     }
 
     /// The text of the value, in an allocation of its exact length. [`Prepared`] keeps that allocation and clears it.
-    fn text(&self) -> Vec<u8> {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut text = Vec::with_capacity(PREFIX.len() + 64);
-        text.extend_from_slice(PREFIX.as_bytes());
-        for byte in self.0.as_bytes() {
-            text.extend([DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0xf)]]);
-        }
-        text
+    fn text(&self) -> Result<Vec<u8>, Error> {
+        let mut text = vec![0; PREFIX.len() + 64];
+        let (prefix, digits) = text.split_at_mut(PREFIX.len());
+        prefix.copy_from_slice(PREFIX.as_bytes());
+        rscodec::with_dit(|dit| {
+            hex::encode_secret(dit, self.0.as_bytes(), digits).expect("64 digits hold the text of 32 bytes");
+        })
+        .map_err(|_| Error::Dit)?;
+        Ok(text)
     }
 }
 
 impl fmt::Debug for Bootstrap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Bootstrap(..)")
-    }
-}
-
-/// The value of a lowercase hexadecimal digit.
-const fn digit(byte: u8) -> Result<u8, Error> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(Error::Form),
     }
 }
 
@@ -387,7 +377,8 @@ impl Authority {
     /// [`Error::Grant`] if `grant` is not the grant that opened the authority, or a binding has another grant.
     /// [`Error::Bound`] if `administrator` has a binding whose CLI credential can be valid at `now`. [`Error::Full`] if
     /// the store holds [`ADMINISTRATORS_MAX`] bindings of the authority, or the log cannot drop an issue.
-    /// [`Error::Time`] if `now` has no bound. [`Error::Time`] if the end of the value overflows. The errors of [`Self::open`] for the
+    /// [`Error::Time`] if `now` has no bound. [`Error::Time`] if the end of the value overflows. [`Error::Dit`] if this
+    /// build on this CPU cannot encode the value with data-independent timing. The errors of [`Self::open`] for the
     /// record of the authority and its bindings, and [`Error::Transition`] for the proposal.
     pub async fn issue<S: Store>(
         &self,
@@ -480,7 +471,7 @@ impl Authority {
             })
             .map_err(Error::Transition)?;
         proposal
-            .prepare(Prepared::new(value.text(), key, version))
+            .prepare(Prepared::new(value.text()?, key, version))
             .map_err(Error::Transition)?;
         Ok((proposal, Plan::default()))
     }
@@ -1506,6 +1497,9 @@ pub enum Status {
 pub enum Error {
     /// The text is not `rsauthnz-bootstrap-1-` and 64 lowercase hexadecimal digits. Refuse it.
     Form,
+    /// This build on this CPU cannot encode or decode a bootstrap value with data-independent timing, as on Windows
+    /// aarch64 without `-C target-feature=+dit`. Build with `-C target-feature=+dit`.
+    Dit,
     /// The host grant is not the grant of the authority: another owner or origin. Open the authority with its grant.
     Grant,
     /// The custody key is not the issuer key of the authority. Open the authority with its issuer key.
@@ -1578,6 +1572,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Form => f.write_str("the text is not a bootstrap value"),
+            Self::Dit => f.write_str("this build cannot handle a bootstrap value with data-independent timing"),
             Self::Grant => f.write_str("the host grant is not the grant of the authority"),
             Self::Issuer => f.write_str("the custody key is not the issuer key of the authority"),
             Self::Unknown => f.write_str("the authority holds no valid bootstrap value of this text"),

@@ -389,6 +389,7 @@ impl RelyingParty {
     /// [`Decision::SignUp`] of an account with a passkey, or a [`Decision::Add`] whose verification is of another
     /// account. [`Error::Time`] if the end of the record overflows. [`Error::Driver`] if the driver does not serve, and
     /// [`Error::Transition`] for the proposal, also for a `decision` that reads more records than the limits permit.
+    /// [`Error::Dit`] if this build on this CPU cannot encode the challenge with data-independent timing.
     /// [`Failure::Store`] if the read fails.
     pub async fn start<S: Store>(
         &self,
@@ -440,7 +441,7 @@ impl RelyingParty {
                 data: encode(&form),
             })
             .map_err(Error::from)?;
-        let options = self.options(user, &challenge, &excluded);
+        let options = self.options(user, &challenge, &excluded)?;
         proposal
             .prepare(Prepared::new(options, key, version))
             .map_err(Error::from)?;
@@ -448,66 +449,73 @@ impl RelyingParty {
     }
 
     /// The options of `PublicKeyCredentialCreationOptionsJSON` for the challenge `challenge`, with the passkeys
-    /// `excluded` of the account.
-    pub(crate) fn options(&self, user: &User<'_>, challenge: &[u8], excluded: &[Credential]) -> Vec<u8> {
+    /// `excluded` of the account. The challenge is a bearer value during the ceremony, so it takes the secret class.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Dit`] if this build on this CPU cannot encode the challenge with data-independent timing.
+    pub(crate) fn options(&self, user: &User<'_>, challenge: &[u8], excluded: &[Credential]) -> Result<Vec<u8>, Error> {
         // Each name can grow six times by its escapes, and base64url makes each ID and the challenge less than twice as
         // long. Each passkey has less than 128 more bytes, and the rest is less than 1 KiB.
         let names = self.id.len() + self.name.len() + user.name.len() + user.display_name.len();
         let ids: usize = excluded.iter().map(|credential| 2 * credential.id.len() + 128).sum();
         let mut out = vec![0; 1024 + 6 * names + ids + 2 * challenge.len()];
-        let len = json::write(&mut out, |options| {
-            options.object(|options| {
-                options.member("rp").object(|rp| {
-                    rp.member("id").str(&self.id)?;
-                    rp.member("name").str(&self.name)
-                })?;
-                options.member("user").object(|entity| {
-                    entity.member("id").base64url(&user.handle.0)?;
-                    entity.member("name").str(user.name)?;
-                    entity.member("displayName").str(user.display_name)
-                })?;
-                options.member("challenge").base64url(challenge)?;
-                options.member("pubKeyCredParams").array(|params| {
-                    for alg in OFFERED {
-                        params.item().object(|param| {
-                            param.member("type").str("public-key")?;
-                            param.member("alg").i64(alg)
-                        })?;
-                    }
-                    Ok(())
-                })?;
-                options.member("timeout").u64(1000 * REGISTRATION_LIFETIME.as_secs())?;
-                options.member("excludeCredentials").array(|list| {
-                    for credential in excluded {
-                        list.item().object(|descriptor| {
-                            descriptor.member("type").str("public-key")?;
-                            descriptor.member("id").base64url(&credential.id)?;
-                            descriptor.member("transports").array(|transports| {
-                                for (at, name) in TRANSPORTS.iter().enumerate() {
-                                    if credential.transports & (1 << at) != 0 {
-                                        transports.item().str(name)?;
+        let len = rscodec::with_dit(|dit| {
+            json::write(&mut out, |options| {
+                options.object(|options| {
+                    options.member("rp").object(|rp| {
+                        rp.member("id").str(&self.id)?;
+                        rp.member("name").str(&self.name)
+                    })?;
+                    options.member("user").object(|entity| {
+                        entity.member("id").base64url(&user.handle.0)?;
+                        entity.member("name").str(user.name)?;
+                        entity.member("displayName").str(user.display_name)
+                    })?;
+                    options.member("challenge").base64url_secret(dit, challenge)?;
+                    options.member("pubKeyCredParams").array(|params| {
+                        for alg in OFFERED {
+                            params.item().object(|param| {
+                                param.member("type").str("public-key")?;
+                                param.member("alg").i64(alg)
+                            })?;
+                        }
+                        Ok(())
+                    })?;
+                    options.member("timeout").u64(1000 * REGISTRATION_LIFETIME.as_secs())?;
+                    options.member("excludeCredentials").array(|list| {
+                        for credential in excluded {
+                            list.item().object(|descriptor| {
+                                descriptor.member("type").str("public-key")?;
+                                descriptor.member("id").base64url(&credential.id)?;
+                                descriptor.member("transports").array(|transports| {
+                                    for (at, name) in TRANSPORTS.iter().enumerate() {
+                                        if credential.transports & (1 << at) != 0 {
+                                            transports.item().str(name)?;
+                                        }
                                     }
-                                }
-                                Ok(())
-                            })
-                        })?;
-                    }
-                    Ok(())
-                })?;
-                options.member("attestation").str("none")?;
-                options.member("authenticatorSelection").object(|selection| {
-                    selection.member("residentKey").str("required")?;
-                    selection.member("requireResidentKey").bool(true)?;
-                    selection.member("userVerification").str("required")
-                })?;
-                options
-                    .member("extensions")
-                    .object(|extensions| extensions.member("credProps").bool(true))
+                                    Ok(())
+                                })
+                            })?;
+                        }
+                        Ok(())
+                    })?;
+                    options.member("attestation").str("none")?;
+                    options.member("authenticatorSelection").object(|selection| {
+                        selection.member("residentKey").str("required")?;
+                        selection.member("requireResidentKey").bool(true)?;
+                        selection.member("userVerification").str("required")
+                    })?;
+                    options
+                        .member("extensions")
+                        .object(|extensions| extensions.member("credProps").bool(true))
+                })
             })
         })
+        .map_err(|_| Error::Dit)?
         .expect("the options fit their buffer");
         out.truncate(len);
-        out
+        Ok(out)
     }
 
     /// Checks the registration `response` of the ceremony whose challenge is `challenge`, and gives the credential.
@@ -1055,7 +1063,8 @@ impl Response {
     /// [`Error::CredentialId`] if `id` and `rawId` differ, and [`Error::Malformed`] for each other difference from
     /// the form, such as a `type` other than `public-key`, a member that is not base64url, or a `clientDataJSON` that is
     /// not JSON of the type `webauthn.create` with the challenge of a registration (32 bytes), of an activation
-    /// ([`RelyingParty::activate`]), or of a recovery ([`RelyingParty::recover`]).
+    /// ([`RelyingParty::activate`]), or of a recovery ([`RelyingParty::recover`]). [`Error::Dit`] if this build on this
+    /// CPU cannot decode the challenge with data-independent timing.
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
         let (id, client_data) = fields.credential("webauthn.create")?;
@@ -1103,7 +1112,8 @@ impl Assertion {
     /// # Errors
     ///
     /// [`Error::CredentialId`] if `id` and `rawId` differ, and [`Error::Malformed`] for each other difference from
-    /// the form, such as a `clientDataJSON` that is not JSON of the type `webauthn.get`.
+    /// the form, such as a `clientDataJSON` that is not JSON of the type `webauthn.get`. [`Error::Dit`] if this build on
+    /// this CPU cannot decode the challenge with data-independent timing.
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
         let (id, client_data) = fields.credential("webauthn.get")?;
@@ -1261,9 +1271,15 @@ impl ClientData {
             return Err(Error::Malformed);
         };
         (found == kind).ok_or(Error::Malformed)?;
+        // A registration challenge is a bearer value, so each challenge decodes with the secret class.
+        let challenge = base64url_by(challenge, |text, out| {
+            rscodec::with_dit(|dit| Url.decode_secret(dit, text, out).map(drop))
+                .map_err(|_| Error::Dit)?
+                .map_err(|_| Error::Malformed)
+        })?;
         let mut text = vec![0; origin.len()];
         Ok(Self {
-            challenge: base64url(challenge)?.into(),
+            challenge: challenge.into(),
             origin: origin.decode(&mut text).map_err(|_| Error::Malformed)?.into(),
             cross_origin,
         })
@@ -1802,6 +1818,13 @@ fn transport(name: Str<'_>) -> u8 {
 
 /// The bytes of the base64url text `text`, with no padding.
 fn base64url(text: Str<'_>) -> Result<Vec<u8>, Error> {
+    base64url_by(text, |text, out| {
+        Url.decode(text, out).map(drop).map_err(|_| Error::Malformed)
+    })
+}
+
+/// The bytes of the base64url text `text`, which `decode` writes into a slice of their length.
+fn base64url_by(text: Str<'_>, decode: impl FnOnce(&[u8], &mut [u8]) -> Result<(), Error>) -> Result<Vec<u8>, Error> {
     let mut unescaped = Vec::new();
     let text = match text.borrowed() {
         Some(text) => text.as_bytes(),
@@ -1811,7 +1834,7 @@ fn base64url(text: Str<'_>) -> Result<Vec<u8>, Error> {
         }
     };
     let mut out = vec![0; Url.decoded_len(text).map_err(|_| Error::Malformed)?];
-    Url.decode(text, &mut out).map_err(|_| Error::Malformed)?;
+    decode(text, &mut out)?;
     Ok(out)
 }
 
@@ -1944,8 +1967,8 @@ pub enum Error {
     /// The text is not a recovery code, or the account has no recovery code with the value: a recovery or a new code
     /// ended it, or it is the code of another account.
     Code,
-    /// This build on this CPU cannot encode or decode a recovery code with data-independent timing, as on Windows aarch64
-    /// without `-C target-feature=+dit`.
+    /// This build on this CPU cannot encode or decode a recovery code or a challenge with data-independent timing, as on
+    /// Windows aarch64 without `-C target-feature=+dit`. Build with `-C target-feature=+dit`.
     Dit,
 }
 
@@ -1998,7 +2021,9 @@ impl fmt::Display for Error {
             Self::Authorization(refusal) => write!(f, "the policy refuses the invitation: {refusal}"),
             Self::RecoveryKey => f.write_str("the relying party has no recovery key"),
             Self::Code => f.write_str("the account has no recovery code with the value"),
-            Self::Dit => f.write_str("this CPU cannot handle a recovery code with data-independent timing"),
+            Self::Dit => {
+                f.write_str("this CPU cannot handle a recovery code or a challenge with data-independent timing")
+            }
         }
     }
 }
