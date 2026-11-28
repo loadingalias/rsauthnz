@@ -12,6 +12,10 @@ It covers peer restarts, competing passkey removals, and an acknowledged revocat
 Its [shared recovery checks](../../models/replica-commit/README.md#shared-recovery) cover abandoned commits, delayed journal writes, snapshot marks, and counter reservations.
 The current Rust driver serves one process per store.
 
+The lost-reply model checks when recovery can tell a caller to start a fresh operation.
+It covers the race with a delayed first write, duplicate delivery, receipt expiry, and restore.
+A status read leaves the operation open. [Lost-reply model and results](../../models/outcome-resolution/README.md)
+
 The authority models check that after crashes, restarts, and restores from an older snapshot,
 nothing that a committed change ended is valid again: no revoked passkey, no consumed one-use value,
 and no reused counter value. They check that a restore adds no anchor whose commit did not complete,
@@ -86,6 +90,7 @@ cargo xtask model grant-approval                                 # every grant p
 cargo xtask model account-recovery                               # five recovery profiles
 cargo xtask model replica-commit                                 # application server restart and store restore
 cargo xtask model replica-commit/SharedTurns.cfg                 # owner turns, outcome lookup, and journal replay
+cargo xtask model outcome-resolution                             # recover one lost reply
 cargo xtask model authority-restore/AuthorityCached.cfg          # a full TLC search
 cargo xtask model authority-restore/AuthorityInd.Step.apalache   # a complete inductive step
 ```
