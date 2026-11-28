@@ -4,9 +4,10 @@ use core::cmp::Ordering;
 use core::num::NonZeroUsize;
 use core::time::Duration;
 
-use rsauthnz::store::journal::{self, Body, End, History};
+use rsauthnz::limits::Limits;
+use rsauthnz::store::journal::{self, Append, Body, End, Floor, History, Mark};
 use rsauthnz::store::{
-    Commit, CrashLoss, Entry, Insert, Inserted, Instance, intent_records, outcome_record, policy_key,
+    Commit, CrashLoss, Insert, Inserted, Instance, JournalWrite, intent_records, outcome_record, policy_key,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 
@@ -576,15 +577,86 @@ pub(super) async fn lost_response<S: Subject>(mut binding: S) -> Checked {
     )
 }
 
+fn floor_append(after: Mark, name: &str, value: u64) -> Append {
+    let body = Body::Floor(Floor {
+        kind: Kind::Session,
+        value,
+    });
+    after
+        .next(&op(name), &body, Limits::default())
+        .expect("the floor fits the journal form")
+}
+
+pub(super) async fn journal_fence<S: Subject>(mut binding: S) -> Checked {
+    let old = start(&mut binding).await?;
+    let left = floor_append(Mark::EMPTY, "left", 1);
+    let right = floor_append(Mark::EMPTY, "right", 2);
+    let mut peer = binding.clone();
+    let (a, b) = both(binding.append(&left, old), peer.append(&right, old)).await;
+    let (first, other) = match (a.map_err(failed("append"))?, b.map_err(failed("append"))?) {
+        (JournalWrite::Accepted, JournalWrite::Conflict) => (&left, &right),
+        (JournalWrite::Conflict, JournalWrite::Accepted) => (&right, &left),
+        _ => return Err("one journal predecessor must have exactly one successor".into()),
+    };
+    let foreign = floor_append(other.head(), "foreign", 3);
+    ensure(
+        peer.append(&foreign, old).await.map_err(failed("append"))? == JournalWrite::Conflict,
+        "the journal accepted a predecessor with the correct sequence and the wrong link",
+    )?;
+    ensure(
+        binding.sync(old).await.map_err(failed("sync"))? == JournalWrite::Accepted,
+        "the first sync refused",
+    )?;
+    let next = floor_append(first.head(), "next", 4);
+    let current = start(&mut binding).await?;
+    ensure(
+        peer.append(&next, old).await.map_err(failed("append"))? == JournalWrite::Conflict,
+        "the journal accepted an old writer at an unchanged head",
+    )?;
+    ensure(
+        binding.append(&next, current).await.map_err(failed("append"))? == JournalWrite::Accepted,
+        "the current writer could not extend the durable head",
+    )?;
+    ensure(
+        peer.sync(old).await.map_err(failed("sync"))? == JournalWrite::Conflict,
+        "the journal confirmed durability to a replaced writer",
+    )?;
+    ensure(
+        binding.sync(current).await.map_err(failed("sync"))? == JournalWrite::Accepted,
+        "the current writer could not sync its append",
+    )?;
+    let entries = Journal::read(&mut binding, Sequence(0), PAGE)
+        .await
+        .map_err(failed("journal read"))?;
+    ensure(
+        entries == [first.entry().clone(), next.entry().clone()],
+        "the durable journal differs from the two accepted entries",
+    )
+}
+
 pub(super) async fn failed_sync<S: Subject>(mut binding: S) -> Checked {
     let instance = start(&mut binding).await?;
-    let first = binding.append(b"e-1").await.map_err(failed("append"))?;
-    binding.sync().await.map_err(failed("sync"))?;
-    let second = binding.append(b"e-2").await.map_err(failed("append"))?;
-    binding.inject(Fault::FailedSync);
-    ensure(binding.sync().await.is_err(), "a sync that failed returned success")?;
+    let first = floor_append(Mark::EMPTY, "first", 1);
+    let second = floor_append(first.head(), "second", 2);
     ensure(
-        binding.sync().await.is_err(),
+        binding.append(&first, instance).await.map_err(failed("append"))? == JournalWrite::Accepted,
+        "the first append refused",
+    )?;
+    ensure(
+        binding.sync(instance).await.map_err(failed("sync"))? == JournalWrite::Accepted,
+        "the first sync refused",
+    )?;
+    ensure(
+        binding.append(&second, instance).await.map_err(failed("append"))? == JournalWrite::Accepted,
+        "the second append refused",
+    )?;
+    binding.inject(Fault::FailedSync);
+    ensure(
+        binding.sync(instance).await.is_err(),
+        "a sync that failed returned success",
+    )?;
+    ensure(
+        binding.sync(instance).await.is_err(),
         "a sync after a failed sync returned success before a start",
     )?;
     let proposal = Build::new("y-1").writes(&key(Kind::Credential, "y-1"), 1).done();
@@ -592,20 +664,20 @@ pub(super) async fn failed_sync<S: Subject>(mut binding: S) -> Checked {
         binding.commit(&proposal, instance).await.is_err(),
         "a commit after a failed sync returned a result before a start",
     )?;
-    start(&mut binding).await?;
+    let current = start(&mut binding).await?;
     let entries = Journal::read(&mut binding, Sequence(0), PAGE)
         .await
         .map_err(failed("read of the journal"))?;
-    let synced = [Entry {
-        sequence: first,
-        data: (*b"e-1").into(),
-    }];
     ensure(
-        entries == synced,
+        entries == core::slice::from_ref(first.entry()),
         "after a failed sync, the journal does not hold exactly the entries whose sync returned",
     )?;
     ensure(
-        binding.append(b"e-3").await.map_err(failed("append"))? == second,
+        binding
+            .append(&floor_append(first.head(), "third", 3), current)
+            .await
+            .map_err(failed("append"))?
+            == JournalWrite::Accepted,
         "the append after a failed sync did not get the sequence after the last durable entry",
     )
 }
@@ -713,7 +785,7 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
     let (proposal, plan_e) = enrollment("e-1");
     let operation = proposal.operation().clone();
     let ticket = run.submit(proposal, plan_e)?;
-    run.drive(once(|effect| matches!(effect, Effect::Sync), Fault::FailedSync))
+    run.drive(once(|effect| matches!(effect, Effect::Sync(_)), Fault::FailedSync))
         .await?;
     ensure(
         run.driver.status() == Status::Down,
@@ -754,6 +826,50 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
     run.submit(proposal, plan_e)?;
     run.drive(at_commit("e-3", Fault::LostResponse)).await?;
     run.driver.start(now());
+    run.steps(|effect| {
+        if matches!(effect, Effect::Append(..)) {
+            Next::Stop
+        } else {
+            Next::Run(None)
+        }
+    })
+    .await?;
+    let profile = super::Profile::new(run.binding.declaration()).map_err(failed("profile"))?;
+    let replacement = super::Driver::new(profile, Limits::default()).map_err(failed("driver"))?;
+    let mut old = core::mem::replace(&mut run.driver, replacement);
+    let Some(Effect::Append(append, instance)) = old.effect() else {
+        return Err("recovery did not issue its pending creation append".into());
+    };
+    let mut pending = History::new(append.after());
+    pending
+        .extend(core::slice::from_ref(append.entry()), Limits::default())
+        .map_err(failed("creation entry"))?;
+    ensure(
+        has(&pending, "e-3", |body| matches!(body, Body::Creation(_))),
+        "recovery did not append the committed anchor",
+    )?;
+    // Replace the worker before its append reaches the journal. The journal head has not moved.
+    run.driver.start(now());
+    ensure(
+        matches!(run.driver.effect(), Some(Effect::Start)),
+        "the replacement did not request storage activation",
+    )?;
+    run.step(&mut |_| Next::Run(None)).await?;
+    let result = run
+        .binding
+        .append(append, instance)
+        .await
+        .map_err(failed("delayed recovery append"))?;
+    ensure(
+        result == JournalWrite::Conflict,
+        "a replaced worker appended a creation at an unchanged head",
+    )?;
+    old.give(super::Output::Appended(result))
+        .map_err(failed("recovery output"))?;
+    ensure(
+        old.status() == Status::Refused(driver::Error::Superseded),
+        "the replaced recovery worker continued after its fence",
+    )?;
     let lookup = run
         .driver
         .lookup(operation)
@@ -851,7 +967,7 @@ pub(super) async fn refusal_void<S: Subject>(binding: S) -> Checked {
             }
             Some(fault) => {
                 // The crash stops the void of the refusal.
-                run.drive(after_commit(name, |effect| matches!(effect, Effect::Append(_)), fault))
+                run.drive(after_commit(name, |effect| matches!(effect, Effect::Append(..)), fault))
                     .await?;
                 ensure(
                     matches!(run.outcome(ticket).await?, Outcome::Unknown(_)),

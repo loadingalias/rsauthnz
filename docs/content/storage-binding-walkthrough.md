@@ -33,7 +33,7 @@ the end.
   records.
 - The journal grows with each entry, and a start reads all of it. The driver moves its mark, but the binding never
   removes old entries.
-- One process uses the files at a time. The lock file stops a second binding on the same store directory.
+- One process uses the files at a time. Directory locks exclude a second writer at either the store or the journal.
 - A start keeps the frames before the first incomplete frame or wrong checksum, as the SQLite write-ahead log
   does. It cannot tell a torn last write from damage inside a file, so damage inside a file loses the writes
   after it.
@@ -46,7 +46,7 @@ disks.
 | Directory | File | Contents |
 | --- | --- | --- |
 | Store | `store` | The store log: one frame for each commit or expiry, with the writes of the frame |
-| Store | `lock` | The lock that keeps out a second process |
+| Store and journal | `lock` | A writer holds both directory locks while it serves |
 | Journal | `journal` | The restore journal: one frame for each entry, with its sequence |
 | Journal | `instance` | The last store instance number. A binding without a journal keeps it in the store directory |
 
@@ -75,8 +75,10 @@ durable.
 
 `Store::start` writes the next number into the file `instance` before it returns. The write is durable: a new file,
 its sync, a rename over `instance`, and a sync of the directory. The file is in the journal directory, so a restore of
-the store does not lower the number. A restore takes a fresh number as its last step, because it runs the same code
-as a start. Each commit compares its instance number with the number in memory.
+the store does not lower the number. A start takes both directory locks and advances the instance before installing a snapshot.
+Each commit, append, and journal sync compares its instance while the binding holds the locks.
+A returning writer uses its remembered file lengths only if the previous instance was its own.
+An empty instance file, or a missing instance file beside existing logs, gives `Error::Instance`.
 
 ### 3. Read one record
 
@@ -118,8 +120,8 @@ after `after`, and stops at the first key that does not start with the prefix.
 
 ### 8. Keep the restore journal
 
-- `Journal::append` writes one frame with the sequence and the bytes of the entry. It gives the next sequence.
-- `Journal::sync` syncs the file. It keeps the number of entries and the length of the file at this sync.
+- `Journal::append` compares the instance and both parts of the head. It writes one frame and installs the successor head under the lock.
+- `Journal::sync` checks the instance and syncs the file. It records the durable length and entry count.
 - `Journal::read` gives only entries before that length, in one read of the file.
 - A start drops each byte after the length of the last sync, and a torn last frame. Then it syncs the file.
 
@@ -142,12 +144,12 @@ Each fault of the suite takes a real failure path of the binding:
 | --- | --- |
 | `Fault::CrashBeforeCommit` | The commit writes its frame, and its sync fails. The binding stops, and the next start drops the frame |
 | `Fault::LostResponse` | The commit writes and syncs its frame, then gives an error and stops |
-| `Fault::CrashAfterAppend` | The append writes its frame and gives its sequence, then the binding stops. The next start drops the append |
+| `Fault::CrashAfterAppend` | The append writes its frame and returns `JournalWrite::Accepted`. Then the binding stops. The next start drops the append |
 | `Fault::FailedSync` | The sync of the journal fails. The binding stops, and the next start drops each append after the last sync |
 
 - `Subject::restart` stops the binding, as a crash does.
 - `Subject::snapshot` gives the store log of the current records.
-- `Subject::restore` writes a snapshot as the store log, then opens the files as a start does.
+- `Subject::restore` takes both directory locks and a fresh instance before writing the snapshot.
 - `Subject::set_clock` gives each later commit the reading of the suite in place of the system clock.
 - `Subject::lose` writes the journal again without the lost entries. Each entry keeps its sequence in its frame, so no
   sequence is used again while later entries remain. A loss of the last entries followed by a start gives their

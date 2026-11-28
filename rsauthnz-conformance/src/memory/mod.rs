@@ -80,9 +80,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rsauthnz::id::AuthorityVersion;
+use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
     self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
-    Journal, Kind, Record, Restore, Sequence, Store,
+    Journal, JournalWrite, Kind, Record, Restore, Sequence, Store,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, OperationId, Proposal};
@@ -161,6 +162,8 @@ const SEEDED_ONE_IN: u8 = 8;
 pub enum Error {
     /// The binding is new, or it had a restart, and it did not start after it.
     Stopped,
+    /// The binding exhausted its store instance numbers. It cannot fence another activation.
+    Instance,
     /// The fault crashed the binding at this primitive or at an earlier one.
     Crash(Fault),
     /// A seeded schedule crashed the binding after a commit gave its result. The commit landed when its result was
@@ -175,6 +178,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stopped => f.write_str("the memory binding did not start"),
+            Self::Instance => f.write_str("the memory binding exhausted its store instances"),
             Self::Crash(fault) => write!(f, "the memory binding crashed with the fault {fault:?}"),
             Self::CrashAfterCommit => f.write_str("the memory binding crashed after a commit"),
             Self::DelayedCommit => f.write_str("the memory binding crashed with a commit in flight"),
@@ -301,9 +305,10 @@ struct Binding {
     store: State,
     /// The durable entries of the journal. A crash, a restart, and a restore keep them.
     journal: BTreeMap<Sequence, Box<[u8]>>,
-    /// The sequence of the last entry that a sync made durable. A loss of entries does not lower it, so no later
-    /// append gets the sequence of a lost entry.
-    synced: Sequence,
+    /// The last durable head. Journal retention keeps this mark.
+    synced: Mark,
+    /// The head including entries that await sync.
+    head: Mark,
     /// The appends after the last sync. A crash loses them, so the next append gets the first sequence of them.
     unsynced: Vec<Entry>,
     /// The instance number of the last start or restore. A start and a restore each write the next number, so it
@@ -335,8 +340,24 @@ impl Binding {
     /// Stops the binding with `error` until the next start. The appends after the last sync are lost.
     fn stop(&mut self, error: Error) -> Error {
         self.stopped = Some(error);
-        self.unsynced.clear();
+        self.discard_unsynced();
         error
+    }
+
+    fn discard_unsynced(&mut self) {
+        self.unsynced.clear();
+        self.head = self.synced;
+    }
+
+    fn next_instance(&mut self) -> Result<(), Error> {
+        let next = self
+            .instance
+            .0
+            .checked_add(1)
+            .ok_or_else(|| self.stop(Error::Instance))?;
+        self.discard_unsynced();
+        self.instance = Instance(next);
+        Ok(())
     }
 
     /// Counts a call of `primitive`, and gives the crash that [`Subject::inject`] or the schedule injects at it.
@@ -468,7 +489,8 @@ impl Memory {
         Self(Arc::new(Mutex::new(Binding {
             store: State::default(),
             journal: BTreeMap::new(),
-            synced: Sequence(0),
+            synced: Mark::EMPTY,
+            head: Mark::EMPTY,
             unsynced: Vec::new(),
             instance: Instance(0),
             stopped: Some(Error::Stopped),
@@ -543,14 +565,14 @@ impl Subject for Memory {
         Snapshot(self.lock().store.clone())
     }
 
-    /// Restores the state of the store from `snapshot`, then writes the next instance number. The store takes commits
+    /// Installs `snapshot` and the next instance under one lock. The store takes commits
     /// at once, and refuses each commit of an earlier start. The journal keeps its entries, and the appends after the
     /// last sync are lost.
     fn restore(&self, snapshot: &Snapshot) {
         let mut binding = self.lock();
-        binding.unsynced.clear();
-        binding.store = snapshot.0.clone();
-        binding.instance = Instance(binding.instance.0.strict_add(1));
+        if binding.next_instance().is_ok() {
+            binding.store = snapshot.0.clone();
+        }
     }
 
     fn lose(&self, sequences: impl RangeBounds<Sequence>) {
@@ -584,7 +606,7 @@ impl Store for Memory {
 
     async fn start(&mut self) -> Result<Instance, Error> {
         let mut binding = self.lock();
-        binding.instance = Instance(binding.instance.0.strict_add(1));
+        binding.next_instance()?;
         binding.stopped = None;
         if let Some((request, instance)) = binding.delayed.take() {
             // The delayed commit lands now, with the instance number of an earlier start, so it refuses.
@@ -654,35 +676,35 @@ impl Store for Memory {
 impl Journal for Memory {
     type Error = Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
         let mut binding = self.lock();
         binding.serving()?;
-        let last = binding.unsynced.last().map_or(binding.synced, |entry| entry.sequence);
-        let sequence = Sequence(last.0.strict_add(1));
-        binding.unsynced.push(Entry {
-            sequence,
-            data: entry.into(),
-        });
+        if binding.instance != instance || binding.head != append.after() {
+            return Ok(JournalWrite::Conflict);
+        }
+        binding.unsynced.push(append.entry().clone());
+        binding.head = append.head();
         if let Some(crash) = binding.crash(Primitive::Append) {
             binding.stop(crash.error());
         }
-        Ok(sequence)
+        Ok(JournalWrite::Accepted)
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
         let mut binding = self.lock();
         binding.serving()?;
+        if binding.instance != instance {
+            return Ok(JournalWrite::Conflict);
+        }
         if let Some(crash) = binding.crash(Primitive::Sync) {
             return Err(binding.stop(crash.error()));
         }
         let entries = mem::take(&mut binding.unsynced);
-        if let Some(last) = entries.last() {
-            binding.synced = last.sequence;
-        }
+        binding.synced = binding.head;
         binding
             .journal
             .extend(entries.into_iter().map(|entry| (entry.sequence, entry.data)));
-        Ok(())
+        Ok(JournalWrite::Accepted)
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {

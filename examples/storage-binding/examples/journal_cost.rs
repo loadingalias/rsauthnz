@@ -271,9 +271,9 @@ fn commit(driver: &mut Driver, binding: &mut Files, (proposal, plan): (Proposal,
 /// in `meter`.
 fn settle(driver: &mut Driver, binding: &mut Files, meter: &mut Meter) {
     while let Some(effect) = driver.effect() {
-        if let Effect::Append(entry) = &effect {
+        if let Effect::Append(append, _) = &effect {
             meter.entries += 1;
-            meter.bytes += entry.len();
+            meter.bytes += append.entry().data.len();
         }
         let output = ready(execute(binding, effect));
         driver.give(output).expect("the output answers its effect");
@@ -297,8 +297,11 @@ async fn execute(binding: &mut Files, effect: Effect<'_>) -> Output {
             .range(prefix, after, limit)
             .await
             .map_or(Output::Failed, Output::Range),
-        Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
-        Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
+        Effect::Append(append, instance) => binding
+            .append(append, instance)
+            .await
+            .map_or(Output::Failed, Output::Appended),
+        Effect::Sync(instance) => binding.sync(instance).await.map_or(Output::Failed, Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),

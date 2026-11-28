@@ -11,8 +11,8 @@ use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
 use crate::store::journal::{self, Anchor, Body, Mark, Role};
 use crate::store::{
-    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, Kind, Profile, Record,
-    Restore, Sequence, audit_record, intent_records, outcome_of, outcome_record,
+    self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Instance, Isolation, JournalWrite, Kind, Profile,
+    Record, Restore, audit_record, intent_records, outcome_of, outcome_record,
 };
 use crate::time::{Reading, ReadingSource};
 use crate::transition::{
@@ -194,9 +194,9 @@ impl Event {
             Effect::Commit(proposal, instance) => Self::Commit(proposal.operation().id.clone(), *instance),
             Effect::Expire(kind, ..) => Self::Expire(*kind),
             Effect::Range(..) => Self::Range,
-            Effect::Append(bytes) => {
+            Effect::Append(append, _) => {
                 // The stored form is `[form, sequence, link, operation, [tag, ...]]`.
-                let Value::Array(items) = cbor::decode(bytes, Limits::default()).unwrap() else {
+                let Value::Array(items) = cbor::decode(&append.entry().data, Limits::default()).unwrap() else {
                     panic!("an entry is an array");
                 };
                 let (Value::Bytes(id), Value::Array(body)) = (&items[3], &items[4]) else {
@@ -210,7 +210,7 @@ impl Event {
                 };
                 Self::Append(written, OperationId::new(id).unwrap())
             }
-            Effect::Sync => Self::Sync,
+            Effect::Sync(_) => Self::Sync,
             Effect::ReadJournal(..) => Self::ReadJournal,
         }
     }
@@ -254,12 +254,9 @@ impl Double {
     fn write(&mut self, bodies: &[(OperationId, Body)]) {
         let mut head = Mark::EMPTY;
         for (operation, body) in bodies {
-            let (data, next) = head.next(operation, body, Limits::default()).unwrap();
-            self.journal.push(store::Entry {
-                sequence: next.sequence,
-                data,
-            });
-            head = next;
+            let append = head.next(operation, body, Limits::default()).unwrap();
+            head = append.head();
+            self.journal.push(append.entry().clone());
         }
         self.synced = self.journal.len();
     }
@@ -299,17 +296,23 @@ impl Double {
                     .map(|(key, record)| (key.clone(), record.clone()))
                     .collect(),
             ),
-            Effect::Append(data) => {
-                let sequence = Sequence(u64::try_from(self.journal.len()).unwrap() + 1);
-                self.journal.push(store::Entry {
-                    sequence,
-                    data: data.into(),
-                });
-                Output::Appended(sequence)
+            Effect::Append(append, instance) => {
+                let head = self
+                    .journal
+                    .last()
+                    .map_or(Mark::EMPTY, |entry| Mark::of(entry.sequence, &entry.data));
+                if instance.0 != self.instance || head != append.after() {
+                    return Output::Appended(JournalWrite::Conflict);
+                }
+                self.journal.push(append.entry().clone());
+                Output::Appended(JournalWrite::Accepted)
             }
-            Effect::Sync => {
+            Effect::Sync(instance) => {
+                if instance.0 != self.instance {
+                    return Output::Synced(JournalWrite::Conflict);
+                }
                 self.synced = self.journal.len();
-                Output::Synced
+                Output::Synced(JournalWrite::Accepted)
             }
             Effect::ReadJournal(after, limit) => Output::Journal(
                 self.journal[..self.synced]

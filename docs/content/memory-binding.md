@@ -97,7 +97,7 @@ Each crash stops the simulated store:
 | `Fault::LostResponse` | `inject` or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit landed |
 | `Error::CrashAfterCommit` | A seed only | `Store::commit` | The result of the commit. The next primitive gives the error | The commit landed when its result is `Accepted` |
 | `Error::DelayedCommit` | A seed only | `Store::commit` | `Err(Error::DelayedCommit)` | The commit arrives after the next start, with the earlier instance number, so it refuses and writes nothing |
-| `Fault::CrashAfterAppend` | `inject` or a seed | `Journal::append` | The sequence of the append. The next primitive gives the error | The append is lost |
+| `Fault::CrashAfterAppend` | `inject` or a seed | `Journal::append` | `JournalWrite::Accepted`. The next primitive gives the error | The append is lost |
 | `Fault::FailedSync` | `inject` or a seed | `Journal::sync` | `Err(Error::Crash(fault))` | No append since the last sync is durable |
 
 After a crash, the store keeps each commit that landed, and the journal keeps each entry whose sync returned. The
@@ -116,7 +116,7 @@ These operations are the methods of `rsauthnz_conformance::suite::Subject`, the 
 | --- | --- |
 | `memory.restart()` | The loss of the process. The store loses all its records: the policy, audit, outcome, and intent records too. The binding stops |
 | `memory.snapshot()` | Gives a `Snapshot` of the state of the store. The mark record of the store (`Kind::Mark`) holds its low-water mark, so the snapshot holds it too ([Restore journal](restore.md)) |
-| `memory.restore(&snapshot)` | Restores the state of the store from the snapshot, then writes the next instance number. The store takes commits at once, and refuses each commit of an earlier start. The appends after the last sync are lost. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
+| `memory.restore(&snapshot)` | Installs the snapshot and the new instance under the same lock. The store takes commits at once, and refuses each commit of an earlier start. The appends after the last sync are lost. Then call `driver.restore(now)`, which applies the journal after the mark of the snapshot |
 | `memory.lose(sequences)` | Removes the durable journal entries in the range `sequences`. `lose(..)` is the loss of the journal, and a smaller range is a gap. No later append gets the sequence of a removed entry |
 | `memory.set_clock(reading)` | Each commit with a deadline reads `reading` in its step, until the next call. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time. Set a later reading to test a commit after its deadline |
 | `memory.with_capacity(capacity)` | The binding with the `Capacity` of the replay records of signatures, in place of 4,096 records and 256 of one agent key. Set it before the first insert |

@@ -48,7 +48,7 @@ An anchor has a `journal::Role`: a sign-in method, a CLI credential, or a recove
 The stored form of an entry is the canonical CBOR array
 `["rsauthnz.journal.1", sequence, link, operation, body]`. The link is the SHA-256 digest of the stored form of the
 entry before it. The first entry holds 32 zero bytes (`Mark::EMPTY`). `head.next(&operation, &body, limits)` gives
-the stored form of the entry after the mark `head`, and the mark of the new entry. It refuses an entry that a history
+a prepared append. Its `entry()` holds the bytes and sequence. Its `head()` identifies the successor. It refuses an entry that a history
 with the same limits cannot read back (`Error::Cbor`).
 
 A `History` reads the journal after a low-water mark:
@@ -75,7 +75,7 @@ use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Human, Id, Principal};
 use rsauthnz::limits::Limits;
 use rsauthnz::store::journal::{self, Body, History, Mark};
-use rsauthnz::store::{Entry, Kind};
+use rsauthnz::store::Kind;
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
 
@@ -93,12 +93,12 @@ proposal.change(Change::End(passkey))?;
 // The removal of the passkey is a fact: each version of the record at or below 3 is dead.
 let entries = journal::entries(&proposal, &[], &[])?;
 let end = entries.end.ok_or("an end entry")?;
-let (bytes, head) = Mark::EMPTY.next(&proposal.operation().id, &Body::End(end), Limits::default())?;
+let append = Mark::EMPTY.next(&proposal.operation().id, &Body::End(end), Limits::default())?;
 
 // A restore from a snapshot with the empty mark reads the journal from its first entry.
 let mut history = History::new(Mark::EMPTY);
-history.extend(&[Entry { sequence: head.sequence, data: bytes }], Limits::default())?;
-assert_eq!(history.head(), head);
+history.extend(core::slice::from_ref(append.entry()), Limits::default())?;
+assert_eq!(history.head(), append.head());
 assert_eq!(journal::replay(history.entries())?.facts().count(), 1);
 ```
 
@@ -169,8 +169,8 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Commit(proposal, instance)` | `Store::commit` | `Committed(commit)` |
 | `Expire(kind, before, limit)` | `Store::expire` | `Expired(count)` |
 | `Range(prefix, after, limit)` | `Store::range` | `Range(records)` |
-| `Append(entry)` | `Journal::append` | `Appended(sequence)` |
-| `Sync` | `Journal::sync` | `Synced` |
+| `Append(append, instance)` | `Journal::append` | `Appended(result)` |
+| `Sync(instance)` | `Journal::sync` | `Synced(result)` |
 | `ReadJournal(after, limit)` | `Journal::read` | `Journal(entries)` |
 
 `Debug` of an effect and of an output shows the length of a journal entry (`Append`, `store::Entry`) and of record
@@ -188,8 +188,7 @@ outcome to the operation in progress, and serves again only after `driver.start(
    record and the journal after its mark, writes the missing creation entries and the voids of reconciliation, and
    then serves.
 2. After a restore of a snapshot, call `driver.restore(now)`, never `start`: a start voids the entries that a restore
-   applies. The restore of the store writes a fresh store instance number as its last step, so a delayed commit of
-   an earlier start refuses also before `driver.restore`. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
+   applies. Exclude writers from earlier instances at both destinations before installing the snapshot. A binding with no journal gets `Error::Unsupported`. The driver records the completions in the mark record before it changes the store, then
    applies the activation and completes each in-doubt consumption. A start after a crash during the restore
    completes the rest before it serves.
 3. Submit a commit with `driver.submit(proposal, plan)`. The `Plan` gives the anchors of the owners that the store
@@ -199,17 +198,19 @@ outcome to the operation in progress, and serves again only after `driver.start(
 4. Look up a lost outcome with `driver.lookup(operation)`. The result is `Lookup::Committed`, `Refused`, `Absent`,
    or `Unknown`. `Unknown` is for a missing outcome record after a restore.
 
+A journal write can return `JournalWrite::Conflict` when the instance or expected head changes.
+The driver stops with `Error::Superseded`. Recover the pending operation under its original identity.
+
 The driver runs one operation at a time, a start first. A commit goes through these effects:
 
 1. The last-anchor check, with no effect. A refusal gives `Outcome::Refused(Error::LastAnchor)`.
 2. A floor entry for each counter whose allocated value passes its durable floor (`driver.allocate(kind)`), the end
    entry, and one sync. A binding with no journal keeps the floors in the mark record, in a commit before this one.
-3. For a proposal with a deadline: the clock effect. A reading that can be at or after the deadline gives
-   `Outcome::Refused(Error::Expired)` with no commit, and the void of the end entry and a sync come first.
-4. The conditional commit, with the instance number of the latest start.
-5. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
+3. The conditional commit checks the instance. For a proposal with a deadline, it also checks the binding's clock in the write.
+   A reading that can reach the deadline gives `Commit::Expired`. The driver makes any required void durable before reporting the refusal.
+4. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
    also carries an intent of `Effect::Journal`, and a commit of the driver ends it after the creation entry.
-6. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
+5. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
    answer.
 
 A start refuses with `Error::Restored` (`Status::Refused`) when the journal shows a commit that the store lost: a

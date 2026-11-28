@@ -8,7 +8,7 @@ use rsauthnz::store::Sequence;
 use rsauthnz::time::Reading;
 use rsauthnz_conformance::suite::{Fault, Subject};
 
-use crate::{Durable, Error, Files, Inner, JOURNAL_FILE, Log, STORE_FILE, State, form, replace};
+use crate::{Error, Files, Inner, JOURNAL_FILE, Log, State, form, replace};
 
 impl Files {
     /// The shared state for a control. A control has no error, so it takes the state after a panic too.
@@ -38,20 +38,12 @@ impl Subject for Files {
         }
     }
 
-    /// Writes `snapshot` as the store log, then opens the files as a start does, with a fresh instance number (guide
-    /// step 2.4). The journal keeps its durable entries.
+    /// Takes a fresh instance under both locks before installing the snapshot. The journal keeps its durable entries.
     fn restore(&self, snapshot: &Self::Snapshot) {
         let mut inner = self.control();
         inner.stop();
-        let durable = inner.state.durable();
         let Some(log) = snapshot else { return };
-        let restored = replace(&self.store, STORE_FILE, log).and_then(|()| {
-            self.open(Durable {
-                store: log.len() as u64,
-                ..durable
-            })
-        });
-        if let Ok(open) = restored {
+        if let Ok(open) = self.open(inner.state.durable(), Some(log)) {
             inner.state = State::Serving(open);
         }
     }
@@ -62,7 +54,7 @@ impl Subject for Files {
         self.control()
             .serve(|open| {
                 let log = open.log()?;
-                let next = log.next;
+                let head = log.head;
                 let mut kept = Vec::new();
                 for entry in log.read(Sequence(0), NonZeroUsize::MAX)? {
                     if !sequences.contains(&entry.sequence) {
@@ -71,7 +63,7 @@ impl Subject for Files {
                 }
                 replace(dir, JOURNAL_FILE, &kept)?;
                 *log = Log::open(dir, u64::MAX)?;
-                log.next = next;
+                log.head = head;
                 Ok::<_, Error>(())
             })
             .unwrap_or_default();

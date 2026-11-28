@@ -45,8 +45,8 @@ only after a start. The binding gives its own error type, `Store::Error` or `Jou
 | `Store::expire(kind, before, limit)` | Removes at most `limit` records of `kind` whose end is before `before`, and gives their number |
 | `Store::outcome(&id)` | A provided method, so a binding does not implement it. It reads the outcome record of the operation identity with `Store::read`, and gives its `transition::Operation`, or `None`. See [Audit and outcome records](#audit-and-outcome-records) |
 | `Store::range(&prefix, after, limit)` | Gives the first `limit` records whose key starts with `prefix` and comes after `after`, in key order, or from the prefix for `None`. It gives fewer only when no more remain, and never a record of another prefix. See [Range reads](#range-reads) |
-| `Journal::append(&entry)` | Appends the entry after the last entry and gives its `Sequence`. The entry is durable only after a later sync returns |
-| `Journal::sync()` | Makes each earlier append durable. A failed sync is a crash: a retry that succeeds does not show that the data is durable |
+| `Journal::append(&append, instance)` | Compares the instance and the full head at the journal. Stores the entry and its new head in one write. A failed comparison gives `JournalWrite::Conflict` |
+| `Journal::sync(instance)` | Confirms durability of earlier appends in the same instance. An old instance gives `JournalWrite::Conflict`. An I/O error stops the binding |
 | `Journal::read(after, limit)` | Gives at most `limit` durable entries (`Entry`) after the sequence `after`, in sequence order |
 
 The entries of the journal have the record format of `rsauthnz::store::journal`. [Restore journal](restore.md) gives

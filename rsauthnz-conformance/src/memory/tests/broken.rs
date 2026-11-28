@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use rsauthnz::limits::Limits;
 use rsauthnz::store::driver;
+use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
-    Capacity, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store,
+    Capacity, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence,
+    Store,
 };
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
@@ -252,16 +254,16 @@ impl Store for Broken {
 impl Journal for Broken {
     type Error = Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
-        self.memory.append(entry).await
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
+        self.memory.append(append, instance).await
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
-        let synced = self.memory.sync().await;
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
+        let synced = self.memory.sync(instance).await;
         if self.defect == Defect::RetriedSync && synced == Err(Error::Crash(Fault::FailedSync)) {
             // The retry: the binding serves again, and the appends that the failure dropped stay lost.
             self.memory.lock().stopped = None;
-            return self.memory.sync().await;
+            return self.memory.sync(instance).await;
         }
         synced
     }
@@ -273,7 +275,7 @@ impl Journal for Broken {
 
 impl Subject for Broken {
     /// The snapshot of the store, the durable journal with its last sequence, and the instance number at the snapshot.
-    type Snapshot = (Snapshot, BTreeMap<Sequence, Box<[u8]>>, Sequence, Instance);
+    type Snapshot = (Snapshot, BTreeMap<Sequence, Box<[u8]>>, Mark, Instance);
 
     fn inject(&self, fault: Fault) {
         self.memory.inject(fault);
@@ -300,6 +302,7 @@ impl Subject for Broken {
             Defect::NoJournal => {
                 binding.journal = journal.clone();
                 binding.synced = *synced;
+                binding.head = *synced;
             }
             Defect::RestoredInstance => {
                 let counter = mem::replace(&mut binding.instance, *instance);
@@ -379,12 +382,12 @@ impl Store for Measured {
 impl Journal for Measured {
     type Error = Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
-        self.memory.append(entry).await
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
+        self.memory.append(append, instance).await
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
-        self.memory.sync().await
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
+        self.memory.sync(instance).await
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {

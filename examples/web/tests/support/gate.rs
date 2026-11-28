@@ -7,7 +7,10 @@ use core::task::{Poll, Waker};
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use rsauthnz::store::{Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store};
+use rsauthnz::store::journal::Append;
+use rsauthnz::store::{
+    Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence, Store,
+};
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{Key, Proposal};
 use rsauthnz_conformance::memory::{Error, Memory, Snapshot};
@@ -124,14 +127,14 @@ impl Store for Gated {
 impl Journal for Gated {
     type Error = Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
         self.pass().await;
-        self.memory.append(entry).await
+        self.memory.append(append, instance).await
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
         self.pass().await;
-        self.memory.sync().await
+        self.memory.sync(instance).await
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {

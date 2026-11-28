@@ -86,13 +86,10 @@ late over the network.
 2. Keep the counter of the numbers where a restore cannot lower it: in the failure domain of the journal. A
    restored lower number lets a delayed commit of the abandoned history land. A binding without a journal keeps the
    counter where a restart does not lower it.
-3. Write the new number durably before `start` returns. A client-server store also writes it into the store, so
-   that each commit reads it in its atomic step. Either order of these two writes is safe, because no commit has the
-   new number before `start` returns.
-4. As the last step of a restore of a snapshot, before the store takes a commit, take a fresh number from the
-   counter. Make it the number that each commit compares. A client-server store writes it into the store, because
-   the restore gave back the copy of the snapshot. Then the store refuses each commit of each earlier start
-   (selected on 2026-11-18).
+3. Install the new number durably at the primary and the journal before `start` returns.
+   Each destination checks its own number at the write.
+4. Exclude earlier writers at both destinations before installing a snapshot.
+   Keep the fresh number outside the snapshot. A single-writer binding can hold both directory locks through installation.
 
 The number of the latest start before the restore is not enough, also when the restore keeps it. A delayed commit of
 that start, for example from an old process that connects again, lands on the restored state. The design model
@@ -280,17 +277,25 @@ A binding that supports restore implements [`Journal`]. The driver writes the re
 and applies the rules ([`journal`]). The binding stores bytes.
 
 1. Keep the journal outside the failure domain of the snapshots, and declare it in [`Restore::Journal`].
-2. Implement [`Journal::append`]. Store the bytes as they are, and give the next [`Sequence`]: the first entry has
-   sequence 1, and each next entry adds one. An append is not durable before a later sync returns.
-3. Implement [`Journal::sync`]. It makes each earlier append durable. When it fails, give the error and do not
-   retry it. After a failed sync, the kernel can drop the data and clear the error, so a later sync that succeeds
-   does not show that the data is durable.
+2. Implement [`Journal::append`]. Compare the request instance and `append.after()` at the journal in the same atomic write.
+   Compare both the sequence and the link. Include entries that await sync.
+   Store `append.entry()` and install `append.head()` together.
+3. Implement [`Journal::sync`]. Check the request instance at the journal before confirming durability.
+   Return `JournalWrite::Accepted` on success. A failed comparison in either primitive gives `JournalWrite::Conflict` without a write.
+   An I/O failure stops the binding. A later sync cannot establish that an earlier failed sync preserved the bytes.
 4. Implement [`Journal::read`]. It gives at most `limit` durable entries ([`Entry`]) after the sequence `after`, in
    the order of their sequences. Give no append whose sync did not return. Do not fill or renumber a gap.
 5. After a crash or a failed sync, drop each append after the last sync that returned. The next append gets the
    sequence after the last durable entry.
 6. Frame each entry, for example with its length and a checksum. Then a start after a crash finds a torn last
    append, which no sync made durable, and drops it.
+
+When upgrading a raw-byte journal, stop the old writers and exclude pending raw appends before opening the conditional interface.
+Derive the initial head from the last retained entry with `Mark::of(sequence, data)`.
+Use `Mark::EMPTY` for a new, empty journal. Preserve the head separately if retention can remove its entry.
+Keep the instance and head at the journal destination. A conditional update or the journal writer's lock can protect both comparisons.
+One conditional append checks both fields. One sync can cover several accepted entries.
+Run the conformance suite with restore enabled and check the result of `JournalFence`.
 
 A binding with no journal declares [`Restore::Unsupported`]. It implements [`Journal`] with methods that give an
 error, because the driver and the suite never call them.
@@ -300,7 +305,6 @@ error, because the driver and the suite never call them.
 [`Journal::append`]: rsauthnz::store::Journal::append
 [`Journal::sync`]: rsauthnz::store::Journal::sync
 [`Journal::read`]: rsauthnz::store::Journal::read
-[`Sequence`]: rsauthnz::store::Sequence
 [`Entry`]: rsauthnz::store::Entry
 
 ## 9. Stop at each error
@@ -344,8 +348,11 @@ async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Out
             .range(prefix, after, limit)
             .await
             .map_or(Output::Failed, Output::Range),
-        Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
-        Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
+        Effect::Append(append, instance) => binding
+            .append(append, instance)
+            .await
+            .map_or(Output::Failed, Output::Appended),
+        Effect::Sync(instance) => binding.sync(instance).await.map_or(Output::Failed, Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),
@@ -412,7 +419,7 @@ as [step 9](#9-stop-at-each-error) states.
 | --- | --- | --- | --- |
 | [`Fault::CrashBeforeCommit`] | [`Store::commit`] | Nothing | An error |
 | [`Fault::LostResponse`] | [`Store::commit`] | The commit, as a commit with no fault | An error |
-| [`Fault::CrashAfterAppend`] | [`Journal::append`] | No durable entry: the crash loses the append | Its sequence. The next primitive gives an error |
+| [`Fault::CrashAfterAppend`] | [`Journal::append`] | No durable entry: the crash loses the append | `JournalWrite::Accepted`. The next primitive gives an error |
 | [`Fault::FailedSync`] | [`Journal::sync`] | No durable entry since the last sync | An error |
 
 Most bindings can inject these faults in their own code, before or after the call to the store. A binding that

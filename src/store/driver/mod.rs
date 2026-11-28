@@ -47,7 +47,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 
 use super::journal::{self, Anchor, Body, Entries, History, Mark, Reads, Role};
-use super::{Commit, Instance, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of};
+use super::{Commit, Instance, JournalWrite, Kind, Profile, Record, Restore, Sequence, intent_records, outcome_of};
 use crate::cbor;
 use crate::id::AuthorityVersion;
 use crate::limits::Limits;
@@ -101,9 +101,9 @@ pub enum Effect<'a> {
     /// [`Store::range`](super::Store::range) of the prefix after the key. Give [`Output::Range`].
     Range(&'a Key, Option<&'a Key>, NonZeroUsize),
     /// [`Journal::append`](super::Journal::append) of the entry. Give [`Output::Appended`].
-    Append(&'a [u8]),
+    Append(&'a journal::Append, Instance),
     /// [`Journal::sync`](super::Journal::sync). Give [`Output::Synced`].
-    Sync,
+    Sync(Instance),
     /// [`Journal::read`](super::Journal::read) after the sequence. Give [`Output::Journal`].
     ReadJournal(Sequence, NonZeroUsize),
 }
@@ -119,8 +119,8 @@ impl fmt::Debug for Effect<'_> {
             Self::Range(prefix, after, limit) => {
                 f.debug_tuple("Range").field(prefix).field(after).field(limit).finish()
             }
-            Self::Append(entry) => f.debug_struct("Append").field("len", &entry.len()).finish(),
-            Self::Sync => f.write_str("Sync"),
+            Self::Append(append, instance) => f.debug_tuple("Append").field(append.entry()).field(instance).finish(),
+            Self::Sync(instance) => f.debug_tuple("Sync").field(instance).finish(),
             Self::ReadJournal(after, limit) => f.debug_tuple("ReadJournal").field(after).field(limit).finish(),
         }
     }
@@ -139,10 +139,10 @@ pub enum Output {
     Expired(usize),
     /// The records of the range.
     Range(Vec<(Key, Record)>),
-    /// The sequence of the appended entry.
-    Appended(Sequence),
-    /// The sync returned.
-    Synced,
+    /// The journal's conditional append result.
+    Appended(JournalWrite),
+    /// The journal's conditional sync result.
+    Synced(JournalWrite),
     /// The journal entries.
     Journal(Vec<super::Entry>),
     /// The primitive failed. It is a crash, and the binding does not retry it.
@@ -219,8 +219,9 @@ pub enum Error {
     Down,
     /// A counter is past its largest value.
     Overflow,
-    /// The binding gave an output that its effect does not ask for, or the sequence of another entry, or it refused
-    /// a commit of the driver. The binding is not valid.
+    /// The journal refused the instance or the predecessor. Reconcile before serving more work.
+    Superseded,
+    /// The binding returned an unexpected output or refused an internal commit.
     Binding,
     /// The mark record of the store has no valid form.
     Record,
@@ -245,6 +246,7 @@ impl Recover for Error {
             | Self::RecordBound(_)
             | Self::RecordBytes
             | Self::Overflow
+            | Self::Superseded
             | Self::Binding
             | Self::Record
             | Self::Restored => Recovery::Refuse,
@@ -284,6 +286,7 @@ impl fmt::Display for Error {
             Self::RecordBytes => f.write_str("a record of the proposal is larger than the record bound of the binding"),
             Self::Down => f.write_str("the driver serves no operation yet"),
             Self::Overflow => f.write_str("a counter is past its largest value"),
+            Self::Superseded => f.write_str("the journal instance or head changed"),
             Self::Binding => f.write_str("the binding gave an output that the driver did not ask for"),
             Self::Record => f.write_str("the mark record of the store has no valid form"),
             Self::Restored => f.write_str("the store state is older than its journal: call restore, not start"),
@@ -805,7 +808,7 @@ struct Looking {
 struct Writing {
     bodies: VecDeque<(OperationId, Body)>,
     /// The stored form of the next append, and its mark.
-    next: Option<(super::Entry, Mark)>,
+    next: Option<journal::Append>,
     sync: bool,
 }
 
@@ -822,33 +825,29 @@ impl Writing {
 
     fn encode(&mut self, core: &Core) -> Result<(), Error> {
         if let Some((operation, body)) = self.bodies.pop_front() {
-            let (data, mark) = core.history.head().next(&operation, &body, core.limits)?;
-            self.next = Some((
-                super::Entry {
-                    sequence: mark.sequence,
-                    data,
-                },
-                mark,
-            ));
+            self.next = Some(core.history.head().next(&operation, &body, core.limits)?);
         }
         Ok(())
     }
 
-    fn effect(&self) -> Option<Effect<'_>> {
+    fn effect(&self, instance: Instance) -> Option<Effect<'_>> {
         match &self.next {
-            Some((entry, _)) => Some(Effect::Append(&entry.data)),
-            None => self.sync.then_some(Effect::Sync),
+            Some(append) => Some(Effect::Append(append, instance)),
+            None => self.sync.then_some(Effect::Sync(instance)),
         }
     }
 
     fn give(&mut self, core: &mut Core, output: Output) -> Result<(), Error> {
         match (self.next.take(), output) {
-            (Some((entry, mark)), Output::Appended(sequence)) if sequence == mark.sequence => {
-                core.history.extend(&[entry], core.limits)?;
+            (Some(append), Output::Appended(JournalWrite::Accepted)) => {
+                core.history
+                    .extend(core::slice::from_ref(append.entry()), core.limits)?;
                 self.sync = true;
                 self.encode(core)
             }
-            (None, Output::Synced) if self.sync => {
+            (Some(_), Output::Appended(JournalWrite::Conflict)) => Err(Error::Superseded),
+            (None, Output::Synced(JournalWrite::Conflict)) if self.sync => Err(Error::Superseded),
+            (None, Output::Synced(JournalWrite::Accepted)) if self.sync => {
                 self.sync = false;
                 Ok(())
             }
@@ -875,7 +874,7 @@ impl Committing {
     fn effect<'a>(&'a self, core: &Core) -> Option<Effect<'a>> {
         match self.proposals.front() {
             Some(proposal) => Some(Effect::Commit(proposal, core.instance)),
-            None => self.after.effect(),
+            None => self.after.effect(core.instance),
         }
     }
 
@@ -1095,7 +1094,7 @@ impl Submitted {
         match &self.phase {
             CommitPhase::Floor(committing) | CommitPhase::Release(committing) => committing.effect(core),
             CommitPhase::Entries(writing) | CommitPhase::Creation(writing) | CommitPhase::Void(writing) => {
-                writing.effect()
+                writing.effect(core.instance)
             }
             CommitPhase::Commit => self
                 .proposal
@@ -1295,7 +1294,7 @@ impl Start {
             StartPhase::Complete(proposals) => proposals
                 .front()
                 .map(|proposal| Effect::Commit(proposal, core.instance)),
-            StartPhase::Reconcile(writing) => writing.effect(),
+            StartPhase::Reconcile(writing) => writing.effect(core.instance),
             StartPhase::Done => None,
         }
     }
@@ -1650,7 +1649,7 @@ impl Advance {
     fn effect<'a>(&'a self, core: &'a Core) -> Option<Effect<'a>> {
         match self {
             Self::Reads(reading) => reading.effect(),
-            Self::Restate(writing, _) => writing.effect(),
+            Self::Restate(writing, _) => writing.effect(core.instance),
             Self::Write(committing, _) => committing.effect(core),
             Self::Begin | Self::Done => None,
         }

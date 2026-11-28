@@ -9,7 +9,8 @@ use std::thread;
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Id, Principal};
 use rsauthnz::limits::Limits;
-use rsauthnz::store::{Commit, Entry, Instance, Journal, Kind, Sequence, Store};
+use rsauthnz::store::journal::{Append, Body, Floor, Mark};
+use rsauthnz::store::{Commit, Entry, Instance, Journal, JournalWrite, Kind, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, Operation, OperationId, Proposal};
 
@@ -55,6 +56,16 @@ fn entries(memory: &mut Memory) -> Result<Vec<Entry>, Error> {
     ready(Journal::read(memory, Sequence(0), NonZeroUsize::MAX))
 }
 
+fn floor(after: Mark, value: u8) -> Append {
+    let body = Body::Floor(Floor {
+        kind: Kind::Session,
+        value: u64::from(value),
+    });
+    after
+        .next(&OperationId::new(&[value]).unwrap(), &body, Limits::default())
+        .unwrap()
+}
+
 /// The seeds of the seeded run, and the steps of each run.
 const SEEDS: u64 = 64;
 const STEPS: u8 = 16;
@@ -63,8 +74,8 @@ const STEPS: u8 = 16;
 #[derive(Debug, PartialEq)]
 enum Call {
     Start(Instance),
-    Append(Result<Sequence, Error>),
-    Sync(Result<(), Error>),
+    Append(Result<JournalWrite, Error>),
+    Sync(Result<JournalWrite, Error>),
     Commit(Result<Commit, Error>),
 }
 
@@ -86,15 +97,18 @@ struct Run {
 impl Run {
     /// One step: an append, a sync, and the commit of a proposal that creates one key.
     fn step(&mut self, step: u8) -> Result<(), Error> {
-        let appended = ready(self.memory.append(&[step]));
+        let head = self
+            .synced
+            .last()
+            .map_or(Mark::EMPTY, |entry| Mark::of(entry.sequence, &entry.data));
+        let append = floor(head, step);
+        let appended = ready(self.memory.append(&append, self.instance));
         self.calls.push(Call::Append(appended));
-        self.unsynced.push(Entry {
-            sequence: appended?,
-            data: Box::new([step]),
-        });
-        let synced = ready(self.memory.sync());
+        assert_eq!(appended?, JournalWrite::Accepted);
+        self.unsynced.push(append.entry().clone());
+        let synced = ready(self.memory.sync(self.instance));
         self.calls.push(Call::Sync(synced));
-        synced?;
+        assert_eq!(synced?, JournalWrite::Accepted);
         self.synced.append(&mut self.unsynced);
 
         let key = Kind::Credential.key(&[step]).unwrap();
@@ -251,21 +265,23 @@ fn an_expiry_pass_removes_the_audit_and_outcome_records_only_after_the_finite_re
 #[test]
 fn an_append_is_durable_only_after_its_sync_returns() {
     let mut memory = Memory::new(Schedule::None);
-    ready(memory.start()).unwrap();
-    let first = ready(memory.append(b"first")).unwrap();
-    ready(memory.sync()).unwrap();
-    let second = ready(memory.append(b"second")).unwrap();
-    let durable = vec![Entry {
-        sequence: first,
-        data: Box::new(*b"first"),
-    }];
+    let instance = ready(memory.start()).unwrap();
+    let first = floor(Mark::EMPTY, 1);
+    let second = floor(first.head(), 2);
+    assert_eq!(ready(memory.append(&first, instance)), Ok(JournalWrite::Accepted));
+    assert_eq!(ready(memory.sync(instance)), Ok(JournalWrite::Accepted));
+    assert_eq!(ready(memory.append(&second, instance)), Ok(JournalWrite::Accepted));
+    let durable = vec![first.entry().clone()];
     assert_eq!(entries(&mut memory), Ok(durable.clone()));
 
     memory.inject(Fault::FailedSync);
-    assert_eq!(ready(memory.sync()), Err(Error::Crash(Fault::FailedSync)));
-    ready(memory.start()).unwrap();
+    assert_eq!(ready(memory.sync(instance)), Err(Error::Crash(Fault::FailedSync)));
+    let current = ready(memory.start()).unwrap();
     assert_eq!(entries(&mut memory), Ok(durable));
-    assert_eq!(ready(memory.append(b"third")), Ok(second));
+    assert_eq!(
+        ready(memory.append(&floor(first.head(), 3), current)),
+        Ok(JournalWrite::Accepted)
+    );
 }
 
 /// A restart and a restore each lose the appends after the last sync, as a crash does, so a sync after the next start
@@ -275,18 +291,22 @@ fn a_restart_or_a_restore_loses_each_append_after_the_last_sync() {
     for stop in ["restart", "restore"] {
         let mut memory = Memory::new(Schedule::None);
         let snapshot = memory.snapshot();
-        ready(memory.start()).unwrap();
-        ready(memory.append(b"synced")).unwrap();
-        ready(memory.sync()).unwrap();
+        let instance = ready(memory.start()).unwrap();
+        let first = floor(Mark::EMPTY, 1);
+        assert_eq!(ready(memory.append(&first, instance)), Ok(JournalWrite::Accepted));
+        assert_eq!(ready(memory.sync(instance)), Ok(JournalWrite::Accepted));
         let durable = entries(&mut memory).unwrap();
-        ready(memory.append(b"unsynced")).unwrap();
+        assert_eq!(
+            ready(memory.append(&floor(first.head(), 2), instance)),
+            Ok(JournalWrite::Accepted)
+        );
         if stop == "restart" {
             memory.restart();
         } else {
             memory.restore(&snapshot);
         }
-        ready(memory.start()).unwrap();
-        ready(memory.sync()).unwrap();
+        let current = ready(memory.start()).unwrap();
+        assert_eq!(ready(memory.sync(current)), Ok(JournalWrite::Accepted));
         assert_eq!(entries(&mut memory), Ok(durable), "{stop}");
     }
 }
@@ -296,11 +316,14 @@ fn a_restart_or_a_restore_loses_each_append_after_the_last_sync() {
 #[test]
 fn a_lost_entry_leaves_a_gap_that_no_append_fills() {
     let mut memory = Memory::new(Schedule::None);
-    ready(memory.start()).unwrap();
-    for entry in [b"1", b"2", b"3", b"4"] {
-        ready(memory.append(entry)).unwrap();
+    let instance = ready(memory.start()).unwrap();
+    let mut head = Mark::EMPTY;
+    for value in 1..=4 {
+        let append = floor(head, value);
+        assert_eq!(ready(memory.append(&append, instance)), Ok(JournalWrite::Accepted));
+        head = append.head();
     }
-    ready(memory.sync()).unwrap();
+    assert_eq!(ready(memory.sync(instance)), Ok(JournalWrite::Accepted));
 
     memory.lose(Sequence(2)..=Sequence(3));
     let sequences = |memory: &mut Memory| {
@@ -313,5 +336,10 @@ fn a_lost_entry_leaves_a_gap_that_no_append_fills() {
     assert_eq!(sequences(&mut memory), [Sequence(1), Sequence(4)]);
     memory.lose(..);
     assert_eq!(sequences(&mut memory), []);
-    assert_eq!(ready(memory.append(b"5")), Ok(Sequence(5)));
+    assert_eq!(
+        ready(memory.append(&floor(head, 5), instance)),
+        Ok(JournalWrite::Accepted)
+    );
+    assert_eq!(ready(memory.sync(instance)), Ok(JournalWrite::Accepted));
+    assert_eq!(sequences(&mut memory), [Sequence(5)]);
 }

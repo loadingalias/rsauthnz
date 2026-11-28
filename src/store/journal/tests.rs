@@ -128,12 +128,9 @@ fn journal(bodies: &[(OperationId, Body)]) -> Vec<store::Entry> {
     bodies
         .iter()
         .map(|(operation, body)| {
-            let (data, next) = head.next(operation, body, Limits::default()).unwrap();
-            head = next;
-            store::Entry {
-                sequence: next.sequence,
-                data,
-            }
+            let append = head.next(operation, body, Limits::default()).unwrap();
+            head = append.head();
+            append.entry().clone()
         })
         .collect()
 }
@@ -288,11 +285,11 @@ fn a_changed_removed_or_foreign_entry_fails_verification() {
     let stored = journal(&bodies);
     History::new(Mark::EMPTY).extend(&stored, Limits::default()).unwrap();
 
-    let (other, _) = mark(&stored, 1)
+    let other = mark(&stored, 1)
         .next(&op("u-1"), &end(unlink("u-1", &passkey, 9)), Limits::default())
         .unwrap();
     let mut changed = stored.clone();
-    changed[1].data = other;
+    changed[1] = other.entry().clone();
     assert_eq!(
         History::new(Mark::EMPTY).extend(&changed, Limits::default()),
         Err(Error::Changed(Sequence(3)))

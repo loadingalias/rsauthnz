@@ -80,10 +80,9 @@ pub trait Subject: Store + Journal + Clone {
     /// [`Restore::Journal`].
     fn snapshot(&self) -> Self::Snapshot;
 
-    /// Restores the state of the store from `snapshot`, and writes a fresh store instance number as its last step. The
-    /// restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses
-    /// each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last
-    /// sync. The suite restores only a binding that declares [`Restore::Journal`].
+    /// Installs `snapshot` under a fresh instance. Exclude old writes at both destinations before installation.
+    /// The journal keeps its durable entries and drops each append after the last sync.
+    /// The suite restores only a binding that declares [`Restore::Journal`].
     fn restore(&self, snapshot: &Self::Snapshot);
 
     /// Removes the durable entries of the journal with a sequence in `sequences`: the loss of entries in the failure
@@ -106,7 +105,7 @@ pub enum Fault {
     CrashBeforeCommit,
     /// A commit writes everything, but its response is lost: the commit gives an error.
     LostResponse,
-    /// The binding crashes after an append gives its sequence, before a sync. The crash loses the append.
+    /// The binding crashes after the journal accepts an append, before a sync. The crash loses the append.
     CrashAfterAppend,
     /// A sync fails and gives an error, and no append since the last sync becomes durable.
     FailedSync,
@@ -151,6 +150,8 @@ pub enum Case {
     /// restore: the delayed commit of an abandoned history. Between a restore and the next start, a commit with the
     /// instance number at the snapshot, or of a start after it, refuses too. Property: `NoStaleCommit`.
     Fencing,
+    /// Two writers can extend one predecessor only once. An old instance cannot append or confirm a sync.
+    JournalFence,
     /// An audit record and an outcome record end at their retention end: the estimate of the audit time of the
     /// proposal plus [`Declaration::outcome_retention`], rounded up by at most one second. An expire before that end
     /// removes neither, so a retried operation learns its outcome.
@@ -209,7 +210,7 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::Deadline,
@@ -220,6 +221,7 @@ impl Case {
         Self::Expiry,
         Self::Range,
         Self::Fencing,
+        Self::JournalFence,
         Self::Retention,
         Self::LostResponse,
         Self::FailedSync,
@@ -255,7 +257,8 @@ impl Case {
             | Self::Restart
             | Self::Bootstrap => true,
             Self::LostResponse => crash,
-            Self::RefusalVoid
+            Self::JournalFence
+            | Self::RefusalVoid
             | Self::RestoreJournal
             | Self::RestoreFloors
             | Self::RestoreRefusal
@@ -279,6 +282,7 @@ impl Case {
             Self::Expiry => cases::expiry(make()).await,
             Self::Range => cases::range(make()).await,
             Self::Fencing => cases::fencing(make()).await,
+            Self::JournalFence => cases::journal_fence(make()).await,
             Self::Retention => cases::retention(make()).await,
             Self::LostResponse => cases::lost_response(make()).await,
             Self::FailedSync => cases::failed_sync(make()).await,
@@ -616,8 +620,11 @@ pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output 
             .range(prefix, after, limit)
             .await
             .map_or(Output::Failed, Output::Range),
-        Effect::Append(entry) => binding.append(entry).await.map_or(Output::Failed, Output::Appended),
-        Effect::Sync => binding.sync().await.map_or(Output::Failed, |()| Output::Synced),
+        Effect::Append(append, instance) => binding
+            .append(append, instance)
+            .await
+            .map_or(Output::Failed, Output::Appended),
+        Effect::Sync(instance) => binding.sync(instance).await.map_or(Output::Failed, Output::Synced),
         Effect::ReadJournal(after, limit) => Journal::read(binding, after, limit)
             .await
             .map_or(Output::Failed, Output::Journal),

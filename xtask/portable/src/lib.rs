@@ -33,8 +33,9 @@ use rsauthnz::id::{Action, AuthorityVersion, Id, Principal, Resource};
 use rsauthnz::limits::{Limit, Limits, SignatureBudget};
 use rsauthnz::local::{self, Admitted, Authority, Bootstrap, Failure, HostGrant, Offer, Status};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
+use rsauthnz::store::journal::Append;
 use rsauthnz::store::{
-    self, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, Kind, Record, Sequence, Store,
+    self, Commit, Declaration, Entry, Insert, Inserted, Instance, Journal, JournalWrite, Kind, Record, Sequence, Store,
 };
 use rsauthnz::time::{Reading, ReadingSource, TimeError};
 use rsauthnz::transition::{self, Audit, Change, Dependency, OperationId, Outcome, Proposal};
@@ -1139,12 +1140,12 @@ impl Store for Defective {
 impl Journal for Defective {
     type Error = memory::Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, memory::Error> {
-        self.memory.append(entry).await
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, memory::Error> {
+        self.memory.append(append, instance).await
     }
 
-    async fn sync(&mut self) -> Result<(), memory::Error> {
-        self.memory.sync().await
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, memory::Error> {
+        self.memory.sync(instance).await
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, memory::Error> {

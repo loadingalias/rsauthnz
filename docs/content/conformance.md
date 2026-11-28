@@ -51,7 +51,7 @@ the refusal.
 
 ## Implement the test controls
 
-`Subject` extends `Store`, `Journal`, and `Clone`. The clones of a subject are handles of one binding: two cases
+`Subject` extends `Store`, `Journal`, and `Clone`. The clones of a subject are handles of one binding. Concurrent cases
 commit with two clones at the same time. Each control acts on the binding of all its clones.
 
 | `Subject` item | Effect | The suite calls it |
@@ -60,7 +60,7 @@ commit with two clones at the same time. Each control acts on the binding of all
 | `inject(fault)` | The next call of the primitive of `fault` takes the fault | Only when the declaration states `CrashInjection::Supported` |
 | `restart()` | The loss of the process. The store loses what `Declaration::crash_loss` states, and the journal keeps each entry whose sync returned. The binding serves again after a start | For each binding |
 | `snapshot()` | Gives a snapshot of the state of the store | Only when the declaration states `Restore::Journal` |
-| `restore(&snapshot)` | Restores the state of the store from the snapshot, and writes a fresh store instance number as its last step. The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync | Only when the declaration states `Restore::Journal` |
+| `restore(&snapshot)` | Restores the state of the store under a fresh instance. The restore does not stop the binding: the store takes commits at once, as a restored database does, and refuses each commit of an earlier start. The journal keeps its durable entries, and loses each append after the last sync | Only when the declaration states `Restore::Journal` |
 | `lose(sequences)` | Removes the durable journal entries with a sequence in the range. A later append does not get the sequence of a removed entry | Only when the declaration states `Restore::Journal` |
 | `set_clock(now)` | Each commit reads `now` in place of the clock of the binding, until the next call. A binding for production reads the system clock with its bound | For each case: the suite sets the fixed time of the case |
 
@@ -70,7 +70,7 @@ The fault is a `rsauthnz_conformance::suite::Fault`, one of four:
 | --- | --- | --- | --- |
 | `CrashBeforeCommit` | `Store::commit` | An error | The commit wrote nothing |
 | `LostResponse` | `Store::commit` | An error | The commit landed |
-| `CrashAfterAppend` | `Journal::append` | The sequence. The next primitive gives an error | The append is lost |
+| `CrashAfterAppend` | `Journal::append` | `JournalWrite::Accepted`. The next primitive gives an error | The append is lost |
 | `FailedSync` | `Journal::sync` | An error | No append since the last sync is durable |
 
 A fault is a crash. After it, each primitive except `Store::start` gives an error until the next start.
@@ -93,6 +93,7 @@ the journal needs `Restore::Journal`. The properties are those of the authority-
 | `Expiry` | Expiry removes at most its limit of ended records of its kind, and no other record | — | `NoLiveRemoved` |
 | `Range` | A range read gives the records of its prefix after its key, in key order, up to its limit. It gives no record of another prefix, such as the administrator binding of another authority | — | — |
 | `Fencing` | A commit with the instance number of an earlier start refuses after a start, after a restart, and after a restore. Between a restore and the next start, a commit with the instance number at the snapshot, or of a start after it, refuses too | — | `NoStaleCommit` |
+| `JournalFence` | Two requests for one head produce one successor. A different link at the same sequence refuses. An earlier instance cannot append or confirm durability | Journal | — |
 | `Retention` | An audit record and an outcome record end at their retention end: the estimate of the audit time of the proposal plus `Declaration::outcome_retention`, rounded up by at most one second. An expire before that end removes neither, so a retried operation learns its outcome | — | — |
 | `LostResponse` | A commit whose response is lost landed: after the next start, its outcome record and its audit are readable. A commit that crashed before it landed wrote nothing | Crash | `MissingOutcomeUnknown` |
 | `FailedSync` | A failed sync gives its failure and stops the binding. No retried sync serves before a start, and no append since the last sync is durable | Crash, journal | — |

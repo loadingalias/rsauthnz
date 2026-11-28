@@ -21,7 +21,7 @@
 //! use rsauthnz::id::{AuthorityVersion, Human, Id, Principal};
 //! use rsauthnz::limits::Limits;
 //! use rsauthnz::store::journal::{self, Body, History, Mark};
-//! use rsauthnz::store::{Entry, Kind};
+//! use rsauthnz::store::Kind;
 //! use rsauthnz::time::{Reading, ReadingSource};
 //! use rsauthnz::transition::{Audit, Change, Dependency, OperationId, Proposal};
 //!
@@ -39,12 +39,12 @@
 //! // The removal of the passkey is a fact: each version of the record at or below 3 is dead.
 //! let entries = journal::entries(&proposal, &[], &[])?;
 //! let end = entries.end.ok_or("an end entry")?;
-//! let (bytes, head) = Mark::EMPTY.next(&proposal.operation().id, &Body::End(end), Limits::default())?;
+//! let append = Mark::EMPTY.next(&proposal.operation().id, &Body::End(end), Limits::default())?;
 //!
 //! // A restore from a snapshot with the empty mark reads the journal from its first entry.
 //! let mut history = History::new(Mark::EMPTY);
-//! history.extend(&[Entry { sequence: head.sequence, data: bytes }], Limits::default())?;
-//! assert_eq!(history.head(), head);
+//! history.extend(core::slice::from_ref(append.entry()), Limits::default())?;
+//! assert_eq!(history.head(), append.head());
 //! assert_eq!(journal::replay(history.entries())?.facts().count(), 1);
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
@@ -99,8 +99,18 @@ impl Mark {
         link: Link([0; 32]),
     };
 
-    /// The stored form of the entry `body` of `operation` after this mark, and the mark of the new entry. Append the
-    /// form, and keep the new mark as the head only when the append gives its sequence.
+    /// The mark of a stored entry. A binding can recover its head from the last frame of its journal.
+    ///
+    /// Cost class: [`Parse`](crate::limits::Class::Parse). It digests the stored bytes once.
+    #[must_use]
+    pub fn of(sequence: Sequence, data: &[u8]) -> Self {
+        Self {
+            sequence,
+            link: Link(crypto::sha256(data)),
+        }
+    }
+
+    /// Prepares one successor of this mark. The stored bytes bind its sequence and predecessor.
     ///
     /// Cost class: [`Parse`](crate::limits::Class::Parse). It encodes the form within `limits` and digests it once.
     ///
@@ -108,11 +118,50 @@ impl Mark {
     ///
     /// [`Error::Cbor`] for an entry that [`History::extend`] cannot read back with `limits`, and [`Error::Overflow`]
     /// after the last sequence.
-    pub fn next(&self, operation: &OperationId, body: &Body, limits: Limits) -> Result<(Box<[u8]>, Self), Error> {
+    pub fn next(&self, operation: &OperationId, body: &Body, limits: Limits) -> Result<Append, Error> {
         let sequence = Sequence(self.sequence.0.checked_add(1).ok_or(Error::Overflow)?);
         let bytes = form::encode(sequence, &self.link, operation, body, limits).map_err(Error::Cbor)?;
-        let link = Link(crypto::sha256(&bytes));
-        Ok((bytes.into_boxed_slice(), Self { sequence, link }))
+        Ok(Append {
+            after: *self,
+            head: Self::of(sequence, &bytes),
+            entry: super::Entry {
+                sequence,
+                data: bytes.into_boxed_slice(),
+            },
+        })
+    }
+}
+
+/// A conditional journal append. [`Mark::next`] binds the two marks to the same immutable entry.
+pub struct Append {
+    after: Mark,
+    head: Mark,
+    entry: super::Entry,
+}
+
+impl fmt::Debug for Append {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Append").field(&self.entry).finish()
+    }
+}
+
+impl Append {
+    /// The head that the journal must still hold at the write.
+    #[must_use]
+    pub const fn after(&self) -> Mark {
+        self.after
+    }
+
+    /// The head that the journal installs with the entry.
+    #[must_use]
+    pub const fn head(&self) -> Mark {
+        self.head
+    }
+
+    /// The bytes and sequence to store.
+    #[must_use]
+    pub const fn entry(&self) -> &super::Entry {
+        &self.entry
     }
 }
 
@@ -391,10 +440,7 @@ impl History {
                 .filter(|(_, entry)| entry.sequence == expected)
                 .ok_or(Error::Form(expected))?;
             (link == self.head.link).ok_or(Error::Changed(expected))?;
-            self.head = Mark {
-                sequence: expected,
-                link: Link(crypto::sha256(&stored.data)),
-            };
+            self.head = Mark::of(expected, &stored.data);
             self.entries.push(entry);
             self.held.push(link);
         }

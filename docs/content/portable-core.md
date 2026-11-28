@@ -145,6 +145,8 @@ a report that equals the expected text: a build alone passes no cell. A failed c
 the command fails. A trap in the Worker gives `trap: <error>` as the report. A browser that gives no report in 180
 seconds fails its cell. Each run owns its temporary profiles. The command stops its browser processes before it removes those profiles.
 A Safari error at `POST /session` occurs before the Worker starts. Check the Safari automation settings on that Mac.
+If Safari reports "Safari was not launched for automation", save your work and quit Safari.
+Run `cargo xtask portable` and let WebDriver start Safari.
 
 ## The cases
 
@@ -165,7 +167,7 @@ the seed or the time of the host.
 | `local authority bootstrap and call` | one administrator, an ML-DSA-65 + Ed25519 credential, and one admitted call |
 | `local authority refusals` | another origin, a reused value, an altered credential, and each invalid composite half refuse |
 | `local authority missing host inputs` | a time with no bound, no signature, and the signature of another key commit nothing |
-| `conformance memory binding` | 25 cases pass |
+| `conformance memory binding` | 26 cases pass |
 | `conformance lost outcome reads` | fails LostResponse |
 | `conformance no instance check` | fails Fencing |
 

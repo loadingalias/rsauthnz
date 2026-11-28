@@ -18,6 +18,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 use core::ops::Bound;
 use core::time::Duration;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -26,10 +27,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsauthnz::id::AuthorityVersion;
+use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
     self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Insert, Inserted, Instance, Isolation,
-    Journal, Kind, Record, Restore, Sequence, Store, audit_record, intent_records, outcome_of, outcome_record,
-    policy_key,
+    Journal, JournalWrite, Kind, Record, Restore, Sequence, Store, audit_record, intent_records, outcome_of,
+    outcome_record, policy_key,
 };
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Change, Dependency, Key, Proposal};
@@ -49,7 +51,7 @@ pub const JOURNAL_FILE: &str = "journal";
 /// no journal.
 pub const INSTANCE_FILE: &str = "instance";
 
-/// The name of the lock file in the store directory.
+/// The name of the lock file in each storage directory.
 pub const LOCK_FILE: &str = "lock";
 
 /// The capacity of the replay records of signatures: small, so that the conformance suite fills it.
@@ -97,6 +99,7 @@ enum State {
 /// whose commit or sync did not return.
 #[derive(Clone, Copy, Debug)]
 struct Durable {
+    instance: Instance,
     store: u64,
     journal: u64,
 }
@@ -104,6 +107,7 @@ struct Durable {
 impl Durable {
     /// No length known: the first start of the process reads each complete frame of each file.
     const UNKNOWN: Self = Self {
+        instance: Instance(0),
         store: u64::MAX,
         journal: u64::MAX,
     };
@@ -118,8 +122,8 @@ struct Open {
     /// The durable length of the store log. Each write syncs before it returns.
     store_len: u64,
     journal: Option<Log>,
-    /// The lock of the store directory, which the binding holds while it serves.
-    _lock: File,
+    /// Exclusive access to both destinations for this instance.
+    _locks: (File, Option<File>),
 }
 
 /// The current records, and the key of each record with an end, by kind and end. Thus an expiry reads only the
@@ -140,8 +144,8 @@ struct Log {
     synced: (usize, u64),
     /// The length of the file.
     len: u64,
-    /// The sequence of the next append. A loss of entries does not lower it.
-    next: Sequence,
+    /// The head including entries that await sync.
+    head: Mark,
 }
 
 /// The cause of a failed primitive. No error holds the bytes of a record.
@@ -156,8 +160,10 @@ pub enum Error {
     /// A file has a complete frame with no valid form, or a proposal has an intent with no CBOR form. A file that
     /// changed outside the binding needs a restore.
     Form,
-    /// Another binding holds the lock of the store directory. Stop it, or give each binding its own directory.
+    /// Another binding holds a storage directory. Use the active binding or wait until it closes.
     Locked,
+    /// Existing logs lack a valid instance number, or the number cannot advance.
+    Instance,
     /// The binding declares no restore support, so it has no journal.
     NoJournal,
 }
@@ -169,7 +175,8 @@ impl fmt::Display for Error {
             Self::Stopped => f.write_str("the binding stopped at an error or a restart, so start it again"),
             Self::Fault(fault) => write!(f, "the injected fault {fault:?} stopped the binding"),
             Self::Form => f.write_str("a file or a proposal has a record with no valid form"),
-            Self::Locked => f.write_str("another binding holds the lock of the store directory"),
+            Self::Locked => f.write_str("another binding holds the store or journal directory"),
+            Self::Instance => f.write_str("the binding cannot establish a fresh storage instance"),
             Self::NoJournal => f.write_str("the binding declares no restore support, so it has no journal"),
         }
     }
@@ -179,7 +186,7 @@ impl core::error::Error for Error {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Stopped | Self::Fault(_) | Self::Form | Self::Locked | Self::NoJournal => None,
+            Self::Stopped | Self::Fault(_) | Self::Form | Self::Locked | Self::Instance | Self::NoJournal => None,
         }
     }
 }
@@ -233,22 +240,28 @@ impl Files {
         self.inner.lock().map_err(|_| Error::Stopped)
     }
 
-    /// Opens the files for a start (guide step 2). Reads the complete frames of the store log up to its durable
-    /// length, rewrites the log with the current records, drops the journal after its durable length, and writes the
-    /// next instance number.
-    fn open(&self, durable: Durable) -> Result<Open, Error> {
-        fs::create_dir_all(&self.store)?;
-        let lock = File::options()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.store.join(LOCK_FILE))?;
-        lock.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => Error::Locked,
-            TryLockError::Error(error) => Error::Io(error),
-        })?;
-        let mut log = read(&self.store.join(STORE_FILE))?;
-        log.truncate(usize::try_from(durable.store).unwrap_or(usize::MAX));
+    /// Locks each destination and takes a fresh instance before installing a snapshot or changing a log.
+    fn open(&self, durable: Durable, snapshot: Option<&[u8]>) -> Result<Open, Error> {
+        let locks = (
+            lock_directory(&self.store)?,
+            self.journal().map(lock_directory).transpose()?,
+        );
+        let (previous, instance) = next_instance(&self.store, self.journal())?;
+        // A later writer can have synced more frames while this handle was stopped.
+        let durable = if durable.instance == previous {
+            durable
+        } else {
+            Durable::UNKNOWN
+        };
+        let journal = self.journal().map(|dir| Log::open(dir, durable.journal)).transpose()?;
+        let log = match snapshot {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => {
+                let mut bytes = read(&self.store.join(STORE_FILE))?;
+                bytes.truncate(usize::try_from(durable.store).unwrap_or(usize::MAX));
+                Cow::Owned(bytes)
+            }
+        };
         let mut records = Records::default();
         for (_, payload) in form::frames(&log).0 {
             for (key, record) in form::read_writes(payload).ok_or(Error::Form)? {
@@ -258,15 +271,13 @@ impl Files {
         let compact = records.form();
         replace(&self.store, STORE_FILE, &compact)?;
         let store = OpenOptions::new().append(true).open(self.store.join(STORE_FILE))?;
-        let journal = self.journal().map(|dir| Log::open(dir, durable.journal)).transpose()?;
-        let instance = next_instance(self.journal().unwrap_or(&self.store))?;
         Ok(Open {
             instance,
             records,
             store,
             store_len: compact.len() as u64,
             journal,
-            _lock: lock,
+            _locks: locks,
         })
     }
 }
@@ -294,6 +305,7 @@ impl State {
     fn durable(&self) -> Durable {
         match self {
             Self::Serving(open) => Durable {
+                instance: open.instance,
                 store: open.store_len,
                 journal: open.journal.as_ref().map_or(0, |log| log.synced.1),
             },
@@ -487,7 +499,6 @@ impl Log {
     /// Opens the journal in `dir` (guide step 8). Drops the bytes after `durable` and a torn last frame, and syncs the
     /// file.
     fn open(dir: &Path, durable: u64) -> Result<Self, Error> {
-        fs::create_dir_all(dir)?;
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -498,6 +509,13 @@ impl Log {
         file.read_to_end(&mut bytes)?;
         bytes.truncate(usize::try_from(durable).unwrap_or(usize::MAX));
         let (payloads, end) = form::frames(&bytes);
+        let head = match payloads.last() {
+            Some((_, payload)) => {
+                let (sequence, data) = form::read_entry(payload).ok_or(Error::Form)?;
+                Mark::of(sequence, data)
+            }
+            None => Mark::EMPTY,
+        };
         let entries = payloads
             .into_iter()
             .map(|(offset, payload)| Ok((form::read_entry(payload).ok_or(Error::Form)?.0, offset as u64)))
@@ -505,26 +523,26 @@ impl Log {
         let len = end as u64;
         file.set_len(len)?;
         file.sync_data()?;
-        let next = entries
-            .last()
-            .map_or(Sequence(1), |(sequence, _)| Sequence(sequence.0 + 1));
         Ok(Self {
             file,
             synced: (entries.len(), len),
             entries,
             len,
-            next,
+            head,
         })
     }
 
-    fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
-        let sequence = self.next;
-        let frame = form::frame(&form::entry(sequence, entry));
+    fn append(&mut self, append: &Append) -> Result<JournalWrite, Error> {
+        if append.after() != self.head {
+            return Ok(JournalWrite::Conflict);
+        }
+        let entry = append.entry();
+        let frame = form::frame(&form::entry(entry.sequence, &entry.data));
         self.file.write_all(&frame)?;
-        self.entries.push((sequence, self.len));
+        self.entries.push((entry.sequence, self.len));
         self.len += frame.len() as u64;
-        self.next = Sequence(sequence.0 + 1);
-        Ok(sequence)
+        self.head = append.head();
+        Ok(JournalWrite::Accepted)
     }
 
     fn sync(&mut self) -> Result<(), Error> {
@@ -573,7 +591,7 @@ impl Store for Files {
     async fn start(&mut self) -> Result<Instance, Error> {
         let mut inner = self.lock()?;
         inner.stop();
-        let open = self.open(inner.state.durable())?;
+        let open = self.open(inner.state.durable(), None)?;
         let instance = open.instance;
         inner.state = State::Serving(open);
         Ok(instance)
@@ -650,25 +668,40 @@ impl Store for Files {
 impl Journal for Files {
     type Error = Error;
 
-    async fn append(&mut self, entry: &[u8]) -> Result<Sequence, Error> {
+    async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
         let mut inner = self.lock()?;
-        let crash = inner.fault.take_if(|fault| *fault == Fault::CrashAfterAppend).is_some();
-        let sequence = inner.serve(|open| open.log()?.append(entry));
-        if crash {
+        let result = inner.serve(|open| {
+            if open.instance != instance {
+                return Ok(JournalWrite::Conflict);
+            }
+            open.log()?.append(append)
+        })?;
+        if result == JournalWrite::Accepted && inner.fault.take_if(|fault| *fault == Fault::CrashAfterAppend).is_some()
+        {
             // The crash after the append: the next start drops it, because no sync made it durable.
             inner.stop();
         }
-        sequence
+        Ok(result)
     }
 
-    async fn sync(&mut self) -> Result<(), Error> {
+    async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
         let mut inner = self.lock()?;
-        let fault = inner.fault.take_if(|fault| *fault == Fault::FailedSync);
-        inner.serve(|open| {
+        let fault = inner.fault;
+        let result = inner.serve(|open| {
+            if open.instance != instance {
+                return Ok(JournalWrite::Conflict);
+            }
             let log = open.log()?;
-            // A failed sync is never retried (guide step 8.3): the next start drops each append after the last sync.
-            fault.map_or_else(|| log.sync(), |fault| Err(Error::Fault(fault)))
-        })
+            if fault == Some(Fault::FailedSync) {
+                return Err(Error::Fault(Fault::FailedSync));
+            }
+            log.sync()?;
+            Ok(JournalWrite::Accepted)
+        });
+        if matches!(result, Err(Error::Fault(Fault::FailedSync))) {
+            inner.fault = None;
+        }
+        result
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {
@@ -701,15 +734,35 @@ fn sync_dir(dir: &Path) -> Result<(), Error> {
     Ok(File::open(dir)?.sync_all()?)
 }
 
-/// Writes the instance number after the last one in `dir` durably, and gives it (guide step 2). A restore does not
-/// lower it, because the counter is in the failure domain of the journal.
-fn next_instance(dir: &Path) -> Result<Instance, Error> {
+/// Holds exclusive access to a storage directory until the returned file closes.
+fn lock_directory(dir: &Path) -> Result<File, Error> {
     fs::create_dir_all(dir)?;
-    let last = match read(&dir.join(INSTANCE_FILE))?.as_slice() {
-        [] => 0,
-        bytes => u64::from_le_bytes(bytes.try_into().map_err(|_| Error::Form)?),
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))?;
+    file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => Error::Locked,
+        TryLockError::Error(error) => Error::Io(error),
+    })?;
+    Ok(file)
+}
+
+/// Advances the instance while the caller holds the directory lock. Returns the previous and current instances.
+fn next_instance(store: &Path, journal: Option<&Path>) -> Result<(Instance, Instance), Error> {
+    let dir = journal.unwrap_or(store);
+    let last = match fs::read(dir.join(INSTANCE_FILE)) {
+        Ok(bytes) => u64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| Error::Instance)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if store.join(STORE_FILE).try_exists()? || (journal.is_some() && dir.join(JOURNAL_FILE).try_exists()?) {
+                return Err(Error::Instance);
+            }
+            0
+        }
+        Err(error) => return Err(error.into()),
     };
-    let next = last.checked_add(1).ok_or(Error::Form)?;
+    let next = last.checked_add(1).ok_or(Error::Instance)?;
     replace(dir, INSTANCE_FILE, &next.to_le_bytes())?;
-    Ok(Instance(next))
+    Ok((Instance(last), Instance(next)))
 }

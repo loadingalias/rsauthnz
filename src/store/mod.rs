@@ -604,18 +604,32 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<(Key, Record)>, Self::Error>>;
 }
 
+/// The result of a conditional write at the journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalWrite {
+    /// The journal performed the requested append or sync.
+    Accepted,
+    /// The instance changed, or the append had a different predecessor. This call changed nothing.
+    Conflict,
+}
+
 /// The restore journal of a binding that supports restore: a durable log in its own failure domain.
 pub trait Journal {
     /// The cause of a failed primitive.
     type Error: core::error::Error;
 
-    /// Appends `entry` after the last entry and gives its sequence. The entry is durable only after a later sync
-    /// returns.
-    fn append(&mut self, entry: &[u8]) -> impl Future<Output = Result<Sequence, Self::Error>>;
+    /// In one journal write, compare `instance` and the complete current head with [`journal::Append::after`].
+    /// Include accepted entries that still await sync. On success, store the entry and its new head together.
+    /// Return [`JournalWrite::Conflict`] if either comparison fails.
+    fn append(
+        &mut self,
+        append: &journal::Append,
+        instance: Instance,
+    ) -> impl Future<Output = Result<JournalWrite, Self::Error>>;
 
-    /// Makes each earlier append durable. A failed sync is a crash: the kernel can drop the data and clear the
-    /// error, so a retry that succeeds does not show that the data is durable.
-    fn sync(&mut self) -> impl Future<Output = Result<(), Self::Error>>;
+    /// Makes each earlier append durable in the same instance. A different instance gives [`JournalWrite::Conflict`].
+    /// A failed I/O sync stops the binding. A later successful sync cannot establish the durability of the lost write.
+    fn sync(&mut self, instance: Instance) -> impl Future<Output = Result<JournalWrite, Self::Error>>;
 
     /// Reads at most `limit` durable entries after `after`, in the order of their sequences.
     fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> impl Future<Output = Result<Vec<Entry>, Self::Error>>;

@@ -3,6 +3,7 @@
 // The binding claims durability on a Unix file system only: its durable rename syncs the directory.
 #![cfg(unix)]
 
+use core::assert_matches;
 use core::mem::DropGuard;
 use core::num::NonZeroUsize;
 use core::pin::pin;
@@ -16,11 +17,12 @@ use std::{env, process};
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Id, Principal};
 use rsauthnz::limits::Limits;
-use rsauthnz::store::{Commit, Entry, Journal, Kind, Restore, Sequence, Store};
+use rsauthnz::store::journal::{Append, Body, Floor, Mark};
+use rsauthnz::store::{Commit, Journal, JournalWrite, Kind, Restore, Sequence, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, Change, Dependency, Key, OperationId, Proposal};
-use rsauthnz_conformance::suite::{self, Case, Report};
-use storage_binding::{Files, JOURNAL_FILE, STORE_FILE};
+use rsauthnz_conformance::suite::{self, Case, Report, Subject as _};
+use storage_binding::{Error, Files, INSTANCE_FILE, JOURNAL_FILE, STORE_FILE};
 
 /// The outcome retention of each binding of the tests.
 const RETENTION: Duration = Duration::from_secs(86_400);
@@ -86,6 +88,17 @@ fn the_binding_without_a_journal_passes_each_case_that_it_selects() {
     assert!(!report.skipped.contains(&Case::Commit), "{report}");
 }
 
+fn floor(after: Mark, value: u64) -> Append {
+    let body = Body::Floor(Floor {
+        kind: Kind::Session,
+        value,
+    });
+    let id = OperationId::new(&value.to_be_bytes()).expect("eight bytes identify the operation");
+    after
+        .next(&id, &body, Limits::default())
+        .expect("a session floor fits the journal limits")
+}
+
 /// A crash in the middle of a write leaves a torn frame at the end of a file: here a complete length with a wrong
 /// checksum. The next start drops it, and serves the commit and the synced journal entry before it.
 #[test]
@@ -93,12 +106,13 @@ fn a_start_after_a_torn_write_serves_the_durable_state() {
     let root = scratch("torn");
     let make = || Files::new(root.join("store"), journal(&root), RETENTION);
     let key = Kind::Session.key(b"s-1").unwrap();
+    let first = floor(Mark::EMPTY, 1);
     {
         let mut binding = make();
         let instance = ready(binding.start()).unwrap();
         assert_eq!(ready(binding.commit(&write(&key), instance)).unwrap(), Commit::Accepted);
-        assert_eq!(ready(binding.append(b"entry")).unwrap(), Sequence(1));
-        ready(binding.sync()).unwrap();
+        assert_eq!(ready(binding.append(&first, instance)).unwrap(), JournalWrite::Accepted);
+        assert_eq!(ready(binding.sync(instance)).unwrap(), JournalWrite::Accepted);
     }
     let torn = [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3];
     for file in [
@@ -114,15 +128,57 @@ fn a_start_after_a_torn_write_serves_the_durable_state() {
     }
 
     let mut binding = make();
-    ready(binding.start()).unwrap();
+    let current = ready(binding.start()).unwrap();
     assert!(ready(Store::read(&mut binding, &key)).unwrap().is_some());
     let entries = ready(Journal::read(&mut binding, Sequence(0), NonZeroUsize::MAX)).unwrap();
-    let expected = Entry {
-        sequence: Sequence(1),
-        data: (*b"entry").into(),
-    };
-    assert_eq!(entries, [expected]);
-    assert_eq!(ready(binding.append(b"next")).unwrap(), Sequence(2));
+    assert_eq!(entries, core::slice::from_ref(first.entry()));
+    assert_eq!(
+        ready(binding.append(&floor(first.head(), 2), current)).unwrap(),
+        JournalWrite::Accepted
+    );
+}
+
+#[test]
+fn a_stopped_writer_preserves_the_commits_of_its_replacement() {
+    let root = scratch("replacement");
+    let make = || Files::new(root.join("store"), journal(&root), RETENTION);
+    let mut old = make();
+    ready(old.start()).unwrap();
+    let snapshot = old.snapshot();
+    old.restart();
+
+    let mut current = make();
+    let instance = ready(current.start()).unwrap();
+    let key = Kind::Session.key(b"session").unwrap();
+    let first = floor(Mark::EMPTY, 1);
+    assert_eq!(ready(current.commit(&write(&key), instance)).unwrap(), Commit::Accepted);
+    assert_eq!(ready(current.append(&first, instance)).unwrap(), JournalWrite::Accepted);
+    assert_eq!(ready(current.sync(instance)).unwrap(), JournalWrite::Accepted);
+    old.restore(&snapshot);
+    assert_matches!(ready(Store::read(&mut old, &key)), Err(Error::Stopped));
+
+    let mut other = Files::new(root.join("other-store"), journal(&root), RETENTION);
+    assert_matches!(ready(other.start()), Err(Error::Locked));
+    drop(current);
+    ready(old.start()).unwrap();
+    assert!(ready(Store::read(&mut old, &key)).unwrap().is_some());
+    assert_eq!(
+        ready(Journal::read(&mut old, Sequence(0), NonZeroUsize::MAX)).unwrap(),
+        core::slice::from_ref(first.entry())
+    );
+}
+
+#[test]
+fn a_missing_or_empty_instance_cannot_reopen_existing_logs() {
+    let root = scratch("instance");
+    let mut binding = Files::new(root.join("store"), journal(&root), RETENTION);
+    ready(binding.start()).unwrap();
+    binding.restart();
+    let instance = root.join("journal").join(INSTANCE_FILE);
+    fs::remove_file(&instance).unwrap();
+    assert_matches!(ready(binding.start()), Err(Error::Instance));
+    fs::write(instance, []).unwrap();
+    assert_matches!(ready(binding.start()), Err(Error::Instance));
 }
 
 /// A proposal that writes the new record `key`.
