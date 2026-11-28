@@ -1067,7 +1067,8 @@ impl Response {
     /// CPU cannot decode the challenge with data-independent timing.
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
-        let (id, client_data) = fields.credential("webauthn.create")?;
+        let id = fields.credential()?;
+        let client_data = ClientData::parse(&fields.client_data()?, "webauthn.create")?;
         [32, ACTIVATION_CHALLENGE_BYTES, RECOVERY_CHALLENGE_BYTES]
             .contains(&client_data.challenge.len())
             .ok_or(Error::Malformed)?;
@@ -1116,11 +1117,12 @@ impl Assertion {
     /// this CPU cannot decode the challenge with data-independent timing.
     pub fn parse(json: &[u8]) -> Result<Self, Error> {
         let fields = Fields::read(json)?;
-        let (id, client_data) = fields.credential("webauthn.get")?;
+        let id = fields.credential()?;
+        let client_data_json = fields.client_data()?;
         Ok(Self {
             id,
-            client_data,
-            client_data_json: base64url(fields.client_data.ok_or(Error::Malformed)?)?.into(),
+            client_data: ClientData::parse(&client_data_json, "webauthn.get")?,
+            client_data_json,
             authenticator_data: base64url(fields.authenticator_data.ok_or(Error::Malformed)?)?.into(),
             signature: base64url(fields.signature.ok_or(Error::Malformed)?)?.into(),
             user_handle: fields
@@ -1218,18 +1220,20 @@ impl<'a> Fields<'a> {
         .map_err(|_| Error::Malformed)
     }
 
-    /// The credential ID and the `clientDataJSON` of the type `kind`, after the checks of the type of the response and
-    /// of its two IDs.
-    fn credential(&self, kind: &str) -> Result<(Box<[u8]>, ClientData), Error> {
-        let (Some(id), Some(raw_id), Some(response), Some(client_data)) =
-            (self.id, self.raw_id, self.kind, self.client_data)
-        else {
+    /// The credential ID, after the checks of the type of the response and of its two IDs.
+    fn credential(&self) -> Result<Box<[u8]>, Error> {
+        let (Some(id), Some(raw_id), Some(response)) = (self.id, self.raw_id, self.kind) else {
             return Err(Error::Malformed);
         };
         (response == "public-key").ok_or(Error::Malformed)?;
         let id = base64url(id)?;
         (id == base64url(raw_id)?).ok_or(Error::CredentialId)?;
-        Ok((id.into(), ClientData::parse(&base64url(client_data)?, kind)?))
+        Ok(id.into())
+    }
+
+    /// The bytes of `clientDataJSON`. They hold the challenge, so they decode with the secret class.
+    fn client_data(&self) -> Result<Box<[u8]>, Error> {
+        Ok(base64url_secret(self.client_data.ok_or(Error::Malformed)?)?.into())
     }
 }
 
@@ -1271,15 +1275,9 @@ impl ClientData {
             return Err(Error::Malformed);
         };
         (found == kind).ok_or(Error::Malformed)?;
-        // A registration challenge is a bearer value, so each challenge decodes with the secret class.
-        let challenge = base64url_by(challenge, |text, out| {
-            rscodec::with_dit(|dit| Url.decode_secret(dit, text, out).map(drop))
-                .map_err(|_| Error::Dit)?
-                .map_err(|_| Error::Malformed)
-        })?;
         let mut text = vec![0; origin.len()];
         Ok(Self {
-            challenge: challenge.into(),
+            challenge: base64url_secret(challenge)?.into(),
             origin: origin.decode(&mut text).map_err(|_| Error::Malformed)?.into(),
             cross_origin,
         })
@@ -1820,6 +1818,16 @@ fn transport(name: Str<'_>) -> u8 {
 fn base64url(text: Str<'_>) -> Result<Vec<u8>, Error> {
     base64url_by(text, |text, out| {
         Url.decode(text, out).map(drop).map_err(|_| Error::Malformed)
+    })
+}
+
+/// The bytes of the base64url text `text`, decoded with the secret class. A registration challenge is a bearer value,
+/// so each challenge and each `clientDataJSON` that holds one decode with it.
+fn base64url_secret(text: Str<'_>) -> Result<Vec<u8>, Error> {
+    base64url_by(text, |text, out| {
+        rscodec::with_dit(|dit| Url.decode_secret(dit, text, out).map(drop))
+            .map_err(|_| Error::Dit)?
+            .map_err(|_| Error::Malformed)
     })
 }
 
