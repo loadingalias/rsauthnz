@@ -12,13 +12,15 @@ use rsauthnz::cbor::Value;
 use rsauthnz::cose::{self, PublicKey};
 use rsauthnz::credential::{self, Released};
 use rsauthnz::evidence::Evidence;
-use rsauthnz::httpsig::{Checked, Draft, Error, Failure, Field, LIFETIME_DEFAULT, Profile, Request, Signed};
+use rsauthnz::httpsig::{
+    AcceptError, Checked, Draft, Error, Failure, Field, LIFETIME_DEFAULT, Profile, Request, Signed,
+};
 use rsauthnz::store::driver::Plan;
 use rsauthnz::store::{self, Capacity, Progress};
 use rsauthnz::time::{Reading, ReadingSource};
-use rsauthnz::transition::{self, OperationId, Outcome};
-use rsauthnz_conformance::memory::Memory;
-use rsauthnz_conformance::suite::Subject as _;
+use rsauthnz::transition::{self, OperationId, Outcome, Recover as _, Recovery};
+use rsauthnz_conformance::memory::{self, Memory};
+use rsauthnz_conformance::suite::{Fault, Subject as _};
 use rscodec::base64::Profile::Standard;
 
 use super::{API, Grantor, action, at, audience, budget, key, keypair, permission, resource, time, trusted};
@@ -149,11 +151,11 @@ fn verify(profile: &Profile, sent: &Sent, seconds: u64) -> Result<Checked, Error
     profile.verify(&sent.with(&view(&sent.fields)), at(seconds))
 }
 
-/// The refusal of a failure of the memory binding, which fails no primitive.
-fn refused(failure: Failure<rsauthnz_conformance::memory::Error>) -> Error {
+/// The refusal of a replay insert on the memory binding with no fault.
+fn refused(failure: AcceptError<memory::Error>) -> Error {
     match failure {
-        Failure::Refused(error) => error,
-        Failure::Store(error) => panic!("the insert failed: {error:?}"),
+        AcceptError::Refused(error) => error,
+        AcceptError::Unknown(error) => panic!("the insert failed: {error:?}"),
     }
 }
 
@@ -438,6 +440,43 @@ fn a_repeated_signature_refuses_also_at_a_second_verifier_and_another_agent_keep
     );
 }
 
+#[test]
+fn a_confirmed_replay_abort_allows_an_explicit_retry_but_a_lost_reply_stops_the_request() {
+    use crate::recovery::{Counting, ReplayFault};
+
+    let (mut grantor, credential, profile) = granted();
+    let read = signed(&Sent::read(), 2, credential.as_bytes(), LIFETIME_DEFAULT, 40);
+    let other = signed_with(&Sent::read(), 2, credential.as_bytes(), &[7; 16], LIFETIME_DEFAULT, 40);
+    let node = &mut grantor.world.site.node;
+    let mut binding = Counting::new(&mut node.memory);
+    let check = |sent| verify(&profile, sent, 41).expect("a valid signature");
+
+    binding.replay_fault = Some(ReplayFault::Abort);
+    let abort = super::ready(check(&read).accept(&mut binding)).unwrap_err();
+    assert_eq!(abort, AcceptError::Refused(Error::Conflict));
+    assert_eq!(abort.recovery(), Recovery::Restart);
+    super::ready(check(&read).accept(&mut binding)).unwrap();
+    assert_eq!(
+        super::ready(check(&read).accept(&mut binding)).err(),
+        Some(AcceptError::Refused(Error::Replayed))
+    );
+
+    binding.replay_fault = Some(ReplayFault::LoseResponse);
+    let lost = super::ready(check(&other).accept(&mut binding)).unwrap_err();
+    assert_eq!(lost, AcceptError::Unknown(memory::Error::Crash(Fault::LostResponse)));
+    assert_eq!(lost.recovery(), Recovery::Refuse);
+    node.driver.start(at(42));
+    node.run();
+    let signatures = store::Kind::Signature.key(&[]).unwrap();
+    let records = super::ready(store::Store::range(
+        &mut node.memory,
+        &signatures,
+        None,
+        NonZeroUsize::new(3).unwrap(),
+    ));
+    assert_eq!(records.unwrap().len(), 2, "the insert whose reply was lost also landed");
+}
+
 /// A captured signature cannot repeat after a restart of a memory store, which loses its records, or after a restore
 /// from a snapshot before its insert. Each start and each restore sets the replay floor, and between a restore and its
 /// floor no insert lands. A signature created later than the floor plus the skew of an agent verifies.
@@ -549,7 +588,10 @@ fn commit(grantor: &mut Grantor, checked: Checked, id: &str, seconds: u64) -> Re
         &grantor.policy,
         at(seconds),
     );
-    let pending = super::ready(check).map_err(refused)?;
+    let pending = super::ready(check).map_err(|failure| match failure {
+        Failure::Refused(error) => error,
+        Failure::Store(error) => panic!("the read failed: {error:?}"),
+    })?;
     let operation = OperationId::new(id.as_bytes()).expect("an identity");
     let (_scope, proposal) = pending
         .propose(operation, Value::Null, at(seconds))

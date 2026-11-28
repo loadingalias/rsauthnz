@@ -741,7 +741,7 @@ pub enum Recovery {
     /// ([`passkey::Error::Removed`](crate::passkey::Error::Removed)). Tell the provider of the passkey to forget it
     /// (`signalUnknownCredential` of WebAuthn Level 3), and sign in with another passkey.
     Forget,
-    /// Refuse the request. The same request refuses again.
+    /// Refuse the request. Stop this attempt without an automatic retry.
     Refuse,
 }
 

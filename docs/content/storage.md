@@ -217,8 +217,9 @@ commit driver, so the requests of many agents insert at the same time. In that s
 4. Reads its clock. When `store::expired(Some(insert.deadline()), reading)` holds, it gives `Inserted::Expired`.
 5. Writes `insert.record()` at `insert.key()`, makes it durable, and gives `Inserted::Accepted`.
 
-Each result except `Accepted` writes nothing. An error is a crash with an unknown outcome: the verifier refuses the
-request, and the agent signs a new one.
+When contention aborts the transaction, return `Inserted::Conflict` only after the store confirms that this attempt wrote nothing.
+The binding can keep serving. If the reply was lost, return a primitive error and stop the binding.
+The insert outcome is unknown. The verifier refuses the request and releases no evidence.
 
 ## Expiry
 

@@ -181,6 +181,14 @@ outcome record. Do all of this in one atomic step, as for a commit:
    [`Inserted::Expired`].
 5. Write [`Insert::record`] at [`Insert::key`], make it durable, and give [`Inserted::Accepted`].
 
+Return [`Inserted::Conflict`] when contention aborts the transaction and the store confirms that this attempt wrote nothing.
+For example, PostgreSQL can report [a serialization failure] with SQLSTATE `40001`. The binding can serve the next request.
+Return a primitive error after a lost reply. Stop the binding as required by [step 9](#9-stop-at-each-error).
+The insert can already be durable. A later read of the key cannot identify which attempt wrote it.
+
+[a serialization failure]: https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
+[`Inserted::Conflict`]: rsauthnz::store::Inserted::Conflict
+
 [`Store::commit`]: rsauthnz::store::Store::commit
 [`Store::insert_replay`]: rsauthnz::store::Store::insert_replay
 [`floor_key`]: rsauthnz::store::floor_key
@@ -304,8 +312,7 @@ all its handles:
 2. Serve again only after the next [`Store::start`].
 3. Do not retry a primitive inside the binding.
 
-Thus a failed sync stops the commits too, and no retried sync lets the binding serve again. Give no error for a
-result that the contract names: a conflict is [`Commit::Conflict`], not an error.
+A failed sync stops commits too. A confirmed transaction conflict returns [`Commit::Conflict`] or [`Inserted::Conflict`], according to the primitive.
 
 [`Store::Error`]: rsauthnz::store::Store::Error
 [`Journal::Error`]: rsauthnz::store::Journal::Error

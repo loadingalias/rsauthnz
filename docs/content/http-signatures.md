@@ -176,9 +176,13 @@ change the order of the fields, and change the case of their names. A proxy can 
 
 ## Errors
 
-Each `httpsig::Error` of a request has the recovery `Refuse`: the same request refuses again, and the agent signs a new
-request. `Full` has the recovery `Restart`: nothing committed, so the agent signs a new request later. `Grant` has
-the recovery of its `grant::Error`.
+`checked.accept(store)` returns `httpsig::AcceptError` on failure. When upgrading a caller, match `AcceptError::Refused(error)` for a confirmed refusal.
+Match `AcceptError::Unknown(cause)` when the binding failed. The store may have written the replay record. Refuse this request and run no application effect.
+A standalone insert has no outcome record to look up. A separate application operation uses its own outcome identity.
+
+`Conflict` and `Full` have recovery `Restart`. A conflict describes only this insert attempt.
+The caller can submit the signed request for verification again while its window remains open.
+`Grant` gives the recovery of its grant error. Each other signature refusal has recovery `Refuse`.
 
 | Error | Cause |
 | --- | --- |
@@ -197,6 +201,7 @@ the recovery of its `grant::Error`.
 | `Limit(limit)` | A signature check costs more than its budget |
 | `Time(error)` | The reading of the time has no bound |
 | `Replayed` | The replay store holds the signature: the request is a repetition |
+| `Conflict` | The store confirmed that contention aborted this insert with no write. The binding can accept another request |
 | `Floor` | The store has no replay floor of its current start, or the signature was created before the floor. Sign again |
 | `Full` | The capacity of the replay store, or the share of the agent key, is full. The recovery is `Restart`: sign again later |
 | `Grant(error)` | The grant check of `checked.check_agent` refused ([Errors](grants.md#errors)) |

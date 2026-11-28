@@ -459,6 +459,8 @@ impl Insert {
 pub enum Inserted {
     /// The binding wrote the record.
     Accepted,
+    /// The store confirmed that contention aborted this attempt before it wrote anything. The binding can keep serving.
+    Conflict,
     /// The store has no replay floor of its current instance, or the signature was created before the time of the
     /// floor ([`Insert::admits`]).
     Floor,
@@ -540,7 +542,8 @@ pub trait Store {
     ///    [`Inserted::Expired`].
     /// 5. Write [`Insert::record`] at [`Insert::key`], make it durable, and give [`Inserted::Accepted`].
     ///
-    /// An error is a crash, with an unknown outcome: the verifier refuses the request, and the agent signs a new one.
+    /// Return [`Inserted::Conflict`] when the store confirms that contention aborted the transaction with no write.
+    /// A lost reply leaves the outcome unknown. Return an error and stop the binding.
     fn insert_replay(&mut self, insert: &Insert) -> impl Future<Output = Result<Inserted, Self::Error>>;
 
     /// The conditional atomic commit of `proposal`, in one serializable step, or in one equivalent atomic step that

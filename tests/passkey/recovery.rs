@@ -184,11 +184,18 @@ impl Lost {
     }
 }
 
-/// The memory binding, with a count of its keyed reads and its range reads.
+/// A transaction abort or a lost response at the replay store.
+pub(super) enum ReplayFault {
+    Abort,
+    LoseResponse,
+}
+
+/// The memory binding with observed reads and writes and a controlled replay response.
 pub(super) struct Counting<'m> {
     memory: &'m mut Memory,
     pub(super) reads: usize,
     pub(super) ranges: usize,
+    pub(super) replay_fault: Option<ReplayFault>,
     pairs: usize,
     commits: usize,
 }
@@ -199,6 +206,7 @@ impl<'a> Counting<'a> {
             memory,
             reads: 0,
             ranges: 0,
+            replay_fault: None,
             pairs: 0,
             commits: 0,
         }
@@ -233,7 +241,14 @@ impl Store for Counting<'_> {
     }
 
     async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, memory::Error> {
-        self.memory.insert_replay(insert).await
+        match self.replay_fault.take() {
+            Some(ReplayFault::Abort) => Ok(Inserted::Conflict),
+            Some(ReplayFault::LoseResponse) => {
+                self.memory.insert_replay(insert).await?;
+                Err(memory::Error::Crash(Fault::LostResponse))
+            }
+            None => self.memory.insert_replay(insert).await,
+        }
     }
 
     async fn expire(&mut self, kind: Kind, before: Duration, limit: NonZeroUsize) -> Result<usize, memory::Error> {

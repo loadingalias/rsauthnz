@@ -607,8 +607,44 @@ pub struct Checked {
     insert: Insert,
 }
 
-/// The failure of a replay insert: a refusal, or a failed primitive of the binding.
+/// A refusal or a failed store read during [`Checked::check_agent`].
 pub type Failure<E> = store::Failure<Error, E>;
+
+/// The failure of a standalone replay insert in [`Checked::accept`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AcceptError<E> {
+    /// The store confirmed that this attempt wrote nothing.
+    Refused(Error),
+    /// The binding failed. It may have written the replay record.
+    Unknown(E),
+}
+
+impl<E> Recover for AcceptError<E> {
+    fn recovery(&self) -> Recovery {
+        match self {
+            Self::Refused(error) => error.recovery(),
+            Self::Unknown(_) => Recovery::Refuse,
+        }
+    }
+}
+
+impl<E> fmt::Display for AcceptError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(error) => error.fmt(f),
+            Self::Unknown(_) => f.write_str("the outcome of the replay insert is unknown"),
+        }
+    }
+}
+
+// A backend error can contain request data. Both formats give only the public diagnosis.
+impl<E> fmt::Debug for AcceptError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl<E: core::error::Error> core::error::Error for AcceptError<E> {}
 
 impl Checked {
     /// Inserts the replay record of the signature into `store`, the replay store of the audience
@@ -620,18 +656,20 @@ impl Checked {
     ///
     /// # Errors
     ///
-    /// [`Error::Replayed`] for a repetition, [`Error::Floor`] for a signature created before the replay floor of the
-    /// store, [`Error::Full`] when the capacity or the share of the agent is full, and [`Error::Expired`] when the
-    /// clock of the store reached `expires` plus the skew. [`Failure::Store`] for an error of the binding: the outcome is
-    /// unknown, so refuse the request, and the agent signs a new one.
-    pub async fn accept<S: Store>(self, store: &mut S) -> Result<Evidence, Failure<S::Error>> {
-        match store.insert_replay(&self.insert).await.map_err(Failure::Store)? {
-            Inserted::Accepted => Ok(self.evidence),
-            Inserted::Present => Err(Failure::Refused(Error::Replayed)),
-            Inserted::Floor => Err(Failure::Refused(Error::Floor)),
-            Inserted::Full => Err(Failure::Refused(Error::Full)),
-            Inserted::Expired => Err(Failure::Refused(Error::Expired)),
-        }
+    /// [`Error::Conflict`] for a confirmed transaction abort, [`Error::Replayed`] for a repetition,
+    /// [`Error::Floor`] for a signature before the replay floor, or [`Error::Full`] for a full store or share.
+    /// [`Error::Expired`] when the store cannot establish that its reading is before the deadline.
+    /// [`AcceptError::Unknown`] after a failed insert. Refuse the request. A standalone insert has no outcome record.
+    pub async fn accept<S: Store>(self, store: &mut S) -> Result<Evidence, AcceptError<S::Error>> {
+        let refusal = match store.insert_replay(&self.insert).await.map_err(AcceptError::Unknown)? {
+            Inserted::Accepted => return Ok(self.evidence),
+            Inserted::Conflict => Error::Conflict,
+            Inserted::Present => Error::Replayed,
+            Inserted::Floor => Error::Floor,
+            Inserted::Full => Error::Full,
+            Inserted::Expired => Error::Expired,
+        };
+        Err(AcceptError::Refused(refusal))
     }
 
     /// Checks the grant of a request that commits a transition, as [`authz::check_agent`] does, and gives the scope with
@@ -734,8 +772,8 @@ pub enum Field {
     Credential,
 }
 
-/// The cause of a refused request or draft. For a refused request, the recovery is to refuse it: the agent signs a new
-/// request. No error holds a byte of the request.
+/// The cause of a refused request or draft. [`Recover::recovery`] gives the caller's next action.
+/// No error holds a byte of the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A field of the profile is missing, longer than [`Limits::bytes`], or not valid. Each signature field is a
@@ -775,6 +813,8 @@ pub enum Error {
     /// The replay store holds the replay record of the signature: the request is a repetition. The repetition does not
     /// show whether the first request committed: the operation identity of the transition shows that.
     Replayed,
+    /// The replay store confirmed that contention aborted this insert with no write. The caller can try again.
+    Conflict,
     /// The replay store has no replay floor of its current start, or the signature was created before the floor. A start
     /// or a restore sets the floor, so a captured request cannot repeat after it. Sign the request again.
     Floor,
@@ -785,11 +825,10 @@ pub enum Error {
 }
 
 impl Recover for Error {
-    /// Sign the request again later after [`Error::Full`]. Refuse each other request: it refuses again, and the agent
-    /// signs a new request.
+    /// The caller can start again after a confirmed replay conflict or a full store.
     fn recovery(&self) -> Recovery {
         match self {
-            Self::Full => Recovery::Restart,
+            Self::Full | Self::Conflict => Recovery::Restart,
             Self::Grant(error) => error.recovery(),
             _ => Recovery::Refuse,
         }
@@ -822,6 +861,7 @@ impl fmt::Display for Error {
             Self::Limit(limit) => write!(f, "the signature check exceeds {limit:?}"),
             Self::Time(error) => write!(f, "the time refused: {error}"),
             Self::Replayed => f.write_str("the replay store holds the signature: the request is a repetition"),
+            Self::Conflict => f.write_str("the replay store aborted the insert because of contention"),
             Self::Floor => f.write_str("the signature was created before the replay floor of the store"),
             Self::Full => f.write_str("the replay store has no room for the signature"),
             Self::Grant(error) => write!(f, "the grant check refused: {error}"),
