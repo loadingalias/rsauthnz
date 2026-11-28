@@ -53,6 +53,7 @@
 //! use rsauthnz_conformance::memory::{Memory, Schedule};
 //! use rsauthnz_conformance::suite::execute;
 //! use rscrypto::auth::MlDsa65Ed25519;
+//! use rscrypto::ChaCha20Rng;
 //!
 //! # /// The policy of the example: it permits each request of a workload action until one day after `now`.
 //! # struct Workloads(AuthorityVersion, Duration);
@@ -146,7 +147,7 @@
 //! let (authority, runner) = (Id::new("acme", "issuer")?, Id::new("acme", "runner-7")?);
 //! let build = Id::new("acme", "build-api")?;
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut ChaCha20Rng::from_seed([1; 32]))?;
 //! driver.start(now);
 //! settle(&mut driver, &mut memory)?;
 //! # let policy = Workloads(AuthorityVersion::new(authority.clone(), &[1])?, now.estimate() + Duration::from_secs(86_400));
@@ -595,7 +596,7 @@ impl Issuer {
         proposal.read(Dependency::Absent(key.clone()))?;
         proposal.change(Change::Write {
             key,
-            version: version(self.authority.clone(), driver.allocate(Kind::Issuer)?),
+            version: version(self.authority.clone(), driver.allocate()?),
             end: None,
             data: self.to_record(),
         })?;
@@ -714,7 +715,7 @@ impl Registration {
         driver: &mut Driver,
     ) -> Result<Self, Error> {
         let key = RecordKey::new(key)?;
-        let generation = Serial(driver.allocate(Kind::Credential)?);
+        let generation = Serial(driver.allocate()?);
         let registration = Self {
             workload,
             key,
@@ -1170,7 +1171,7 @@ impl Pending {
             policy,
             now,
         )?;
-        let serial = Serial(driver.allocate(Kind::Credential)?);
+        let serial = Serial(driver.allocate()?);
         let claims = Claims::new(
             issuer.authority.clone(),
             audience.clone(),
@@ -1314,7 +1315,7 @@ impl Revocation<'_> {
             },
         ]);
         let checked = authz::check(self.by, &Mode::Revoke.action(), &resource(&workload), policy, now)?;
-        let value = driver.allocate(Kind::Credential)?;
+        let value = driver.allocate_after(&registration.version)?;
         let audit = Audit {
             actor: self.by.subject().clone(),
             action: Mode::Revoke.action(),
@@ -1459,7 +1460,7 @@ impl IssuerRotation<'_> {
         proposal.read(Dependency::Version(store_key.clone(), record.version.clone()))?;
         proposal.change(Change::Write {
             key: store_key.clone(),
-            version: later(&record.version, driver.allocate(Kind::Issuer)?)?,
+            version: later(&record.version, driver.allocate_after(&record.version)?)?,
             end: None,
             data: rotated.to_record(),
         })?;

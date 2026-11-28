@@ -189,7 +189,10 @@ impl Epoch {
         plan: &mut Plan,
         driver: &mut Driver,
     ) -> Result<Self, Error> {
-        let serial = driver.allocate(Kind::AccountState)?;
+        let serial = match &self.version {
+            Some(previous) => driver.allocate_after(previous)?,
+            None => driver.allocate()?,
+        };
         let version = rp.version(serial);
         let revision = Revision::after(&self.scope, self.number, self.version.clone()).ok_or(Error::Full)?;
         let next = Self {

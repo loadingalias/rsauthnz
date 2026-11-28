@@ -161,6 +161,7 @@ use rsauthnz::store::{Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
+use rscrypto::ChaCha20Rng;
 
 /// The output of a future of the memory binding, which is ready at its first poll.
 fn ready<T>(future: impl Future<Output = T>) -> T {
@@ -184,7 +185,7 @@ assert_eq!(Identifier::parse(b"c2Vzc2lvbg").err(), Some(Error::Identifier));
 // The store serves after the start of its commit driver.
 let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut ChaCha20Rng::from_seed([1; 32]))?;
 driver.start(now);
 while let Some(effect) = driver.effect() {
     let output = ready(execute(&mut memory, effect));

@@ -226,6 +226,10 @@ impl Store for Counting<'_> {
         self.memory.start().await
     }
 
+    async fn instance(&mut self) -> Result<Instance, memory::Error> {
+        self.memory.instance().await
+    }
+
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, memory::Error> {
         self.reads += 1;
         Store::read(self.memory, key).await
@@ -481,7 +485,7 @@ fn a_second_recovery_in_doubt_survives_both_earlier_snapshots() {
             .propose(&[])
             .unwrap();
         let operation = proposal.operation().clone();
-        site.node.memory.inject(Fault::LostResponse);
+        site.node.memory.inject_application(Fault::LostResponse);
         assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
         let snapshot = if restore_initial { &initial } else { &after_first };
         site.node.memory.restore(snapshot);
@@ -517,7 +521,7 @@ fn a_lost_recovery_response_releases_the_session_only_from_the_commit_that_consu
     let (proposal, plan, opening) = lost.propose(&Passkey::new(Algorithm::Ed25519, -8, 2), Passkeys::Keep);
     let operation = proposal.operation().clone();
     let site = &mut lost.site;
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
 
     // The binding stopped as at a crash. After its start, the code refuses a second use, and the lookup of the operation

@@ -27,6 +27,10 @@ pub(super) const REPLAY_FLOOR: &str = "store.replay-floor";
 pub(super) const INTENT: &str = "store.intent";
 /// The action of a commit of a restore, and of a completion.
 pub(super) const RESTORE: &str = "store.restore";
+/// The action of a commit that reserves, retires, or releases owner turns.
+pub(super) const TURN: &str = "store.turn";
+/// The action of the commit that closes an operation after a lost reply.
+pub(super) const CLOSE: &str = "store.close";
 
 /// The most bytes in a record that the driver writes for itself within `limits`. The driver reads its mark record
 /// back within `limits`, and the anchors of a restore and of a completion come from journal entries within `limits`,
@@ -37,7 +41,7 @@ pub(super) fn bytes_max(limits: Limits) -> usize {
     let id = OperationId::new(&[0; 32]).expect("an identity of 32 bytes is valid");
     // The longest time form: each part of each duration takes its widest CBOR head.
     let now = Reading::new(Duration::MAX, Some(Duration::MAX), ReadingSource::Caller);
-    let base = [MARK, REPLAY_FLOOR, INTENT, RESTORE]
+    let base = [MARK, REPLAY_FLOOR, INTENT, RESTORE, TURN, CLOSE]
         .map(|action| {
             audit_record(&proposal(id.clone(), action, now, Limits::default()))
                 .1

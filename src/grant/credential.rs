@@ -19,8 +19,8 @@ use crate::crypto::{self, Algorithm};
 use crate::custody::Handle;
 use crate::id::{Agent, Audience, Authority, Id, Kind as IdKind, Principal, Purpose};
 use crate::limits::SignatureBudget;
+use crate::store::Store;
 use crate::store::driver::{Driver, Plan};
-use crate::store::{Kind, Store};
 use crate::time::Reading;
 use crate::transition::{Audit, Dependency, OperationId, Proposal};
 
@@ -312,7 +312,7 @@ impl Grants {
         // The draft keeps whole seconds. The reading is before the deadline, so the end is after the issue.
         let issued = Duration::from_secs(now.estimate().as_secs());
         let expires = issued.saturating_add(lifetime).min(grant.deadline);
-        let serial = Serial(driver.allocate(Kind::Credential).map_err(Error::Driver)?);
+        let serial = Serial(driver.allocate().map_err(Error::Driver)?);
         let subject = Subject::Agent {
             agent: agent.clone(),
             owner: identity.owner.clone(),

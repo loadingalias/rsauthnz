@@ -26,7 +26,10 @@ The model assumes recovery can close admission at both destinations. It represen
 A version conflict in this model is the primary store's answer to the driver. The owner-turn model checks when a caller can receive a refusal.
 The [authority model](../authority-restore/README.md) covers anchor creation, refusal voids, and in-doubt completion under its storage-crash assumption.
 The shared recovery checks below cover the writes that establish that crash boundary.
-The current [commit driver](../../src/store/driver/mod.rs) serializes requests through one driver per store.
+The [commit driver](../../src/store/driver/mod.rs) implements these rules for several drivers on one store.
+A join reads the installed generation and writes none. Only an activation takes a fresh generation.
+The driver keeps the closed-step rule of the journal itself: an end entry reads its owner turn again before each append after a conflict.
+The model covers the replacement of a counter value. The driver also checks a new record of a key that can repeat against the dead version of its journal facts. No profile checks that rule yet.
 
 ## Removing different sign-in methods
 

@@ -508,44 +508,173 @@ pub(super) async fn fencing<S: Subject>(mut binding: S) -> Checked {
         "a commit with the instance number of the latest start refused",
     )?;
 
+    // A join reads the installed instance and writes none, so a commit of a peer in that instance still lands.
+    let joined = binding.instance().await.map_err(failed("instance"))?;
+    ensure(joined == current, "a join changed the installed instance")?;
+    ensure(
+        committed(&mut binding, &proposal("f-joined"), current).await? == Commit::Accepted,
+        "after a join, a commit with the instance number of the latest start refused",
+    )?;
+
+    let journal = journaled(&binding.declaration());
     let mut old = Run::started(binding).await?;
     let first = proposal("f-first");
-    let first_op = first.operation().clone();
     let in_flight = old.submit(first, Plan::default())?;
     old.until_commit("f-first").await?;
-    let second = proposal("f-queued");
-    let second_op = second.operation().clone();
-    let queued = old.submit(second, Plan::default())?;
-    let mut replacement = Run::started(old.binding.clone()).await?;
+    let queued = old.submit(proposal("f-queued"), Plan::default())?;
+    let mut peer = Run::started(old.binding.clone()).await?;
     old.settle().await?;
     ensure(
-        old.driver.status() == Status::Refused(driver::Error::Superseded),
-        "a stale primary write kept its driver in service",
+        old.driver.status() == Status::Serving,
+        "a peer that joined stopped a driver of the open instance",
     )?;
-    for (ticket, original) in [(in_flight, first_op), (queued, second_op)] {
+    for ticket in [in_flight, queued] {
         ensure(
-            matches!(old.outcome(ticket).await?, Outcome::Unknown(op) if op == original),
+            matches!(old.outcome(ticket).await?, Outcome::Accepted(_)),
+            "a driver of the open instance lost a commit when a peer joined",
+        )?;
+    }
+    peer.commit(proposal("f-peer"), Plan::default(), "the peer").await?;
+
+    if journal {
+        // An activation fences each driver of the earlier instance at the primary store and at the journal.
+        let stale = proposal("f-stale");
+        let original = stale.operation().clone();
+        let in_flight = old.submit(stale, Plan::default())?;
+        old.until_commit("f-stale").await?;
+        let end = Build::new("f-end").ends(&key(Kind::Credential, "f-first"), 1).done();
+        let ending = old.submit(end, Plan::default())?;
+        peer.activate().await?;
+        peer.serving()?;
+        old.settle().await?;
+        ensure(
+            old.driver.status() == Status::Refused(driver::Error::Superseded),
+            "a stale primary write kept its driver in service",
+        )?;
+        ensure(
+            matches!(old.outcome(in_flight).await?, Outcome::Unknown(op) if op == original),
             "a superseded driver lost the original operation identity",
         )?;
-    }
-    replacement
-        .commit(proposal("f-new"), Plan::default(), "the replacement writer")
-        .await?;
-    let before = proposal("f-before-start");
-    let original = before.operation().clone();
-    let queued = replacement.submit(before, Plan::default())?;
-    replacement.start().await?;
-    ensure(
-        matches!(replacement.outcome(queued).await?, Outcome::Unknown(op) if op == original),
-        "a queued operation crossed a requested start",
-    )?;
-    for name in ["f-first", "f-queued", "f-before-start"] {
         ensure(
-            !replacement.holds(&key(Kind::Credential, name)).await?,
-            "a stale operation wrote a credential after a new start",
+            matches!(old.outcome(ending).await?, Outcome::Unknown(_)),
+            "a queued operation crossed an activation",
+        )?;
+
+        // The end entry of a driver of the earlier instance, delayed across a later activation, refuses.
+        let mut late = Run::started(peer.binding.clone()).await?;
+        let end = Build::new("f-late").ends(&key(Kind::Credential, "f-peer"), 1).done();
+        late.submit(end, Plan::default())?;
+        late.steps(|effect| {
+            if matches!(effect, Effect::Append(..)) {
+                Next::Stop
+            } else {
+                Next::Run(None)
+            }
+        })
+        .await?;
+        let Some(Effect::Append(append, instance)) = late.driver.effect() else {
+            return Err("the change of a fact issued no end entry".into());
+        };
+        peer.activate().await?;
+        let result = peer
+            .binding
+            .append(append, instance)
+            .await
+            .map_err(failed("delayed append"))?;
+        ensure(
+            result == JournalWrite::Conflict,
+            "an end entry of an earlier instance landed after an activation",
+        )?;
+        ensure(
+            peer.holds(&key(Kind::Credential, "f-peer")).await?
+                && !peer.holds(&key(Kind::Credential, "f-stale")).await?,
+            "a stale operation changed the store after an activation",
         )?;
     }
-    Ok(())
+
+    let before = proposal("f-before-start");
+    let original = before.operation().clone();
+    let queued = peer.submit(before, Plan::default())?;
+    peer.start().await?;
+    ensure(
+        matches!(peer.outcome(queued).await?, Outcome::Unknown(op) if op == original),
+        "a queued operation crossed a requested start",
+    )?;
+    ensure(
+        !peer.holds(&key(Kind::Credential, "f-before-start")).await?,
+        "a queued operation wrote a credential after a new start",
+    )
+}
+
+pub(super) async fn servers<S: Subject>(binding: S) -> Checked {
+    let mut first = Run::seeded(binding).await?;
+    // A second driver joins the open instance: it installs none.
+    let mut second = Run::new(first.binding.clone())?;
+    second.driver.start(now());
+    ensure(
+        matches!(second.driver.effect(), Some(Effect::Instance)),
+        "a second driver did not join the open instance",
+    )?;
+    second.settle().await?;
+    second.serving()?;
+    ensure(
+        second.driver.instance() == first.driver.instance(),
+        "two drivers of one store serve in two instances",
+    )?;
+
+    // A restart of either driver leaves the other one committing: the restart is a new driver that joins.
+    for (index, restarts) in ["the second", "the first"].into_iter().enumerate() {
+        let (holder, other) = if index == 0 {
+            (&mut first, &mut second)
+        } else {
+            (&mut second, &mut first)
+        };
+        let name = format!("w-{index}");
+        let ticket = holder.submit(
+            Build::new(&name).writes(&key(Kind::Credential, &name), 1).done(),
+            Plan::default(),
+        )?;
+        holder.until_commit(&name).await?;
+        *other = Run::started(other.binding.clone()).await?;
+        holder.settle().await?;
+        ensure(
+            matches!(holder.outcome(ticket).await?, Outcome::Accepted(_)),
+            &format!("a restart of {restarts} driver stopped a commit of its peer"),
+        )?;
+    }
+
+    // Two removals of the two sign-in methods of `a1` race on two drivers.
+    let (a1p, a1q) = (key(Kind::Credential, "a1p"), key(Kind::Credential, "a1q"));
+    let held = [anchor(&a1p, sign_in("a1")), anchor(&a1q, sign_in("a1"))];
+    let race = first.submit(Build::new("r-1").ends(&a1p, 1).done(), plan(&held, &[], &[]))?;
+    first.until_commit("r-1").await?;
+    let lost = second.submit(Build::new("r-2").ends(&a1q, 1).done(), plan(&held, &[], &[]))?;
+    second.settle().await?;
+    ensure(
+        matches!(second.outcome(lost).await?, Outcome::Conflict),
+        "a removal entered an owner turn that a peer holds",
+    )?;
+    first.settle().await?;
+    ensure(
+        matches!(first.outcome(race).await?, Outcome::Accepted(_)),
+        "the removal that holds the owner turn did not commit",
+    )?;
+    let retry = second.submit(
+        Build::new("r-3").ends(&a1q, 1).done(),
+        plan(&[anchor(&a1q, sign_in("a1"))], &[], &[]),
+    )?;
+    second.settle().await?;
+    ensure(
+        matches!(
+            second.outcome(retry).await?,
+            Outcome::Refused(rsauthnz::transition::Error::LastAnchor)
+        ),
+        "a removal ended the last sign-in method of an account",
+    )?;
+    ensure(
+        second.holds(&a1q).await? && !second.holds(&a1p).await?,
+        "the race of two removals left no sign-in method",
+    )
 }
 
 /// The most that a store rounds up the end of an audit or outcome record: a store that keeps whole seconds.
@@ -896,8 +1025,9 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
         "cJournaled: a commit that crashed before it landed changed the store",
     )?;
 
-    // cCommitted: the commit lands and its response is lost. The start writes the creation entry, and a lookup and
-    // an anchor change of the owner are answered only after it.
+    // cCommitted: the commit lands and its response is lost. The next start writes the creation entry. A peer joins
+    // while that append is in flight: it finishes the turn of the owner itself, and a lookup and an anchor change of
+    // the owner are answered only after the creation entry.
     let (proposal, plan_e) = enrollment("e-3");
     let operation = proposal.operation().clone();
     run.submit(proposal, plan_e)?;
@@ -912,8 +1042,8 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
     })
     .await?;
     let profile = super::Profile::new(run.binding.declaration()).map_err(failed("profile"))?;
-    let replacement = super::Driver::new(profile, Limits::default()).map_err(failed("driver"))?;
-    let mut old = core::mem::replace(&mut run.driver, replacement);
+    let peer = super::Driver::new(profile, Limits::default(), &mut super::random()).map_err(failed("driver"))?;
+    let mut old = core::mem::replace(&mut run.driver, peer);
     let Some(Effect::Append(append, instance)) = old.effect() else {
         return Err("recovery did not issue its pending creation append".into());
     };
@@ -925,32 +1055,14 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
         has(&pending, "e-3", |body| matches!(body, Body::Creation(_))),
         "recovery did not append the committed anchor",
     )?;
-    // Replace the worker before its append reaches the journal. The journal head has not moved.
+    // The peer joins the open instance, so the worker before it keeps its instance.
     run.driver.start(now());
     ensure(
-        matches!(run.driver.effect(), Some(Effect::Start)),
-        "the replacement did not request storage activation",
+        matches!(run.driver.effect(), Some(Effect::Instance)),
+        "the peer did not join the open instance",
     )?;
-    run.step(&mut |_| Next::Run(None)).await?;
-    let result = run
-        .binding
-        .append(append, instance)
-        .await
-        .map_err(failed("delayed recovery append"))?;
-    ensure(
-        result == JournalWrite::Conflict,
-        "a replaced worker appended a creation at an unchanged head",
-    )?;
-    old.give(super::Output::Appended(result))
-        .map_err(failed("recovery output"))?;
-    ensure(
-        old.status() == Status::Refused(driver::Error::Superseded),
-        "the replaced recovery worker continued after its fence",
-    )?;
-    let lookup = run
-        .driver
-        .lookup(operation)
-        .map_err(|error| format!("the driver refused a lookup: {error}"))?;
+    run.settle().await?;
+    run.serving()?;
     let a1p = key(Kind::Credential, "a1p");
     let held = [
         anchor(&a1p, sign_in("a1")),
@@ -958,15 +1070,53 @@ pub(super) async fn crash_points<S: Subject>(binding: S) -> Checked {
         anchor(&a1s, sign_in("a1")),
     ];
     let unlink = run.submit(Build::new("u-1").ends(&a1p, 1).done(), plan(&held, &[], &[]))?;
+    let (answer, created) = answered(&mut run, unlink, "e-3").await?;
+    ensure(
+        created && matches!(answer, Answer::Outcome(Outcome::Accepted(_))),
+        &format!(
+            "cCommitted: an anchor change of the owner was answered before the creation entry of its anchor commit: \
+             {answer:?}"
+        ),
+    )?;
+    let lookup = run
+        .driver
+        .lookup(operation)
+        .map_err(|error| format!("the driver refused a lookup: {error}"))?;
     let (answer, created) = answered(&mut run, lookup, "e-3").await?;
     ensure(
         created && matches!(answer, Answer::Lookup(Lookup::Committed(_))),
         "cCommitted: a lookup did not report the commit after its creation entry",
     )?;
-    let (answer, created) = answered(&mut run, unlink, "e-3").await?;
+    // The delayed append of the earlier worker is at a head that the peer moved, so it refuses, and the worker
+    // finds the creation entry of the peer and appends none.
+    let result = run
+        .binding
+        .append(append, instance)
+        .await
+        .map_err(failed("delayed recovery append"))?;
     ensure(
-        created && matches!(answer, Answer::Outcome(Outcome::Accepted(_))),
-        "cCommitted: an anchor change of the owner was answered before the creation entry of its anchor commit",
+        result == JournalWrite::Conflict,
+        "a delayed creation append landed at a head that a peer moved",
+    )?;
+    old.give(super::Output::Appended(result))
+        .map_err(failed("recovery output"))?;
+    while let Some(effect) = old.effect() {
+        let output = super::execute(&mut run.binding, effect).await;
+        old.give(output).map_err(failed("recovery output"))?;
+    }
+    ensure(
+        old.status() == Status::Serving,
+        "a worker stopped at a conflict with the entries of a peer",
+    )?;
+    let history = run.history().await?;
+    let creations = history
+        .entries()
+        .iter()
+        .filter(|entry| entry.operation == op("e-3") && matches!(entry.body, Body::Creation(_)))
+        .count();
+    ensure(
+        creations == 1,
+        "the journal holds the creation entry of one commit twice",
     )?;
     run.serving()?;
     ensure(
@@ -1157,7 +1307,7 @@ pub(super) async fn restore_journal<S: Subject>(binding: S) -> Checked {
 async fn release<S: Subject>(run: &mut Run<S>, name: &str) -> Result<u64, String> {
     let value = run
         .driver
-        .allocate(Kind::Session)
+        .allocate()
         .map_err(|error| format!("the driver gave no counter value: {error}"))?;
     let proposal = Build::new(name).writes(&key(Kind::Session, name), value).done();
     run.commit(proposal, Plan::default(), "a session").await?;

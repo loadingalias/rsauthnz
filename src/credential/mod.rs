@@ -45,6 +45,7 @@
 //! # use rsauthnz_conformance::memory::{Memory, Schedule};
 //! # use rsauthnz_conformance::suite::execute;
 //! use rscrypto::auth::MlDsa65Ed25519;
+//! use rscrypto::ChaCha20Rng;
 //!
 //! # type Failure = Box<dyn core::error::Error>;
 //! # /// Commits the issuance transition of `draft`, which carries its artifact, with the driver on a memory binding.
@@ -56,7 +57,7 @@
 //! #         output
 //! #     }
 //! #     let mut memory = Memory::new(Schedule::None);
-//! #     let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+//! #     let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut ChaCha20Rng::from_seed([1; 32]))?;
 //! #     let mut settle = |driver: &mut Driver| -> Result<(), Failure> {
 //! #         while let Some(effect) = driver.effect() {
 //! #             let output = ready(execute(&mut memory, effect));

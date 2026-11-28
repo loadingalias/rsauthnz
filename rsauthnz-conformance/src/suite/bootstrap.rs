@@ -18,8 +18,8 @@ use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 use super::{
-    Checked, Fault, Kind, Lookup, Outcome, Plan, Proposal, Run, Subject, account, at_commit, authority, crashes,
-    ensure, now, op,
+    Checked, Fault, Lookup, Outcome, Plan, Proposal, Run, Subject, account, at_commit, authority, crashes, ensure, now,
+    op,
 };
 
 /// A composite key pair. rscrypto signs in place of custody. A fixed filler makes the key reproducible.
@@ -155,10 +155,7 @@ async fn propose<S: Subject>(
     client: &Keys,
     name: &str,
 ) -> Result<(Proposal, Plan), String> {
-    let serial = run
-        .driver
-        .allocate(Kind::Credential)
-        .map_err(refused("an allocation"))?;
+    let serial = run.driver.allocate().map_err(refused("an allocation"))?;
     let pending = auth
         .bootstrap(&mut run.binding, value, &client.public, Serial(serial), now())
         .await

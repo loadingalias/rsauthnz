@@ -29,6 +29,7 @@ use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite;
 use rscodec::base64::Profile::Standard;
 use rscodec::json::{self, Profile::Rfc8259, Slot};
+use rscrypto::ChaCha20Rng;
 use rscrypto::auth::Ed25519SecretKey;
 
 const ROOT: &[u8] = include_bytes!("x509/slh-dsa-root.der");
@@ -114,6 +115,7 @@ impl Node {
         let driver = Driver::new(
             Profile::new(memory.declaration()).expect("a profile"),
             Limits::default(),
+            &mut ChaCha20Rng::from_seed([11; 32]),
         )
         .expect("a driver");
         let mut node = Self { memory, driver };

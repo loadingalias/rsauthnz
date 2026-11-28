@@ -92,12 +92,12 @@ fn commit(memory: &mut Memory, driver: &mut Driver, (proposal, plan): (Proposal,
 fn main() {
     let mut memory = Memory::new(Schedule::None);
     let profile = Profile::new(memory.declaration()).expect("a profile");
-    let mut driver = Driver::new(profile, Limits::default()).expect("a driver");
+    let mut random = ChaCha20Rng::from_seed([5; 32]);
+    let mut driver = Driver::new(profile, Limits::default(), &mut random).expect("a driver");
     driver.start(at(0));
     run(&mut memory, &mut driver);
     let authority = Id::new("acme", "auth").expect("an identifier");
     let rp = RelyingParty::new(authority, RP_ID, ORIGIN, "Acme", [3; 32], Limits::default()).expect("a relying party");
-    let mut random = ChaCha20Rng::from_seed([5; 32]);
 
     // One ES256 passkey of one account, as a synchronized passkey registers it: the counter stays zero.
     let account = Id::new("acme", "alice").expect("an identifier");

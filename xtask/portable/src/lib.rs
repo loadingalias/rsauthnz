@@ -430,7 +430,8 @@ fn settle(memory: &mut Memory, driver: &mut Driver) -> Result<(), String> {
 fn started(now: Reading) -> Result<(Memory, Driver), String> {
     let mut memory = Memory::new(Schedule::None);
     let profile = store::Profile::new(memory.declaration()).map_err(|error| format!("the profile: {error}"))?;
-    let mut driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
+    let mut driver = Driver::new(profile, Limits::default(), &mut ChaCha20Rng::from_seed([9; 32]))
+        .map_err(|error| format!("the driver: {error}"))?;
     driver.start(now);
     settle(&mut memory, &mut driver)?;
     Ok((memory, driver))
@@ -720,11 +721,7 @@ impl Local {
     /// The proposal of the bootstrap of `value` with the CLI key `key`, whose credential custody signs with the issuer
     /// key.
     fn propose(&mut self, value: &Bootstrap, key: &Handle) -> Result<(Proposal, Plan), String> {
-        let serial = Serial(
-            self.driver
-                .allocate(Kind::Credential)
-                .map_err(|error| format!("the serial: {error}"))?,
-        );
+        let serial = Serial(self.driver.allocate().map_err(|error| format!("the serial: {error}"))?);
         let pending = ready(
             self.authority
                 .bootstrap(&mut self.memory, value, &Self::holder(key)?, serial, self.now),
@@ -904,7 +901,7 @@ fn local_refusals(journey: &mut LocalJourney) -> Verdict {
     let serial = Serial(
         local
             .driver
-            .allocate(Kind::Credential)
+            .allocate()
             .map_err(|error| format!("the serial: {error}"))?,
     );
     let reused = ready(local.authority.bootstrap(
@@ -985,7 +982,7 @@ fn local_inputs(journey: &mut LocalJourney) -> Verdict {
     let serial = Serial(
         local
             .driver
-            .allocate(Kind::Credential)
+            .allocate()
             .map_err(|error| format!("the serial: {error}"))?,
     );
     let bootstrap = ready(
@@ -1088,6 +1085,12 @@ impl Store for Defective {
 
     async fn start(&mut self) -> Result<Instance, memory::Error> {
         let instance = self.memory.start().await?;
+        *self.instance.lock().unwrap_or_else(PoisonError::into_inner) = Some(instance);
+        Ok(instance)
+    }
+
+    async fn instance(&mut self) -> Result<Instance, memory::Error> {
+        let instance = self.memory.instance().await?;
         *self.instance.lock().unwrap_or_else(PoisonError::into_inner) = Some(instance);
         Ok(instance)
     }

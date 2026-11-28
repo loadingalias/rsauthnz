@@ -18,6 +18,8 @@ use std::path::Path;
 use std::time::Instant;
 use std::{env, fs, process};
 
+use rscrypto::ChaCha20Rng;
+
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{AuthorityVersion, Human, Id, Principal};
 use rsauthnz::limits::Limits;
@@ -203,7 +205,8 @@ impl Mode {
     fn new(store: &Path, restore: Restore) -> Self {
         let mut binding = Files::new(store.into(), restore, Duration::from_secs(86_400));
         let profile = Profile::new(binding.declaration()).expect("the file binding declares a serializable commit");
-        let mut driver = Driver::new(profile, Limits::default()).expect("the record bound of the binding is enough");
+        let mut driver = Driver::new(profile, Limits::default(), &mut ChaCha20Rng::from_seed([3; 32]))
+            .expect("the record bound of the binding is enough");
         driver.start(now());
         settle(&mut driver, &mut binding, &mut Meter::default());
         assert_eq!(driver.status(), Status::Serving);
@@ -284,6 +287,7 @@ fn settle(driver: &mut Driver, binding: &mut Files, meter: &mut Meter) {
 async fn execute(binding: &mut Files, effect: Effect<'_>) -> Output {
     match effect {
         Effect::Start => binding.start().await.map_or(Output::Failed, Output::Started),
+        Effect::Instance => binding.instance().await.map_or(Output::Failed, Output::Instance),
         Effect::Read(key) => Store::read(binding, key).await.map_or(Output::Failed, Output::Read),
         Effect::Commit(proposal, instance) => binding
             .commit(proposal, instance)

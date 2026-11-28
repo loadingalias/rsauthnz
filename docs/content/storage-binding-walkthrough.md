@@ -34,6 +34,7 @@ the end.
 - The journal grows with each entry, and a start reads all of it. The driver moves its mark, but the binding never
   removes old entries.
 - One process uses the files at a time. Directory locks exclude a second writer at either the store or the journal.
+  Several servers of that process share the binding: each one runs its own driver on its own clone of `Files`.
 - A start keeps the frames before the first incomplete frame or wrong checksum, as the SQLite write-ahead log
   does. It cannot tell a torn last write from damage inside a file, so damage inside a file loses the writes
   after it.
@@ -79,6 +80,9 @@ the store does not lower the number. A start takes both directory locks and adva
 Each commit, append, and journal sync compares its instance while the binding holds the locks.
 A returning writer uses its remembered file lengths only if the previous instance was its own.
 An empty instance file, or a missing instance file beside existing logs, gives `Error::Instance`.
+`Store::instance` gives the number of the file and writes none, or `Instance(0)` when no start wrote the file. A
+stopped binding opens its files again in that instance: the one writer of the files lost no write that a primitive
+acknowledged, so a join needs no new instance.
 
 ### 3. Read one record
 
@@ -129,8 +133,9 @@ after `after`, and stops at the first key that does not start with the prefix.
 ### 9. Stop at each error
 
 Each primitive runs on the open files. An error stops the binding: it closes the files and keeps the durable length of
-each file. Each primitive except `Store::start` then gives `Error::Stopped`. The binding retries nothing. A start
-drops each write after the durable lengths, so a write whose sync failed does not come back after the start.
+each file. The handles share one writer, so the error stops each handle. Each primitive except `Store::start` and
+`Store::instance` then gives `Error::Stopped`. The binding retries nothing. Each of the two opens the files again and
+drops each write after the durable lengths, so a write whose sync failed does not come back.
 
 ### 10. Run the commit driver
 

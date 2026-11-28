@@ -41,7 +41,7 @@ use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
 use rsauthnz::local::{self, Authority, Bootstrap, HostGrant, Offer};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
-use rsauthnz::store::{Kind, Profile, Store as _};
+use rsauthnz::store::{Profile, Store as _};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
@@ -137,7 +137,7 @@ fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
 
     let custody = FileCustody::open(dir, Isolation::User)?;
     let mut memory = Memory::new(Schedule::None).with_clock(Arc::new(clock));
-    let mut driver = Driver::new(Profile::new(memory.declaration())?, limits)?;
+    let mut driver = Driver::new(Profile::new(memory.declaration())?, limits, &mut random)?;
     driver.start(now);
     settle(&mut memory, &mut driver)?;
     println!("The store is the memory binding: a restart of this process loses each record.");
@@ -170,7 +170,7 @@ fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
 
     // 4. The CLI submits the text and its public key. The authority signs the CLI credential with the issuer key.
     let value = Bootstrap::parse(&text)?;
-    let serial = Serial(driver.allocate(Kind::Credential)?);
+    let serial = Serial(driver.allocate()?);
     let pending = ready(authority.bootstrap(&mut memory, &value, &holder, serial, now))?;
     let signature = custody.sign(&issuer, Algorithm::MlDsa65Ed25519, &pending.to_be_signed(), &mut random)?;
     let bootstrap = pending.finish(&signature, OperationId::new(b"bootstrap-1")?)?;
@@ -179,7 +179,7 @@ fn steps(dir: &Path, mut random: ChaCha20Rng) -> Result<(), Failure> {
     println!("4. The authority bound {alice} as the first administrator, with a CLI credential of {bytes} bytes.");
 
     // 5. The value is one-use, so a second bootstrap with it refuses.
-    let serial = Serial(driver.allocate(Kind::Credential)?);
+    let serial = Serial(driver.allocate()?);
     match ready(authority.bootstrap(&mut memory, &value, &holder, serial, now)) {
         Err(local::Failure::Refused(error @ local::Error::Unknown)) => {
             println!("5. A second bootstrap with the same value refused: {error}.");

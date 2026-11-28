@@ -192,6 +192,10 @@ impl Store for Ended {
         Ok(Instance(1))
     }
 
+    async fn instance(&mut self) -> Result<Instance, !> {
+        Ok(Instance(1))
+    }
+
     async fn read(&mut self, _: &Key) -> Result<Option<Record>, !> {
         Ok(None)
     }
@@ -289,6 +293,10 @@ impl Store for Records {
     }
 
     async fn start(&mut self) -> Result<Instance, !> {
+        Ok(Instance(1))
+    }
+
+    async fn instance(&mut self) -> Result<Instance, !> {
         Ok(Instance(1))
     }
 

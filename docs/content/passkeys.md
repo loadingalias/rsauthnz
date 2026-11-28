@@ -228,11 +228,11 @@ fn finish(rp: &RelyingParty, memory: &mut Memory, driver: &mut Driver, body: &[u
 
 let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+let mut random = ChaCha20Rng::from_seed([7; 32]);
+let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 driver.start(now);
 run(&mut memory, &mut driver)?;
 // Seed the generator from the entropy of the host. The key of the sign-in challenges is a secret of the host too.
-let mut random = ChaCha20Rng::from_seed([7; 32]);
 let key = [3; 32];
 let rp = RelyingParty::new(Id::new("acme", "auth")?, "app.example", "https://app.example", "Acme", key, Limits::default())?;
 

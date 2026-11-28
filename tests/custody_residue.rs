@@ -289,7 +289,7 @@ fn a_bootstrap_value_leaves_no_secret_in_freed_memory() {
     use rsauthnz::limits::Limits;
     use rsauthnz::local::{Authority, Bootstrap, HostGrant};
     use rsauthnz::store::driver::{Answer, Driver, Plan};
-    use rsauthnz::store::{self, Kind, Store};
+    use rsauthnz::store::{self, Store};
     use rsauthnz::time::{Reading, ReadingSource};
     use rsauthnz::transition::{OperationId, Outcome, Proposal};
     use rsauthnz_conformance::memory::{Memory, Schedule};
@@ -350,7 +350,8 @@ fn a_bootstrap_value_leaves_no_secret_in_freed_memory() {
     )
     .unwrap();
     let mut memory = Memory::new(Schedule::None);
-    let mut driver = Driver::new(store::Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
+    let profile = store::Profile::new(memory.declaration()).unwrap();
+    let mut driver = Driver::new(profile, Limits::default(), &mut ChaCha20Rng::from_seed([13; 32])).unwrap();
     driver.start(now);
     settle(&mut memory, &mut driver);
     let grant = HostGrant {
@@ -376,7 +377,7 @@ fn a_bootstrap_value_leaves_no_secret_in_freed_memory() {
         };
         let value = Bootstrap::parse(core::str::from_utf8(receipt.artifact().unwrap()).unwrap()).unwrap();
         drop(receipt);
-        let serial = Serial(driver.allocate(Kind::Credential).unwrap());
+        let serial = Serial(driver.allocate().unwrap());
         let pending = ready(authority.bootstrap(&mut memory, &value, &holder.to_bytes(), serial, now)).unwrap();
         drop((pending, value));
     });

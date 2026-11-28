@@ -311,7 +311,11 @@ impl Grants {
             .into_iter()
             .try_for_each(|read| proposal.read(read))
             .map_err(Error::Transition)?;
-        let revision = driver.allocate(Kind::Grant).map_err(Error::Driver)?;
+        let revision = match &record {
+            Some(record) => driver.allocate_after(&record.version),
+            None => driver.allocate(),
+        }
+        .map_err(Error::Driver)?;
         let grant = Grant {
             agent: agent.clone(),
             owner: owner.clone(),

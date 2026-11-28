@@ -3,14 +3,16 @@
 //!
 //! [`Memory`] implements [`Store`] and [`Journal`] in the memory of the process. One mutex holds all its state, so
 //! each primitive is one atomic step and each commit is serializable. The clones of a [`Memory`] share one binding:
-//! give each concurrent caller its own clone.
+//! give each concurrent caller, such as each driver of a server, its own clone.
 //!
 //! The binding simulates a durable store, and a restore journal in a separate failure domain. [`Subject::inject`] gives
 //! a [`Fault`] of the suite to the next call of its primitive. A [`Schedule`] injects crashes at the primitives: each
 //! fault, and two crashes of its own ([`Error::CrashAfterCommit`] and [`Error::DelayedCommit`]). The same faults and
 //! the same calls give the same results. A crash keeps each commit of the simulated store that landed, and each entry
-//! of the journal whose sync returned. It loses the appends after the last sync. After a crash, each primitive except
-//! [`Store::start`] gives the [`Error`] of the crash.
+//! of the journal whose sync returned. A crash at a commit or an append stops only the clone that made the call: the
+//! journal keeps an accepted append, and the next sync covers it. A failed sync crashes the whole binding: each clone
+//! stops, and the appends after the last sync are lost. A stopped clone gives the [`Error`] of its crash until it calls
+//! [`Store::start`] or [`Store::instance`].
 //!
 //! The binding implements [`Subject`], the controls of the conformance [suite](crate::suite), and passes each case.
 //! [`Subject::restart`] is the loss of the process: the store loses all its state, and the journal keeps its synced
@@ -79,7 +81,7 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use rsauthnz::id::AuthorityVersion;
+use rsauthnz::id::{AuthorityVersion, Id, Principal};
 use rsauthnz::store::journal::{Append, Mark};
 use rsauthnz::store::{
     self, Capacity, Commit, CrashInjection, CrashLoss, Declaration, Entry, Expiry, Insert, Inserted, Instance,
@@ -267,6 +269,8 @@ struct Request {
     records: Vec<(Key, Record)>,
     /// The deadline of the proposal, which the clock of the binding checks when the commit applies.
     deadline: Option<Duration>,
+    /// The proposal is a commit of the driver itself, such as the reservation of an owner turn.
+    driver: bool,
 }
 
 impl Request {
@@ -285,6 +289,8 @@ impl Request {
             changes: proposal.changes().to_vec(),
             records,
             deadline: proposal.deadline(),
+            driver: proposal.audit().actor
+                == Principal::Workload(Id::new("rsauthnz", "driver").expect("the driver identifier is valid")),
         }
     }
 }
@@ -314,13 +320,18 @@ struct Binding {
     /// The instance number of the last start or restore. A start and a restore each write the next number, so it
     /// increases for the life of the binding, and a commit from each earlier start refuses.
     instance: Instance,
-    /// The error of each primitive until the next start, or `None` while the binding serves.
-    stopped: Option<Error>,
-    /// A commit of [`Error::DelayedCommit`] and its instance number. It lands after the next start.
+    /// Whether a handle started or joined the binding since it was new or since its last restart.
+    started: bool,
+    /// The number of crashes of the whole binding: a failed sync or a restart. A handle of an earlier number gives
+    /// [`Error::Stopped`] until it starts or joins again.
+    epoch: u64,
+    /// A commit of [`Error::DelayedCommit`] and its instance number. It lands at the next start or join.
     delayed: Option<(Request, Instance)>,
     schedule: Schedule,
     /// The fault of [`Subject::inject`] for the next call of its primitive.
     injected: Option<Fault>,
+    /// The fault of [`Memory::inject_application`] for the next commit of a proposal of the application.
+    application: Option<Fault>,
     /// The number of calls of each primitive that can take a fault, in the order of [`Primitive`].
     calls: [u64; 3],
     /// The clock of [`Memory::set_clock`] or [`Memory::with_clock`], which each commit with a deadline reads.
@@ -332,16 +343,11 @@ struct Binding {
 }
 
 impl Binding {
-    /// Gives the error of a stopped binding.
-    fn serving(&self) -> Result<(), Error> {
-        self.stopped.map_or(Ok(()), Err)
-    }
-
-    /// Stops the binding with `error` until the next start. The appends after the last sync are lost.
-    fn stop(&mut self, error: Error) -> Error {
-        self.stopped = Some(error);
+    /// Crashes the whole binding: each handle stops until it starts or joins again, and the appends after the last
+    /// sync are lost.
+    fn crash_all(&mut self) {
+        self.epoch = self.epoch.strict_add(1);
         self.discard_unsynced();
-        error
     }
 
     fn discard_unsynced(&mut self) {
@@ -350,14 +356,17 @@ impl Binding {
     }
 
     fn next_instance(&mut self) -> Result<(), Error> {
-        let next = self
-            .instance
-            .0
-            .checked_add(1)
-            .ok_or_else(|| self.stop(Error::Instance))?;
+        let next = self.instance.0.checked_add(1).ok_or(Error::Instance)?;
         self.discard_unsynced();
         self.instance = Instance(next);
         Ok(())
+    }
+
+    /// Lands the delayed commit with the instance number that it carries, at a start or a join.
+    fn deliver(&mut self) {
+        if let Some((request, instance)) = self.delayed.take() {
+            self.apply(request, instance);
+        }
     }
 
     /// Counts a call of `primitive`, and gives the crash that [`Subject::inject`] or the schedule injects at it.
@@ -387,26 +396,30 @@ impl Binding {
         }
     }
 
-    /// The commit of `request` with the instance number `instance`, after the crash that it takes.
-    fn commit(&mut self, request: Request, instance: Instance) -> Result<Commit, Error> {
-        self.serving()?;
-        match self.crash(Primitive::Commit) {
-            Some(crash @ Crash::Fault(Fault::CrashBeforeCommit)) => Err(self.stop(crash.error())),
+    /// The commit of `request` with the instance number `instance`, and the crash of the handle after it, if any.
+    fn commit(&mut self, request: Request, instance: Instance) -> (Result<Commit, Error>, Option<Error>) {
+        let crash = match self.application.take_if(|_| !request.driver) {
+            Some(fault) => {
+                self.calls[Primitive::Commit as usize] = self.calls[Primitive::Commit as usize].strict_add(1);
+                Some(Crash::Fault(fault))
+            }
+            None => self.crash(Primitive::Commit),
+        };
+        match crash {
+            Some(crash @ Crash::Fault(Fault::CrashBeforeCommit)) => (Err(crash.error()), Some(crash.error())),
             Some(crash @ Crash::Fault(Fault::LostResponse)) => {
                 self.apply(request, instance);
-                Err(self.stop(crash.error()))
+                (Err(crash.error()), Some(crash.error()))
             }
-            Some(crash @ Crash::AfterCommit) => {
-                let commit = self.apply(request, instance);
-                self.stop(crash.error());
-                Ok(commit)
-            }
+            Some(crash @ Crash::AfterCommit) => (Ok(self.apply(request, instance)), Some(crash.error())),
             Some(crash @ Crash::Delayed) => {
                 self.delayed = Some((request, instance));
-                Err(self.stop(crash.error()))
+                (Err(crash.error()), Some(crash.error()))
             }
             // A commit takes only the crashes of a commit.
-            Some(Crash::Fault(Fault::CrashAfterAppend | Fault::FailedSync)) | None => Ok(self.apply(request, instance)),
+            Some(Crash::Fault(Fault::CrashAfterAppend | Fault::FailedSync)) | None => {
+                (Ok(self.apply(request, instance)), None)
+            }
         }
     }
 
@@ -477,26 +490,36 @@ fn fixed(now: Reading) -> Clock {
     Clock(Arc::new(move || now))
 }
 
-/// A handle of one memory binding. Its clones share the binding.
+/// A handle of one memory binding. Its clones share the binding. Each handle is one connection: a crash at a
+/// primitive of a handle stops that handle, and the other handles serve. A failed sync and a restart crash the whole
+/// binding, so each handle stops.
 #[derive(Clone, Debug)]
-pub struct Memory(Arc<Mutex<Binding>>);
+pub struct Memory {
+    binding: Arc<Mutex<Binding>>,
+    /// The crash of this handle, until it starts or joins again.
+    crashed: Option<Error>,
+    /// The crash number of the binding at the last start or join of this handle.
+    epoch: u64,
+}
 
 impl Memory {
     /// Makes a binding with an empty store and an empty journal, which injects the faults of `schedule`. It serves
     /// after its first start.
     #[must_use]
     pub fn new(schedule: Schedule) -> Self {
-        Self(Arc::new(Mutex::new(Binding {
+        let binding = Arc::new(Mutex::new(Binding {
             store: State::default(),
             journal: BTreeMap::new(),
             synced: Mark::EMPTY,
             head: Mark::EMPTY,
             unsynced: Vec::new(),
             instance: Instance(0),
-            stopped: Some(Error::Stopped),
+            started: false,
+            epoch: 0,
             delayed: None,
             schedule,
             injected: None,
+            application: None,
             calls: [0; 3],
             clock: fixed(Reading::new(
                 Duration::ZERO,
@@ -505,7 +528,12 @@ impl Memory {
             )),
             retention: RETENTION,
             capacity: CAPACITY,
-        })))
+        }));
+        Self {
+            binding,
+            crashed: None,
+            epoch: 0,
+        }
     }
 
     /// The binding with the outcome retention `retention`: each audit and outcome record of a later commit ends that
@@ -525,6 +553,20 @@ impl Memory {
         self
     }
 
+    /// Gives `fault`, a fault of a commit, to the next commit of a proposal of the application: not to a commit of the
+    /// driver itself, such as the reservation of an owner turn before an anchor change.
+    ///
+    /// # Panics
+    ///
+    /// If `fault` is not a fault of a commit.
+    pub fn inject_application(&self, fault: Fault) {
+        assert!(
+            matches!(fault, Fault::CrashBeforeCommit | Fault::LostResponse),
+            "a fault of a commit"
+        );
+        self.lock().application = Some(fault);
+    }
+
     /// Sets the reading of the clock of the binding, which each commit with a deadline reads: the controlled clock of a
     /// test. The first reading is the start of the Unix epoch, before each deadline of a test at a fixed time.
     pub fn set_clock(&self, now: Reading) {
@@ -542,7 +584,36 @@ impl Memory {
     /// The shared state. No step of the binding panics while it holds the lock, so a poisoned lock holds a
     /// consistent state.
     fn lock(&self) -> MutexGuard<'_, Binding> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.binding.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The shared state of a handle that serves, or the error of its crash.
+    fn serving(&self) -> Result<MutexGuard<'_, Binding>, Error> {
+        let binding = self.lock();
+        match self.crashed {
+            Some(error) => Err(error),
+            None if !binding.started || binding.epoch != self.epoch => Err(Error::Stopped),
+            None => Ok(binding),
+        }
+    }
+
+    /// The commit of `request` with the instance number `instance`. A crash at it stops this handle.
+    fn request(&mut self, request: Request, instance: Instance) -> Result<Commit, Error> {
+        let mut binding = self.serving()?;
+        let (commit, crash) = binding.commit(request, instance);
+        drop(binding);
+        if crash.is_some() {
+            self.crashed = crash;
+        }
+        commit
+    }
+
+    /// Serves this handle again after a crash: a start or a join.
+    fn join(&mut self, binding: &mut Binding) {
+        binding.started = true;
+        self.crashed = None;
+        self.epoch = binding.epoch;
+        binding.deliver();
     }
 }
 
@@ -557,7 +628,8 @@ impl Subject for Memory {
     /// after the last sync are lost.
     fn restart(&self) {
         let mut binding = self.lock();
-        binding.stop(Error::Stopped);
+        binding.crash_all();
+        binding.started = false;
         binding.store = State::default();
     }
 
@@ -605,37 +677,39 @@ impl Store for Memory {
     }
 
     async fn start(&mut self) -> Result<Instance, Error> {
-        let mut binding = self.lock();
+        let binding = Arc::clone(&self.binding);
+        let mut binding = binding.lock().unwrap_or_else(PoisonError::into_inner);
         binding.next_instance()?;
-        binding.stopped = None;
-        if let Some((request, instance)) = binding.delayed.take() {
-            // The delayed commit lands now, with the instance number of an earlier start, so it refuses.
-            binding.apply(request, instance);
-        }
+        // A delayed commit lands now, with the instance number of an earlier start, so it refuses.
+        self.join(&mut binding);
+        Ok(binding.instance)
+    }
+
+    async fn instance(&mut self) -> Result<Instance, Error> {
+        let binding = Arc::clone(&self.binding);
+        let mut binding = binding.lock().unwrap_or_else(PoisonError::into_inner);
+        // A delayed commit lands now, in the instance that it carries.
+        self.join(&mut binding);
         Ok(binding.instance)
     }
 
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {
-        let binding = self.lock();
-        binding.serving()?;
+        let binding = self.serving()?;
         Ok(binding.store.records.get(key).cloned())
     }
 
     async fn read_pair(&mut self, keys: [&Key; 2]) -> Result<[Option<Record>; 2], Error> {
-        let binding = self.lock();
-        binding.serving()?;
+        let binding = self.serving()?;
         Ok(keys.map(|key| binding.store.records.get(key).cloned()))
     }
 
     async fn commit(&mut self, proposal: &Proposal, instance: Instance) -> Result<Commit, Error> {
-        let mut binding = self.lock();
-        let request = Request::new(proposal, binding.retention);
-        binding.commit(request, instance)
+        let retention = self.serving()?.retention;
+        self.request(Request::new(proposal, retention), instance)
     }
 
     async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
-        let mut binding = self.lock();
-        binding.serving()?;
+        let mut binding = self.serving()?;
         Ok(binding.insert(insert))
     }
 
@@ -646,8 +720,7 @@ impl Store for Memory {
         limit: NonZeroUsize,
         instance: Instance,
     ) -> Result<Expiry, Error> {
-        let mut binding = self.lock();
-        binding.serving()?;
+        let mut binding = self.serving()?;
         if instance != binding.instance {
             return Ok(Expiry::Superseded);
         }
@@ -671,8 +744,7 @@ impl Store for Memory {
         after: Option<&Key>,
         limit: NonZeroUsize,
     ) -> Result<Vec<(Key, Record)>, Error> {
-        let binding = self.lock();
-        binding.serving()?;
+        let binding = self.serving()?;
         Ok(binding
             .store
             .range(prefix, after)
@@ -686,27 +758,32 @@ impl Journal for Memory {
     type Error = Error;
 
     async fn append(&mut self, append: &Append, instance: Instance) -> Result<JournalWrite, Error> {
-        let mut binding = self.lock();
-        binding.serving()?;
+        let mut binding = self.serving()?;
         if binding.instance != instance || binding.head != append.after() {
             return Ok(JournalWrite::Conflict);
         }
         binding.unsynced.push(append.entry().clone());
         binding.head = append.head();
-        if let Some(crash) = binding.crash(Primitive::Append) {
-            binding.stop(crash.error());
+        // The journal keeps the accepted append. The handle crashes after it, and the next sync covers the append.
+        let crash = binding.crash(Primitive::Append);
+        drop(binding);
+        if let Some(crash) = crash {
+            self.crashed = Some(crash.error());
         }
         Ok(JournalWrite::Accepted)
     }
 
     async fn sync(&mut self, instance: Instance) -> Result<JournalWrite, Error> {
-        let mut binding = self.lock();
-        binding.serving()?;
+        let mut binding = self.serving()?;
         if binding.instance != instance {
             return Ok(JournalWrite::Conflict);
         }
         if let Some(crash) = binding.crash(Primitive::Sync) {
-            return Err(binding.stop(crash.error()));
+            // The journal failed, so each handle stops, and the appends after the last sync are lost.
+            binding.crash_all();
+            drop(binding);
+            self.crashed = Some(crash.error());
+            return Err(crash.error());
         }
         let entries = mem::take(&mut binding.unsynced);
         binding.synced = binding.head;
@@ -717,8 +794,7 @@ impl Journal for Memory {
     }
 
     async fn read(&mut self, after: Sequence, limit: NonZeroUsize) -> Result<Vec<Entry>, Error> {
-        let binding = self.lock();
-        binding.serving()?;
+        let binding = self.serving()?;
         Ok(binding
             .journal
             .range((Bound::Excluded(after), Bound::Unbounded))

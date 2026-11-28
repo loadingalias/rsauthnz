@@ -61,7 +61,7 @@ secret from the human.
      human compares the fingerprint with the one on the screen of the CLI.
    - `None`: the code is wrong, or the commit did not accept. Show nothing of the request, and ask the human to give
      the code again. A wrong code counts against the bound.
-5. Get fresh verification from the browser session. Allocate `serial` with `driver.allocate(Kind::Credential)`.
+5. Get fresh verification from the browser session. Allocate `serial` with `driver.allocate()`.
    Commit the proposal and plan from `authority.approve(store, &fresh, &code, Serial(serial), now, random)`.
    `checked.release(&outcome)` gives `Some(None)` when the approval committed, and `None` for a wrong code or another
    outcome.
@@ -198,7 +198,7 @@ let custody = FileCustody::open(&dir, Isolation::User)?;
 let issuer = custody.enroll(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &mut random)?;
 
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 driver.start(now);
 while let Some(effect) = driver.effect() {
     let output = ready(execute(&mut memory, effect));
@@ -215,7 +215,7 @@ let value = Bootstrap::parse(&String::from_utf8(artifact(commit(&mut memory, &mu
 // 2. The CLI draws a key ID, records it with `alice`, and enrolls its key before it submits the value.
 let key = custody.enroll(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &mut random)?;
 let holder: [u8; 1984] = key.public_key().as_slice().try_into()?;
-let serial = Serial(driver.allocate(Kind::Credential)?);
+let serial = Serial(driver.allocate()?);
 let pending = ready(authority.bootstrap(&mut memory, &value, &holder, serial, now))?;
 let signature = custody.sign(&issuer, Algorithm::MlDsa65Ed25519, &pending.to_be_signed(), &mut random)?;
 let bootstrap = pending.finish(&signature, OperationId::new(b"b-1")?)?;

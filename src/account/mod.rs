@@ -52,13 +52,13 @@
 //!
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut random = ChaCha20Rng::from_seed([7; 32]);
+//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 //! driver.start(now);
 //! while let Some(effect) = driver.effect() {
 //!     let output = ready(execute(&mut memory, effect));
 //!     driver.give(output)?;
 //! }
-//! let mut random = ChaCha20Rng::from_seed([7; 32]);
 //! let rp = RelyingParty::new(Id::new("acme", "auth")?, "app.example", "https://app.example", "Acme", [3; 32], Limits::default())?;
 //!
 //! // Bob opens the link of an invitation with a value that the store does not hold.
@@ -368,7 +368,7 @@ impl RelyingParty {
         proposal.read(Dependency::Policy(checked.permit().version.clone()))?;
         proposal.until(checked.deadline());
         proposal.read(Dependency::Absent(key.clone()))?;
-        let version = self.version(driver.allocate(Kind::Invitation)?);
+        let version = self.version(driver.allocate()?);
         let data = passkey::encode(&Value::Array(vec![
             Value::Text(INVITATION_FORM),
             invite.recipient.to_cbor(),
@@ -509,7 +509,7 @@ impl RelyingParty {
                 self.removal_key(&invitation.handle, credential.id()),
             ))
             .map_err(passkey::Error::from)?;
-        let version = self.version(driver.allocate(Kind::Credential).map_err(passkey::Error::from)?);
+        let version = self.version(driver.allocate().map_err(passkey::Error::from)?);
         proposal
             .change(Change::Write {
                 key: credential_key.clone(),
@@ -586,7 +586,7 @@ impl RelyingParty {
         proposal.read(Dependency::Version(passkey.key.clone(), passkey.version.clone()))?;
         let mut credential = passkey.credential.clone();
         credential.name = name.into();
-        let version = self.version(driver.allocate(Kind::Credential)?);
+        let version = self.version(driver.allocate_after(&passkey.version)?);
         proposal.change(Change::Write {
             key: passkey.key.clone(),
             version,
@@ -658,7 +658,7 @@ impl RelyingParty {
         proposal
             .read(Dependency::Absent(mark.clone()))
             .map_err(passkey::Error::from)?;
-        let version = self.version(driver.allocate(Kind::Removal).map_err(passkey::Error::from)?);
+        let version = self.version(driver.allocate().map_err(passkey::Error::from)?);
         proposal
             .change(Change::Write {
                 key: mark,

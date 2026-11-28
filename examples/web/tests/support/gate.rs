@@ -89,6 +89,11 @@ impl Store for Gated {
         self.memory.start().await
     }
 
+    async fn instance(&mut self) -> Result<Instance, Error> {
+        self.pass().await;
+        self.memory.instance().await
+    }
+
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {
         self.pass().await;
         Store::read(&mut self.memory, key).await

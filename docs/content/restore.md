@@ -191,6 +191,7 @@ fn run(driver: &mut Driver, mut execute: impl FnMut(Effect<'_>) -> Output) {
 | `Effect` | Primitive | `Output` |
 | --- | --- | --- |
 | `Start` | `Store::start` | `Started(instance)` |
+| `Instance` | `Store::instance` | `Instance(instance)` |
 | `Read(key)` | `Store::read` | `Read(record)` |
 | `Commit(proposal, instance)` | `Store::commit` | `Committed(commit)` |
 | `Expire(kind, before, limit, instance)` | `Store::expire` | `Expired(Expiry::Removed(count))` or `Expired(Expiry::Superseded)` |
@@ -210,9 +211,14 @@ of the commit ([Commit](storage.md#commit)). The driver reads no clock for it. A
 Give `Output::Failed` when a primitive fails. It is a crash: the driver stops (`Status::Down`), gives an unknown
 outcome to the operation in progress, and serves again only after `driver.start(now)`. Do not retry the primitive.
 
-1. Call `driver.start(now)` at first, and after each crash. It writes a new store instance number, reads the mark
-   record and the journal after its mark, writes the missing creation entries and the voids of reconciliation, and
-   then serves.
+Several servers can each run a driver on one store. [Run several servers on one store](servers.md) gives the setup,
+the recovery of a lost reply, and the cost of each shared operation.
+
+1. Call `driver.start(now)` at first, and after each crash. When the replay floor names the installed instance, the
+   start joins it: it reads the mark record and the journal after its mark, and writes no instance. Otherwise it
+   activates a new store instance number, writes the missing creation entries and the voids of reconciliation, and
+   publishes the replay floor. Then it settles the work that a crash of this driver cut, reserves two blocks of the
+   counter, and serves.
 2. Exclude earlier writers at both destinations before installing a snapshot. After installation, call `driver.restore(now)`.
    A binding without a journal returns `Error::Unsupported`.
    The driver records the restore instance before it applies the journal or deletes pending challenges and approvals.
@@ -222,26 +228,39 @@ outcome to the operation in progress, and serves again only after `driver.start(
    holds, the writes that replace a dead version, and the role of each new anchor. Take the answer with
    `driver.take(ticket)`. A proposal with a record longer than `record_bytes_max` refuses with
    `Error::RecordBytes`, and the binding never gets it.
-4. Look up a lost outcome with `driver.lookup(operation)`. A matching record gives `Lookup::Committed`.
-   A request binding mismatch gives `Lookup::Refused`. A missing record gives `Lookup::Unknown`, including after expiry or restore.
-   This read leaves the original request open.
+4. Look up a lost outcome with `driver.lookup(operation)`. A matching record gives `Lookup::Committed` after the
+   creation entry of an anchor commit is durable. A request binding mismatch, or a closure, gives `Lookup::Refused`.
+   A missing record gives `Lookup::Unknown`, including after expiry or restore. This read leaves the original
+   request open.
+5. Recover a lost outcome with `driver.recover(handle, now)`, with the handle of `driver.handle(&proposal)` before the
+   submission. A missing record in the instance and the retention of the handle gives `Recovered::Fresh`: a closure
+   fences the original. [Recover a lost reply](servers.md#recover-a-lost-reply).
 
-A stale primary commit or expiry returns `Superseded`. A journal write returns `JournalWrite::Conflict` if the instance or expected head changes.
-The driver stops with `Error::Superseded`. Keep the original identity of each uncertain operation.
+A stale primary commit or expiry returns `Superseded`, and the driver stops with `Error::Superseded`. Keep the
+original identity of each uncertain operation. A journal write that returns `JournalWrite::Conflict` reads the new
+entries of the peers, and appends again at the new head. A read that gives no new entry syncs first, because a peer
+can have an accepted append that awaits its sync. A conflict with no new entry after that sync is a change of
+instance, so the driver stops with `Error::Superseded`.
 A queued submission receives `Outcome::Unknown` when a new start or restore retires its queue.
 Submissions made after that request wait for the new activation. Status reads can cross activation.
 
-The driver runs one operation at a time, a start first. A commit goes through these effects:
+The driver runs one operation at a time, a start first. A value of the counter (`driver.allocate()`,
+`driver.allocate_after(&previous)`) comes from a block that the journal reserved before the call, so a commit writes
+no floor entry. A commit goes through these effects:
 
-1. The last-anchor check, with no effect. A refusal gives `Outcome::Refused(Error::LastAnchor)`.
-2. A floor entry for each counter whose allocated value passes its durable floor (`driver.allocate(kind)`), the end
-   entry, and one sync. A binding with no journal keeps the floors in the mark record, in a commit before this one.
-3. The conditional commit checks the instance. For a proposal with a deadline, it also checks the binding's clock in the write.
+1. For an anchor change: one commit that writes the held turn of each owner (`Kind::Turn`). A turn of a peer gives
+   its help, or `Outcome::Conflict` while the peer can still commit.
+2. For an anchor change, or a new record of a key that can repeat: a read of the new journal entries. Then the
+   last-anchor check, with no effect. A refusal gives `Outcome::Refused(Error::LastAnchor)`. A new record below a
+   dead version of its key gives `Outcome::Conflict`.
+3. The end entry and one sync.
+4. The conditional commit checks the instance. It also reads and advances each owner turn of the change. For a proposal with a deadline, it also checks the binding's clock in the write.
    A reading that can reach the deadline gives `Commit::Expired`. The driver makes any required void durable before reporting the refusal.
-4. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
-   also carries an intent of `Effect::Journal`, and a commit of the driver ends it after the creation entry.
-5. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
-   answer.
+5. After an accepted commit: the creation entry and a sync, then the answer. An anchor commit with no consumption
+   also carries an intent of `Effect::Journal`. One commit of the driver ends the owner turns and the intent after
+   the creation entry.
+6. After a conflict, or the outcome record of another request: the void of the end entry and a sync, then the
+   answer, and one commit that ends the owner turns.
 
 A start refuses with `Error::Restored` (`Status::Refused`) when the journal shows a commit that the store lost: a
 later write of the mark record, or the creation entry of an anchor with no end that the store lacks. After each write
@@ -255,4 +274,6 @@ such a commit landed, so its loss looks the same as a crash before the commit.
 `driver.cancel(ticket)` ends an operation that waits. The operation in progress runs to its commit or its refusal,
 and it gives no answer. The driver moves the mark of the mark record after each start, on `driver.advance(now)`, and
 after `ADVANCE_AT` entries, so the journal after the mark stays under `JOURNAL_ENTRIES_MAX` entries. A start that
-finds a longer journal refuses with `Error::Long`.
+finds a longer journal refuses with `Error::Long`. The mark passes only the entries of the operations that finished:
+it stays before each entry of an operation that holds an owner turn, and the move of the mark gives that turn its
+help.

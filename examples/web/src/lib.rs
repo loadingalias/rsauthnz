@@ -185,7 +185,8 @@ impl<S: Subject + Send + 'static> App<S> {
         let sessions = Sessions::new(authority(), id("app"), SESSION_POLICY, Limits::default())
             .map_err(|error| format!("the sessions: {error}"))?;
         let profile = Profile::new(store.declaration()).map_err(|error| format!("the profile: {error}"))?;
-        let mut driver = Driver::new(profile, Limits::default()).map_err(|error| format!("the driver: {error}"))?;
+        let mut driver =
+            Driver::new(profile, Limits::default(), &mut random).map_err(|error| format!("the driver: {error}"))?;
         let now = clock();
         driver.start(now);
         settle(&mut store, &mut driver);

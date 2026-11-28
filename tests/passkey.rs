@@ -14,6 +14,8 @@ mod enroll;
 mod grant;
 #[path = "passkey/recovery.rs"]
 mod recovery;
+#[path = "passkey/servers.rs"]
+mod servers;
 #[path = "passkey/session.rs"]
 mod session;
 #[path = "passkey/vectors.rs"]
@@ -150,6 +152,7 @@ impl Node {
         let driver = Driver::new(
             Profile::new(memory.declaration()).expect("a profile"),
             Limits::default(),
+            &mut ChaCha20Rng::from_seed([12; 32]),
         )
         .expect("a driver");
         let mut node = Self { memory, driver };
@@ -525,7 +528,7 @@ fn the_options_offer_the_profile_and_release_only_after_the_start_commits() {
     let mut site = Site::new();
     let (proposal, plan) = site.propose_start(&alice(), HANDLE).expect("a start");
     // A lost response releases no options: the browser gets no challenge whose record may not exist.
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
     site.node.start();
 
@@ -787,7 +790,7 @@ fn a_registration_in_doubt_completes_once_at_restore() {
     let (proposal, plan) = site.propose(&json, at(1));
     let operation = proposal.operation().clone();
     // The commit lands, and its response is lost. Then the store comes back from the snapshot before the commit.
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
     site.node.memory.restore(&snapshot);
     site.node.driver.restore(at(0)).expect("a restore");
@@ -1117,7 +1120,7 @@ fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
     // The commit lands and its response is lost: the unknown outcome releases nothing.
     let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(10)), HANDLE).json();
     let (proposal, plan, opening) = site.sign_in(&json, at(11)).expect("a sign-in");
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     let outcome = site.node.commit(proposal, plan);
     assert!(matches!(outcome, Outcome::Unknown(_)));
     assert!(opening.release(&outcome).is_none());
@@ -1127,7 +1130,7 @@ fn a_lost_sign_in_response_resolves_by_a_lookup_of_the_server() {
     let json = Get::new(&passkey, RP_ID, ORIGIN, site.options(at(20)), HANDLE).json();
     let (proposal, plan, opening) = site.sign_in(&json, at(21)).expect("a sign-in");
     let operation = proposal.operation().clone();
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
     site.node.start();
     let ticket = site.node.driver.lookup(operation).expect("a lookup");

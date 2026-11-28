@@ -317,14 +317,7 @@ impl Grantor {
                 revision: forged.revision,
             },
             grant::purpose(),
-            Serial(
-                self.world
-                    .site
-                    .node
-                    .driver
-                    .allocate(Kind::Credential)
-                    .expect("a serial"),
-            ),
+            Serial(self.world.site.node.driver.allocate().expect("a serial")),
             time(86_400),
         );
         let holder = key(self.holder);

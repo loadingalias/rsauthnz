@@ -137,6 +137,7 @@ impl World {
         let driver = Driver::new(
             Profile::new(memory.declaration()).expect("a profile"),
             Limits::default(),
+            &mut ChaCha20Rng::from_seed([17; 32]),
         )
         .expect("a driver");
         let rp = RelyingParty::new(

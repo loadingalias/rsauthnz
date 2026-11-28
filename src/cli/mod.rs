@@ -86,7 +86,7 @@
 //! let issuer = custody.enroll(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &mut random)?;
 //!
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 //! driver.start(now);
 //! while let Some(effect) = driver.effect() {
 //!     let output = ready(execute(&mut memory, effect));
@@ -103,7 +103,7 @@
 //! // 2. The CLI draws a key ID, records it with `alice`, and enrolls its key before it submits the value.
 //! let key = custody.enroll(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &mut random)?;
 //! let holder: [u8; 1984] = key.public_key().as_slice().try_into()?;
-//! let serial = Serial(driver.allocate(Kind::Credential)?);
+//! let serial = Serial(driver.allocate()?);
 //! let pending = ready(authority.bootstrap(&mut memory, &value, &holder, serial, now))?;
 //! let signature = custody.sign(&issuer, Algorithm::MlDsa65Ed25519, &pending.to_be_signed(), &mut random)?;
 //! let bootstrap = pending.finish(&signature, OperationId::new(b"b-1")?)?;

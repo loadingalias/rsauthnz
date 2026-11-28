@@ -103,7 +103,7 @@
 //! let issuer = Handle::new(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &issuer_public)?;
 //!
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 //! driver.start(now);
 //! settle(&mut memory, &mut driver)?;
 //!
@@ -116,7 +116,7 @@
 //!
 //! // 2. The client stores its key, then submits the value and its public key. Custody signs the CLI credential.
 //! let value = Bootstrap::parse(&text)?;
-//! let serial = Serial(driver.allocate(Kind::Credential)?);
+//! let serial = Serial(driver.allocate()?);
 //! let pending = ready(authority.bootstrap(&mut memory, &value, &holder_public, serial, now))?;
 //! let signature = issuer_secret.sign_deterministic(&pending.to_be_signed(), &[])?;
 //! let bootstrap = pending.finish(signature.as_bytes(), OperationId::new(b"b-1")?)?;

@@ -218,7 +218,8 @@ pub enum Body {
     /// acknowledgement.
     Creation(Vec<Anchor>),
     /// The void of the end or creation entry with this sequence: its operation did not commit. A replay ignores that
-    /// entry.
+    /// entry. A helper that fenced an attempt with no end entry appends a terminal void of the sequence 0, which no
+    /// entry has: it moves the head, so a concurrent end entry of that attempt refuses at the journal.
     Void(Sequence),
     /// An allocation floor, which is durable before the commit of a value above the earlier floor.
     Floor(Floor),
@@ -323,6 +324,21 @@ enum Owner<'a> {
 }
 
 impl Role {
+    /// The key of the turn record of the owner of the anchor ([`Kind::Turn`]): the SHA-256 digest of the canonical CBOR
+    /// form `[0, account]` or `[1, authority]` of the owner.
+    pub(crate) fn turn(&self) -> Key {
+        let form = match self.owner() {
+            Owner::Account(account) => cbor::Value::Array(alloc::vec![cbor::Value::Unsigned(0), account.to_cbor()]),
+            Owner::Authority(authority) => {
+                cbor::Value::Array(alloc::vec![cbor::Value::Unsigned(1), authority.to_cbor()])
+            }
+        };
+        let form = cbor::encode(&form, Limits::FORM).expect("the form of an identifier has no map and no simple value");
+        Kind::Turn
+            .key(&crypto::sha256(&form))
+            .expect("a key of 33 bytes is valid")
+    }
+
     const fn owner(&self) -> Owner<'_> {
         match self {
             Self::SignIn(account) | Self::Cli(account) | Self::Recovery(account) | Self::AccountState(account) => {
@@ -550,7 +566,7 @@ impl History {
     }
 
     /// The mark before the entry at `index`.
-    fn before(&self, index: usize) -> Mark {
+    pub(crate) fn before(&self, index: usize) -> Mark {
         match (self.entries.get(index), self.held.get(index)) {
             (Some(entry), Some(link)) => Mark {
                 sequence: Sequence(entry.sequence.0 - 1),

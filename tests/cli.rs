@@ -21,7 +21,7 @@ use rsauthnz::id::Id;
 use rsauthnz::limits::Limits;
 use rsauthnz::local::{self, Admission, Admitted, Authority, Bootstrap, Error, Failure, HostGrant, Offer, Unlink};
 use rsauthnz::store::driver::{Answer, Driver, Plan};
-use rsauthnz::store::{self, Kind, Profile, Store};
+use rsauthnz::store::{self, Profile, Store};
 use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{self, Change, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule, Snapshot};
@@ -112,7 +112,13 @@ impl<'c> World<'c> {
     /// authority and issuer key has.
     fn with(custody: &'c dyn Custody, issuer: Handle, random: ChaCha20Rng) -> Self {
         let memory = Memory::new(Schedule::None);
-        let driver = Driver::new(Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
+        let mut random = random;
+        let driver = Driver::new(
+            Profile::new(memory.declaration()).unwrap(),
+            Limits::default(),
+            &mut random,
+        )
+        .unwrap();
         let grant = HostGrant {
             owner: Id::new("acme", "owner").unwrap(),
             origin: Id::new("acme", "build-app").unwrap(),
@@ -231,7 +237,7 @@ impl<'c> World<'c> {
     /// key `key`.
     fn propose_at(&mut self, auth: &Authority, administrator: &str, key: &Handle, at: Reading) -> (Proposal, Plan) {
         let value = self.issue(auth, administrator, at).unwrap();
-        let serial = Serial(self.driver.allocate(Kind::Credential).unwrap());
+        let serial = Serial(self.driver.allocate().unwrap());
         let pending = ready(auth.bootstrap(&mut self.memory, &value, &holder(key), serial, at)).unwrap();
         let signature = self.sign(&pending.to_be_signed());
         pending.finish(&signature, self.operation()).unwrap()
@@ -419,7 +425,7 @@ fn a_cli_whose_bootstrap_response_was_lost_reads_its_credential_and_proves_posse
     // The CLI stores its key in custody before it submits the bootstrap, whose response is lost.
     let key = world.key();
     let bootstrap = world.propose(&auth, "alice", &key);
-    world.memory.inject(Fault::LostResponse);
+    world.memory.inject_application(Fault::LostResponse);
     assert_matches!(world.commit(bootstrap), Outcome::Unknown(_));
     world.start();
 

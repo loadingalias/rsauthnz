@@ -36,7 +36,7 @@ The window identifies the period for which the store can establish the full hist
 The model follows one operation, its delayed copies, one optional reservation, one retirement, and one optional restore.
 It treats a primary write as atomic. It assumes a binding has a durable test for retention coverage.
 It does not measure time or the length of a client's wait. The model counts durable effects even when a snapshot loses their records.
-The production driver still needs the recovery action and conformance evidence.
+The production driver implements the recovery action (`Driver::recover`). A closure is the outcome record of the identity, so the commit check of the original compares it.
 The separate model checks settlement of an owner's journal work and fencing at both destinations. [Shared recovery](../replica-commit/README.md#shared-recovery)
 
 ## Evidence

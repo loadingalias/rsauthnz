@@ -290,7 +290,7 @@ fn an_activation_in_doubt_completes_once_at_restore() {
     let (proposal, plan) = invited.propose(&json);
     let operation = proposal.operation().clone();
     // The commit lands, and its response is lost. Then the store comes back from the snapshot before the commit.
-    invited.site.node.memory.inject(Fault::LostResponse);
+    invited.site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(invited.site.node.commit(proposal, plan), Outcome::Unknown(_)));
     invited.site.node.memory.restore(&snapshot);
     invited.site.node.driver.restore(at(0)).expect("a restore");
@@ -354,7 +354,7 @@ impl Site {
     }
 
     /// The proposal of the removal of `passkey` of alice with `fresh` at `now`, from the list of her passkeys.
-    fn remove(&mut self, fresh: &Fresh, passkey: &Passkey, now: Reading) -> Result<(Proposal, Plan), Error> {
+    pub(super) fn remove(&mut self, fresh: &Fresh, passkey: &Passkey, now: Reading) -> Result<(Proposal, Plan), Error> {
         let handle = UserHandle::from_bytes(HANDLE);
         let listed = ready(self.rp.passkeys(&mut self.node.memory, &handle)).map_err(refused)?;
         let listed = listed

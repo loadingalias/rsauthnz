@@ -161,6 +161,9 @@ pub enum Kind {
     /// The replay record of one accepted HTTP message signature of an agent ([`crate::httpsig`]). Its key is
     /// [`Insert::key`], and [`Declaration::signatures`] bounds the records of this kind.
     Signature = 28,
+    /// The turn of one owner of anchors, an account or an authority: the anchor change that holds it, and the phase of
+    /// that change. The commit driver writes it, so the anchor changes of one owner run one at a time across servers.
+    Turn = 29,
 }
 
 /// What the consumption of a one-use record pays for.
@@ -175,7 +178,7 @@ pub enum Pays {
 
 impl Kind {
     /// Each kind, in the order of its number.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Credential,
         Self::ProviderLink,
         Self::Registration,
@@ -204,6 +207,7 @@ impl Kind {
         Self::AccountState,
         Self::AgentEnrollment,
         Self::Signature,
+        Self::Turn,
     ];
 
     /// What the consumption of a record of this kind pays for, or `None` for a kind that is not one-use.
@@ -235,8 +239,18 @@ impl Kind {
             | Self::Workload
             | Self::Removal
             | Self::AccountState
-            | Self::Signature => None,
+            | Self::Signature
+            | Self::Turn => None,
         }
+    }
+
+    /// Whether a key of this kind can name a record again after a commit ended it, such as the grant of one agent by
+    /// one owner. Journal replay ends each version of a key at or below its dead version, so the commit driver checks a
+    /// new record of such a kind against the facts of the journal. The keys of the other kinds hold fresh random bytes
+    /// or a fresh counter value, or their records are anchors, whose commits read the journal under the owner turn.
+    #[must_use]
+    pub const fn repeats(&self) -> bool {
+        matches!(self, Self::Grant | Self::Agent | Self::Removal)
     }
 
     /// Whether a record of this kind can have an end, so that expiry can remove it. An expiry pass makes no call for
@@ -255,6 +269,7 @@ impl Kind {
                 | Self::Issuer
                 | Self::Workload
                 | Self::AccountState
+                | Self::Turn
         )
     }
 
@@ -523,6 +538,10 @@ pub trait Store {
     /// restore cannot lower it, for example in the failure domain of the journal: a restored lower number lets a
     /// delayed commit of the abandoned history land.
     fn start(&mut self) -> impl Future<Output = Result<Instance, Self::Error>>;
+
+    /// Gives the instance number that the latest start installed, with no write. A driver that joins the store reads
+    /// it, and serves in that instance when the replay floor names the same number.
+    fn instance(&mut self) -> impl Future<Output = Result<Instance, Self::Error>>;
 
     /// Reads the current state of the record `key`, or `None` when no record has the key. It is a keyed read: it
     /// never scans other records. The proposal lists the result as a dependency: a version, or an absence.

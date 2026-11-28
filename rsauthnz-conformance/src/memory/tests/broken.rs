@@ -56,10 +56,12 @@ enum Defect {
     NoInsertClock,
     /// The binding counts the capacity but no share, so one agent key fills the store.
     NoShare,
+    /// A join installs a new instance, as a start does, so it fences each peer of the open instance.
+    JoinStarts,
 }
 
 impl Defect {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::NoAtomicCheck,
         Self::LostOutcomes,
         Self::WriteSkew,
@@ -72,6 +74,7 @@ impl Defect {
         Self::NoDeadline,
         Self::NoInsertClock,
         Self::NoShare,
+        Self::JoinStarts,
     ];
 
     /// The cases that name the defect. A commit with no atomic check is a check-then-write path, so two concurrent
@@ -89,6 +92,7 @@ impl Defect {
             Self::NoDeadline => &[Case::Deadline],
             Self::NoInsertClock => &[Case::ReplayInsert],
             Self::NoShare => &[Case::ReplayCapacity],
+            Self::JoinStarts => &[Case::Fencing, Case::Servers],
         }
     }
 }
@@ -144,6 +148,13 @@ impl Store for Broken {
         self.memory.start().await
     }
 
+    async fn instance(&mut self) -> Result<Instance, Error> {
+        if self.defect == Defect::JoinStarts {
+            return self.memory.start().await;
+        }
+        self.memory.instance().await
+    }
+
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {
         if self.defect == Defect::LostOutcomes && Kind::of(key) == Some(Kind::Outcome) {
             return Ok(None);
@@ -180,9 +191,8 @@ impl Store for Broken {
                     .retain(|dependency| !matches!(dependency, Dependency::Absent(key) if !written.contains(key)));
             }
             Defect::NoInstanceCheck => {
-                let mut binding = self.memory.lock();
-                let current = binding.instance;
-                return binding.commit(request, current);
+                let current = self.memory.lock().instance;
+                return self.memory.request(request, current);
             }
             Defect::NoDeadline => request.deadline = None,
             Defect::NoRetention => {
@@ -198,11 +208,12 @@ impl Store for Broken {
             | Defect::RestoredInstance
             | Defect::OpenRange
             | Defect::NoInsertClock
-            | Defect::NoShare => {
+            | Defect::NoShare
+            | Defect::JoinStarts => {
                 return self.memory.commit(proposal, instance).await;
             }
         }
-        self.memory.lock().commit(request, instance)
+        self.memory.request(request, instance)
     }
 
     async fn insert_replay(&mut self, insert: &Insert) -> Result<Inserted, Error> {
@@ -245,8 +256,7 @@ impl Store for Broken {
             Some(after) if after >= prefix => Bound::Excluded(after.clone()),
             _ => Bound::Included(prefix.clone()),
         };
-        let binding = self.memory.lock();
-        binding.serving()?;
+        let binding = self.memory.serving()?;
         Ok(binding
             .store
             .records
@@ -268,7 +278,9 @@ impl Journal for Broken {
         let synced = self.memory.sync(instance).await;
         if self.defect == Defect::RetriedSync && synced == Err(Error::Crash(Fault::FailedSync)) {
             // The retry: the binding serves again, and the appends that the failure dropped stay lost.
-            self.memory.lock().stopped = None;
+            let epoch = self.memory.lock().epoch;
+            self.memory.crashed = None;
+            self.memory.epoch = epoch;
             return self.memory.sync(instance).await;
         }
         synced
@@ -343,6 +355,10 @@ impl Store for Measured {
 
     async fn start(&mut self) -> Result<Instance, Error> {
         self.memory.start().await
+    }
+
+    async fn instance(&mut self) -> Result<Instance, Error> {
+        self.memory.instance().await
     }
 
     async fn read(&mut self, key: &Key) -> Result<Option<Record>, Error> {

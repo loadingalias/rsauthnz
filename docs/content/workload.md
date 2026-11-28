@@ -313,6 +313,7 @@ use rsauthnz::workload::{self, By, Ceiling, Issuer, Pending, Registration, Repla
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
 use rscrypto::auth::MlDsa65Ed25519;
+use rscrypto::ChaCha20Rng;
 
 type Failure = Box<dyn core::error::Error>;
 
@@ -357,7 +358,7 @@ let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_s
 let (authority, runner) = (Id::new("acme", "issuer")?, Id::new("acme", "runner-7")?);
 let build = Id::new("acme", "build-api")?;
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut ChaCha20Rng::from_seed([1; 32]))?;
 driver.start(now);
 settle(&mut driver, &mut memory)?;
 

@@ -20,6 +20,7 @@ use rsauthnz::transition::{Audit, OperationId, Outcome, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
 use rsauthnz_http::{add_signature, signature_draft, verify_signature};
+use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 /// The output of `future`, which the memory binding makes ready at its first poll.
@@ -59,6 +60,7 @@ fn issued(claims: &Claims, holder: &[u8; 1984], now: Reading) -> Vec<u8> {
     let mut driver = Driver::new(
         store::Profile::new(memory.declaration()).expect("the setup of the test"),
         Limits::default(),
+        &mut ChaCha20Rng::from_seed([15; 32]),
     )
     .expect("the setup of the test");
     let mut settle = |driver: &mut Driver| {

@@ -35,6 +35,7 @@
 //! use rsauthnz::time::{Reading, ReadingSource};
 //! use rsauthnz_conformance::memory::{Memory, Schedule};
 //! use rsauthnz_conformance::suite::execute;
+//! use rscrypto::ChaCha20Rng;
 //!
 //! /// The output of a future of the memory binding, which is ready at its first poll.
 //! fn ready<T>(future: impl Future<Output = T>) -> T {
@@ -58,7 +59,7 @@
 //! // The store serves after the start of its commit driver.
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut ChaCha20Rng::from_seed([1; 32]))?;
 //! driver.start(now);
 //! while let Some(effect) = driver.effect() {
 //!     let output = ready(execute(&mut memory, effect));
@@ -260,7 +261,7 @@ impl Sessions {
             &tag,
             Some(&session.tag),
         )?;
-        let version = self.version(driver.allocate(Kind::Session)?);
+        let version = self.version(driver.allocate_after(&session.version)?);
         proposal.change(Change::Write {
             key: session.key.clone(),
             version,
@@ -424,7 +425,7 @@ impl Sessions {
         let end = add(started, self.policy.idle)?;
         let data = self.record(&evidence, epoch, started, started, &tag, None)?;
         proposal.read(Dependency::Absent(key.clone()))?;
-        let version = self.version(driver.allocate(Kind::Session)?);
+        let version = self.version(driver.allocate()?);
         proposal.change(Change::Write {
             key,
             version,

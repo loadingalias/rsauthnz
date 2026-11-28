@@ -14,7 +14,7 @@ use rsauthnz::local::{
     Holder, Offer,
     enroll::{CliId, Status},
 };
-use rsauthnz::store::{Kind, driver::Plan};
+use rsauthnz::store::driver::Plan;
 use rsauthnz::time::Reading;
 use rsauthnz::transition::{OperationId, Outcome, Recovery};
 use rsauthnz_http::{Problem, Refusal};
@@ -129,7 +129,7 @@ impl<S: Subject> State<S> {
         let (access, account) = self.cli_access(request, now)?;
         (account.id.to_string() == reviewed).ok_or(Problem::Recovery(Recovery::Restart))?;
         let fresh = Fresh::check(&access, FRESH_MAX, now)?;
-        let serial = Serial(self.driver.allocate(Kind::Credential)?);
+        let serial = Serial(self.driver.allocate()?);
         let (proposal, plan, checked) =
             wait(
                 self.cli

@@ -114,6 +114,11 @@ impl fmt::Debug for OperationId {
     }
 }
 
+/// The request binding of a closure: an outcome record that recovery writes for an operation that did not commit. No
+/// SHA-256 digest of a request is all zero bytes, so no commit of a request has this outcome record, and each later
+/// copy of the closed operation finds it in its atomic commit and refuses.
+pub(crate) const CLOSED: [u8; 32] = [0; 32];
+
 /// An operation: its identity and its request binding. The store keeps it as the outcome record of the identity.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Operation {
@@ -133,7 +138,9 @@ impl Operation {
     /// authority, such as the evidence of a sign-in, so no caller can make one without a durable commit.
     #[must_use]
     pub(crate) fn answer(&self, submitted: &Self) -> Outcome {
-        if self == submitted {
+        if self.binding == CLOSED {
+            Outcome::Refused(Error::Closed)
+        } else if self == submitted {
             Outcome::Accepted(Receipt {
                 operation: self.id.clone(),
                 artifact: None,
@@ -666,6 +673,44 @@ impl Proposal {
         }
     }
 
+    /// Adds the closure of `operation`: the read of the absence of its outcome record, and the write of the outcome
+    /// record of [`CLOSED`] with no end. Only the recovery of the commit driver writes an outcome record of another
+    /// operation, so this skips the rule of [`Self::change`], and it adds one read and one change past the limits.
+    pub(crate) fn close(&mut self, operation: &OperationId) {
+        let key = Kind::Outcome
+            .key(operation.as_bytes())
+            .expect("an operation identity of at most 64 bytes makes a valid key");
+        let version = AuthorityVersion::new(
+            Id::new("rsauthnz", "outcome").expect("the owner of a record version is a valid identifier"),
+            &[1],
+        )
+        .expect("a one-byte coordinate is valid");
+        self.dependencies.push(Dependency::Absent(key.clone()));
+        self.changes.push(Change::Write {
+            key,
+            version,
+            end: None,
+            data: CLOSED.into(),
+        });
+    }
+
+    /// Adds the guard of an owner turn: the read of `key` at `held`, and its write at `next` with `data`. The commit
+    /// driver adds one guard for each owner of an anchor change, past the limits of the proposal, so an application
+    /// proposal at its limits stays valid.
+    pub(crate) fn guard(&mut self, key: Key, held: AuthorityVersion, next: AuthorityVersion, data: Box<[u8]>) {
+        assert!(
+            next.compare(&held) == Ok(Ordering::Greater),
+            "the next turn version follows the held one"
+        );
+        self.dependencies.push(Dependency::Version(key.clone(), held));
+        self.changes.push(Change::Write {
+            key,
+            version: next,
+            end: None,
+            data,
+        });
+    }
+
     /// The receipt of the accepted proposal, which releases the prepared artifact. Only the commit of the proposal
     /// accepts it.
     pub(crate) fn accept(self) -> Receipt {
@@ -779,6 +824,9 @@ pub enum Error {
     /// The actor of the audit is an agent. An agent acts only under the grant of its owner: take the proposal from the
     /// scope of the request ([`Granted::propose`](crate::authz::Granted::propose)).
     Agent,
+    /// Recovery closed the operation identity after a lost reply: the operation did not commit, and it can never
+    /// commit. Start the request again with a fresh identity.
+    Closed,
 }
 
 /// The recovery of a refusal: the action of its caller. Each error that a request can reach implements it, so a
@@ -790,11 +838,11 @@ pub trait Recover {
 }
 
 impl Recover for Error {
-    /// The recovery of the caller: propose again after [`Error::Changed`] and [`Error::Full`], and refuse each other
-    /// request.
+    /// The recovery of the caller: propose again after [`Error::Changed`], [`Error::Full`], and [`Error::Closed`], and
+    /// refuse each other request.
     fn recovery(&self) -> Recovery {
         match self {
-            Self::Changed | Self::Full => Recovery::Restart,
+            Self::Changed | Self::Full | Self::Closed => Recovery::Restart,
             Self::OperationId
             | Self::Key
             | Self::Request(_)
@@ -828,6 +876,7 @@ impl fmt::Display for Error {
             Self::Expired => f.write_str("the commit can be at or after the deadline of the proposal"),
             Self::Full => f.write_str("the replay record of the signature does not fit the capacity of the store"),
             Self::Agent => f.write_str("the actor is an agent, which acts only under the scope of its grant"),
+            Self::Closed => f.write_str("recovery closed the operation, which did not commit and never commits"),
         }
     }
 }

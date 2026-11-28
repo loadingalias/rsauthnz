@@ -70,8 +70,9 @@ version a greater coordinate, for example a counter in big-endian bytes of a fix
 of two owners do not compare: `compare` gives `VersionError::Owners`.
 The [restore journal](restore.md) uses this order: a fact states that each version of a record at or below a
 version is dead. rsauthnz writes the later versions of the issuer and registration records of
-[workloads](workload.md) itself. Each one has a new value of a counter of the commit driver, so it is greater than
-each earlier version, also after a restore.
+[workloads](workload.md) itself. Each one has a value of the counter of the commit driver above the earlier version
+(`driver.allocate_after(&previous)`), so it is greater than each earlier version, also after a restore and when
+another server wrote the earlier version.
 
 ```rust
 use rsauthnz::id::{AuthorityVersion, Id, VersionError};

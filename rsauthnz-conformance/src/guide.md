@@ -6,8 +6,9 @@ single writer. rsauthnz ships no storage backend, so a binding that passes the s
 state.
 
 You implement only primitives: one bounded effect for each call. The commit driver of the core ([`Driver`]) orders
-every write: the journal entries, the commits, the voids, the creation entries, and the acknowledgements. No step of
-this guide asks you to order two writes. Each step names the public items that it implements. The
+every write: the journal entries, the commits, the owner turns, the voids, the creation entries, and the
+acknowledgements. Several application servers can each run a driver on one binding. No step of this guide asks you
+to order two writes, or to coordinate two servers. Each step names the public items that it implements. The
 [memory binding] is the reference implementation of each primitive.
 
 [conformance suite]: crate::suite
@@ -79,7 +80,13 @@ without a journal skips the restore cases. [`Report::skipped`] names each case t
 
 Implement [`Store::start`]. It gives a new [`Instance`], and each commit compares its instance with the number of
 the latest start ([step 4](#4-commit-a-proposal)). Thus a commit from an earlier start refuses, also when it arrives
-late over the network.
+late over the network. The driver calls it only to activate the store: at its first start, after the store lost its
+state, and for a restore.
+
+Implement [`Store::instance`]. It gives the number that the latest start installed, and it writes nothing. Give
+`Instance(0)` when no start installed a number yet. A server that starts joins the store with this read, so the
+servers that already serve keep their instance. A handle that stopped at an error
+([step 9](#9-stop-at-each-error)) serves again after this call.
 
 1. Give a number that is larger than each number that an earlier start gave. This applies also after a restart and
    after a restore.
@@ -95,10 +102,11 @@ The number of the latest start before the restore is not enough, also when the r
 that start, for example from an old process that connects again, lands on the restored state. The design model
 permits a restore only after a crash, and no commit of the run before the restore lands after it.
 
-One driver serves each store at a time. A start fences each commit of an earlier start, so a second driver on the
-same store makes the commits of the first one refuse.
+Never install a new number in [`Store::instance`]. A join that installs one fences each server of the open instance:
+their commits refuse with [`Commit::Superseded`], and the suite case `Servers` fails.
 
 [`Store::start`]: rsauthnz::store::Store::start
+[`Store::instance`]: rsauthnz::store::Store::instance
 [`Instance`]: rsauthnz::store::Instance
 
 ## 3. Read one record
@@ -309,12 +317,14 @@ error, because the driver and the suite never call them.
 
 ## 9. Stop at each error
 
-An error of a primitive ([`Store::Error`] or [`Journal::Error`]) is a crash. Keep one state for the binding and
-all its handles:
+An error of a primitive ([`Store::Error`] or [`Journal::Error`]) is a crash of the handle that called it:
 
-1. After an error of any primitive, give an error from each primitive except [`Store::start`].
-2. Serve again only after the next [`Store::start`].
-3. Do not retry a primitive inside the binding.
+1. After an error of a primitive, give an error from each primitive of that handle except [`Store::start`] and
+   [`Store::instance`]. A handle that is one connection to a shared store stops alone. A binding whose handles share
+   one writer, such as one process that writes local files, stops each handle.
+2. A failed sync of the journal can lose the appends of each handle, so it stops each handle.
+3. Serve again only after the next [`Store::start`] or [`Store::instance`] of the handle.
+4. Do not retry a primitive inside the binding.
 
 A failed sync stops commits too. A confirmed transaction conflict returns [`Commit::Conflict`] or [`Inserted::Conflict`], according to the primitive.
 
@@ -335,6 +345,7 @@ use rsauthnz::store::{Journal, Store};
 async fn execute<B: Store + Journal>(binding: &mut B, effect: Effect<'_>) -> Output {
     match effect {
         Effect::Start => binding.start().await.map_or(Output::Failed, Output::Started),
+        Effect::Instance => binding.instance().await.map_or(Output::Failed, Output::Instance),
         Effect::Read(key) => Store::read(binding, key).await.map_or(Output::Failed, Output::Read),
         Effect::Commit(proposal, instance) => binding
             .commit(proposal, instance)
@@ -372,11 +383,11 @@ async fn settle<B: Store + Journal>(driver: &mut Driver, binding: &mut B) -> Res
 1. Make the driver with [`Driver::new`], from the [`Profile`] of the declaration of the binding and the [`Limits`].
    It refuses a record bound below [`record_bytes_min`] ([step 1](#1-declare-the-guarantees)).
 2. Call [`Driver::start`] at first and after each crash, then settle. [`Driver::status`] gives
-   [`Status::Serving`] when the store serves.
+   [`Status::Serving`] when the store serves. Each server of the store makes its own driver on its own handle.
 3. After a restore of a snapshot, call [`Driver::restore`], never [`Driver::start`].
 4. Submit each proposal with [`Driver::submit`] and its [`Plan`], settle, and take the answer with
    [`Driver::take`].
-5. Look up a lost outcome with [`Driver::lookup`].
+5. Look up a lost outcome with [`Driver::lookup`], or recover it with [`Driver::recover`].
 
 The documentation of the [`driver`] module gives each operation of the driver and its refusals.
 
@@ -391,6 +402,7 @@ The documentation of the [`driver`] module gives each operation of the driver an
 [`Driver::submit`]: rsauthnz::store::driver::Driver::submit
 [`Driver::take`]: rsauthnz::store::driver::Driver::take
 [`Driver::lookup`]: rsauthnz::store::driver::Driver::lookup
+[`Driver::recover`]: rsauthnz::store::driver::Driver::recover
 [`Status::Serving`]: rsauthnz::store::driver::Status::Serving
 [`Plan`]: rsauthnz::store::driver::Plan
 [`Effect`]: rsauthnz::store::driver::Effect
@@ -400,7 +412,8 @@ The documentation of the [`driver`] module gives each operation of the driver an
 ## 11. Implement the test controls
 
 Implement [`Subject`] for the binding. It adds the controls of a test to the primitives. The clones of a subject are
-handles of one binding, and each control acts on all of them. Two cases commit from two clones at the same time.
+handles of one binding, and each control acts on all of them. Two cases commit from two clones at the same time, and
+the case `Servers` runs one driver on each of two clones.
 
 | Control | Implement it so that |
 | --- | --- |
@@ -469,6 +482,7 @@ step. This table gives the step that each case checks first:
 | `Expiry` | [6](#6-expire-ended-records) |
 | `Range` | [7](#7-read-one-key-prefix) |
 | `Fencing` | [2](#2-keep-the-store-instance-number), [4](#4-commit-a-proposal), [11](#11-implement-the-test-controls) |
+| `Servers` | [2](#2-keep-the-store-instance-number), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
 | `Retention` | [5](#5-keep-audit-and-outcome-records-for-their-retention), [6](#6-expire-ended-records) |
 | `LostResponse` | [4](#4-commit-a-proposal), [5](#5-keep-audit-and-outcome-records-for-their-retention), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
 | `FailedSync` | [8](#8-keep-the-restore-journal), [9](#9-stop-at-each-error), [11](#11-implement-the-test-controls) |
@@ -488,9 +502,13 @@ step. This table gives the step that each case checks first:
 
 The failure messages of the cases name these effects of the driver on the primitives:
 
-- **The floor before a commit.** A commit can write a counter value, such as a session generation, from
-  [`Driver::allocate`]. When the value passes the durable floor, the driver appends a floor entry ([`Floor`]) and
-  syncs before the commit. Thus a restore never gives a released value again.
+- **The floor before a value.** A commit can write a counter value, such as a session generation, from
+  [`Driver::allocate`]. Each driver gives values only from its own blocks, and it appends the floor entry
+  ([`Floor`]) of each block and syncs before it gives a value of the block. Thus two servers never give one value,
+  and a restore never gives a released value again.
+- **The owner turn of an anchor change.** Before an anchor change, such as the removal of a passkey, the driver
+  writes the turn record of each owner ([`Kind::Turn`]) in one commit. The commit of the change reads each turn and
+  advances it, and a later commit ends it. A peer that finds a turn of a stopped server finishes or retires it.
 - **The end entry before a commit.** Before a commit that removes authority, the driver appends an end entry and
   syncs. A restore applies it, so a snapshot cannot make an unlinked passkey or a revoked session valid again.
 - **The creation entry before the answer.** After an accepted commit that creates an anchor, such as a passkey, the
@@ -498,9 +516,12 @@ The failure messages of the cases name these effects of the driver on the primit
   entry is durable.
 - **The void of a refusal.** After a conflict, or the outcome record of another request, the driver appends a void
   of the end entry and syncs. Only then does it give the refusal. A restore ignores a voided entry, so the refusal stays true.
-- **Reconciliation at each start.** After [`Store::start`], the driver reads the mark record and the journal after
-  its mark. It writes the missing creation entry of each anchor commit that landed, and a void of each end entry
-  whose commit did not land.
+- **A join at each start.** The driver reads [`Store::instance`] and the replay floor. When the floor names the
+  instance, the driver reads the mark record and the journal after its mark, and serves with no write of an
+  instance. It settles the work of its own operations that a crash cut.
+- **Reconciliation at each activation.** After [`Store::start`], the driver reads the mark record and the journal
+  after its mark. It writes the missing creation entry of each anchor commit that landed, and a void of each end
+  entry whose commit did not land.
 - **Restore.** [`Driver::restore`] applies each entry after the mark of the snapshot before the store serves. It
   ends each record that a fact ends, writes each anchor that a creation entry made, raises each floor, and ends each
   pending sign-in challenge and approval. A replacement resumes recorded cleanup even when zero consumptions need completion.
@@ -515,6 +536,7 @@ The documentation of the [`journal`] module gives the entries and the rules.
 
 [`Driver::allocate`]: rsauthnz::store::driver::Driver::allocate
 [`Floor`]: rsauthnz::store::journal::Floor
+[`Kind::Turn`]: rsauthnz::store::Kind::Turn
 
 ## Crash evidence without crash injection
 

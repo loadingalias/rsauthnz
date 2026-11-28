@@ -18,6 +18,7 @@ use rsauthnz::time::{Reading, ReadingSource};
 use rsauthnz::transition::{Audit, OperationId, Outcome, Prepared, Proposal};
 use rsauthnz_conformance::memory::{Memory, Schedule};
 use rsauthnz_conformance::suite::execute;
+use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{
     CompositeMlDsaError, EcdsaP256SecretKey, Ed25519SecretKey, MlDsa65EcdsaP256, MlDsa65EcdsaP256SecretKey,
     MlDsa65Ed25519, MlDsa65Ed25519SecretKey, MlDsa65SecretKey, MlDsa65Seed,
@@ -171,7 +172,7 @@ fn ready<F: Future>(future: F) -> F::Output {
 fn released(issuer: &Custody, draft: Draft) -> Vec<u8> {
     let mut memory = Memory::new(Schedule::None);
     let profile = store::Profile::new(memory.declaration()).expect("the memory binding has a profile");
-    let mut driver = Driver::new(profile, Limits::default()).expect("a driver");
+    let mut driver = Driver::new(profile, Limits::default(), &mut ChaCha20Rng::from_seed([14; 32])).expect("a driver");
     let mut settle = |driver: &mut Driver| {
         while let Some(effect) = driver.effect() {
             let output = ready(execute(&mut memory, effect));

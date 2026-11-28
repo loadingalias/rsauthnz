@@ -43,7 +43,7 @@ impl Subject for Files {
         let mut inner = self.control();
         inner.stop();
         let Some(log) = snapshot else { return };
-        if let Ok(open) = self.open(inner.state.durable(), Some(log)) {
+        if let Ok(open) = self.open(inner.state.durable(), Some(log), true) {
             inner.state = State::Serving(open);
         }
     }

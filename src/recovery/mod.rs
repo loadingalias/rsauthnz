@@ -60,13 +60,13 @@
 //!
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut random = ChaCha20Rng::from_seed([7; 32]);
+//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 //! driver.start(now);
 //! while let Some(effect) = driver.effect() {
 //!     let output = ready(execute(&mut memory, effect));
 //!     driver.give(output)?;
 //! }
-//! let mut random = ChaCha20Rng::from_seed([7; 32]);
 //! // The host keeps both keys in its custody. A new recovery key ends each recovery code.
 //! let rp = RelyingParty::new(Id::new("acme", "auth")?, "app.example", "https://app.example", "Acme", [3; 32], Limits::default())?
 //!     .with_recovery([4; 32]);
@@ -289,6 +289,7 @@ impl RelyingParty {
                 data: stored.record.data.clone(),
             })
             .collect();
+        let previous = earlier.as_ref().map(|record| record.version.clone());
         let replaced = match earlier {
             Some(record) => {
                 let (holder, _, _) = self.code_form(&record.data)?;
@@ -315,7 +316,11 @@ impl RelyingParty {
             Ok::<_, Error>(())
         })?;
         let digest = crypto::blake3_keyed(secret.as_bytes(), &[FORM.as_bytes(), key.as_bytes(), code.as_bytes()]);
-        let version = self.version(driver.allocate(Kind::Recovery).map_err(Error::from)?);
+        let serial = match &previous {
+            Some(previous) => driver.allocate_after(previous),
+            None => driver.allocate(),
+        };
+        let version = self.version(serial.map_err(Error::from)?);
         let data = passkey::encode(&Value::Array(vec![
             Value::Text(FORM),
             account.to_cbor(),
@@ -455,7 +460,7 @@ impl RelyingParty {
         proposal
             .read(Dependency::Absent(self.removal_key(&handle, credential.id())))
             .map_err(Error::from)?;
-        let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
+        let version = self.version(driver.allocate().map_err(Error::from)?);
         proposal
             .change(Change::Write {
                 key: credential_key.clone(),

@@ -38,9 +38,12 @@ use core::mem;
 use core::num::NonZeroUsize;
 use core::ops::RangeBounds;
 use core::pin::pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use std::collections::BTreeMap;
+
+use rscrypto::ChaCha20Rng;
 
 use rsauthnz::cbor::Value;
 use rsauthnz::id::{Authority, AuthorityVersion, Human, Id, Principal};
@@ -148,8 +151,15 @@ pub enum Case {
     Range,
     /// A commit with the instance number of an earlier start refuses after a start, after a restart, and after a
     /// restore: the delayed commit of an abandoned history. Between a restore and the next start, a commit with the
-    /// instance number at the snapshot, or of a start after it, refuses too. Property: `NoStaleCommit`.
+    /// instance number at the snapshot, or of a start after it, refuses too. A join ([`Store::instance`]) installs
+    /// no instance, so a driver of the open instance keeps committing when a peer joins. An activation fences the
+    /// commits and the journal appends of each driver of the earlier instance. Property: `NoStaleCommit`.
     Fencing,
+    /// Two drivers on the clones of one binding: the second one joins with no fence, and a restart of either one
+    /// leaves the other committing. Two removals of the two sign-in methods of one account race: the removal that
+    /// holds the owner turn commits, the other one conflicts, and its retry refuses at the last sign-in method.
+    /// Properties: `KeepsSignIn`, `Responsive`.
+    Servers,
     /// Two writers can extend one predecessor only once. An old instance cannot append or confirm a sync.
     JournalFence,
     /// Audit and outcome records last through the audit time plus [`Declaration::outcome_retention`], rounded up by at most one second.
@@ -211,7 +221,7 @@ pub enum Case {
 
 impl Case {
     /// Each case, in the order of [`run`].
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Commit,
         Self::DependencyConflict,
         Self::Deadline,
@@ -222,6 +232,7 @@ impl Case {
         Self::Expiry,
         Self::Range,
         Self::Fencing,
+        Self::Servers,
         Self::JournalFence,
         Self::Retention,
         Self::LostResponse,
@@ -255,6 +266,7 @@ impl Case {
             | Self::Expiry
             | Self::Range
             | Self::Fencing
+            | Self::Servers
             | Self::Retention
             | Self::Restart
             | Self::Bootstrap => true,
@@ -285,6 +297,7 @@ impl Case {
             Self::Expiry => cases::expiry(make()).await,
             Self::Range => cases::range(make()).await,
             Self::Fencing => cases::fencing(make()).await,
+            Self::Servers => cases::servers(make()).await,
             Self::JournalFence => cases::journal_fence(make()).await,
             Self::Retention => cases::retention(make()).await,
             Self::LostResponse => cases::lost_response(make()).await,
@@ -611,6 +624,7 @@ fn seed() -> (Proposal, Plan) {
 pub async fn execute<S: Subject>(binding: &mut S, effect: Effect<'_>) -> Output {
     match effect {
         Effect::Start => binding.start().await.map_or(Output::Failed, Output::Started),
+        Effect::Instance => binding.instance().await.map_or(Output::Failed, Output::Instance),
         Effect::Read(key) => Store::read(binding, key).await.map_or(Output::Failed, Output::Read),
         Effect::Commit(proposal, instance) => binding
             .commit(proposal, instance)
@@ -705,12 +719,23 @@ enum Next {
     Stop,
 }
 
+/// A random generator with a seed that no earlier call gave, so the drivers of one binding have different identities.
+fn random() -> ChaCha20Rng {
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let mut seed = [0; 32];
+    seed[..8].copy_from_slice(&RUNS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    ChaCha20Rng::from_seed(seed)
+}
+
 /// A driver on a binding: the harness of each case that runs the driver.
 struct Run<S> {
     binding: S,
     driver: Driver,
-    /// The audit record that the commit of each submitted proposal writes.
-    audits: BTreeMap<Ticket, (Key, Record)>,
+    /// The operation of each submitted proposal.
+    submitted: BTreeMap<Ticket, OperationId>,
+    /// The audit record of the commit of each submitted operation, as the driver gave it to the binding with the
+    /// guards of its owner turns.
+    audits: BTreeMap<OperationId, (Key, Record)>,
 }
 
 impl<S: Subject> Run<S> {
@@ -718,11 +743,12 @@ impl<S: Subject> Run<S> {
     fn new(binding: S) -> Result<Self, String> {
         let profile = Profile::new(binding.declaration())
             .map_err(|error| format!("the profile refuses the declaration: {error}"))?;
-        let driver = Driver::new(profile, Limits::default())
+        let driver = Driver::new(profile, Limits::default(), &mut random())
             .map_err(|error| format!("the driver refuses the binding: {error}"))?;
         Ok(Self {
             binding,
             driver,
+            submitted: BTreeMap::new(),
             audits: BTreeMap::new(),
         })
     }
@@ -753,6 +779,15 @@ impl<S: Subject> Run<S> {
         };
         if let Some(fault) = fault {
             self.binding.inject(fault);
+        }
+        if let Effect::Commit(proposal, _) = &effect
+            && self
+                .submitted
+                .values()
+                .any(|operation| *operation == proposal.operation().id)
+        {
+            self.audits
+                .insert(proposal.operation().id.clone(), audit_record(proposal));
         }
         let output = execute(&mut self.binding, effect).await;
         self.driver
@@ -825,12 +860,12 @@ impl<S: Subject> Run<S> {
 
     /// Submits `proposal` with `plan`.
     fn submit(&mut self, proposal: Proposal, plan: Plan) -> Result<Ticket, String> {
-        let audit = audit_record(&proposal);
+        let operation = proposal.operation().id.clone();
         let ticket = self
             .driver
             .submit(proposal, plan)
             .map_err(|error| format!("the driver refused a proposal of the suite: {error}"))?;
-        self.audits.insert(ticket, audit);
+        self.submitted.insert(ticket, operation);
         Ok(ticket)
     }
 
@@ -840,7 +875,11 @@ impl<S: Subject> Run<S> {
             Some(Answer::Outcome(outcome)) => outcome,
             answer => return Err(format!("a commit has no outcome: {answer:?}")),
         };
-        if let (Outcome::Accepted(_), Some((key, audit))) = (&outcome, self.audits.get(&ticket)) {
+        let audit = self
+            .submitted
+            .get(&ticket)
+            .and_then(|operation| self.audits.get(operation));
+        if let (Outcome::Accepted(_), Some((key, audit))) = (&outcome, audit) {
             let stored = Store::read(&mut self.binding, key).await.map_err(failed("read"))?;
             ensure(same(stored.as_ref(), audit), "an accepted commit has no audit record")?;
         }

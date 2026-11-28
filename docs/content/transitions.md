@@ -141,6 +141,10 @@ The commit of a proposal has one of four outcomes. `outcome.recovery()` gives th
 
 Keep the original operation after an unknown outcome. A new operation can issue a second grant if the first one committed.
 A lookup with the same identity and request binding returns the retained receipt. A missing receipt leaves the outcome unknown.
+Only a recovery (`driver.recover(handle, now)`) can establish that a fresh attempt is safe: it closes a missing
+operation, so the original never commits, and gives `Recovered::Fresh`. Take the handle with
+`driver.handle(&proposal)` before the submission ([Recover a lost reply](servers.md#recover-a-lost-reply)). A later
+copy of a closed operation gives `Refused(Error::Closed)`, whose recovery is `Restart` with a fresh identity.
 When upgrading from an alpha with `Lookup::Absent`, remove its restart branch and handle a missing receipt with `Lookup::Unknown`.
 On a site, the server looks up an unknown outcome itself, because the browser does not know the operation.
 `rsauthnz_http::problem(recovery)` gives the response of each recovery to the browser ([Lost
@@ -204,6 +208,7 @@ operation stays in doubt, so the client never starts it again as a new operation
 | `Expired` | The reading of the clock of the binding at the commit can be at or after the deadline of the proposal, or it has no bound. Nothing committed | `Refuse` |
 | `Full` | The replay record of a signature that the proposal writes does not fit the capacity of the store. Nothing committed: sign the request again later | `Restart` |
 | `Agent` | The actor of `Proposal::new` is an agent. Take the proposal from the scope of the request of the agent | `Refuse` |
+| `Closed` | Recovery closed the operation identity after a lost reply. The operation did not commit, and it never commits | `Restart` with a fresh identity |
 
 ## Limits
 

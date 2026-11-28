@@ -13,7 +13,8 @@ binding](storage-binding.md) gives the steps from the primitives to a binding th
 ## Declare the binding
 
 A binding states its guarantees in a `Declaration`. `Profile::new(declaration)` accepts it or refuses it. The commit
-driver takes only an accepted `Profile` (`Driver::new(profile, limits)`), so no driver exists for a refused binding.
+driver takes only an accepted `Profile` (`Driver::new(profile, limits, &mut random)`), so no driver exists for a
+refused binding.
 
 | `Declaration` field | Meaning | Refusal |
 | --- | --- | --- |
@@ -24,20 +25,22 @@ driver takes only an accepted `Profile` (`Driver::new(profile, limits)`), so no 
 | `restore` | `Restore::Unsupported`, or `Restore::Journal { location, failure_domain }` for a binding that implements `Journal`. The failure domain of the journal is outside that of the snapshots that it protects. [Restore journal](restore.md) gives what the journal keeps | — |
 | `key_bytes_max` | The most bytes in a key that the binding stores | `Error::KeyBound` below 2048 (`transition::Key::BYTES_MAX`), the longest key of the core |
 | `signatures` | The `Capacity` of the replay records of HTTP signatures (`Kind::Signature`): `records_max`, the most records, and `share_max`, the most records of one agent key in one audience | `Error::Capacity` for a `share_max` of 0 or above `records_max` |
-| `record_bytes_max` | The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit record, or an outcome record. The audit record holds the key of each change | `Driver::new(profile, limits)` gives `driver::Error::RecordBound(least)` below `driver::record_bytes_min(limits)`, the longest record that the driver writes for itself. `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer record. `driver.submit` calls it and refuses with `driver::Error::RecordBytes`, so the binding never gets the proposal |
+| `record_bytes_max` | The most bytes in one record that the binding stores: the record form of a write, an intent record, an audit record, or an outcome record. The audit record holds the key of each change | `Driver::new(profile, limits, &mut random)` gives `driver::Error::RecordBound(least)` below `driver::record_bytes_min(limits)`, the longest record that the driver writes for itself. `profile.admit(&proposal)` gives `Error::RecordBytes` for a longer record. `driver.submit` calls it and refuses with `driver::Error::RecordBytes`, so the binding never gets the proposal |
 
 ## Primitives
 
 Each method of `Store` and `Journal` returns a future, and the core runs no executor. A binding that does no I/O
 gives futures that are ready at once. A binding with asynchronous I/O awaits it in its futures.
 
-An error of a primitive is a crash. The binding stops serving and does not retry the primitive. It serves again
-only after a start. The binding gives its own error type, `Store::Error` or `Journal::Error`.
+An error of a primitive is a crash of the handle that called it. The handle stops serving and does not retry the
+primitive. It serves again only after `Store::start` or `Store::instance`. A failed sync of the journal stops each
+handle. The binding gives its own error type, `Store::Error` or `Journal::Error`.
 
 | Primitive | Effect |
 | --- | --- |
 | `Store::declaration()` | Gives the `Declaration` |
-| `Store::start()` | Writes the next store instance number (`Instance`) durably, before reconciliation, and gives it. Keep the number where a restore cannot lower it, for example in the failure domain of the journal. A restored lower number lets a delayed commit of the abandoned history land |
+| `Store::start()` | Writes the next store instance number (`Instance`) durably, before reconciliation, and gives it. Keep the number where a restore cannot lower it, for example in the failure domain of the journal. A restored lower number lets a delayed commit of the abandoned history land. The driver calls it only to activate the store |
+| `Store::instance()` | Gives the number that the latest start installed, or `Instance(0)` before the first start, and writes nothing. A server joins the store with it ([Run several servers on one store](servers.md)) |
 | `Store::read(&key)` | Gives the current `Record` of the key (`version`, `end`, and `data`), or `None`. It is a keyed read: it never scans other records |
 | `Store::read_pair([&first, &second])` | Looks up both keys in one store state. Returns two results in request order. Each absent key gives `None`. A repeated key gives the same result twice |
 | `Store::commit(&proposal, instance)` | The conditional atomic commit. See [Commit](#commit) |
@@ -82,7 +85,7 @@ Otherwise it writes nothing.
 | `Superseded` | A newer store instance owns the write. Stop the old driver and keep each uncertain operation identity |
 | `Expired` | The proposal has a deadline, and the clock of the binding can be at or after it, or has no bound. The driver gives `Refused(Error::Expired)` |
 | `Full` | A new replay record of a signature does not fit the capacity. The driver gives `Refused(Error::Full)`, with the recovery `Restart` |
-| `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). The commit driver gives the outcome from it: the receipt of the first commit for the same request, or `Error::Reuse` |
+| `Recorded(record)` | The store has an outcome record of the operation identity, and `record` is its `transition::Operation` (`store::outcome_of`). The commit driver gives the outcome from it: the receipt of the first commit for the same request, `Error::Reuse`, or `Error::Closed` for the closure of a recovery ([Recover a lost reply](servers.md#recover-a-lost-reply)) |
 
 An error of the commit is a crash with an unknown outcome. The commit takes a proposal, so state changes cannot
 commit without their audit and their outcome record. The rustdoc of `rsauthnz::store` shows it with a compiled
@@ -123,6 +126,7 @@ kind back. The records of two kinds with the same identifier have two keys.
 | `AccountState` | The newest recovery revision or enrollment revision of an account | `None` |
 | `AgentEnrollment` | A pending enrollment request of an agent, which its owner approves in a browser ([Enroll an agent](agent-enrollment.md)) | `Pays::Nothing` |
 | `Signature` | The replay record of one accepted HTTP signature of an agent: the share of the agent key in its audience, then the digest of the nonce ([Sign the requests of an agent](http-signatures.md#the-replay-store)) | `None` |
+| `Turn` | The turn of one owner of anchors, an account or an authority: the anchor change that holds it, its attempt, and its phase. The driver writes it, and it has no end ([Run several servers on one store](servers.md#what-changes-when-servers-share-a-store)) | `None` |
 
 `consumption()` states what the consumption of a one-use record pays for. The restore journal records a
 consumption that pays for an anchor, and a restore completes it when it is in doubt. A consumption that pays for
@@ -186,7 +190,9 @@ index serves it without a scan of other records. The core reads these prefixes:
 
 | Prefix | Records | Reader |
 | --- | --- | --- |
-| `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each start, and a worker after a crash |
+| `Kind::Intent.key(&[])`: the kind byte | The effect intents | The driver at each activation, and a worker after a crash |
+| `Kind::Intent` and an operation identity | The intents of one operation, and of each longer identity that starts with it | The driver at a lookup, a recovery, and the help of an owner turn |
+| `Kind::Turn.key(&[])`: the kind byte | The held owner turns | The driver at each move of the mark |
 | The kind byte of `Kind::Administrator` and the SHA-256 digest of a local authority: 33 bytes | The administrator bindings of the authority | The report, the issue, and the unlink of a [local authority](local-authority.md), and its open after a restore lost its record |
 | That prefix and the SHA-256 digest of the authority and an administrator: 65 bytes | The bindings of the administrator | The bootstrap, the challenge, and the recovery of a credential of a [local authority](local-authority.md) |
 | `Kind::Credential` and the current passkey prefix (33 bytes) | Current passkeys of one account and passkey site | [Manage passkeys](accounts.md) |
@@ -247,9 +253,9 @@ Capture `driver.instance()?` when scheduling cleanup. Pass that instance through
 If a pass returns `ExpiryError::Superseded`, stop the job. Earlier pages can have completed.
 
 One pass of `store::expire(binding, now, limit, instance)` makes one `Store::expire` call for each kind that can end
-(`kind.ends()`). No call goes to the provider links, administrator bindings, agent identities, the replay floor, the
-intents, the policy records, the mark record, the records of local authorities, the issuers, or the workload
-registrations, because their records have no end. Each call removes
+(`kind.ends()`). No call goes to the provider links, agent identities, the replay floor, the
+intents, the policy records, the mark record, the records of local authorities, the issuers, the workload
+registrations, the account states, or the owner turns, because their records have no end. Each call removes
 at most `limit` records whose end is before the earliest time of `now`, so a record that a check can still accept
 stays. The pass gives `Progress::More` while a kind can have more ended records. A reading with no known bound
 gives `ExpiryError::Time` and removes nothing. The host chooses when to run each pass, and its cost class is

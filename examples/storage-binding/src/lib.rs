@@ -240,13 +240,14 @@ impl Files {
         self.inner.lock().map_err(|_| Error::Stopped)
     }
 
-    /// Locks each destination and takes a fresh instance before installing a snapshot or changing a log.
-    fn open(&self, durable: Durable, snapshot: Option<&[u8]>) -> Result<Open, Error> {
+    /// Locks each destination before installing a snapshot or changing a log. A start takes a fresh instance, and a
+    /// join keeps the installed one.
+    fn open(&self, durable: Durable, snapshot: Option<&[u8]>, fresh: bool) -> Result<Open, Error> {
         let locks = (
             lock_directory(&self.store)?,
             self.journal().map(lock_directory).transpose()?,
         );
-        let (previous, instance) = next_instance(&self.store, self.journal())?;
+        let (previous, instance) = installed(&self.store, self.journal(), fresh)?;
         // A later writer can have synced more frames while this handle was stopped.
         let durable = if durable.instance == previous {
             durable
@@ -591,7 +592,24 @@ impl Store for Files {
     async fn start(&mut self) -> Result<Instance, Error> {
         let mut inner = self.lock()?;
         inner.stop();
-        let open = self.open(inner.state.durable(), None)?;
+        let open = self.open(inner.state.durable(), None, true)?;
+        let instance = open.instance;
+        inner.state = State::Serving(open);
+        Ok(instance)
+    }
+
+    /// The installed instance, or `Instance(0)` before the first start. A stopped binding opens its files again in
+    /// that instance: the one writer of the files lost no write that a primitive acknowledged, so a join needs no
+    /// fresh instance.
+    async fn instance(&mut self) -> Result<Instance, Error> {
+        let mut inner = self.lock()?;
+        if let State::Serving(open) = &inner.state {
+            return Ok(open.instance);
+        }
+        if !self.journal().unwrap_or(&self.store).join(INSTANCE_FILE).try_exists()? {
+            return Ok(Instance(0));
+        }
+        let open = self.open(inner.state.durable(), None, false)?;
         let instance = open.instance;
         inner.state = State::Serving(open);
         Ok(instance)
@@ -758,8 +776,9 @@ fn lock_directory(dir: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
-/// Advances the instance while the caller holds the directory lock. Returns the previous and current instances.
-fn next_instance(store: &Path, journal: Option<&Path>) -> Result<(Instance, Instance), Error> {
+/// The installed instance, which a `fresh` call advances, while the caller holds the directory lock. Returns the
+/// previous and current instances.
+fn installed(store: &Path, journal: Option<&Path>, fresh: bool) -> Result<(Instance, Instance), Error> {
     let dir = journal.unwrap_or(store);
     let last = match fs::read(dir.join(INSTANCE_FILE)) {
         Ok(bytes) => u64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| Error::Instance)?),
@@ -771,6 +790,9 @@ fn next_instance(store: &Path, journal: Option<&Path>) -> Result<(Instance, Inst
         }
         Err(error) => return Err(error.into()),
     };
+    if !fresh {
+        return Ok((Instance(last), Instance(last)));
+    }
     let next = last.checked_add(1).ok_or(Error::Instance)?;
     replace(dir, INSTANCE_FILE, &next.to_le_bytes())?;
     Ok((Instance(last), Instance(next)))

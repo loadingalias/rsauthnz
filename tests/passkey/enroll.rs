@@ -125,7 +125,7 @@ impl World {
             .expect("a request");
         let device = self.artifact((proposal, plan));
         let device = DeviceCode::from_bytes(device.try_into().expect("32 bytes"));
-        let serial = Serial(self.site.node.driver.allocate(Kind::Credential).expect("a serial"));
+        let serial = Serial(self.site.node.driver.allocate().expect("a serial"));
         Cli {
             key,
             code,
@@ -623,7 +623,7 @@ fn a_cli_that_alice_approves_calls_for_her_account_and_makes_no_administrator_ca
     ));
     let text = world.artifact(issue.map_err(refused_local).expect("an issue"));
     let value = Bootstrap::parse(core::str::from_utf8(&text).expect("text")).expect("a value");
-    let serial = Serial(world.site.node.driver.allocate(Kind::Credential).expect("a serial"));
+    let serial = Serial(world.site.node.driver.allocate().expect("a serial"));
     let administrator = Pair::new(3);
     let bootstrap = world.authority.bootstrap(
         &mut world.site.node.memory,
@@ -716,7 +716,7 @@ fn a_cli_whose_finish_response_was_lost_reads_its_credential_and_proves_possessi
     let fresh = world.fresh();
     world.approve(&cli, &fresh, 21).expect("an approval");
     let (proposal, plan) = world.finish(&cli, &alice(), 22).expect("a finish");
-    world.site.node.memory.inject(Fault::LostResponse);
+    world.site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(world.site.node.commit(proposal, plan), Outcome::Unknown(_)));
     world.site.node.start();
 
@@ -742,7 +742,7 @@ fn a_restore_completes_a_finish_in_doubt_once_and_keeps_an_acknowledged_one() {
     let acknowledged = world.artifact(finish);
     let (proposal, plan) = world.finish(&doubt, &alice(), 22).expect("a finish");
     let operation = proposal.operation().clone();
-    world.site.node.memory.inject(Fault::LostResponse);
+    world.site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(world.site.node.commit(proposal, plan), Outcome::Unknown(_)));
     world.site.node.memory.restore(&snapshot);
     world.site.node.driver.restore(at(0)).expect("a restore");

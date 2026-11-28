@@ -251,7 +251,7 @@ fn a_lost_renewal_response_releases_the_next_generation_after_a_lookup_of_the_se
     let access = site.active(first.identifier(), at(70));
     let (proposal, plan, renewal) = site.renew(&access, at(70)).expect("a renewal");
     let operation = proposal.operation().clone();
-    site.node.memory.inject(Fault::LostResponse);
+    site.node.memory.inject_application(Fault::LostResponse);
     assert!(matches!(site.node.commit(proposal, plan), Outcome::Unknown(_)));
     site.node.start();
     let ticket = site.node.driver.lookup(operation).expect("a lookup");

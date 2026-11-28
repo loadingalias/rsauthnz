@@ -106,11 +106,11 @@
 //!
 //! let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 //! let mut memory = Memory::new(Schedule::None);
-//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+//! let mut random = ChaCha20Rng::from_seed([7; 32]);
+//! let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 //! driver.start(now);
 //! run(&mut memory, &mut driver)?;
 //! // Seed the generator from the entropy of the host. The key of the sign-in challenges is a secret of the host too.
-//! let mut random = ChaCha20Rng::from_seed([7; 32]);
 //! let key = [3; 32];
 //! let rp = RelyingParty::new(Id::new("acme", "auth")?, "app.example", "https://app.example", "Acme", key, Limits::default())?;
 //!
@@ -426,7 +426,7 @@ impl RelyingParty {
         proposal.read(Dependency::Absent(key.clone())).map_err(Error::from)?;
         proposal.read(epoch.dependency()).map_err(Error::from)?;
         decision.apply(&mut proposal, account, &epoch, !records.is_empty())?;
-        let version = self.version(driver.allocate(Kind::Registration).map_err(Error::from)?);
+        let version = self.version(driver.allocate().map_err(Error::from)?);
         let form = Value::Array(vec![
             Value::Text(PENDING_FORM),
             account.to_cbor(),
@@ -668,7 +668,7 @@ impl RelyingParty {
         proposal
             .read(Dependency::Absent(self.removal_key(&handle, &credential.id)))
             .map_err(Error::from)?;
-        let version = self.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
+        let version = self.version(driver.allocate().map_err(Error::from)?);
         proposal
             .change(Change::Write {
                 key: key.clone(),
@@ -1649,8 +1649,9 @@ impl SignIn {
         let actor = Principal::Human(account.clone());
         let mut proposal = owner.proposal_by(OperationId::random(random), actor, action, &request, records.now)?;
         proposal.read(records.epoch.dependency()).map_err(Error::from)?;
+        let previous = records.record.version;
         proposal
-            .read(Dependency::Version(records.key.clone(), records.record.version))
+            .read(Dependency::Version(records.key.clone(), previous.clone()))
             .map_err(Error::from)?;
         // No attestation proves where the key lives, so the evidence has no binding, and only the reported flags.
         let mut evidence = Evidence::new(
@@ -1665,7 +1666,7 @@ impl SignIn {
         evidence.backup = Some(reported);
         evidence.possible_clone = possible_clone;
         if let Some(credential) = update {
-            let version = owner.version(driver.allocate(Kind::Credential).map_err(Error::from)?);
+            let version = owner.version(driver.allocate_after(&previous).map_err(Error::from)?);
             let data = credential.record(&account, &records.handle);
             proposal
                 .change(Change::Write {
@@ -1680,7 +1681,7 @@ impl SignIn {
         proposal
             .read(Dependency::Absent(records.replay.clone()))
             .map_err(Error::from)?;
-        let version = owner.version(driver.allocate(Kind::Replay).map_err(Error::from)?);
+        let version = owner.version(driver.allocate().map_err(Error::from)?);
         proposal
             .change(Change::Write {
                 key: records.replay,

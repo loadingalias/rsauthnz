@@ -26,7 +26,7 @@ use http::StatusCode;
 use rsauthnz::account::FRESH_MAX;
 use rsauthnz::agent::{ATTEMPTS_MAX, UserCode};
 use rsauthnz::crypto::Algorithm;
-use rsauthnz_conformance::suite::{Fault, Subject as _};
+use rsauthnz_conformance::suite::Fault;
 use support::{Browser, Site, member};
 
 #[tokio::test]
@@ -145,7 +145,7 @@ async fn browser_approval_requires_fresh_verification_and_the_native_cli_recover
     assert_eq!(switched.body, r#"{"recovery":"restart"}"#);
     site.sign_in(&mut browser, &passkey, handle).await;
     site.post(&mut browser, "/cli/approve", approve.as_bytes()).await;
-    site.memory.inject(Fault::LostResponse);
+    site.memory.inject_application(Fault::LostResponse);
 
     let status = exit(&mut child).await;
     let mut tail = String::new();

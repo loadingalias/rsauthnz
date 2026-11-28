@@ -55,7 +55,7 @@ the credential.
 4. The client generates its key in its custody and stores it before it submits the value. A completion that the
    client never heard about then binds a key that the client has.
 5. Take the text and the public key of the client, an ML-DSA-65 + Ed25519 key of 1,984 bytes. Allocate a serial with
-   `driver.allocate(Kind::Credential)`, and call `authority.bootstrap(store, &value, holder, serial, now)`.
+   `driver.allocate()`, and call `authority.bootstrap(store, &value, holder, serial, now)`.
 6. Sign the bytes of `pending.to_be_signed()` with the issuer key in custody. `pending.finish(signature, operation)`
    verifies the signature and gives the proposal. Its commit consumes the value, writes the issuance record of the
    credential, and binds the administrator. The artifact of the receipt is the CLI credential. The proposal has the end
@@ -129,7 +129,7 @@ let (issuer_public, holder_public) = (issuer_public.to_bytes(), holder_public.to
 let issuer = Handle::new(KeyId::random(&mut random), Algorithm::MlDsa65Ed25519, &issuer_public)?;
 
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default())?;
+let mut driver = Driver::new(store::Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 driver.start(now);
 settle(&mut memory, &mut driver)?;
 
@@ -142,7 +142,7 @@ let text = String::from_utf8(commit(&mut memory, &mut driver, issue)?)?;
 
 // 2. The client stores its key, then submits the value and its public key. Custody signs the CLI credential.
 let value = Bootstrap::parse(&text)?;
-let serial = Serial(driver.allocate(Kind::Credential)?);
+let serial = Serial(driver.allocate()?);
 let pending = ready(authority.bootstrap(&mut memory, &value, &holder_public, serial, now))?;
 let signature = issuer_secret.sign_deterministic(&pending.to_be_signed(), &[])?;
 let bootstrap = pending.finish(signature.as_bytes(), OperationId::new(b"b-1")?)?;

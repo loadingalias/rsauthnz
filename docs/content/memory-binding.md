@@ -81,28 +81,31 @@ futures in an executor gets the same results.
 ## Inject faults
 
 `memory.inject(fault)` gives `fault`, a `rsauthnz_conformance::suite::Fault`, to the next call of its primitive. It
-is a method of `rsauthnz_conformance::suite::Subject`, so import the trait. `Schedule` selects the crashes of the other
-calls:
+is a method of `rsauthnz_conformance::suite::Subject`, so import the trait. `memory.inject_application(fault)` gives a
+fault of a commit to the next commit of a proposal of the application, and not to a commit of the driver itself, such
+as the reservation of an owner turn before an anchor change. Use it to lose the reply of the commit of an operation.
+`Schedule` selects the crashes of the other calls:
 
 | `Schedule` | Faults |
 | --- | --- |
 | `Schedule::None` | No fault |
 | `Schedule::Seeded(seed)` | Each commit, append, and sync takes a crash with a chance of one in 8. Each crash of the primitive in the table below has the same chance. The draw of each call is the RapidHash of the call with the seed, so a seed gives the same crashes at each run |
 
-Each crash stops the simulated store:
+Each crash stops the clone that made the call. A failed sync stops each clone:
 
 | Crash | Injected by | Primitive | Result | Durable state after the crash |
 | --- | --- | --- | --- | --- |
-| `Fault::CrashBeforeCommit` | `inject` or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit wrote nothing |
-| `Fault::LostResponse` | `inject` or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit landed |
+| `Fault::CrashBeforeCommit` | `inject`, `inject_application`, or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit wrote nothing |
+| `Fault::LostResponse` | `inject`, `inject_application`, or a seed | `Store::commit` | `Err(Error::Crash(fault))` | The commit landed |
 | `Error::CrashAfterCommit` | A seed only | `Store::commit` | The result of the commit. The next primitive gives the error | The commit landed when its result is `Accepted` |
-| `Error::DelayedCommit` | A seed only | `Store::commit` | `Err(Error::DelayedCommit)` | The commit arrives after the next start, with the earlier instance number, so it refuses and writes nothing |
-| `Fault::CrashAfterAppend` | `inject` or a seed | `Journal::append` | `JournalWrite::Accepted`. The next primitive gives the error | The append is lost |
+| `Error::DelayedCommit` | A seed only | `Store::commit` | `Err(Error::DelayedCommit)` | The commit arrives at the next start or join, with its instance number. After a start it refuses and writes nothing. After a join of the same instance it can land |
+| `Fault::CrashAfterAppend` | `inject` or a seed | `Journal::append` | `JournalWrite::Accepted`. The next primitive of the clone gives the error | The journal keeps the append until the next sync, which makes it durable. A start or a failed sync loses it |
 | `Fault::FailedSync` | `inject` or a seed | `Journal::sync` | `Err(Error::Crash(fault))` | No append since the last sync is durable |
 
-After a crash, the store keeps each commit that landed, and the journal keeps each entry whose sync returned. The
-crash loses each append after the last sync, and the next append gets the first sequence of the lost appends. Each
-primitive except `Store::start` gives the error of the crash until the next start.
+After a crash, the store keeps each commit that landed, and the journal keeps each entry whose sync returned. A failed
+sync, a restart, and a start lose each append after the last sync, and the next append gets the first sequence of
+the lost appends. Each primitive of the stopped clone except `Store::start` and `Store::instance` gives the error of
+the crash until one of them.
 
 ## Restart, restore, and the journal
 
@@ -122,15 +125,18 @@ These operations are the methods of `rsauthnz_conformance::suite::Subject`, the 
 | `memory.with_capacity(capacity)` | The binding with the `Capacity` of the replay records of signatures, in place of 4,096 records and 256 of one agent key. Set it before the first insert |
 | `memory.with_clock(clock)` | The binding whose commits read `clock`, an `Arc<dyn Fn() -> Reading + Send + Sync>`: the clock of the host, such as the system clock with its bound. The web example and the native CLI example give it |
 
-A stopped binding gives `Error::Stopped` until the next `Store::start`. Each start and each restore writes a larger
-instance number for the life of the binding. Thus a commit from each earlier start refuses, also between a restore
-and the next start.
+A stopped handle gives the error of its crash, or `Error::Stopped`, until its next `Store::start` or
+`Store::instance`. A crash at a commit or an append stops only the clone that made the call: the journal keeps an
+accepted append, and the next sync covers it. A failed sync and a restart stop each clone. Each start and each
+restore writes a larger instance number for the life of the binding. Thus a commit from each earlier start refuses,
+also between a restore and the next start.
 
 ## Share the binding between callers
 
-`Memory` is a handle. Its clones share one binding, so give each concurrent caller its own clone. One mutex holds all
-the state, so each primitive is one atomic step, and each commit is serializable. Two commits that read the absence
-of one key give one commit and one conflict.
+`Memory` is a handle. Its clones share one binding, so give each concurrent caller its own clone, such as the driver
+of each server ([Run several servers on one store](servers.md)). One mutex holds all the state, so each primitive is
+one atomic step, and each commit is serializable. Two commits that read the absence of one key give one commit and
+one conflict.
 
 ## Declaration
 

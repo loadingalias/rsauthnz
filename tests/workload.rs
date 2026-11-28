@@ -31,6 +31,7 @@ use rsauthnz::workload::{
 };
 use rsauthnz_conformance::memory::{Memory, Schedule, Snapshot};
 use rsauthnz_conformance::suite::{self, Fault, Subject as _};
+use rscrypto::ChaCha20Rng;
 use rscrypto::auth::{CompositeMlDsaError, Ed25519SecretKey, MlDsa65Ed25519, MlDsa65Ed25519SecretKey};
 
 /// The time of the first request.
@@ -217,7 +218,8 @@ impl Node {
     /// A started node with an empty store.
     fn new() -> Self {
         let memory = Memory::new(Schedule::None);
-        let driver = Driver::new(Profile::new(memory.declaration()).unwrap(), Limits::default()).unwrap();
+        let profile = Profile::new(memory.declaration()).unwrap();
+        let driver = Driver::new(profile, Limits::default(), &mut ChaCha20Rng::from_seed([16; 32])).unwrap();
         let mut node = Self { memory, driver };
         node.start();
         node
@@ -565,7 +567,7 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     // The commit lands, and its response is lost: the release gives no credential.
     let (proposal, plan, awaiting, signature) = host.signed(issuance("i-lost", &operator, &build), at(0));
     let serial = awaiting.serial();
-    host.node.memory.inject(Fault::LostResponse);
+    host.node.memory.inject_application(Fault::LostResponse);
     let outcome = host.node.commit(proposal, plan);
     let Err(Release::Unknown(operation)) = awaiting.release(outcome) else {
         panic!("a lost response released a credential, or gave another error than an unknown outcome");
@@ -598,7 +600,7 @@ fn a_credential_is_released_only_by_the_accepted_commit_of_its_own_operation() {
     // A crash before the commit: the release gives no credential, and nothing committed.
     let (proposal, plan, awaiting, _) = host.signed(issuance("i-crash", &operator, &build), at(0));
     let serial = awaiting.serial();
-    host.node.memory.inject(Fault::CrashBeforeCommit);
+    host.node.memory.inject_application(Fault::CrashBeforeCommit);
     let outcome = host.node.commit(proposal, plan);
     assert!(matches!(awaiting.release(outcome), Err(Release::Unknown(_))));
     host.node.start();

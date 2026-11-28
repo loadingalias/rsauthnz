@@ -123,13 +123,13 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 
 let now = Reading::new(Duration::from_secs(1_800_000_000), Some(Duration::from_secs(1)), ReadingSource::Caller);
 let mut memory = Memory::new(Schedule::None);
-let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default())?;
+let mut random = ChaCha20Rng::from_seed([7; 32]);
+let mut driver = Driver::new(Profile::new(memory.declaration())?, Limits::default(), &mut random)?;
 driver.start(now);
 while let Some(effect) = driver.effect() {
     let output = ready(execute(&mut memory, effect));
     driver.give(output)?;
 }
-let mut random = ChaCha20Rng::from_seed([7; 32]);
 // The host keeps both keys in its custody. A new recovery key ends each recovery code.
 let rp = RelyingParty::new(Id::new("acme", "auth")?, "app.example", "https://app.example", "Acme", [3; 32], Limits::default())?
     .with_recovery([4; 32]);

@@ -139,7 +139,7 @@ async fn a_person_runs_each_step_of_the_journey_through_the_http_api() {
 
     // The renewal rotates the cookie even when the server must look up the accepted commit.
     let previous = laptop.cookie.clone();
-    site.memory.inject(Fault::LostResponse);
+    site.memory.inject_application(Fault::LostResponse);
     site.post(&mut laptop, "/sessions/renew", b"{}").await;
     assert!(laptop.cookie.is_some() && laptop.cookie != previous);
     let account = site.account(&mut laptop).await;

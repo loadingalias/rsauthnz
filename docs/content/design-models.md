@@ -10,7 +10,7 @@ recovery commit and generation checks after restore.
 The [replica commit model](../../models/replica-commit/README.md) checks the design for several application servers on one store.
 It covers peer restarts, competing passkey removals, and an acknowledged revocation after restore.
 Its [shared recovery checks](../../models/replica-commit/README.md#shared-recovery) cover abandoned commits, delayed journal writes, snapshot marks, and counter reservations.
-The current Rust driver serves one process per store.
+The Rust driver keeps these rules for several servers on one store ([Run several servers on one store](servers.md)).
 
 The lost-reply model checks when recovery can tell a caller to start a fresh operation.
 It covers the race with a delayed first write, duplicate delivery, receipt expiry, and restore.

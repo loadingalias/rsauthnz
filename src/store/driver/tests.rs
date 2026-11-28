@@ -1,13 +1,14 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::assert_matches;
 use core::time::Duration;
 
-use super::{
-    AlphaSource, Answer, Begin, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min,
-};
+use rscrypto::ChaCha20Rng;
+
+use super::start::Begin;
+use super::{AlphaSource, Answer, Driver, Effect, Error, Lookup, Output, Plan, Status, Ticket, record_bytes_min};
 use crate::cbor::{self, Value};
 use crate::id::{AuthorityVersion, Human, Id, Principal};
 use crate::limits::Limits;
@@ -94,10 +95,15 @@ fn declaration(journal: bool) -> Declaration {
 /// The proposal of the operation `name` for the request `request`: it reads each record of `ends` at version 1 and
 /// ends it, and it writes each new record of `writes` at version 1.
 fn request(name: &str, request: &str, ends: &[&Key], writes: &[&Key]) -> Proposal {
+    request_at(now(), name, request, ends, writes)
+}
+
+/// The proposal of [`request`] with the audit time `time`.
+fn request_at(time: Reading, name: &str, request: &str, ends: &[&Key], writes: &[&Key]) -> Proposal {
     let audit = Audit {
         actor: Principal::Human(account("u-1")),
         action: Id::new("acme.auth", "test").unwrap(),
-        time: now(),
+        time,
     };
     let mut proposal = Proposal::new(op(name), audit, &Value::Text(request), Limits::default()).unwrap();
     for record in ends {
@@ -177,6 +183,7 @@ enum Written {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {
     Start,
+    Instance,
     Read(Key),
     Commit(OperationId, Instance),
     Expire(Kind),
@@ -192,6 +199,7 @@ impl Event {
     fn of(effect: &Effect<'_>) -> Self {
         match effect {
             Effect::Start => Self::Start,
+            Effect::Instance => Self::Instance,
             Effect::Read(key) => Self::Read((*key).clone()),
             Effect::Commit(proposal, instance) => Self::Commit(proposal.operation().id.clone(), *instance),
             Effect::Expire(kind, ..) => Self::Expire(*kind),
@@ -273,6 +281,7 @@ impl Double {
                 self.instance += 1;
                 Output::Started(Instance(self.instance))
             }
+            Effect::Instance => Output::Instance(Instance(self.instance)),
             Effect::Read(key) => Output::Read(self.records.get(key).cloned()),
             Effect::Commit(proposal, instance) => Output::Committed(self.commit(proposal, instance)),
             Effect::Expire(kind, before, limit, instance) => {
@@ -399,7 +408,12 @@ struct Harness {
 impl Harness {
     fn new(declaration: Declaration, double: Double) -> Self {
         Self {
-            driver: Driver::new(Profile::new(declaration).unwrap(), Limits::default()).unwrap(),
+            driver: Driver::new(
+                Profile::new(declaration).unwrap(),
+                Limits::default(),
+                &mut ChaCha20Rng::from_seed([1; 32]),
+            )
+            .unwrap(),
             double,
             events: Vec::new(),
             tickets: Vec::new(),
@@ -508,16 +522,16 @@ enum Point {
     AfterCreation,
 }
 
-/// For each crash point of the model, the effects of the next start give the model's outcome: an end entry that no
-/// commit followed gets a void, a commit with no creation entry gets it, and a lookup reports a commit only after its
-/// creation entry.
+/// For each crash point of the model, the effects of the next start give the model's outcome: a change that did not
+/// commit gets its void, also before its end entry, because a peer is not fenced and a delayed append could still land.
+/// A commit with no creation entry gets it, and a lookup reports a commit only after its creation entry.
 #[test]
 fn each_crash_point_gives_the_model_outcome_after_the_next_start() {
     let reg = key(Kind::Registration, "reg-1");
     let a1s = key(Kind::Credential, "a1s");
     // (crash point, operation, effect, fault, a void at the start, a creation entry at the start, commit)
     let rows = [
-        ("cChecked", "e-1", Point::End, Fault::Fail, false, false, false),
+        ("cChecked", "e-1", Point::End, Fault::Fail, true, false, false),
         ("cJournaled", "e-1", Point::Commit, Fault::Fail, true, false, false),
         ("cCommitted", "e-1", Point::Commit, Fault::Lost, false, true, true),
         ("cCreated", "i-1", Point::AfterCreation, Fault::Fail, false, false, true),
@@ -571,7 +585,8 @@ fn each_crash_point_gives_the_model_outcome_after_the_next_start() {
 }
 
 /// A refusal writes the void of its end entry before its answer, so a refusal that the client received stays true
-/// after a restore: for a conflict, and for an operation identity that another request used.
+/// after a restore: for a conflict. An operation identity that another request used refuses at the reservation of the
+/// owner turn, before any journal entry.
 #[test]
 fn a_refusal_voids_its_end_entry_before_its_answer() {
     let a1p = key(Kind::Credential, "a1p");
@@ -585,13 +600,14 @@ fn a_refusal_voids_its_end_entry_before_its_answer() {
         }
         let ticket = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
         harness.run(|_| None);
-        let void = harness.at(&appended(Written::Void, "u-1"));
-        assert_eq!(harness.events[void + 1], Event::Sync, "{refusal}");
-        assert!(void < harness.at(&Event::Answer(ticket)), "{refusal}");
         let answer = harness.answers.remove(&ticket);
         if refusal == "conflict" {
+            let void = harness.at(&appended(Written::Void, "u-1"));
+            assert_eq!(harness.events[void + 1], Event::Sync, "{refusal}");
+            assert!(void < harness.at(&Event::Answer(ticket)), "{refusal}");
             assert_matches!(answer, Some(Answer::Outcome(Outcome::Conflict)));
         } else {
+            assert!(!harness.has(&appended(Written::End, "u-1")));
             assert_matches!(
                 answer,
                 Some(Answer::Outcome(Outcome::Refused(crate::transition::Error::Reuse)))
@@ -631,26 +647,209 @@ fn a_commit_at_or_after_the_deadline_of_its_proposal_refuses_with_no_write() {
     }
 }
 
-/// The floor of a counter is durable before the commit of a value above it. One floor entry covers a block of
-/// values, so the next value of the block needs none.
+/// A second driver on the store of `harness`, with its own identity.
+fn peer(seed: u8) -> Driver {
+    Driver::new(
+        Profile::new(declaration(true)).unwrap(),
+        Limits::default(),
+        &mut ChaCha20Rng::from_seed([seed; 32]),
+    )
+    .unwrap()
+}
+
+/// Runs `driver` on `double` until it has no effect, and gives its events.
+fn drive(driver: &mut Driver, double: &mut Double) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Some(effect) = driver.effect() {
+        events.push(Event::of(&effect));
+        let output = double.execute(effect, None);
+        driver.give(output).unwrap();
+    }
+    events
+}
+
+/// A reading `seconds` after [`now`].
+fn after(seconds: u64) -> Reading {
+    Reading::new(
+        Duration::from_secs(1_000 + seconds),
+        Some(Duration::from_secs(1)),
+        ReadingSource::Caller,
+    )
+}
+
+/// A second server joins the open instance with no write of an instance, so the first server keeps committing. Each
+/// driver gives values only from its own blocks, which the journal reserved, so no value repeats across the servers.
 #[test]
-fn a_floor_is_durable_before_the_commit_of_a_value_above_it() {
+fn a_second_driver_joins_with_no_fence_and_its_values_are_disjoint() {
     let mut harness = Harness::serving(true);
-    assert_eq!(harness.driver.allocate(Kind::Session), Ok(1));
+    let mut second = peer(2);
+    second.start(now());
+    let events = drive(&mut second, &mut harness.double);
+    assert!(!events.contains(&Event::Start), "a join installs no instance");
+    assert_eq!(second.status(), Status::Serving);
+
+    let block = 2 * super::FLOOR_BLOCK.get();
+    let ours: BTreeSet<u64> = (0..block).map(|_| harness.driver.allocate().unwrap()).collect();
+    let theirs: BTreeSet<u64> = (0..block).map(|_| second.allocate().unwrap()).collect();
+    assert_eq!(ours.len() + theirs.len(), 2 * usize::try_from(block).unwrap());
+    assert!(ours.is_disjoint(&theirs));
+
     let first = harness.submit(proposal("s-1", &[], &[&key(Kind::Session, "s-1")]), Plan::default());
     harness.run(|_| None);
-    let floor = harness.at(&appended(Written::Floor, "s-1"));
-    assert_eq!(harness.events[floor + 1], Event::Sync);
-    assert!(floor < harness.at(&Event::Commit(op("s-1"), Instance(1))));
+    let ticket = second
+        .submit(proposal("s-2", &[], &[&key(Kind::Session, "s-2")]), Plan::default())
+        .unwrap();
+    drive(&mut second, &mut harness.double);
     assert_matches!(
         harness.answers.remove(&first),
         Some(Answer::Outcome(Outcome::Accepted(_)))
     );
+    assert_matches!(second.take(ticket), Some(Answer::Outcome(Outcome::Accepted(_))));
+}
 
-    assert_eq!(harness.driver.allocate(Kind::Session), Ok(2));
-    harness.submit(proposal("s-2", &[], &[&key(Kind::Session, "s-2")]), Plan::default());
+/// Two servers change the anchors of one owner. The second one waits for the turn of the first one until the
+/// patience of the turn ends, then retires it and voids its change, so the change of the first one never commits.
+#[test]
+fn a_peer_retires_a_stalled_turn_after_its_patience_and_the_stalled_change_refuses() {
+    let mut harness = Harness::serving(true);
+    let mut second = peer(2);
+    second.start(now());
+    drive(&mut second, &mut harness.double);
+    let a1p = key(Kind::Credential, "a1p");
+    let a1q = key(Kind::Credential, "a1q");
+
+    // The first server holds the turn of `a1` and stops before its end entry.
+    let stalled = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
+    harness.run_until(|event| matches!(event, Event::Append(..)), |_| None);
+
+    let early = second
+        .submit(proposal("u-2", &[&a1q], &[]), plan(&passkeys(), &[]))
+        .unwrap();
+    drive(&mut second, &mut harness.double);
+    assert_matches!(second.take(early), Some(Answer::Outcome(Outcome::Conflict)));
+
+    let patience = super::TURN_PATIENCE.as_secs() + 5;
+    let late = request_at(after(patience), "u-3", "u-3", &[&a1q], &[]);
+    let ticket = second.submit(late, plan(&passkeys(), &[])).unwrap();
+    drive(&mut second, &mut harness.double);
+    assert_matches!(second.take(ticket), Some(Answer::Outcome(Outcome::Accepted(_))));
+    assert!(!harness.holds(&a1q));
+
+    // The first server continues: its end entry conflicts at the journal, and the void of the helper closed it.
     harness.run(|_| None);
-    assert!(!harness.has(&appended(Written::Floor, "s-2")));
+    let mut history = journal::History::new(Mark::EMPTY);
+    history.extend(&harness.double.journal, Limits::default()).unwrap();
+    let entries = || history.entries().iter().filter(|entry| entry.operation == op("u-1"));
+    assert!(!entries().any(|entry| matches!(entry.body, Body::End(_))));
+    assert!(entries().any(|entry| matches!(entry.body, Body::Void(_))));
+    assert_matches!(
+        harness.answers.remove(&stalled),
+        Some(Answer::Outcome(Outcome::Refused(transition::Error::Closed)))
+    );
+    assert!(harness.holds(&a1p));
+}
+
+/// Recovery after a lost reply closes an operation that did not commit, in the same commit check as the original. The
+/// original then refuses at its commit, and recovery answers that a fresh attempt is safe.
+#[test]
+fn recovery_closes_a_missing_operation_and_the_original_never_commits() {
+    let mut harness = Harness::serving(true);
+    let session = key(Kind::Session, "s-1");
+    let original = proposal("s-1", &[], &[&session]);
+    let handle = harness.driver.handle(&original).unwrap();
+    let ticket = harness.driver.recover(handle, now()).unwrap();
+    harness.tickets.push(ticket);
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&ticket),
+        Some(Answer::Recovered(super::Recovered::Fresh))
+    );
+
+    let late = harness.submit(original, Plan::default());
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&late),
+        Some(Answer::Outcome(Outcome::Refused(transition::Error::Closed)))
+    );
+    assert!(!harness.holds(&session));
+
+    // A handle of an earlier instance proves nothing after a restore.
+    harness.driver.restore(now()).unwrap();
+    harness.run(|_| None);
+    let missing = proposal("s-2", &[], &[&key(Kind::Session, "s-2")]);
+    let stale = super::Handle {
+        instance: Instance(1),
+        ..harness.driver.handle(&missing).unwrap()
+    };
+    let ticket = harness.driver.recover(stale, now()).unwrap();
+    harness.tickets.push(ticket);
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&ticket),
+        Some(Answer::Recovered(super::Recovered::Unknown))
+    );
+}
+
+/// A key that can name a record again needs a version above each dead version of its journal facts: a lower version
+/// conflicts, and the next allocation of the driver is above the dead version.
+#[test]
+fn a_new_record_of_a_repeated_key_takes_a_version_above_its_dead_version() {
+    let mut harness = Harness::serving(true);
+    let grant = key(Kind::Grant, "g-1");
+    let mut second = peer(2);
+    second.start(now());
+    drive(&mut second, &mut harness.double);
+    // A peer wrote the grant at a value of its later block, and ended it.
+    let dead = second.allocate().unwrap();
+    let fact = journal::Fact {
+        key: grant.clone(),
+        version: AuthorityVersion::new(Id::new("acme", "auth").unwrap(), &dead.to_be_bytes()).unwrap(),
+    };
+    let end = journal::End {
+        facts: vec![fact],
+        consumption: None,
+    };
+    let head = harness
+        .double
+        .journal
+        .last()
+        .map_or(Mark::EMPTY, |entry| Mark::of(entry.sequence, &entry.data));
+    let append = head.next(&op("r-1"), &Body::End(end), Limits::default()).unwrap();
+    harness.double.journal.push(append.entry().clone());
+    harness.double.synced = harness.double.journal.len();
+
+    let issue = |name: &str, value: u64| {
+        let mut proposal = proposal(name, &[], &[]);
+        proposal.read(Dependency::Absent(grant.clone())).unwrap();
+        let version = AuthorityVersion::new(Id::new("acme", "auth").unwrap(), &value.to_be_bytes()).unwrap();
+        proposal
+            .change(Change::Write {
+                key: grant.clone(),
+                version,
+                end: None,
+                data: Box::new(*b"record"),
+            })
+            .unwrap();
+        proposal
+    };
+    let low = harness.driver.allocate().unwrap();
+    assert!(low < dead);
+    let ticket = harness.submit(issue("g-1", low), Plan::default());
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&ticket),
+        Some(Answer::Outcome(Outcome::Conflict))
+    );
+    assert!(!harness.holds(&grant));
+
+    let high = harness.driver.allocate().unwrap();
+    assert!(high > dead);
+    let ticket = harness.submit(issue("g-2", high), Plan::default());
+    harness.run(|_| None);
+    assert_matches!(
+        harness.answers.remove(&ticket),
+        Some(Answer::Outcome(Outcome::Accepted(_)))
+    );
 }
 
 /// After a crash between a commit and its creation entry, the next start writes the creation entry before it serves.
@@ -688,7 +887,11 @@ fn a_record_bound_below_the_records_of_the_driver_refuses_at_the_construction() 
             record_bytes_max: bytes,
             ..declaration(true)
         };
-        Driver::new(Profile::new(declaration).unwrap(), Limits::default())
+        Driver::new(
+            Profile::new(declaration).unwrap(),
+            Limits::default(),
+            &mut ChaCha20Rng::from_seed([1; 32]),
+        )
     };
     assert_matches!(driver(least - 1), Err(Error::RecordBound(bytes)) if bytes == least);
     assert_matches!(driver(least), Ok(_));
@@ -726,25 +929,34 @@ fn a_proposal_over_the_record_bound_refuses_before_the_binding_gets_it() {
     );
 }
 
-/// Each commit carries the instance number of the latest start, so the binding refuses a commit of an earlier
-/// instance.
+/// A start after a crash joins the open instance, so a peer of the same instance keeps serving. A restore activates a
+/// new instance, and each later commit carries it, so the binding refuses each commit of the earlier instance.
 #[test]
-fn a_commit_carries_the_instance_number_of_the_latest_start() {
+fn a_start_joins_the_open_instance_and_a_restore_activates_a_new_one() {
     let mut harness = Harness::serving(true);
     harness.submit(
         proposal("u-1", &[&key(Kind::Credential, "a1p")], &[]),
         plan(&passkeys(), &[]),
     );
     harness.run(once(committed("u-1"), Fault::Fail));
+    harness.events.clear();
     harness.driver.start(now());
     harness.run(|_| None);
-    harness.events.clear();
+    assert!(!harness.has(&Event::Start), "a join installs no instance");
     harness.submit(
         proposal("u-2", &[&key(Kind::Credential, "a1q")], &[]),
         plan(&passkeys(), &[]),
     );
     harness.run(|_| None);
-    assert!(harness.has(&Event::Commit(op("u-2"), Instance(2))));
+    assert!(harness.has(&Event::Commit(op("u-2"), Instance(1))));
+    harness.driver.restore(now()).unwrap();
+    harness.run(|_| None);
+    harness.submit(
+        proposal("u-3", &[&key(Kind::Credential, "a1r")], &[]),
+        plan(&passkeys(), &[]),
+    );
+    harness.run(|_| None);
+    assert!(harness.has(&Event::Commit(op("u-3"), Instance(2))));
 }
 
 /// A journal with two in-doubt consumptions: the recovery `r-1` of `a2c`, then the bootstrap `b-1`.
@@ -1094,14 +1306,22 @@ fn a_binding_without_a_journal_gets_no_journal_effect() {
     assert_eq!(harness.driver.restore(now()), Err(Error::Unsupported));
 }
 
-/// The last-anchor check refuses an unlink of the last sign-in method before any effect.
+/// The last-anchor check refuses an unlink of the last sign-in method under the turn of the owner, before any journal
+/// entry, and the refusal releases the turn.
 #[test]
 fn the_last_sign_in_method_cannot_be_unlinked() {
     let mut harness = Harness::serving(true);
     let a1p = key(Kind::Credential, "a1p");
     let ticket = harness.submit(proposal("u-1", &[&a1p], &[]), plan(&[anchor(&a1p, sign_in("a1"))], &[]));
     harness.run(|_| None);
-    assert_eq!(harness.events, [Event::Answer(ticket)]);
+    assert!(!harness.events.iter().any(|event| matches!(event, Event::Append(..))));
+    assert!(
+        !harness
+            .double
+            .records
+            .keys()
+            .any(|key| Kind::of(key) == Some(Kind::Turn))
+    );
     assert_matches!(
         harness.answers.remove(&ticket),
         Some(Answer::Outcome(Outcome::Refused(crate::transition::Error::LastAnchor)))
@@ -1114,7 +1334,7 @@ fn the_last_sign_in_method_cannot_be_unlinked() {
 fn an_advance_moves_the_mark_past_the_reflected_entries() {
     let mut harness = Harness::serving(true);
     let a1p = key(Kind::Credential, "a1p");
-    assert_eq!(harness.driver.allocate(Kind::Session), Ok(1));
+    assert_eq!(harness.driver.allocate(), Ok(1));
     harness.submit(proposal("s-1", &[], &[&key(Kind::Session, "s-1")]), Plan::default());
     harness.submit(proposal("u-1", &[&a1p], &[]), plan(&passkeys(), &[]));
     harness.driver.advance(now());
@@ -1124,7 +1344,8 @@ fn an_advance_moves_the_mark_past_the_reflected_entries() {
     harness.driver.start(now());
     harness.run(|_| None);
     assert!(!harness.has(&Event::Read(a1p)));
-    assert_eq!(harness.driver.allocate(Kind::Session), Ok(super::FLOOR_BLOCK.get() + 1));
+    // Each start reserves a block in use and a spare block above each earlier reservation.
+    assert_eq!(harness.driver.allocate(), Ok(2 * super::FLOOR_BLOCK.get() + 1));
 }
 
 /// How a test changes the store between two starts.
